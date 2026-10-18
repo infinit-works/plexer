@@ -1,0 +1,607 @@
+{
+  "generatedAt": "2026-10-20T11:26:35.533Z",
+  "model": "argon-low",
+  "totals": {
+    "cold": {
+      "calls": 239,
+      "turns": 153,
+      "toolOutputTokens": 233849,
+      "uncachedInputTokens": 851993,
+      "cachedInputTokens": 6847863,
+      "cumulativeInputTokens": 7699856,
+      "finalContextTokens": 498482,
+      "totalModelOutputTokens": 95451,
+      "searchMs": 2759000,
+      "totalMs": 2759000,
+      "score": 61,
+      "maxScore": 64
+    },
+    "plexer": {
+      "calls": 180,
+      "turns": 130,
+      "toolOutputTokens": 183048,
+      "uncachedInputTokens": 646761,
+      "cachedInputTokens": 5122714,
+      "cumulativeInputTokens": 5769475,
+      "finalContextTokens": 446227,
+      "totalModelOutputTokens": 114880,
+      "searchMs": 1855000,
+      "totalMs": 1861000,
+      "score": 61,
+      "maxScore": 64
+    }
+  },
+  "tasks": [
+    {
+      "id": "S1",
+      "instance_id": "instance_qutebrowser__qutebrowser-0833b5f6f140d04200ec91605f88704dd18e2970-v059c6fdc75567943479b23ebca7c07b5e9a7f34c",
+      "repo": "qutebrowser/qutebrowser",
+      "language": "python",
+      "gold_files": [
+        "qutebrowser/browser/qtnetworkdownloads.py",
+        "qutebrowser/browser/webkit/network/networkreply.py",
+        "qutebrowser/misc/ipc.py"
+      ],
+      "cold": {
+        "conversationId": "8fe63e60-7100-4ebe-b42c-3a56a8cdb6f8",
+        "calls": 8,
+        "turns": 5,
+        "toolOutputTokens": 6902,
+        "uncachedInputTokens": 20534,
+        "cachedInputTokens": 53586,
+        "cumulativeInputTokens": 74120,
+        "finalContextTokens": 16439,
+        "totalModelOutputTokens": 1165,
+        "searchMs": 34000,
+        "totalMs": 34000,
+        "score": 7,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.5,
+        "symRecall": 0.5,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "qutebrowser/browser/webkit/network/networkreply.py",
+          "tests/unit/browser/webkit/network/test_networkreply.py"
+        ],
+        "goldSourceFiles": [
+          "qutebrowser/browser/webkit/network/networkreply.py"
+        ],
+        "dockerPassed": null
+      },
+      "plexer": {
+        "conversationId": "af0f00c0-8a05-4d89-b6ec-2f05db8214dd",
+        "calls": 8,
+        "turns": 5,
+        "toolOutputTokens": 5701,
+        "uncachedInputTokens": 28483,
+        "cachedInputTokens": 45664,
+        "cumulativeInputTokens": 74147,
+        "finalContextTokens": 16159,
+        "totalModelOutputTokens": 1242,
+        "searchMs": 61000,
+        "totalMs": 63000,
+        "score": 7,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.5,
+        "symRecall": 0.5,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "qutebrowser/browser/webkit/network/networkreply.py",
+          "tests/unit/browser/webkit/network/test_networkreply.py"
+        ],
+        "goldSourceFiles": [
+          "qutebrowser/browser/webkit/network/networkreply.py"
+        ],
+        "dockerPassed": null
+      }
+    },
+    {
+      "id": "S2",
+      "instance_id": "instance_qutebrowser__qutebrowser-0d2afd58f3d0e34af21cee7d8a3fc9d855594e9f-vnan",
+      "repo": "qutebrowser/qutebrowser",
+      "language": "python",
+      "gold_files": [
+        "qutebrowser/app.py",
+        "qutebrowser/browser/eventfilter.py",
+        "qutebrowser/keyinput/modeman.py",
+        "qutebrowser/utils/qtutils.py"
+      ],
+      "plexer": {
+        "conversationId": "4aba81d1-2a5a-40ea-bfbc-d4a592f9a673",
+        "calls": 28,
+        "turns": 18,
+        "toolOutputTokens": 46403,
+        "uncachedInputTokens": 123857,
+        "cachedInputTokens": 1232114,
+        "cumulativeInputTokens": 1355971,
+        "finalContextTokens": 99795,
+        "totalModelOutputTokens": 22536,
+        "searchMs": 367000,
+        "totalMs": 368000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.8,
+        "symRecall": 0.769,
+        "tokenRecall": 0.763,
+        "modifiedFiles": [
+          "qutebrowser/app.py",
+          "qutebrowser/browser/eventfilter.py",
+          "qutebrowser/keyinput/modeman.py",
+          "qutebrowser/utils/qtutils.py",
+          "tests/unit/utils/test_qtutils.py"
+        ],
+        "goldSourceFiles": [
+          "qutebrowser/app.py",
+          "qutebrowser/browser/eventfilter.py",
+          "qutebrowser/keyinput/modeman.py",
+          "qutebrowser/utils/qtutils.py"
+        ],
+        "dockerPassed": null
+      },
+      "cold": {
+        "conversationId": "319a049f-cfdc-4c00-b6dc-8b7213064c03",
+        "calls": 50,
+        "turns": 33,
+        "toolOutputTokens": 59711,
+        "uncachedInputTokens": 268921,
+        "cachedInputTokens": 2815142,
+        "cumulativeInputTokens": 3084063,
+        "finalContextTokens": 134953,
+        "totalModelOutputTokens": 37787,
+        "searchMs": 856000,
+        "totalMs": 856000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.8,
+        "symRecall": 0.769,
+        "tokenRecall": 0.763,
+        "modifiedFiles": [
+          "qutebrowser/app.py",
+          "qutebrowser/browser/eventfilter.py",
+          "qutebrowser/keyinput/modeman.py",
+          "qutebrowser/utils/qtutils.py",
+          "tests/unit/utils/test_qtutils.py"
+        ],
+        "goldSourceFiles": [
+          "qutebrowser/app.py",
+          "qutebrowser/browser/eventfilter.py",
+          "qutebrowser/keyinput/modeman.py",
+          "qutebrowser/utils/qtutils.py"
+        ],
+        "dockerPassed": null
+      }
+    },
+    {
+      "id": "S3",
+      "instance_id": "instance_flipt-io__flipt-0b119520afca1cf25c470ff4288c464d4510b944",
+      "repo": "flipt-io/flipt",
+      "language": "go",
+      "gold_files": [
+        "internal/cleanup/cleanup.go",
+        "internal/cmd/authn.go",
+        "internal/config/authentication.go"
+      ],
+      "plexer": {
+        "conversationId": "2989aed3-5711-4c1d-939b-c3cb98989c25",
+        "calls": 29,
+        "turns": 21,
+        "toolOutputTokens": 28087,
+        "uncachedInputTokens": 97320,
+        "cachedInputTokens": 849056,
+        "cumulativeInputTokens": 946376,
+        "finalContextTokens": 66151,
+        "totalModelOutputTokens": 18648,
+        "searchMs": 262000,
+        "totalMs": 263000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.75,
+        "symRecall": 0.857,
+        "tokenRecall": 0.942,
+        "modifiedFiles": [
+          "internal/cleanup/cleanup.go",
+          "internal/cleanup/cleanup_test.go",
+          "internal/cmd/authn.go",
+          "internal/config/authentication.go"
+        ],
+        "goldSourceFiles": [
+          "internal/cleanup/cleanup.go",
+          "internal/cmd/authn.go",
+          "internal/config/authentication.go"
+        ],
+        "dockerPassed": null
+      },
+      "cold": {
+        "conversationId": "b8d1f8ec-a467-4aea-9737-64da88a6c4a3",
+        "calls": 32,
+        "turns": 26,
+        "toolOutputTokens": 49119,
+        "uncachedInputTokens": 121483,
+        "cachedInputTokens": 1535723,
+        "cumulativeInputTokens": 1657206,
+        "finalContextTokens": 97105,
+        "totalModelOutputTokens": 16496,
+        "searchMs": 426000,
+        "totalMs": 426000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.75,
+        "symRecall": 0.786,
+        "tokenRecall": 0.884,
+        "modifiedFiles": [
+          "internal/cleanup/cleanup.go",
+          "internal/cleanup/cleanup_test.go",
+          "internal/cmd/authn.go",
+          "internal/config/authentication.go"
+        ],
+        "goldSourceFiles": [
+          "internal/cleanup/cleanup.go",
+          "internal/cmd/authn.go",
+          "internal/config/authentication.go"
+        ],
+        "dockerPassed": null
+      }
+    },
+    {
+      "id": "S4",
+      "instance_id": "instance_flipt-io__flipt-15b76cada1ef29cfa56b0fba36754be36243dded",
+      "repo": "flipt-io/flipt",
+      "language": "go",
+      "gold_files": [
+        "internal/storage/cache/cache.go",
+        "internal/storage/storage.go",
+        "ui/src/app/flags/rollouts/Rollouts.tsx",
+        "ui/src/app/flags/rules/Rules.tsx"
+      ],
+      "cold": {
+        "conversationId": "e3f1b4fd-205b-4171-8f51-ee0ea91cd094",
+        "calls": 19,
+        "turns": 19,
+        "toolOutputTokens": 16349,
+        "uncachedInputTokens": 60561,
+        "cachedInputTokens": 401946,
+        "cumulativeInputTokens": 462507,
+        "finalContextTokens": 34575,
+        "totalModelOutputTokens": 5280,
+        "searchMs": 185000,
+        "totalMs": 185000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.667,
+        "symRecall": 1,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "internal/storage/cache/cache.go",
+          "internal/storage/cache/cache_test.go",
+          "internal/storage/storage.go"
+        ],
+        "goldSourceFiles": [
+          "internal/storage/cache/cache.go",
+          "internal/storage/storage.go"
+        ],
+        "dockerPassed": null
+      },
+      "plexer": {
+        "conversationId": "da7e635d-7250-4f61-ad36-b7536cd4ad14",
+        "calls": 18,
+        "turns": 12,
+        "toolOutputTokens": 20194,
+        "uncachedInputTokens": 64858,
+        "cachedInputTokens": 314922,
+        "cumulativeInputTokens": 379780,
+        "finalContextTokens": 46917,
+        "totalModelOutputTokens": 10156,
+        "searchMs": 152000,
+        "totalMs": 152000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.667,
+        "symRecall": 1,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "internal/storage/cache/cache.go",
+          "internal/storage/cache/cache_test.go",
+          "internal/storage/storage.go"
+        ],
+        "goldSourceFiles": [
+          "internal/storage/cache/cache.go",
+          "internal/storage/storage.go"
+        ],
+        "dockerPassed": null
+      }
+    },
+    {
+      "id": "S5",
+      "instance_id": "instance_NodeBB__NodeBB-087e6020e490b4a1759f38c1ad03869511928263-vf2cf3cbd463b7ad942381f1c6d077626485a1e9e",
+      "repo": "NodeBB/NodeBB",
+      "language": "js",
+      "gold_files": [
+        "src/middleware/header.js",
+        "src/user/email.js",
+        "src/user/profile.js",
+        "src/user/reset.js"
+      ],
+      "plexer": {
+        "conversationId": "40fbbdce-a15b-4cf4-b117-0948dd440d38",
+        "calls": 20,
+        "turns": 15,
+        "toolOutputTokens": 14573,
+        "uncachedInputTokens": 65183,
+        "cachedInputTokens": 309511,
+        "cumulativeInputTokens": 374694,
+        "finalContextTokens": 35246,
+        "totalModelOutputTokens": 5538,
+        "searchMs": 146000,
+        "totalMs": 146000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 1,
+        "symRecall": 1,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "src/middleware/header.js",
+          "src/user/email.js",
+          "src/user/profile.js",
+          "src/user/reset.js"
+        ],
+        "goldSourceFiles": [
+          "src/middleware/header.js",
+          "src/user/email.js",
+          "src/user/profile.js",
+          "src/user/reset.js"
+        ],
+        "dockerPassed": null
+      },
+      "cold": {
+        "conversationId": "c1fe4ff5-c91f-4e89-affc-3f90f003619d",
+        "calls": 30,
+        "turns": 14,
+        "toolOutputTokens": 15595,
+        "uncachedInputTokens": 48580,
+        "cachedInputTokens": 322643,
+        "cumulativeInputTokens": 371223,
+        "finalContextTokens": 37910,
+        "totalModelOutputTokens": 6777,
+        "searchMs": 202000,
+        "totalMs": 202000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.8,
+        "symRecall": 1,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "src/middleware/header.js",
+          "src/user/email.js",
+          "src/user/profile.js",
+          "src/user/reset.js",
+          "test/user.js"
+        ],
+        "goldSourceFiles": [
+          "src/middleware/header.js",
+          "src/user/email.js",
+          "src/user/profile.js",
+          "src/user/reset.js"
+        ],
+        "dockerPassed": null
+      }
+    },
+    {
+      "id": "S6",
+      "instance_id": "instance_NodeBB__NodeBB-0c81642997ea1d827dbd02c311db9d4976112cd4-vf2cf3cbd463b7ad942381f1c6d077626485a1e9e",
+      "repo": "NodeBB/NodeBB",
+      "language": "js",
+      "gold_files": [
+        "src/posts/queue.js",
+        "src/socket.io/posts.js",
+        "src/topics/merge.js"
+      ],
+      "plexer": {
+        "conversationId": "ea6da952-0cbc-442c-85cb-033d99186938",
+        "calls": 8,
+        "turns": 4,
+        "toolOutputTokens": 8827,
+        "uncachedInputTokens": 34821,
+        "cachedInputTokens": 54205,
+        "cumulativeInputTokens": 89026,
+        "finalContextTokens": 23963,
+        "totalModelOutputTokens": 2601,
+        "searchMs": 45000,
+        "totalMs": 45000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 1,
+        "symRecall": 1,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "src/posts/queue.js",
+          "src/topics/merge.js"
+        ],
+        "goldSourceFiles": [
+          "src/posts/queue.js",
+          "src/topics/merge.js"
+        ],
+        "dockerPassed": null
+      },
+      "cold": {
+        "conversationId": "d9cca5d6-80d4-4717-9765-e40a342ca329",
+        "calls": 33,
+        "turns": 15,
+        "toolOutputTokens": 20181,
+        "uncachedInputTokens": 124291,
+        "cachedInputTokens": 345865,
+        "cumulativeInputTokens": 470156,
+        "finalContextTokens": 44281,
+        "totalModelOutputTokens": 5492,
+        "searchMs": 354000,
+        "totalMs": 354000,
+        "score": 8,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.667,
+        "symRecall": 1,
+        "tokenRecall": 1,
+        "modifiedFiles": [
+          "src/posts/queue.js",
+          "src/topics/merge.js",
+          "test/posts.js"
+        ],
+        "goldSourceFiles": [
+          "src/posts/queue.js",
+          "src/topics/merge.js"
+        ],
+        "dockerPassed": null
+      }
+    },
+    {
+      "id": "S7",
+      "instance_id": "instance_tutao__tutanota-51818218c6ae33de00cbea3a4d30daac8c34142e-vc4e41fd0029957297843cb9dec4a25c7c756f029",
+      "repo": "tutao/tutanota",
+      "language": "ts",
+      "gold_files": [
+        "src/desktop/DesktopDownloadManager.ts",
+        "src/desktop/DesktopNetworkClient.ts"
+      ],
+      "cold": {
+        "conversationId": "84e447f8-a760-49d4-a240-3b052b328ec1",
+        "calls": 27,
+        "turns": 22,
+        "toolOutputTokens": 32241,
+        "uncachedInputTokens": 88669,
+        "cachedInputTokens": 798572,
+        "cumulativeInputTokens": 887241,
+        "finalContextTokens": 68171,
+        "totalModelOutputTokens": 13892,
+        "searchMs": 478000,
+        "totalMs": 478000,
+        "score": 7,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.333,
+        "symRecall": 0.923,
+        "tokenRecall": 0.645,
+        "modifiedFiles": [
+          "app-android/app/src/main/assets/tutanota",
+          "app-ios/tutanota/tutanota-web",
+          "fdroid-metadata-workaround",
+          "src/desktop/DesktopDownloadManager.ts",
+          "src/desktop/DesktopNetworkClient.ts",
+          "test/client/desktop/DesktopDownloadManagerTest.ts"
+        ],
+        "goldSourceFiles": [
+          "src/desktop/DesktopDownloadManager.ts",
+          "src/desktop/DesktopNetworkClient.ts"
+        ],
+        "dockerPassed": null
+      },
+      "plexer": {
+        "conversationId": "4d75e3d8-ba98-47d7-a1c4-3f939b91e5f1",
+        "calls": 36,
+        "turns": 33,
+        "toolOutputTokens": 35723,
+        "uncachedInputTokens": 153789,
+        "cachedInputTokens": 1744066,
+        "cumulativeInputTokens": 1897855,
+        "finalContextTokens": 111245,
+        "totalModelOutputTokens": 48121,
+        "searchMs": 664000,
+        "totalMs": 665000,
+        "score": 7,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 1,
+        "symRecall": 0.846,
+        "tokenRecall": 0.621,
+        "modifiedFiles": [
+          "src/desktop/DesktopDownloadManager.ts",
+          "src/desktop/DesktopNetworkClient.ts"
+        ],
+        "goldSourceFiles": [
+          "src/desktop/DesktopDownloadManager.ts",
+          "src/desktop/DesktopNetworkClient.ts"
+        ],
+        "dockerPassed": null
+      }
+    },
+    {
+      "id": "S8",
+      "instance_id": "instance_tutao__tutanota-de49d486feef842101506adf040a0f00ded59519-v10a26bfb45a064b93f4fc044a0254925037b88f1",
+      "repo": "tutao/tutanota",
+      "language": "ts",
+      "gold_files": [
+        "src/api/worker/facades/DeviceEncryptionFacade.ts",
+        "src/misc/credentials/NativeCredentialsEncryption.ts"
+      ],
+      "cold": {
+        "conversationId": "36ca88f0-5573-47d8-a518-363c725f971f",
+        "calls": 40,
+        "turns": 19,
+        "toolOutputTokens": 33751,
+        "uncachedInputTokens": 118954,
+        "cachedInputTokens": 574386,
+        "cumulativeInputTokens": 693340,
+        "finalContextTokens": 65048,
+        "totalModelOutputTokens": 8562,
+        "searchMs": 224000,
+        "totalMs": 224000,
+        "score": 7,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 0.333,
+        "symRecall": 1,
+        "tokenRecall": 0.65,
+        "modifiedFiles": [
+          "app-android/app/src/main/assets/tutanota",
+          "app-ios/tutanota/tutanota-web",
+          "fdroid-metadata-workaround",
+          "src/api/worker/facades/DeviceEncryptionFacade.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts",
+          "test/client/misc/credentials/NativeCredentialsEncryptionTest.ts"
+        ],
+        "goldSourceFiles": [
+          "src/api/worker/facades/DeviceEncryptionFacade.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts"
+        ],
+        "dockerPassed": null
+      },
+      "plexer": {
+        "conversationId": "9ec4058d-7082-4dbe-8555-5ec608a77fc5",
+        "calls": 33,
+        "turns": 22,
+        "toolOutputTokens": 23540,
+        "uncachedInputTokens": 78450,
+        "cachedInputTokens": 573176,
+        "cumulativeInputTokens": 651626,
+        "finalContextTokens": 46751,
+        "totalModelOutputTokens": 6038,
+        "searchMs": 158000,
+        "totalMs": 159000,
+        "score": 7,
+        "maxScore": 8,
+        "fileRecall": 1,
+        "filePrecision": 1,
+        "symRecall": 1,
+        "tokenRecall": 0.65,
+        "modifiedFiles": [
+          "src/api/worker/facades/DeviceEncryptionFacade.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts"
+        ],
+        "goldSourceFiles": [
+          "src/api/worker/facades/DeviceEncryptionFacade.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts"
+        ],
+        "dockerPassed": null
+      }
+    }
+  ]
+}

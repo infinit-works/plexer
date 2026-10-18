@@ -1,0 +1,122 @@
+{
+  "T1": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T1-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/kohls-admin"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T1-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/kohls-admin"
+    }
+  },
+  "T2": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T2-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T2-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/flux"
+    }
+  },
+  "T3": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T3-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/sert"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T3-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/sert"
+    }
+  },
+  "T4": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T4-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/z"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T4-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/z"
+    }
+  },
+  "T5": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T5-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/plexer"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T5-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/plexer"
+    }
+  },
+  "T6": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T6-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/kohls-admin"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T6-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/kohls-admin"
+    }
+  },
+  "T7": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T7-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T7-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/flux"
+    }
+  },
+  "T8": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T8-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/building-tools"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T8-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/building-tools"
+    }
+  },
+  "T9": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T9-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/plexer"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T9-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/plexer"
+    }
+  },
+  "T10": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T10-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/flux"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T10-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/flux"
+    }
+  },
+  "T11": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T11-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/sert"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T11-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/sert"
+    }
+  },
+  "T12": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T12-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-plexer/building-tools"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-low/T12-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-low-cold/building-tools"
+    }
+  }
+}

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>plexer viz — Code Graph Viewer</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="workspace">
+    <section id="canvas-stage" class="canvas-stage">
+      <canvas id="graph-canvas"></canvas>
+      <div id="canvas-empty" class="empty-state hidden"></div>
+    </section>
+
+    <aside id="outline-sidebar" class="outline-sidebar">
+      <div class="outline-sidebar-header">
+        <div class="outline-sidebar-title-wrap">
+          <span class="outline-sidebar-title">Outline</span>
+          <span id="outline-count" class="outline-count"></span>
+        </div>
+        <div class="outline-sidebar-actions">
+          <button type="button" id="outline-expand-all" class="btn-xs" title="Expand all directories & files">Expand</button>
+          <button type="button" id="outline-collapse-all" class="btn-xs" title="Collapse files (click again to collapse directories)">Collapse</button>
+          <button type="button" id="outline-close" class="btn-icon" title="Hide Outline sidebar ([)">✕</button>
+        </div>
+      </div>
+      <div id="outline-list" class="outline-list"></div>
+    </aside>
+
+    <header class="topbar">
+      <button type="button" id="outline-toggle-btn" class="btn outline-toggle-btn active" title="Toggle Outline sidebar ([ or O)" aria-expanded="true">
+        <span class="outline-toggle-icon">☰</span>
+        <span>Outline</span>
+      </button>
+      <span id="repo-name" class="repo-name"></span>
+      <span id="repo-subtitle" class="repo-subtitle hidden"></span>
+
+      <nav id="view-tabs" class="tabs" role="tablist">
+        <button class="tab active" id="tab-modules" data-tab="modules" role="tab" title="Module dependency graph (1)">Modules</button>
+        <button class="tab" id="tab-symbols" data-tab="symbols" role="tab" title="Full symbol call/reference graph (2)">Symbols</button>
+        <button class="tab hidden" id="tab-context" data-tab="context" role="tab" title="Blast radius & concept graph (3)">Blast</button>
+      </nav>
+
+      <div class="search-wrap">
+        <input id="search-input" type="search" placeholder="Find… (/)" title="Search nodes (/ to focus, Enter / ↑ / ↓ to cycle matches)" autocomplete="off" spellcheck="false">
+        <span id="search-count" class="search-count"></span>
+      </div>
+
+      <select id="scope-select" class="control-select hidden" title="Filter by directory">
+        <option value="">All scopes</option>
+      </select>
+
+      <button id="btn-fit" class="btn" title="Fit graph to view (F)">Fit</button>
+      <button id="btn-relayout" class="btn" title="Re-pack layout (R)">Pack</button>
+    </header>
+
+    <div id="canvas-hud" class="canvas-hud">
+      <span id="hud-stats" class="hud-stats"></span>
+      <div id="hud-legend" class="hud-legend"></div>
+    </div>
+
+    <div id="zoom-hud" class="zoom-hud">
+      <button type="button" id="zoom-out-btn" class="zoom-btn" title="Zoom out (−)">−</button>
+      <button type="button" id="zoom-reset-btn" class="zoom-pct" title="Reset zoom to 100% (0)">100%</button>
+      <button type="button" id="zoom-in-btn" class="zoom-btn" title="Zoom in (+)">+</button>
+      <span class="zoom-sep"></span>
+      <button type="button" id="zoom-fit-btn" class="zoom-btn zoom-fit" title="Fit graph to view (F)">Fit</button>
+    </div>
+
+    <aside id="inspector" class="inspector hidden">
+      <div class="inspector-header">
+        <div>
+          <div class="inspector-badges">
+            <span id="insp-kind" class="badge"></span>
+            <span id="insp-scope" class="badge badge-muted hidden"></span>
+          </div>
+          <h2 id="insp-title" class="inspector-title"></h2>
+        </div>
+        <button id="insp-close" class="btn-icon" title="Close inspector (Esc)">✕</button>
+      </div>
+      <div class="inspector-loc-row">
+        <code id="insp-loc" class="inspector-loc"></code>
+        <button id="insp-copy" class="btn-xs" title="Copy path:span">Copy</button>
+        <button id="insp-focus-symbols" class="btn-xs hidden" title="Focus in Symbols graph">Focus Graph</button>
+      </div>
+      <div id="insp-controls-row" class="inspector-controls-row">
+        <span class="insp-controls-label">Reachability</span>
+        <div id="insp-hops" class="hop-pills" role="group" aria-label="Reachability hops">
+          <button type="button" class="hop-pill active" data-hop="1" title="Direct 1-hop callers & callees">1 hop</button>
+          <button type="button" class="hop-pill" data-hop="2" title="2-hop neighborhood">2 hops</button>
+          <button type="button" class="hop-pill" data-hop="all" title="Full transitive closure">All</button>
+        </div>
+        <span class="insp-shift-hint" title="Hold Shift and click any other node on the canvas to trace the shortest path">Shift+Click path</span>
+      </div>
+      <div id="insp-path-box" class="insp-path-box hidden"></div>
+      <pre id="insp-sig" class="inspector-sig hidden"></pre>
+      <p id="insp-summary" class="inspector-summary hidden"></p>
+      <div id="insp-source-box" class="insp-source-box hidden"></div>
+      <div id="insp-sections" class="inspector-sections"></div>
+    </aside>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

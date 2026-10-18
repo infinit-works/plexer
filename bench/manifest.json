@@ -1,0 +1,122 @@
+{
+  "T1": {
+    "cold": {
+      "conversationId": "2f0edfb0-d8e4-467f-862d-292b6d1c41b9",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/kohls-admin"
+    },
+    "plexer": {
+      "conversationId": "29c87815-ae3c-4f70-9dbd-d80c524b5703",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/kohls-admin"
+    }
+  },
+  "T2": {
+    "cold": {
+      "conversationId": "bbd3536a-f9e7-452e-9383-2ce24d62e20d",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "2f81e3f6-a908-45b6-a3ee-5d2944fc2ad2",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/flux"
+    }
+  },
+  "T3": {
+    "cold": {
+      "conversationId": "892c8793-5391-4423-ac10-8468ef7cbeb7",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/sert"
+    },
+    "plexer": {
+      "conversationId": "7a6abc04-77cd-4134-937f-9344672a09ef",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/sert"
+    }
+  },
+  "T4": {
+    "cold": {
+      "conversationId": "4deb5236-26c1-4208-bbad-181ef243f873",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/z"
+    },
+    "plexer": {
+      "conversationId": "d69e6720-9a9b-4975-928f-83fd30f63e38",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/z"
+    }
+  },
+  "T5": {
+    "cold": {
+      "conversationId": "88f95d87-0abd-40df-ad34-6aacfa127c84",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/plexer"
+    },
+    "plexer": {
+      "conversationId": "7cfdcb81-2214-44cb-9c98-b3bcbeb76eeb",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/plexer"
+    }
+  },
+  "T6": {
+    "cold": {
+      "conversationId": "3aece969-dc1f-4b64-89d6-8ad23d3f2039",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/kohls-admin"
+    },
+    "plexer": {
+      "conversationId": "99406bc3-48ab-4642-abcd-982207032eff",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/kohls-admin"
+    }
+  },
+  "T7": {
+    "cold": {
+      "conversationId": "6aa4ae55-e588-45e0-8212-7bcdebf9bc62",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "5001e7d6-87e4-4ed1-bd0a-fd4a1315f17b",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/flux"
+    }
+  },
+  "T8": {
+    "cold": {
+      "conversationId": "cef5c3b7-2955-4081-b88c-e87b7b357acb",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/building-tools"
+    },
+    "plexer": {
+      "conversationId": "b2064574-cba4-43a3-a034-ede582f5b725",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/building-tools"
+    }
+  },
+  "T9": {
+    "cold": {
+      "conversationId": "63af0a7a-249b-440a-8b11-9c2e80eb0b22",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/plexer"
+    },
+    "plexer": {
+      "conversationId": "dcc78a78-0fdb-49fa-bc7e-f59db66ad30a",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/plexer"
+    }
+  },
+  "T10": {
+    "cold": {
+      "conversationId": "6262f239-99d1-44a9-8a43-e6c2cccfdeee",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "e3e8a83c-1ddc-4cdf-ac07-793f091c3a16",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/flux"
+    }
+  },
+  "T11": {
+    "cold": {
+      "conversationId": "4c0448f4-3e74-4f42-88a0-0ed9e1721201",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/sert"
+    },
+    "plexer": {
+      "conversationId": "95436e53-4d6f-46b2-a5c2-ebe730fd1924",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/sert"
+    }
+  },
+  "T12": {
+    "cold": {
+      "conversationId": "ef173436-ae07-4859-8cd7-643ba7c275bc",
+      "cloneDir": "/tmp/plexer-ab-agy-cold/building-tools"
+    },
+    "plexer": {
+      "conversationId": "8e3c9fa6-9807-4270-89e3-2305d1365eb0",
+      "cloneDir": "/tmp/plexer-ab-agy-plexer/building-tools"
+    }
+  }
+}

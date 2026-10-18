@@ -1,0 +1,6 @@
+interface:
+  display_name: "Plexer Context Graph"
+  short_description: "Structural codebase graph, caller tracing, and symbol search"
+  default_prompt: "Use $plexer (`plexer ask --source`, `plexer callers`, `plexer grep`, `plexer skeleton`, `plexer map`) to locate symbols, trace callers, and scope edits before reading or grepping source files."
+policy:
+  allow_implicit_invocation: true

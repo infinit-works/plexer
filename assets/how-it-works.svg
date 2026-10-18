@@ -1,0 +1,432 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 260" width="100%" height="100%" role="img" aria-label="How Plexer Works: Your Codebase (25 languages) is indexed by plexer init (offline, $0, seconds) into a Live Code Graph in plexer/, powering Turn-1 Code Search, Callers &amp; Blast Radius, and an Interactive Web Graph.">
+  <title>How Plexer Works</title>
+  <desc>Four-stage overview: 1. Your Codebase (25 languages supported) flows into 2. plexer init (offline, $0, in seconds: parses symbols and links, and wires 12 AI coding tools), which builds 3. Live Code Graph in plexer/ (exact file:line symbol spans, cross-file call and import graph, re-parsing changed files in milliseconds), powering 4. Turn-1 Code Search, Callers and Blast Radius, and Interactive Web Graph.</desc>
+
+  <defs>
+    <style>
+      .font-sans {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+      }
+      .font-mono {
+        font-family: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      }
+
+      .title {
+        font-size: 14px;
+        font-weight: 600;
+        fill: #f1f5f9;
+        letter-spacing: -0.01em;
+      }
+      .title-hub {
+        font-size: 14.5px;
+        font-weight: 700;
+        fill: #f8fafc;
+        letter-spacing: -0.01em;
+      }
+      .subtitle {
+        font-size: 12px;
+        font-weight: 500;
+        fill: #64748b;
+      }
+      .pill-text {
+        font-size: 11.5px;
+        font-weight: 500;
+        fill: #cbd5e1;
+      }
+      .pill-more {
+        font-size: 11.5px;
+        font-weight: 600;
+        fill: #38bdf8;
+      }
+      .item-title {
+        font-size: 13px;
+        font-weight: 600;
+        fill: #e2e8f0;
+      }
+      .item-sub {
+        font-size: 11.5px;
+        font-weight: 400;
+        fill: #64748b;
+      }
+      .map-row-text {
+        font-size: 12.5px;
+        font-weight: 500;
+        fill: #e2e8f0;
+      }
+      .code-inline {
+        font-size: 11.5px;
+        font-weight: 500;
+        fill: #94a3b8;
+      }
+
+      /* Signal beams: normalized to pathLength="100" */
+      .beam-glow {
+        fill: none;
+        stroke: #38bdf8;
+        stroke-width: 5;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-dasharray: 36 150;
+        stroke-dashoffset: 36;
+        opacity: 0;
+      }
+      .beam-core {
+        fill: none;
+        stroke: #7dd3fc;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-dasharray: 36 150;
+        stroke-dashoffset: 36;
+        opacity: 0;
+      }
+
+      .beam-s1-glow {
+        animation: flow-s1-glow 3.2s linear infinite;
+      }
+      .beam-s1-core {
+        animation: flow-s1-core 3.2s linear infinite;
+      }
+      .beam-s2-glow {
+        animation: flow-s2-glow 3.2s linear infinite;
+      }
+      .beam-s2-core {
+        animation: flow-s2-core 3.2s linear infinite;
+      }
+      .beam-s3-glow {
+        animation: flow-s3-glow 3.2s linear infinite;
+      }
+      .beam-s3-core {
+        animation: flow-s3-core 3.2s linear infinite;
+      }
+
+      .hub-pulse {
+        animation: hub-breathe 3.2s ease-in-out infinite;
+      }
+
+      /* Stage 1 -> 2 wave (0% to 34%) */
+      @keyframes flow-s1-core {
+        0% {
+          stroke-dashoffset: 36;
+          opacity: 0;
+        }
+        5% {
+          opacity: 1;
+        }
+        29% {
+          opacity: 1;
+        }
+        34%, 100% {
+          stroke-dashoffset: -100;
+          opacity: 0;
+        }
+      }
+      @keyframes flow-s1-glow {
+        0% {
+          stroke-dashoffset: 36;
+          opacity: 0;
+        }
+        5% {
+          opacity: 0.28;
+        }
+        29% {
+          opacity: 0.28;
+        }
+        34%, 100% {
+          stroke-dashoffset: -100;
+          opacity: 0;
+        }
+      }
+
+      /* Stage 2 -> 3 wave (30% to 64%) */
+      @keyframes flow-s2-core {
+        0%, 30% {
+          stroke-dashoffset: 36;
+          opacity: 0;
+        }
+        35% {
+          opacity: 1;
+        }
+        59% {
+          opacity: 1;
+        }
+        64%, 100% {
+          stroke-dashoffset: -100;
+          opacity: 0;
+        }
+      }
+      @keyframes flow-s2-glow {
+        0%, 30% {
+          stroke-dashoffset: 36;
+          opacity: 0;
+        }
+        35% {
+          opacity: 0.28;
+        }
+        59% {
+          opacity: 0.28;
+        }
+        64%, 100% {
+          stroke-dashoffset: -100;
+          opacity: 0;
+        }
+      }
+
+      /* Stage 3 -> 4 fan-out wave (60% to 96%) */
+      @keyframes flow-s3-core {
+        0%, 60% {
+          stroke-dashoffset: 36;
+          opacity: 0;
+        }
+        65% {
+          opacity: 1;
+        }
+        91% {
+          opacity: 1;
+        }
+        96%, 100% {
+          stroke-dashoffset: -100;
+          opacity: 0;
+        }
+      }
+      @keyframes flow-s3-glow {
+        0%, 60% {
+          stroke-dashoffset: 36;
+          opacity: 0;
+        }
+        65% {
+          opacity: 0.28;
+        }
+        91% {
+          opacity: 0.28;
+        }
+        96%, 100% {
+          stroke-dashoffset: -100;
+          opacity: 0;
+        }
+      }
+
+      @keyframes hub-breathe {
+        0%, 30%, 100% {
+          stroke-opacity: 0.5;
+        }
+        62% {
+          stroke-opacity: 0.95;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .beam-s1-glow,
+        .beam-s1-core,
+        .beam-s2-glow,
+        .beam-s2-core,
+        .beam-s3-glow,
+        .beam-s3-core,
+        .hub-pulse {
+          animation: none;
+        }
+      }
+    </style>
+
+    <!-- Card Surfaces -->
+    <linearGradient id="card-surface" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#121824" />
+      <stop offset="100%" stop-color="#0d121b" />
+    </linearGradient>
+
+    <linearGradient id="hub-surface" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#141d2e" />
+      <stop offset="100%" stop-color="#0f1522" />
+    </linearGradient>
+
+    <linearGradient id="hub-border" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#6366f1" />
+    </linearGradient>
+  </defs>
+
+  <!-- ================= CONNECTORS (TRACKS & ANIMATED BEAMS) ================= -->
+  <g>
+    <!-- Connector 1 -> 2 -->
+    <path d="M 200 130 H 240" fill="none" stroke="#26354d" stroke-width="1.75" />
+    <path d="M 200 130 H 240" pathLength="100" class="beam-glow beam-s1-glow" />
+    <path d="M 200 130 H 240" pathLength="100" class="beam-core beam-s1-core" />
+
+    <!-- Connector 2 -> 3 -->
+    <path d="M 468 130 H 508" fill="none" stroke="#26354d" stroke-width="1.75" />
+    <path d="M 468 130 H 508" pathLength="100" class="beam-glow beam-s2-glow" />
+    <path d="M 468 130 H 508" pathLength="100" class="beam-core beam-s2-core" />
+
+    <!-- Connector 3 -> 4 (Rounded Orthogonal Tree) -->
+    <path d="M 752 130 H 802" fill="none" stroke="#26354d" stroke-width="1.75" />
+    <path d="M 777 130 V 52 Q 777 44 785 44 H 802 M 777 130 V 208 Q 777 216 785 216 H 802" fill="none" stroke="#26354d" stroke-width="1.75" />
+
+    <path d="M 752 130 H 777 V 52 Q 777 44 785 44 H 802" pathLength="100" class="beam-glow beam-s3-glow" />
+    <path d="M 752 130 H 777 V 52 Q 777 44 785 44 H 802" pathLength="100" class="beam-core beam-s3-core" />
+
+    <path d="M 752 130 H 802" pathLength="100" class="beam-glow beam-s3-glow" />
+    <path d="M 752 130 H 802" pathLength="100" class="beam-core beam-s3-core" />
+
+    <path d="M 752 130 H 777 V 208 Q 777 216 785 216 H 802" pathLength="100" class="beam-glow beam-s3-glow" />
+    <path d="M 752 130 H 777 V 208 Q 777 216 785 216 H 802" pathLength="100" class="beam-core beam-s3-core" />
+  </g>
+
+  <!-- ================= STAGE 1: YOUR CODEBASE ================= -->
+  <g transform="translate(8, 8)">
+    <rect width="192" height="244" rx="12" fill="url(#card-surface)" stroke="#222d3f" stroke-width="1.25" />
+
+    <!-- Icon: Code Brackets -->
+    <rect x="18" y="18" width="34" height="34" rx="8" fill="#151e2e" stroke="#26354d" stroke-width="1" />
+    <path d="M 31 30 L 27 35 L 31 40 M 39 30 L 43 35 L 39 40 M 36.2 28.5 L 33.8 41.5" fill="none" stroke="#38bdf8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- Header Text -->
+    <text x="64" y="32" class="font-sans title">Your Codebase</text>
+    <text x="64" y="49" class="font-sans subtitle">25 languages</text>
+
+    <line x1="18" y1="68" x2="174" y2="68" stroke="#1c2536" stroke-width="1" />
+
+    <!-- 2x3 Language Grid -->
+    <g transform="translate(18, 86)">
+      <rect x="0" y="0" width="74" height="36" rx="6" fill="#141b27" stroke="#1e293b" stroke-width="1" />
+      <text x="37" y="22" text-anchor="middle" class="font-mono pill-text">TS / JS</text>
+
+      <rect x="82" y="0" width="74" height="36" rx="6" fill="#141b27" stroke="#1e293b" stroke-width="1" />
+      <text x="119" y="22" text-anchor="middle" class="font-mono pill-text">Python</text>
+
+      <rect x="0" y="50" width="74" height="36" rx="6" fill="#141b27" stroke="#1e293b" stroke-width="1" />
+      <text x="37" y="72" text-anchor="middle" class="font-mono pill-text">Go</text>
+
+      <rect x="82" y="50" width="74" height="36" rx="6" fill="#141b27" stroke="#1e293b" stroke-width="1" />
+      <text x="119" y="72" text-anchor="middle" class="font-mono pill-text">Rust</text>
+
+      <rect x="0" y="100" width="74" height="36" rx="6" fill="#141b27" stroke="#1e293b" stroke-width="1" />
+      <text x="37" y="122" text-anchor="middle" class="font-mono pill-text">Luau</text>
+
+      <rect x="82" y="100" width="74" height="36" rx="6" fill="#132032" stroke="#1e3a5f" stroke-width="1" />
+      <text x="119" y="122" text-anchor="middle" class="font-sans pill-more">+19 more</text>
+    </g>
+  </g>
+
+  <!-- ================= STAGE 2: PLEXER INIT ================= -->
+  <g transform="translate(240, 8)">
+    <rect width="228" height="244" rx="12" fill="url(#card-surface)" stroke="#222d3f" stroke-width="1.25" />
+
+    <!-- Icon: Scanner / Tree -->
+    <rect x="18" y="18" width="34" height="34" rx="8" fill="#151e2e" stroke="#26354d" stroke-width="1" />
+    <line x1="35" y1="29" x2="29" y2="40" stroke="#38bdf8" stroke-width="1.5" />
+    <line x1="35" y1="29" x2="41" y2="40" stroke="#38bdf8" stroke-width="1.5" />
+    <circle cx="35" cy="28" r="2.8" fill="#151e2e" stroke="#38bdf8" stroke-width="1.6" />
+    <circle cx="29" cy="40" r="2.4" fill="#38bdf8" />
+    <circle cx="41" cy="40" r="2.4" fill="#38bdf8" />
+
+    <!-- Header Text -->
+    <text x="64" y="32" class="font-mono title">plexer init</text>
+    <text x="64" y="49" class="font-sans subtitle">Offline · $0 · Seconds</text>
+
+    <line x1="18" y1="68" x2="210" y2="68" stroke="#1c2536" stroke-width="1" />
+
+    <!-- Row 1: Parses symbols & links -->
+    <circle cx="24" cy="102" r="3" fill="#38bdf8" />
+    <text x="36" y="106" class="font-sans item-title">Parses symbols &amp; links</text>
+    <text x="36" y="126" class="font-sans item-sub">Functions, types, calls &amp; imports</text>
+
+    <line x1="18" y1="154" x2="210" y2="154" stroke="#1c2536" stroke-width="1" />
+
+    <!-- Row 2: Wires 12 AI coding tools -->
+    <circle cx="24" cy="186" r="3" fill="#38bdf8" />
+    <text x="36" y="190" class="font-sans item-title">Wires 12 AI coding tools</text>
+    <text x="36" y="210" class="font-sans item-sub">Skills, lifecycle hooks &amp; MCP</text>
+  </g>
+
+  <!-- ================= STAGE 3: LIVE CODE GRAPH (CENTRAL HUB) ================= -->
+  <g transform="translate(508, 8)">
+    <rect width="244" height="244" rx="12" fill="url(#hub-surface)" stroke="#26354d" stroke-width="1.25" />
+    <rect width="244" height="244" rx="12" fill="none" stroke="url(#hub-border)" stroke-width="1.5" class="hub-pulse" />
+
+    <!-- Icon: Connected Map -->
+    <rect x="18" y="18" width="34" height="34" rx="8" fill="#162238" stroke="#2c446e" stroke-width="1" />
+    <line x1="29" y1="30" x2="41" y2="30" stroke="#38bdf8" stroke-width="1.5" />
+    <line x1="29" y1="30" x2="35" y2="41" stroke="#38bdf8" stroke-width="1.5" />
+    <line x1="41" y1="30" x2="35" y2="41" stroke="#38bdf8" stroke-width="1.5" />
+    <circle cx="29" cy="30" r="2.5" fill="#38bdf8" />
+    <circle cx="41" cy="30" r="2.5" fill="#38bdf8" />
+    <circle cx="35" cy="41" r="2.5" fill="#7dd3fc" />
+
+    <!-- Header Text -->
+    <text x="64" y="32" class="font-sans title-hub">Live Code Graph</text>
+    <text x="64" y="49" class="font-sans subtitle">Saved locally in <tspan class="font-mono code-inline">plexer/</tspan></text>
+
+    <line x1="18" y1="68" x2="226" y2="68" stroke="#1e2b42" stroke-width="1" />
+
+    <!-- Row 1: Exact file:line symbol spans -->
+    <circle cx="24" cy="98" r="3" fill="#38bdf8" />
+    <text x="36" y="102" class="font-sans map-row-text">Exact <tspan class="font-mono code-inline">file:line</tspan> symbol spans</text>
+
+    <line x1="18" y1="126" x2="226" y2="126" stroke="#1c273c" stroke-width="1" />
+
+    <!-- Row 2: Cross-file call & import graph -->
+    <circle cx="24" cy="156" r="3" fill="#38bdf8" />
+    <text x="36" y="160" class="font-sans map-row-text">Cross-file call &amp; import graph</text>
+
+    <line x1="18" y1="184" x2="226" y2="184" stroke="#1c273c" stroke-width="1" />
+
+    <!-- Row 3: Re-parses changed files in ms -->
+    <circle cx="24" cy="214" r="3" fill="#38bdf8" />
+    <text x="36" y="218" class="font-sans map-row-text">Re-parses changed files in ms</text>
+  </g>
+
+  <!-- ================= STAGE 4: 3 OUTCOME CARDS ================= -->
+
+  <!-- Output 1: Turn-1 Code Search -->
+  <g transform="translate(802, 8)">
+    <rect width="290" height="72" rx="12" fill="url(#card-surface)" stroke="#222d3f" stroke-width="1.25" />
+
+    <!-- Agent Sparkle Icon -->
+    <rect x="18" y="19" width="34" height="34" rx="8" fill="#151e2e" stroke="#26354d" stroke-width="1" />
+    <path d="M 35 26 Q 35 36 45 36 Q 35 36 35 46 Q 35 36 25 36 Q 35 36 35 26 Z" fill="none" stroke="#38bdf8" stroke-width="1.6" stroke-linejoin="round" />
+
+    <text x="64" y="33" class="font-sans title">Turn-1 Code Search</text>
+    <text x="64" y="51" class="font-sans item-sub">Exact <tspan class="font-mono code-inline">file:line</tspan> spans in one call</text>
+  </g>
+
+  <!-- Output 2: Callers & Blast Radius -->
+  <g transform="translate(802, 94)">
+    <rect width="290" height="72" rx="12" fill="url(#card-surface)" stroke="#222d3f" stroke-width="1.25" />
+
+    <!-- Terminal Icon -->
+    <rect x="18" y="19" width="34" height="34" rx="8" fill="#151e2e" stroke="#26354d" stroke-width="1" />
+    <path d="M 29 31 L 34 36 L 29 41 M 36 41 H 42" fill="none" stroke="#38bdf8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+
+    <text x="64" y="33" class="font-sans title">Callers &amp; Blast Radius</text>
+    <text x="64" y="51" class="font-sans item-sub">Trace every caller &amp; what edits affect</text>
+  </g>
+
+  <!-- Output 3: Interactive Web Graph -->
+  <g transform="translate(802, 180)">
+    <rect width="290" height="72" rx="12" fill="url(#card-surface)" stroke="#222d3f" stroke-width="1.25" />
+
+    <!-- Interactive Graph Icon -->
+    <rect x="18" y="19" width="34" height="34" rx="8" fill="#151e2e" stroke="#26354d" stroke-width="1" />
+    <line x1="29" y1="40" x2="35" y2="30" stroke="#38bdf8" stroke-width="1.5" />
+    <line x1="35" y1="30" x2="41" y2="39" stroke="#38bdf8" stroke-width="1.5" />
+    <circle cx="35" cy="30" r="2.3" fill="#38bdf8" />
+    <circle cx="29" cy="40" r="2.3" fill="#38bdf8" />
+    <circle cx="41" cy="39" r="2.3" fill="#38bdf8" />
+
+    <text x="64" y="33" class="font-sans title">Interactive Web Graph</text>
+    <text x="64" y="51" class="font-sans item-sub">Explore architecture &amp; diffs in browser</text>
+  </g>
+
+  <!-- ================= ANCHOR DOTS (TOP LAYER FOR SYMMETRY) ================= -->
+  <g fill="#0f1522" stroke="#38bdf8" stroke-width="1.5">
+    <circle cx="200" cy="130" r="2.5" />
+    <circle cx="240" cy="130" r="2.5" />
+    <circle cx="468" cy="130" r="2.5" />
+    <circle cx="508" cy="130" r="2.5" />
+    <circle cx="752" cy="130" r="2.5" />
+    <circle cx="777" cy="130" r="2" fill="#38bdf8" stroke="none" />
+    <circle cx="802" cy="44" r="2.5" />
+    <circle cx="802" cy="130" r="2.5" />
+    <circle cx="802" cy="216" r="2.5" />
+  </g>
+</svg>

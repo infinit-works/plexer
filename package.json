@@ -1,0 +1,64 @@
+{
+	"name": "@plexer/cli",
+	"version": "1.0.3",
+	"description": "Offline structural code graph for AI coding agents.",
+	"type": "module",
+	"bin": {
+		"plexer": "bin/plexer.js"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"author": "Infinit Works",
+	"license": "MIT",
+	"homepage": "https://github.com/infinit-works/plexer#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/infinit-works/plexer.git"
+	},
+	"bugs": {
+		"url": "https://github.com/infinit-works/plexer/issues"
+	},
+	"keywords": [
+		"context-graph",
+		"code-graph",
+		"tree-sitter",
+		"mcp",
+		"luau",
+		"roblox",
+		"claude-code",
+		"antigravity",
+		"codex",
+		"ai-agents"
+	],
+	"preferGlobal": true,
+	"files": [
+		"bin",
+		"src",
+		"grammars",
+		"agents",
+		"assets",
+		"SKILL.md",
+		"README.md",
+		"LICENSE"
+	],
+	"types": "./src/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.d.ts",
+			"default": "./src/index.js"
+		}
+	},
+	"scripts": {
+		"test": "node --test test/*.test.js",
+		"bench": "node bench/run.js"
+	},
+	"dependencies": {
+		"commander": "^15.0.0",
+		"tree-sitter-wasm": "^2.0.4",
+		"web-tree-sitter": "^0.27.1"
+	},
+	"engines": {
+		"node": ">=20"
+	}
+}
