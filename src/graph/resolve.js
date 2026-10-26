@@ -84,61 +84,39 @@ function reachable(file, candidatePath) {
     const to = familyOf(candidatePath);
     return to === null || from === to;
 }
-export function resolveEdges(nodes, rawEdges, opts = {}) {
+function indexPathSuffixes(map, path) {
+    const parts = toPosixPath(path).split("/");
+    for (let i = 0; i < parts.length; i++)
+        pushMap(map, parts.slice(i).join("/"), path);
+}
+function buildResolutionIndex(nodes, rawEdges, opts) {
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const globalName = new Map();
     const perFileName = new Map();
-    // Owner-qualified method index: "Owner.method" → candidate method nodes, for
-    // typed member-call resolution (recvType + name → a specific class's method).
     const ownerMethod = new Map();
-    // Go package resolution: dir (posix) → its `.go` file node ids, for import mapping.
     const goFilesByDir = new Map();
-    // Java package resolution: a file's package-path suffix (`com/acme/Foo.java`) → its
-    // file node ids. A Java import names a type by its fully-qualified name, which by
-    // language convention mirrors the directory path under whatever source root the
-    // project uses (`src/main/java/`, `src/`, …) — so the suffix is the portable key.
     const javaFilesBySuffix = new Map();
-    // C/C++ header resolution: a file's path-suffix (`net/socket.h`, `socket.h`) → its
-    // file node ids, so an `#include` reached through an `-I` dir (not relative to the
-    // including file) still resolves to the in-repo header when the suffix is unique.
     const cFilesBySuffix = new Map();
-    // Rust crate roots: the directory holding a `lib.rs` or `main.rs`. A `use crate::a::b`
-    // resolves to `<crate root>/a/b.rs` (or `.../a/b/mod.rs`), relative to the crate the
-    // importing file belongs to — so a workspace with several crates stays unambiguous.
     const rustCrateRoots = [];
-    // PHP class resolution: a file's path-suffix (`Models/User.php`, `User.php`) → its file
-    // node ids. A `use App\Models\User` names a PSR-4 class whose file mirrors the namespace
-    // tail under some (unknown) source root, so the suffix is the portable key.
     const phpFilesBySuffix = new Map();
     const hasGoModules = !!opts.goModules?.length;
-    const indexSuffixes = (map, path) => {
-        const parts = toPosixPath(path).split("/");
-        for (let i = 0; i < parts.length; i++)
-            pushMap(map, parts.slice(i).join("/"), path);
-    };
     for (const n of nodes) {
         if (n.kind === "file") {
             if (hasGoModules && n.path.endsWith(".go")) {
                 const dir = posix.dirname(toPosixPath(n.path));
                 pushMap(goFilesByDir, dir, n.id);
             }
-            if (n.path.endsWith(".java")) {
-                // Index every directory-boundary suffix, since the source root is unknown:
-                // `src/main/java/com/acme/Foo.java` is reachable as `com/acme/Foo.java`,
-                // `acme/Foo.java`, and so on. The import's own FQN picks the right depth.
-                indexSuffixes(javaFilesBySuffix, n.id);
-            }
+            if (n.path.endsWith(".java"))
+                indexPathSuffixes(javaFilesBySuffix, n.id);
             if (C_EXT.test(n.path))
-                indexSuffixes(cFilesBySuffix, n.id);
+                indexPathSuffixes(cFilesBySuffix, n.id);
             if (n.path.endsWith(".php"))
-                indexSuffixes(phpFilesBySuffix, n.id);
-            {
-                const p = toPosixPath(n.path);
-                if (p === "lib.rs" || p === "main.rs")
-                    rustCrateRoots.push("");
-                else if (p.endsWith("/lib.rs") || p.endsWith("/main.rs"))
-                    rustCrateRoots.push(posix.dirname(p));
-            }
+                indexPathSuffixes(phpFilesBySuffix, n.id);
+            const p = toPosixPath(n.path);
+            if (p === "lib.rs" || p === "main.rs")
+                rustCrateRoots.push("");
+            else if (p.endsWith("/lib.rs") || p.endsWith("/main.rs"))
+                rustCrateRoots.push(posix.dirname(p));
             continue;
         }
         pushMap(globalName, n.name, n);
@@ -152,190 +130,142 @@ export function resolveEdges(nodes, rawEdges, opts = {}) {
                 pushMap(ownerMethod, `${owner}.${n.name}`, n);
         }
     }
-    // classParents: class/interface name → its declared base-class names, from raw
-    // `extends` edges (source id's own name → the base name). Used to walk up an
-    // inheritance chain when a receiver's own type has no matching method.
     const classParents = new Map();
-    for (const e of rawEdges) {
-        if (e.relation !== "extends" || !e.name)
-            continue;
-        // The declaring class's own bare name — read from its node (keyed by n.name, set
-        // once at mint time) rather than re-derived by slicing e.source, which breaks once
-        // ids can carry a dedup ordinal (A3's `Cache~2`).
-        const ownName = byId.get(e.source)?.name;
-        if (!ownName)
-            continue;
-        pushMap(classParents, ownName, e.name);
-    }
-    // classTraits: class name → trait names from raw `implements` edges in PHP files.
-    // PHP models `use SomeTrait;` as implements; trait methods live on the trait owner,
-    // not the using class, so resolveTypedMember walks these after the class lookup fails.
     const classTraits = new Map();
     for (const e of rawEdges) {
-        if (e.relation !== "implements" || !e.name || !e.file.endsWith(".php"))
-            continue;
-        const ownName = byId.get(e.source)?.name;
-        if (!ownName)
-            continue;
-        pushMap(classTraits, ownName, e.name);
+        if (e.relation === "extends" && e.name) {
+            const ownName = byId.get(e.source)?.name;
+            if (ownName)
+                pushMap(classParents, ownName, e.name);
+        }
+        else if (e.relation === "implements" && e.name && e.file.endsWith(".php")) {
+            const ownName = byId.get(e.source)?.name;
+            if (ownName)
+                pushMap(classTraits, ownName, e.name);
+        }
     }
-    const resolveImportTarget = (spec, file) => {
-        if (hasGoModules && file.endsWith(".go"))
-            return resolveGoImport(spec, opts.goModules, goFilesByDir);
-        if (file.endsWith(".java"))
-            return resolveJavaImport(spec, javaFilesBySuffix);
-        if (C_EXT.test(file))
-            return resolveCInclude(spec, file, byId, cFilesBySuffix);
-        if (file.endsWith(".rs"))
-            return resolveRustUse(spec, file, byId, rustCrateRoots);
-        if (file.endsWith(".php"))
-            return resolvePhpUse(spec, phpFilesBySuffix);
-        return resolveImport(spec, file, byId);
+    return {
+        byId,
+        globalName,
+        perFileName,
+        ownerMethod,
+        goFilesByDir,
+        javaFilesBySuffix,
+        cFilesBySuffix,
+        rustCrateRoots,
+        phpFilesBySuffix,
+        classParents,
+        classTraits,
+        hasGoModules,
     };
+}
+function resolveImportTargetForFile(spec, file, resIdx, opts) {
+    if (resIdx.hasGoModules && file.endsWith(".go"))
+        return resolveGoImport(spec, opts.goModules, resIdx.goFilesByDir);
+    if (file.endsWith(".java"))
+        return resolveJavaImport(spec, resIdx.javaFilesBySuffix);
+    if (C_EXT.test(file))
+        return resolveCInclude(spec, file, resIdx.byId, resIdx.cFilesBySuffix);
+    if (file.endsWith(".rs"))
+        return resolveRustUse(spec, file, resIdx.byId, resIdx.rustCrateRoots);
+    if (file.endsWith(".php"))
+        return resolvePhpUse(spec, resIdx.phpFilesBySuffix);
+    return resolveImport(spec, file, resIdx.byId);
+}
+function resolveReferenceEdge(e, resIdx, emitResolvedEdge) {
+    const { byId, perFileName, globalName, phpFilesBySuffix } = resIdx;
+    if (e.specifier) {
+        const targetFile = e.file.endsWith(".php")
+            ? resolvePhpUse(e.specifier, phpFilesBySuffix)
+            : resolveImport(e.specifier, e.file, byId);
+        if (!byId.has(targetFile))
+            return;
+        const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
+        if (candidates.length === 1)
+            emitResolvedEdge(e.source, candidates[0].id, "references", "extracted");
+    }
+    else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
+        const refKinds = ["class", "interface", "trait", "enum"];
+        const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
+        if (hit && hit.id !== e.source)
+            emitResolvedEdge(e.source, hit.id, "references", hit.confidence);
+    }
+    else if (e.file.endsWith(".java") && byId.get(e.source)?.origin === "ast") {
+        const hit = resolveName(e.name, e.file, ["interface"], perFileName, globalName);
+        const anno = hit ? byId.get(hit.id) : undefined;
+        if (hit && hit.id !== e.source && anno?.signature?.includes("@interface"))
+            emitResolvedEdge(e.source, hit.id, "references", hit.confidence);
+        else
+            emitResolvedEdge(e.source, e.name, "references", "inferred");
+    }
+    else if (byId.get(e.source)?.origin === "generic") {
+        const refKinds = ["class", "interface", "struct", "enum", "type", "module"];
+        const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
+        if (hit && hit.id !== e.source)
+            emitResolvedEdge(e.source, hit.id, "references", hit.confidence);
+    }
+}
+function resolveCallEdge(e, resIdx, emitResolvedEdge) {
+    const { byId, perFileName, globalName, ownerMethod, classParents, classTraits } = resIdx;
+    if (e.viaMember) {
+        if (!e.recvType)
+            return;
+        const hit = resolveTypedMember(e.recvType, e.name, e.file, ownerMethod, classParents, classTraits, e.argCount);
+        if (hit === "ambiguous")
+            return;
+        if (hit) {
+            emitResolvedEdge(e.source, hit.id, "calls", hit.confidence);
+            return;
+        }
+        if (!e.implicitSelf)
+            return;
+    }
+    const srcOrigin = byId.get(e.source)?.origin;
+    const callKinds = e.kinds ??
+        (srcOrigin === "generic"
+            ? ["function", "method"]
+            : e.file.endsWith(".java")
+                ? ["class", "struct", "enum", "interface"]
+                : ["function"]);
+    let hit = resolveName(e.name, e.file, callKinds, perFileName, globalName);
+    if (!hit && PY_EXT.test(e.file))
+        hit = resolveName(e.name, e.file, PY_CTOR_KINDS, perFileName, globalName);
+    if (!hit && SWIFT_EXT.test(e.file))
+        hit = resolveName(e.name, e.file, SWIFT_CTOR_KINDS, perFileName, globalName);
+    if (hit)
+        emitResolvedEdge(e.source, hit.id, "calls", hit.confidence);
+}
+export function resolveEdges(nodes, rawEdges, opts = {}) {
+    const resIdx = buildResolutionIndex(nodes, rawEdges, opts);
     const out = [];
     const seen = new Set();
-    const add = (source, target, relation, confidence) => {
+    const emitResolvedEdge = (source, target, relation, confidence) => {
         const key = `${source}\0${relation}\0${target}`;
         if (seen.has(key))
             return;
         seen.add(key);
         out.push({ source, target, relation, confidence });
     };
-    resolveLuauEdges(nodes, rawEdges, add, opts);
+    resolveLuauEdges(nodes, rawEdges, emitResolvedEdge, opts);
     for (const e of rawEdges) {
-        if (e.file?.endsWith(".luau")) continue;
+        if (e.file?.endsWith(".luau"))
+            continue;
         if (e.relation === "contains" && e.targetId) {
-            add(e.source, e.targetId, "contains", "extracted");
+            emitResolvedEdge(e.source, e.targetId, "contains", "extracted");
         }
         else if (e.relation === "imports" && e.specifier) {
-            add(e.source, resolveImportTarget(e.specifier, e.file), "imports", "extracted");
+            emitResolvedEdge(e.source, resolveImportTargetForFile(e.specifier, e.file, resIdx, opts), "imports", "extracted");
         }
         else if (e.relation === "extends" || e.relation === "implements") {
-            // `implements` also resolves to a `trait` — PHP models trait composition
-            // (`use SomeTrait;`) as an implements edge, and a trait is a valid target.
             const kinds = e.relation === "implements" ? ["interface", "trait"] : ["class", "interface"];
-            const hit = resolveName(e.name, e.file, kinds, perFileName, globalName);
-            // an unresolved base is usually an external/imported type — keep the name.
-            add(e.source, hit?.id ?? e.name, e.relation, hit?.confidence ?? "inferred");
+            const hit = resolveName(e.name, e.file, kinds, resIdx.perFileName, resIdx.globalName);
+            emitResolvedEdge(e.source, hit?.id ?? e.name, e.relation, hit?.confidence ?? "inferred");
         }
         else if (e.relation === "references" && e.name) {
-            if (e.specifier) {
-                // A named import gives both halves needed for sound resolution: the module
-                // it came from and the exported name. Resolve inside that file only, so a
-                // same-named symbol elsewhere in the repo cannot become a false edge.
-                const targetFile = e.file.endsWith(".php")
-                    ? resolvePhpUse(e.specifier, phpFilesBySuffix)
-                    : resolveImport(e.specifier, e.file, byId);
-                if (!byId.has(targetFile))
-                    continue; // external or unresolved module
-                const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
-                if (candidates.length === 1)
-                    add(e.source, candidates[0].id, "references", "extracted");
-            }
-            else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
-                // PHP attribute without a `use` import (same-file or globally unique class).
-                const refKinds = ["class", "interface", "trait", "enum"];
-                const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
-                if (hit && hit.id !== e.source)
-                    add(e.source, hit.id, "references", hit.confidence);
-            }
-            else if (e.file.endsWith(".java") && byId.get(e.source)?.origin === "ast") {
-                // Java annotation without a specifier (same-file or globally unique
-                // `@interface`). Annotation types are `interface` kind — a class of the
-                // same name is not a match, so `@Entity` cannot collapse onto an in-repo
-                // `class Entity`. Kind alone still cannot tell `@interface Service`
-                // from `interface Service`, so only accept a candidate whose header
-                // contains the literal `@interface` (`includes`, not `startsWith`: a
-                // meta-annotated type is `@Documented @Retention(...) public @interface
-                // JsonAdapter`). Unresolved targets keep the bare name, matching
-                // heritage, rather than dropping the way PHP attributes do.
-                const refKinds = ["interface"];
-                const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
-                const anno = hit ? byId.get(hit.id) : undefined;
-                if (hit && hit.id !== e.source && anno?.signature?.includes("@interface"))
-                    add(e.source, hit.id, "references", hit.confidence);
-                else
-                    add(e.source, e.name, "references", "inferred");
-            }
-            else if (byId.get(e.source)?.origin === "generic") {
-                // Breadth tier: a bare-name structural reference (extends / implements /
-                // object-creation / module alias) the grammar marked but cannot type. Resolve
-                // to a type-like definition, drop-rather-than-guess, never a self-loop. Gated on
-                // generic origin so depth-tier references (which always carry a specifier) are
-                // provably untouched.
-                const refKinds = ["class", "interface", "struct", "enum", "type", "module"];
-                const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
-                if (hit && hit.id !== e.source)
-                    add(e.source, hit.id, "references", hit.confidence);
-            }
+            resolveReferenceEdge(e, resIdx, emitResolvedEdge);
         }
         else if (e.relation === "calls") {
-            if (e.viaMember) {
-                if (!e.recvType)
-                    continue;
-                const hit = resolveTypedMember(e.recvType, e.name, e.file, ownerMethod, classParents, classTraits, e.argCount);
-                if (hit === "ambiguous")
-                    continue; // drop — never guess past an ambiguous owner
-                if (hit) {
-                    add(e.source, hit.id, "calls", hit.confidence);
-                    continue;
-                }
-                // No owner-qualified match means the call is unresolved. A unique bare
-                // method name is not evidence that this receiver has that method — a
-                // name-fallback here was measured to HALVE call-edge precision (73%→37%
-                // vs a compiler-grade oracle) for a 3x count inflation, i.e. noise.
-                //
-                // One carve-out, which is NOT that fallback: a Swift `implicitSelf` edge
-                // carries two readings of one bare call — member (tried above, in
-                // Swift's own inner-scope-first order) and free function. Zero members
-                // on the whole owner chain means the call was a free-function call after
-                // all, so it falls through to bare-name resolution; an ambiguous member
-                // set has already dropped it above, and a resolved member never reaches
-                // here — a name defined as both member and free function yields the
-                // member edge alone, exactly as Swift dispatches it.
-                if (!e.implicitSelf)
-                    continue;
-            }
-            // Every language's bare-name call is a free function, except R (Phase 4):
-            // an untyped `obj$method()` there sets e.kinds to also allow a "method"
-            // match — see extract.js's calleeName R branch for why (R6 methods are
-            // never kind "function", so without this every such call would be
-            // unconditionally unresolvable rather than just occasionally ambiguous).
-            // Three cases, because "a bare call" means something different per tier:
-            //
-            //  - generic (breadth tier): tags.scm captures ALL calls as bare names, since it
-            //    cannot type a receiver. In method-heavy languages those target methods, so
-            //    widen to methods — ONLY here, leaving depth-tier precision untouched (an
-            //    ambiguous function-vs-method name still drops).
-            //  - Java (depth tier): an implicit-`this` call is spelled as a member call in
-            //    extract.js, so the only bare call reaching here is `new Foo()`, whose target
-            //    is a TYPE. Against the function index every constructor edge would drop.
-            //  - everything else: functions, exactly as before.
-            //
-            // R (depth tier, Phase 4) sets `e.kinds` itself for an untyped `obj$method()`
-            // (see above), and that explicit choice wins over the per-tier default.
-            const srcOrigin = byId.get(e.source)?.origin;
-            const callKinds = e.kinds ??
-                (srcOrigin === "generic"
-                    ? ["function", "method"]
-                    : e.file.endsWith(".java")
-                        ? ["class", "struct", "enum", "interface"]
-                        : ["function"]);
-            let hit = resolveName(e.name, e.file, callKinds, perFileName, globalName);
-            // Python is the Java case without the `new` to mark it: `Widget()` is an
-            // ordinary call node, so a constructor edge dies against the function-only
-            // index. Java can widen to types outright; Python has free functions, so
-            // widening would trade real function edges for type ones. Hence a fallback,
-            // not a swap — types are tried only once functions have found nothing, and
-            // resolveName's same-file-then-unique-global rule still drops the ambiguous.
-            if (!hit && PY_EXT.test(e.file)) {
-                hit = resolveName(e.name, e.file, PY_CTOR_KINDS, perFileName, globalName);
-            }
-            if (!hit && SWIFT_EXT.test(e.file)) {
-                hit = resolveName(e.name, e.file, SWIFT_CTOR_KINDS, perFileName, globalName);
-            }
-            if (hit)
-                add(e.source, hit.id, "calls", hit.confidence); // drop unresolved calls (too noisy)
+            resolveCallEdge(e, resIdx, emitResolvedEdge);
         }
     }
     return out;

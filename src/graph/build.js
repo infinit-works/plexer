@@ -95,88 +95,25 @@ function resolverConfigHash(root, repoFiles, scopes, goModules) {
     configFiles.sort();
     return contentHash(JSON.stringify({ scopes, goModules, configFiles }));
 }
-export async function buildGraph(dir, opts = {}) {
-    const root = resolve(dir);
-    const outDir = contextDirFor(root, opts.contextDir);
-    const walkCfg = readWalkConfig(root, opts.contextDir);
-    const walked = walkDir(root, walkCfg.includeDirs, {
-        followSubmodules: walkCfg.followSubmodules,
-        followNestedRepos: walkCfg.followNestedRepos,
+function isGraphBuildUnchanged(opts, parsed, seed, priorAskIndex, priorExtract, files, entries, prior, configHash, nodes) {
+    if (opts.reuse === false ||
+        parsed !== 0 ||
+        Boolean(seed.from) ||
+        priorAskIndex?.version !== 2 ||
+        Object.keys(priorExtract.files).length !== files.length ||
+        !Object.keys(entries).every((k) => k in priorExtract.files) ||
+        prior === null ||
+        prior.meta?.config_hash !== configHash ||
+        prior.nodes.length !== nodes.length) {
+        return false;
+    }
+    const priorById = new Map(prior.nodes.map((n) => [n.id, n]));
+    return nodes.every((n) => {
+        const p = priorById.get(n.id);
+        return p !== undefined && p.body_hash === n.body_hash;
     });
-    const onlyDirs = opts.onlyDirs && opts.onlyDirs.length > 0 ? new Set(opts.onlyDirs) : undefined;
-    const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
-    const files = listSourceStats(root, outDir, repoFiles, undefined, opts.extensions);
-    const discoveredScopes = discoverScopes(root, repoFiles);
-    const seed = opts.reuse === false ? { seeded: false } : seedGraph(root, { contextDir: opts.contextDir });
-    const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
-    const { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty } = await extractSourceFiles(files, priorExtract, {
-        onProgress: opts.onProgress,
-    });
-    const scopes = applyMinSubstanceGuard(discoveredScopes, nodes);
-    const goModules = readGoModules(root, repoFiles);
-    const configHash = resolverConfigHash(root, repoFiles, scopes, goModules);
-    const prior = opts.reuse === false ? null : readGraph(wiringPath(outDir));
-    const priorAskIndex = opts.reuse === false ? null : readAskIndex(outDir);
-    let noSourceChanges = false;
-    if (opts.reuse !== false &&
-        parsed === 0 &&
-        !seed.from &&
-        priorAskIndex?.version === 2 &&
-        Object.keys(priorExtract.files).length === files.length &&
-        Object.keys(entries).every((k) => k in priorExtract.files) &&
-        prior !== null &&
-        prior.meta?.config_hash === configHash &&
-        prior.nodes.length === nodes.length) {
-        const priorById = new Map(prior.nodes.map((n) => [n.id, n]));
-        noSourceChanges = nodes.every((n) => {
-            const p = priorById.get(n.id);
-            return p !== undefined && p.body_hash === n.body_hash;
-        });
-    }
-    const sortedLanguages = [...langs].sort();
-    let edges;
-    let graph;
-    let graphPath;
-    if (noSourceChanges) {
-        edges = prior.edges;
-        graph = prior;
-        graphPath = wiringPath(outDir);
-        if (mtimeDirty) {
-            writeExtractCache(outDir, {
-                ...emptyExtractCache(),
-                files: entries,
-            });
-        }
-        if (mtimeDirty || !readFingerprint(outDir)?.dirs)
-            writeFingerprint(outDir, entries, opts.onlyDirs, root);
-    }
-    else {
-        edges = resolveEdges(nodes, rawEdges, { goModules, root });
-        graph = {
-            meta: {
-                version: 1,
-                nodeCount: nodes.length,
-                edgeCount: edges.length,
-                languages: sortedLanguages,
-                scopes,
-                config_hash: configHash,
-            },
-            nodes,
-            edges,
-        };
-        graphPath = writeGraph(graph, outDir);
-        try {
-            writeAskIndex(outDir, graph, priorAskIndex);
-        }
-        catch (err) {
-            errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
-        }
-        writeExtractCache(outDir, {
-            ...emptyExtractCache(),
-            files: entries,
-        });
-        writeFingerprint(outDir, entries, opts.onlyDirs, root);
-    }
+}
+function finalizeGraphBuildOutput(root, outDir, opts, graph, nodes, edges, sortedLanguages) {
     let cardStats = { written: 0, pruned: 0, files: [] };
     if (!opts.graphOnly) {
         ensureGitignored(root, outDir);
@@ -208,10 +145,73 @@ export async function buildGraph(dir, opts = {}) {
     const byRelation = {};
     for (const e of edges)
         byRelation[e.relation] = (byRelation[e.relation] ?? 0) + 1;
+    return { cardsWritten: cardStats.written, byKind, byRelation };
+}
+export async function buildGraph(dir, opts = {}) {
+    const root = resolve(dir);
+    const outDir = contextDirFor(root, opts.contextDir);
+    const walkCfg = readWalkConfig(root, opts.contextDir);
+    const walked = walkDir(root, walkCfg.includeDirs, {
+        followSubmodules: walkCfg.followSubmodules,
+        followNestedRepos: walkCfg.followNestedRepos,
+    });
+    const onlyDirs = opts.onlyDirs && opts.onlyDirs.length > 0 ? new Set(opts.onlyDirs) : undefined;
+    const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
+    const files = listSourceStats(root, outDir, repoFiles, undefined, opts.extensions);
+    const discoveredScopes = discoverScopes(root, repoFiles);
+    const seed = opts.reuse === false ? { seeded: false } : seedGraph(root, { contextDir: opts.contextDir });
+    const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
+    const { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty } = await extractSourceFiles(files, priorExtract, {
+        onProgress: opts.onProgress,
+    });
+    const scopes = applyMinSubstanceGuard(discoveredScopes, nodes);
+    const goModules = readGoModules(root, repoFiles);
+    const configHash = resolverConfigHash(root, repoFiles, scopes, goModules);
+    const prior = opts.reuse === false ? null : readGraph(wiringPath(outDir));
+    const priorAskIndex = opts.reuse === false ? null : readAskIndex(outDir);
+    const noSourceChanges = isGraphBuildUnchanged(opts, parsed, seed, priorAskIndex, priorExtract, files, entries, prior, configHash, nodes);
+    const sortedLanguages = [...langs].sort();
+    let edges;
+    let graph;
+    let graphPath;
+    if (noSourceChanges) {
+        edges = prior.edges;
+        graph = prior;
+        graphPath = wiringPath(outDir);
+        if (mtimeDirty)
+            writeExtractCache(outDir, { ...emptyExtractCache(), files: entries });
+        if (mtimeDirty || !readFingerprint(outDir)?.dirs)
+            writeFingerprint(outDir, entries, opts.onlyDirs, root);
+    }
+    else {
+        edges = resolveEdges(nodes, rawEdges, { goModules, root });
+        graph = {
+            meta: {
+                version: 1,
+                nodeCount: nodes.length,
+                edgeCount: edges.length,
+                languages: sortedLanguages,
+                scopes,
+                config_hash: configHash,
+            },
+            nodes,
+            edges,
+        };
+        graphPath = writeGraph(graph, outDir);
+        try {
+            writeAskIndex(outDir, graph, priorAskIndex);
+        }
+        catch (err) {
+            errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        writeExtractCache(outDir, { ...emptyExtractCache(), files: entries });
+        writeFingerprint(outDir, entries, opts.onlyDirs, root);
+    }
+    const { cardsWritten, byKind, byRelation } = finalizeGraphBuildOutput(root, outDir, opts, graph, nodes, edges, sortedLanguages);
     return {
         contextDir: outDir,
         graphPath,
-        cards: cardStats.written,
+        cards: cardsWritten,
         files: files.length,
         parsed,
         reused,

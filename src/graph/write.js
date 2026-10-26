@@ -8,23 +8,9 @@
  * timestamps, so rebuilding an unchanged repo produces a byte-identical file and
  * git diffs stay minimal.
  */
-import { join } from "node:path";
-import { readJson, writeJsonAtomic } from "../util/state.js";
-/** Hidden subdir under the context dir that holds machine-only graph artifacts. */
-export const GRAPH_DIR = ".graph";
-export const GRAPH_FILE = "wiring.json";
-/** Absolute path to the wiring graph for a context dir: `<dir>/.graph/wiring.json`. */
-export function wiringPath(outDir) {
-    return join(outDir, GRAPH_DIR, GRAPH_FILE);
-}
-/**
- * Read an existing wiring graph for use as the Tier-2 cache. Returns null when the
- * file is absent or unparseable (a fresh build, or a corrupt file we'll replace).
- */
-export function readGraph(path) {
-    const g = readJson(path);
-    return g && g.meta?.version === 1 && Array.isArray(g.nodes) ? g : null;
-}
+import { GRAPH_DIR, GRAPH_FILE, readGraph, wiringPath } from "../context/node-file.js";
+import { writeJsonAtomic } from "../util/state.js";
+export { GRAPH_DIR, GRAPH_FILE, readGraph, wiringPath };
 export function writeGraph(graph, outDir) {
     const sorted = {
         ...graph,

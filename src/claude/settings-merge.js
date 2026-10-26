@@ -1,4 +1,4 @@
-import { isPlexerEntry } from '../hosts/config-write.js';
+import { isPlexerEntry } from '../util/state.js';
 const SL_CMD = 'node "${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/plexer-statusline.cjs"';
 /** Stable marker for "this statusLine is Plexer's", not the full command string —
  * an older shim path or a PLEXER_DIR wrapper still names this file. */
@@ -21,14 +21,15 @@ const REPO_HELPERS = '${CLAUDE_PROJECT_DIR:-.}/.claude/helpers';
 function hookCmd(arg, helpers = REPO_HELPERS) {
     return `node "${helpers}/plexer-hooks.cjs" ${arg}`;
 }
+/** Claude Code reads a hook's `timeout` in seconds, not milliseconds. */
 function plexerBlocks(helpers) {
     return {
         PostToolUse: [
-            { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd('post-edit', helpers), timeout: 10000 }] },
+            { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd('post-edit', helpers), timeout: 10 }] },
         ],
-        UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('prompt', helpers), timeout: 15000 }] }],
-        SessionStart: [{ hooks: [{ type: 'command', command: hookCmd('session-start', helpers), timeout: 8000 }] }],
-        Stop: [{ hooks: [{ type: 'command', command: hookCmd('stop', helpers), timeout: 8000 }] }],
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('prompt', helpers), timeout: 15 }] }],
+        SessionStart: [{ hooks: [{ type: 'command', command: hookCmd('session-start', helpers), timeout: 8 }] }],
+        Stop: [{ hooks: [{ type: 'command', command: hookCmd('stop', helpers), timeout: 8 }] }],
     };
 }
 /**

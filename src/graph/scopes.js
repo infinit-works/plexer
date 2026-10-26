@@ -24,8 +24,26 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { shouldSkipDir, walkDir } from "../ingest/fs.js";
-import { relPosix, stripTrailingSlashes, toPosixPath } from "../util/paths.js";
+import {
+    assertPrefixIndexed,
+    pathUnderPrefix,
+    relPosix,
+    scopeLabel,
+    scopeOf,
+    scopesHereClause,
+    scopesOfGraph,
+    stripTrailingSlashes,
+    toPosixPath,
+} from "../util/paths.js";
 import { readJson, readWalkConfig } from "../util/state.js";
+export {
+    assertPrefixIndexed,
+    pathUnderPrefix,
+    scopeLabel,
+    scopeOf,
+    scopesHereClause,
+    scopesOfGraph,
+};
 /** Project-marker files, checked in this order (also the order `markers` is built in). */
 const MARKERS = ["package.json", "go.mod", "pyproject.toml", "setup.py", "Cargo.toml", "composer.json", "pom.xml", "build.gradle", "build.gradle.kts"];
 const CANONICAL_ROOT = [{ prefix: "", label: "", markers: [] }];
@@ -123,18 +141,7 @@ function resolveGlob(dirs, pattern) {
         return parent === base;
     });
 }
-/** Walk the tree (reusing `walkDir`'s persisted directory and submodule
- * choices) and find project-marker dirs. */
-export function discoverScopes(root, repoFiles) {
-    const absRoot = resolve(root);
-    if (!repoFiles) {
-        const walkCfg = readWalkConfig(absRoot);
-        repoFiles = walkDir(root, walkCfg.includeDirs, {
-            followSubmodules: walkCfg.followSubmodules,
-            followNestedRepos: walkCfg.followNestedRepos,
-        });
-    }
-    const dirs = collectDirs(absRoot, repoFiles);
+function collectScopeCandidates(absRoot, dirs) {
     const markerMap = new Map();
     for (const dir of dirs) {
         const found = MARKERS.filter((m) => existsSync(join(absRoot, dir, m)));
@@ -174,56 +181,31 @@ export function discoverScopes(root, repoFiles) {
         else
             candidates.set(dir, { markers: markerMap.get(dir) ?? [], isWorkspace: true });
     }
-    // Rule 4: nesting collapse — evaluated in two ordered passes against FROZEN
-    // snapshots (deletions are marked first, then applied), never against the
-    // live `candidates` map mid-iteration. That's what makes the outcome
-    // layout-determined instead of `readdirSync`/Map-iteration-order-determined:
-    // deciding "does ancestor X still exist" by checking a map you're
-    // simultaneously deleting from means the answer depends on which candidate
-    // happens to be visited first, which depends on directory read order.
-    //
-    //   Pass A — workspace override (uses the ORIGINAL frozen candidate set):
-    //     for every workspace-glob candidate, find its nearest candidate
-    //     ancestor in the original set; if that ancestor is not itself a
-    //     workspace match, queue it for deletion ("a workspace-glob match wins
-    //     over its parent"). All Pass-A deletions are collected first, then
-    //     applied together — so it doesn't matter which workspace candidate is
-    //     considered first, the ancestor lookups all read the same frozen set.
-    //     Applying them produces the "post-glob-resolution" stable set.
-    //
-    //   Pass B — plain nesting collapse (uses the POST-A set, NOT the original
-    //     frozen set): for every remaining candidate, find its nearest ancestor
-    //     in the post-A set; if one exists, the deeper candidate is queued for
-    //     deletion (keep the shallower ancestor) UNLESS it's a workspace match
-    //     whose ancestor is NOT itself a workspace match — that's the one case
-    //     Pass A already grants immunity to ("workspace beats a non-workspace
-    //     parent"). Rule 4's workspace exception does NOT extend to a workspace
-    //     candidate nested under ANOTHER workspace candidate (e.g. a recursive
-    //     `packages/**` glob matching both `packages/a` and `packages/a/b`, or a
-    //     `packages/**` glob sweeping every markerless dir under a real package)
-    //     — that pair falls back to the plain rule, same as any other nested
-    //     pair: keep the shallower, drop the deeper.
-    //
-    // Running Pass B against the post-A set (rather than the frozen one) is
-    // what makes a Pass-A deletion visible downstream: a candidate whose only
-    // nesting ancestor was itself removed by the workspace override is no
-    // longer "nested" and survives — regardless of whether that candidate or
-    // the workspace match happened to be discovered first on disk.
-    const findNearestAncestorCandidate = (prefix, set) => {
-        const segs = prefix.split("/");
-        for (let i = segs.length - 1; i >= 1; i--) {
-            const ancestor = segs.slice(0, i).join("/");
-            if (set.has(ancestor))
-                return ancestor;
-        }
-        return null;
-    };
+    return candidates;
+}
+function findNearestAncestorScopeCandidate(prefix, set) {
+    const segs = prefix.split("/");
+    for (let i = segs.length - 1; i >= 1; i--) {
+        const ancestor = segs.slice(0, i).join("/");
+        if (set.has(ancestor))
+            return ancestor;
+    }
+    return null;
+}
+/**
+ * Rule 4: nesting collapse — evaluated in two ordered passes against FROZEN
+ * snapshots (deletions are marked first, then applied), never against the
+ * live `candidates` map mid-iteration.
+ *   Pass A — workspace override (uses the ORIGINAL frozen candidate set).
+ *   Pass B — plain nesting collapse (uses the POST-A set).
+ */
+function collapseNestedScopeCandidates(candidates) {
     const frozen = new Map(candidates);
     const passADeletes = new Set();
     for (const [prefix, entry] of frozen) {
         if (!entry.isWorkspace)
             continue;
-        const ancestor = findNearestAncestorCandidate(prefix, frozen);
+        const ancestor = findNearestAncestorScopeCandidate(prefix, frozen);
         if (ancestor && !frozen.get(ancestor).isWorkspace)
             passADeletes.add(ancestor);
     }
@@ -234,19 +216,30 @@ export function discoverScopes(root, repoFiles) {
     for (const [prefix, entry] of postA) {
         if (prefix === "")
             continue;
-        const ancestor = findNearestAncestorCandidate(prefix, postA);
+        const ancestor = findNearestAncestorScopeCandidate(prefix, postA);
         if (!ancestor)
             continue;
         const ancestorEntry = postA.get(ancestor);
-        // Keep only a workspace candidate whose nearest surviving ancestor is
-        // NOT itself a workspace match (Pass A's exemption). Every other nested
-        // pair — non-workspace child under anything, or workspace child under an
-        // ALSO-workspace ancestor — collapses to the shallower one here.
         if (!entry.isWorkspace || ancestorEntry.isWorkspace)
             passBDeletes.add(prefix);
     }
     for (const prefix of passBDeletes)
         candidates.delete(prefix);
+}
+/** Walk the tree (reusing `walkDir`'s persisted directory and submodule
+ * choices) and find project-marker dirs. */
+export function discoverScopes(root, repoFiles) {
+    const absRoot = resolve(root);
+    if (!repoFiles) {
+        const walkCfg = readWalkConfig(absRoot);
+        repoFiles = walkDir(root, walkCfg.includeDirs, {
+            followSubmodules: walkCfg.followSubmodules,
+            followNestedRepos: walkCfg.followNestedRepos,
+        });
+    }
+    const dirs = collectDirs(absRoot, repoFiles);
+    const candidates = collectScopeCandidates(absRoot, dirs);
+    collapseNestedScopeCandidates(candidates);
     const survivors = [...candidates.entries()].map(([prefix, c]) => ({ prefix, ...c }));
     // Rule 6: canonical single-scope form when only root survives, or nothing does.
     if (survivors.length === 0)
@@ -263,75 +256,19 @@ export function discoverScopes(root, repoFiles) {
     scopes.sort((a, b) => b.prefix.length - a.prefix.length || a.prefix.localeCompare(b.prefix));
     return scopes;
 }
-/** Nearest-prefix owner. `scopes` MUST be sorted prefix-length desc; "" matches all.
- * Falls back to a synthetic root scope when `scopes` has no explicit "" entry and
- * nothing else matches — every path resolves to some scope. */
-export function scopeOf(path, scopes) {
-    for (const s of scopes) {
-        if (s.prefix === "")
-            continue; // root is the fallback, checked last
-        if (path === s.prefix || path.startsWith(`${s.prefix}/`))
-            return s;
-    }
-    return scopes.find((s) => s.prefix === "") ?? { prefix: "", label: "", markers: [] };
-}
-/** Display form of a scope prefix: "" reads as "(root)", everything else gets
- * a trailing slash. Shared by ask's `matched in:`/`also matched:` footer, the
- * `--in` no-match error, and the multi-scope zero-hit note. */
-export function scopeLabel(prefix) {
-    return prefix === "" ? "(root)" : `${prefix}/`;
-}
-/** " — scopes here: a/ · b/" when `scopes` is genuinely multi-scope (>1
- * entries), else "" — the shared clause `ask` appends to its zero-hit note
- * and its `--in` no-match error, so a caller is always told what IS indexed
- * rather than getting a bare miss. */
-export function scopesHereClause(scopes) {
-    if (scopes.length <= 1)
-        return "";
-    return ` — scopes here: ${scopes.map((s) => scopeLabel(s.prefix)).join(" · ")}`;
-}
-/** Segment-aware "is `path` at or under `prefix`?" — a plain `path.startsWith`
- * would wrongly let "frontend" match "frontend-utils"; this requires an exact
- * segment boundary, same rule `scopeOf` uses for its own prefix match. Root
- * (`""`) matches every path. Used to filter ask's doc/node set for
- * `--in <path-prefix>`. */
-export function pathUnderPrefix(path, prefix) {
-    return prefix === "" || path === prefix || path.startsWith(`${prefix}/`);
-}
-/**
- * Validate a normalized `--in` prefix against the graph before a query runs. A
- * prefix matching no indexed node is a caller mistake (typo, wrong sub-project,
- * or a mid-path fragment where a prefix is required) rather than a legitimate
- * zero-hit query, so every `--in`-taking command fails loudly and identically
- * instead of printing empty output the caller has to interpret.
- *
- * Pass the prefix through `normalizePathPrefix` first — an un-normalized
- * `src\gpu` or `src/` will not match anything here.
- */
-export function assertPrefixIndexed(graph, prefix) {
-    if (!prefix || graph.nodes.some((n) => pathUnderPrefix(n.path, prefix)))
-        return;
-    throw new Error(`nothing indexed under "${prefix}/"${scopesHereClause(scopesOfGraph(graph))} (or any path prefix)`);
-}
 /** Immediate subdirs of `root` that are themselves git repos (have `.git`).
  * Used by workspace federation (Task 5). */
 export function discoverWorkspaceChildren(root) {
     const absRoot = resolve(root);
     const { includeDirs: includes } = readWalkConfig(absRoot);
-    let entries;
+    let entries = [];
     try {
         entries = readdirSync(absRoot, { withFileTypes: true });
     }
     catch {
-        return [];
+        /* unreadable root */
     }
     return entries
         .filter((e) => e.isDirectory() && !shouldSkipDir(e.name, includes) && existsSync(join(absRoot, e.name, ".git")))
         .map((e) => e.name);
-}
-/** Every consumer's entry point to a graph's scopes: absent `meta.scopes`
- * (graphs where discovery found nothing but the root) defaults to the
- * canonical single-scope form. Never read `graph.meta.scopes` directly. */
-export function scopesOfGraph(graph) {
-    return graph?.meta?.scopes ?? CANONICAL_ROOT;
 }

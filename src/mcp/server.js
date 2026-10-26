@@ -7,7 +7,7 @@ import { TOOLS, callTool } from './tools.js';
 import { mcpInstructions } from './instructions.js';
 import { hasPlexerIndex } from '../graph/root.js';
 import { mainWorktreeRoot } from '../graph/seed.js';
-import { readCurrentVersion } from '../cli-meta.js';
+import { readCurrentVersion } from '../util/cli-meta.js';
 function send(msg) {
     process.stdout.write(`${JSON.stringify(msg)}\n`);
 }
@@ -57,7 +57,14 @@ export function startMcpServer(root = process.cwd(), dirOverride, version = read
             case 'tools/list': {
                 if (isNotification)
                     return;
-                reply(id, { tools: advertised(root, dirOverride).map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+                reply(id, {
+                    tools: advertised(root, dirOverride).map((t) => ({
+                        name: t.name,
+                        description: t.description,
+                        inputSchema: t.inputSchema,
+                        ...(t.annotations ? { annotations: t.annotations } : {}),
+                    })),
+                });
                 return;
             }
             case 'tools/call': {

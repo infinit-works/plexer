@@ -14,6 +14,7 @@ import {
     resolveContextDir,
     readStdin,
     projectDir,
+    writeAgyLastRepo,
 } from '../util/state.js';
 import { claudeScriptPath } from './paths.js';
 import { ensureFreshGraph } from '../graph/refresh.js';
@@ -26,6 +27,45 @@ import { pinnedHits, pointerCovers, pointersOverlap } from './pin.js';
  * conversational ("yes go ahead", "thanks") and the coverage gate can't judge
  * them reliably with so few terms. */
 export const MIN_PROMPT_CHARS = 12;
+
+export const LEADING_SLASH_COMMANDS_RE = /^(?:\/(?:plan|grill-me|review|simplify|commit|pr|revise-rules|learn|skill-creator|token-telemetry|auto-compact|goal|boost|compact|schedule|browser|plugin|automation|teamwork-preview|agy-customizations|antigravity-guide|doctor|clear|help|init|status|cost)\b\s*)+/i;
+
+export function stripLeadingSlashCommands(text) {
+    return String(text ?? '').trim().replace(LEADING_SLASH_COMMANDS_RE, '').trim();
+}
+
+/**
+ * True when a hook prompt payload is a synthetic harness notification, subagent/peer
+ * message, interrupt marker, slash-only command, or short operational git/deploy/approval
+ * reply with no code identifiers or file paths.
+ */
+export function isSyntheticOrMetaPrompt(raw) {
+    const t = String(raw ?? '').trim();
+    if (!t)
+        return true;
+    if (
+        /^<task-notification>/i.test(t) ||
+        /^<system-reminder>/i.test(t) ||
+        /^<local-command-/i.test(t) ||
+        /^Another Claude session sent a message:/i.test(t) ||
+        /<agent-message\b/i.test(t) ||
+        /^\[Request interrupted by user\]$/i.test(t)
+    ) {
+        return true;
+    }
+    const stripped = stripLeadingSlashCommands(t);
+    if (stripped.length < MIN_PROMPT_CHARS)
+        return true;
+    const hasCodeSignal = /`[^`\n]+`|[A-Za-z0-9_/-]+\.(?:py|go|js|ts|tsx|jsx|mjs|cjs|luau|lua|rs|c|cc|cpp|h|hpp|java|rb|php|cs|swift|kt|scala|sh|json|toml|yaml|yml|md)\b|[a-z][A-Z]|[A-Za-z0-9]+_[A-Za-z0-9]+/.test(stripped);
+    if (
+        !hasCodeSignal &&
+        stripped.length < 80 &&
+        /^(?:(?:tested|done|ok|okay|yes|yep|sure|thanks|great|nice|please|now|good|lgtm)[,.\s]+)*(?:commit|push|deploy|stage|merge|ship|run\s+(?:the\s+)?tests?|go\s+ahead|proceed|looks\s+good)\b/i.test(stripped)
+    ) {
+        return true;
+    }
+    return false;
+}
 
 export function underPlexer(dir, file) {
     const rel = file.startsWith(dir) ? file.slice(dir.length) : file;
@@ -60,13 +100,15 @@ export function recordFileEdit(dir, file) {
 }
 
 export function readOrientation(dir, budgetBytes = 1200) {
+    let formatted = null;
     try {
         const idx = readFileSync(join(resolveContextDir(dir), 'INDEX.md'), 'utf8');
-        return formatOrientation(idx, budgetBytes);
+        formatted = formatOrientation(idx, budgetBytes);
     }
     catch {
-        return null;
+        /* INDEX.md absent */
     }
+    return formatted;
 }
 
 const PROMPT_BOILERPLATE_NOISE = new Set([
@@ -195,11 +237,7 @@ export function detectPromptIntent(prompt) {
     return { wantsCallSites, editEnvelope };
 }
 
-function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
-    const cleaned = cleanPromptBoilerplate(text);
-    if (!vocab)
-        return cleaned;
-    const { dfMap, stemDf, nameTokens, nameStems, pathTokens, compoundSymbols, nDocs } = vocab;
+function extractBacktickPhrases(cleaned) {
     const backtickPhrases = [];
     const backticked = new Set();
     if (!PROMPT_BOILERPLATE_NOISE.has('plexer'))
@@ -238,6 +276,10 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
                 backticked.add(t);
         }
     }
+    return { backtickPhrases, backticked };
+}
+
+function extractCamelAndCompoundPhrases(cleaned, compoundSymbols) {
     const camelOrCodePhrases = [];
     const camelOrCode = new Set();
     for (const m of cleaned.matchAll(/\b([a-z]+[A-Z][A-Za-z0-9_]*|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9_]*|[a-z0-9_]+(?:_[a-z0-9_]+)+|[A-Za-z0-9_/-]+\.(?:py|go|js|ts|tsx|jsx|luau|rs))\b/g)) {
@@ -262,8 +304,7 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
                 continue;
             const tri = w3 && !PROMPT_BOILERPLATE_NOISE.has(w3) ? `${w1}${w2}${w3}` : '';
             if (tri && compoundSymbols.has(tri)) {
-                const sym = compoundSymbols.get(tri);
-                camelOrCodePhrases.push(sym);
+                camelOrCodePhrases.push(compoundSymbols.get(tri));
                 camelOrCode.add(w1);
                 camelOrCode.add(w2);
                 camelOrCode.add(w3);
@@ -276,11 +317,7 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
             const fwdStem = `${stemToken(w1)}${stemToken(w2)}`;
             const revStem = `${stemToken(w2)}${stemToken(w1)}`;
             const fwdSym = fwdStem.length >= 8 ? compoundSymbols.get(fwdStem) : undefined;
-            if (
-                (bi.length >= 8 && compoundSymbols.has(bi)) ||
-                fwdSym?.includes('.') ||
-                (revStem.length >= 7 && compoundSymbols.has(revStem))
-            ) {
+            if ((bi.length >= 8 && compoundSymbols.has(bi)) || fwdSym?.includes('.') || (revStem.length >= 7 && compoundSymbols.has(revStem))) {
                 const sym = compoundSymbols.get(bi) ?? (fwdSym?.includes('.') ? fwdSym : undefined) ?? compoundSymbols.get(revStem);
                 camelOrCodePhrases.push(sym);
                 camelOrCode.add(w1);
@@ -303,7 +340,11 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
             }
         }
     }
-    const rawCompounds = [...new Set([...backtickPhrases, ...camelOrCodePhrases])];
+    return { camelOrCodePhrases, camelOrCode };
+}
+
+function selectTopCompounds(vocab, rawCompounds, maxCompounds) {
+    const { dfMap, stemDf, nameTokens, nameStems, pathTokens, nDocs } = vocab;
     const scoredCompounds = rawCompounds.map((c) => {
         const subToks = tokenize(c).filter((t) => !PROMPT_BOILERPLATE_NOISE.has(t));
         const isFile = /\.(?:py|go|js|ts|tsx|jsx|luau|rs)$/i.test(c);
@@ -335,6 +376,18 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
                 exactSingleCompounds.add(dp);
         }
     }
+    return { compounds, exactSingleCompounds };
+}
+
+function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
+    const cleaned = cleanPromptBoilerplate(text);
+    if (!vocab)
+        return cleaned;
+    const { dfMap, stemDf, nameTokens, nameStems, pathTokens, compoundSymbols, nDocs } = vocab;
+    const { backtickPhrases, backticked } = extractBacktickPhrases(cleaned);
+    const { camelOrCodePhrases, camelOrCode } = extractCamelAndCompoundPhrases(cleaned, compoundSymbols);
+    const rawCompounds = [...new Set([...backtickPhrases, ...camelOrCodePhrases])];
+    const { compounds, exactSingleCompounds } = selectTopCompounds(vocab, rawCompounds, maxCompounds);
     const rawToks = tokenize(cleaned);
     const allToks = [...new Set(rawToks)].filter((t) => !PROMPT_BOILERPLATE_NOISE.has(t) && t.length >= 3);
     const scored = [];
@@ -375,6 +428,244 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
     return [...compounds, ...topWords].join(' ');
 }
 
+function distillMultiFileReqQueries(vocab, outDir, cleaned, uniqueFiles, ifaceTypeNames) {
+    const graph = loadGraphCached(outDir);
+    const targetFiles = uniqueFiles.slice(0, 4).map((f) =>
+        f.replace(/^\/tmp\/[A-Za-z0-9._-]+\/(?:(?:clean|indexed)\/)?[A-Za-z0-9._-]+\//, '')
+    );
+    let clauseSource = cleaned.replace(/\n##+\s+New Interfaces[\s\S]*$/i, '');
+    for (const tn of ifaceTypeNames)
+        clauseSource = clauseSource.replaceAll(tn, '');
+    const clauses = clauseSource
+        .split(/\n+/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 15 && !s.startsWith('#') && !s.startsWith('<') && s.length < 220);
+    const pairs = [];
+    for (const fRel of targetFiles) {
+        const base = basename(fRel);
+        const stem = base.replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+        const symToks = new Set();
+        for (const n of graph?.nodes ?? []) {
+            if (!n.path || n.kind === 'file')
+                continue;
+            if (n.path === fRel || n.path.endsWith(`/${base}`)) {
+                for (const t of tokenize(n.name ?? '')) {
+                    if (t.length >= 3 && !PROMPT_BOILERPLATE_NOISE.has(t)) {
+                        symToks.add(t);
+                        symToks.add(stemToken(t));
+                    }
+                }
+            }
+        }
+        for (let idx = 0; idx < clauses.length; idx++) {
+            const c = clauses[idx];
+            if (targetFiles.some((of) => of !== fRel && c.includes(basename(of))))
+                continue;
+            let score = c.includes(base) ? 16 : 0;
+            const cToks = [...new Set(tokenize(c))].filter((t) => !PROMPT_BOILERPLATE_NOISE.has(t));
+            for (let i = 0; i < cToks.length - 1; i++) {
+                if (`${cToks[i]}${cToks[i + 1]}` === stem)
+                    score += 12;
+            }
+            for (const t of cToks) {
+                if (t.length < 3)
+                    continue;
+                const st = stemToken(t);
+                if (symToks.has(t) || symToks.has(st))
+                    score += 3;
+                else if (t.length >= 4 && [...symToks].some((s) => s.length >= 6 && (s.startsWith(t) || s.endsWith(t))))
+                    score += 2;
+            }
+            if (score > 0)
+                pairs.push({ fRel, idx, c, score });
+        }
+    }
+    pairs.sort((a, b) => b.score - a.score);
+    const assigned = new Map();
+    const usedIdx = new Set();
+    for (const p of pairs) {
+        if (assigned.has(p.fRel) || usedIdx.has(p.idx))
+            continue;
+        assigned.set(p.fRel, p.c);
+        usedIdx.add(p.idx);
+    }
+    const queries = [];
+    for (const fRel of targetFiles) {
+        const matchedClause = assigned.get(fRel) ?? '';
+        const sub = distillSegment(vocab, `\`${fRel}\` ${matchedClause}`, 5, 2);
+        if (sub && !queries.includes(sub))
+            queries.push(sub);
+    }
+    return queries.slice(0, 4);
+}
+
+function distillIfaceSplitBullets(vocab, bullets, uniqueFiles, headSection, ifaceText, ifaceTypeNames, helpers) {
+    const { stripNewTypes, stripUsedCompounds, recordCompounds, usedCompounds } = helpers;
+    const ifaceFile = uniqueFiles[0].replace(/^\/tmp\/[A-Za-z0-9._-]+\/(?:(?:clean|indexed)\/)?[A-Za-z0-9._-]+\//, '');
+    const ifaceStem = basename(ifaceFile).replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+    const ifaceBullets = bullets.filter((b) => [...ifaceTypeNames].some((tn) => b.includes(tn)));
+    const otherBullets = bullets.filter((b) => ![...ifaceTypeNames].some((tn) => b.includes(tn)));
+    if (ifaceBullets.length < 2 || otherBullets.length < 2)
+        return null;
+    const queries = [];
+    const g1 = distillSegment(vocab, stripNewTypes(`${ifaceText}\n${ifaceBullets.join('\n')}`), 8, 4);
+    if (g1) {
+        queries.push(g1);
+        recordCompounds(g1);
+    }
+    for (const ob of otherBullets) {
+        let cleanedOb = ob;
+        const andIdx = ob.search(/\band\s+[a-z]+-[a-z]+/i);
+        if (andIdx > 0 && ob.slice(0, andIdx).toLowerCase().includes(ifaceStem)) {
+            cleanedOb = ob
+                .slice(andIdx + 4)
+                .replace(new RegExp(`\\b${ifaceStem}\\s+validation\\b`, 'gi'), '')
+                .replace(/\bvalidation\s+helpers\b/gi, '')
+                .replace(/\bvalidation\b/gi, '');
+        }
+        const sub = distillSegment(vocab, stripUsedCompounds(cleanedOb), 7, 3);
+        const lead = (sub || '').split(/\s+/)[0] ?? '';
+        if (sub && (/[a-z][A-Z]|\./.test(lead) || cleanedOb !== ob) && !queries.includes(sub)) {
+            queries.push(sub);
+            recordCompounds(sub);
+        }
+    }
+    const headSub = distillSegment(
+        vocab,
+        stripUsedCompounds(headSection.replace(new RegExp(`\\b${ifaceStem}\\b`, 'gi'), '')),
+        5,
+        2
+    );
+    const headLead = (headSub || '').split(/\s+/)[0] ?? '';
+    if (headSub && /[a-z][A-Z]/.test(headLead) && !usedCompounds.has(headLead) && !queries.includes(headSub)) {
+        queries.push(headSub);
+    }
+    return queries.slice(0, 4);
+}
+
+function distillMultiBulletReqQueries(vocab, bullets, uniqueFiles, headSection, ifaceText, ifaceTypeNames) {
+    const stripNewTypes = (text) => {
+        let out = text;
+        for (const tn of ifaceTypeNames) {
+            const esc = tn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            out = out.replace(new RegExp(`[A-Za-z0-9_.]*${esc}\\b`, 'g'), '');
+        }
+        return out;
+    };
+    const usedCompounds = new Set();
+    const stripUsedCompounds = (text) => {
+        let out = stripNewTypes(text).replace(/`([^`\n]+)`/g, (m, inner) => {
+            const base = inner.replace(/\(\)$/, '');
+            for (const c of usedCompounds) {
+                if (base === c || base.startsWith(`${c}.`) || c.startsWith(`${base}.`))
+                    return '';
+            }
+            return m;
+        });
+        for (const c of usedCompounds) {
+            const toks = tokenize(c).filter((t) => !/^(?:get|set|is|on|handle)$/.test(t));
+            if (toks.length === 2) {
+                out = out
+                    .replace(new RegExp(`\\b${toks[0]}\\w*\\s+${toks[1]}\\w*\\b`, 'gi'), '')
+                    .replace(new RegExp(`\\b${toks[1]}\\w*\\s+${toks[0]}\\w*\\b`, 'gi'), '');
+            }
+        }
+        return out;
+    };
+    const recordCompounds = (qStr) => {
+        for (const w of (qStr || '').split(/\s+/).slice(0, 3)) {
+            if (w)
+                usedCompounds.add(w.replace(/\(\)$/, ''));
+        }
+    };
+    if (ifaceTypeNames.size >= 2 && bullets.length >= 5 && uniqueFiles.length === 1) {
+        const splitRes = distillIfaceSplitBullets(vocab, bullets, uniqueFiles, headSection, ifaceText, ifaceTypeNames, {
+            stripNewTypes,
+            stripUsedCompounds,
+            recordCompounds,
+            usedCompounds,
+        });
+        if (splitRes)
+            return splitRes;
+    }
+    const queries = [];
+    const third = Math.ceil(bullets.length / 3);
+    const twoThirds = Math.ceil((bullets.length * 2) / 3);
+    const g1 = distillSegment(vocab, stripNewTypes(`${headSection.slice(0, 350)}\n${ifaceText}\n${bullets.slice(0, third).join('\n')}`), 8, 4);
+    recordCompounds(g1);
+    const g2 = distillSegment(vocab, stripUsedCompounds(bullets.slice(third, twoThirds).join('\n')), 8, 4);
+    recordCompounds(g2);
+    const g3 = distillSegment(vocab, stripUsedCompounds(bullets.slice(twoThirds).join('\n')), 8, 4);
+    for (const g of [g1, g2, g3]) {
+        if (g && !queries.includes(g))
+            queries.push(g);
+    }
+    return queries.slice(0, 3);
+}
+
+function distillStructuredReqQueries(vocab, outDir, cleaned) {
+    const strippedRepro = cleaned.replace(
+        /(?:^|\n)(?:##+\s*|\*\*)Steps\s+to\s+Reproduce([\s\S]*?)(?=\n(?:##+\s+|\*\*[A-Z]))/i,
+        (_m, body) => {
+            const bt = [...String(body).matchAll(/`([^`\n]{3,60})`/g)].map((x) => `\`${x[1]}\``).join(' ');
+            return bt ? `\n${bt}\n` : '\n';
+        },
+    );
+    const reqMatch = /(?:^|\n)##+\s+Requirements\b([\s\S]*?)(?=\n##+\s+|$)/i.exec(strippedRepro);
+    const ifaceMatch = /(?:^|\n)##+\s+New Interfaces\b([\s\S]*?)(?=\n##+\s+|$)/i.exec(strippedRepro);
+    const headSection = strippedRepro.split(/\n##+\s+Requirements\b/i)[0] ?? strippedRepro;
+    const reqText = reqMatch ? reqMatch[1].trim() : '';
+    const ifaceText = ifaceMatch && !/no new interfaces/i.test(ifaceMatch[1]) ? ifaceMatch[1].trim() : '';
+    const ifaceTypeNames = new Set([
+        ...[...ifaceText.matchAll(/\b(?:New\s+(?:error\s+)?(?:class|type|interface|struct)\s+)([A-Za-z_][A-Za-z0-9_]*)/gi)]
+            .map((m) => m[1]),
+        ...[...ifaceText.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`\s+added\s+to\s+`([A-Za-z_][A-Za-z0-9_]*)`/gi)]
+            .flatMap((m) => [m[1], m[2]]),
+        ...[...ifaceText.matchAll(/(?:^|\n)\s*[-*]\s*Name:\s*`?([A-Za-z_][A-Za-z0-9_]*)`?/gi)]
+            .map((m) => m[1]),
+    ]);
+    const queries = [];
+    if (reqText) {
+        const bullets = reqText.split(/\n(?=\s*[-*]\s+)/).map((b) => b.trim()).filter(Boolean);
+        const fileMentions = [...strippedRepro.matchAll(/\b([A-Za-z0-9_/-]+\.(?:py|go|js|ts|tsx|jsx|luau|rs))\b/g)]
+            .map((m) => m[1].replace(/^\/app\//, ''));
+        const uniqueFiles = [...new Set(fileMentions)];
+        if (uniqueFiles.length >= 2) {
+            return distillMultiFileReqQueries(vocab, outDir, cleaned, uniqueFiles, ifaceTypeNames);
+        }
+        if (bullets.length >= 3) {
+            return distillMultiBulletReqQueries(vocab, bullets, uniqueFiles, headSection, ifaceText, ifaceTypeNames);
+        }
+        if (bullets.length === 2) {
+            let b1Text = bullets[0];
+            let b2Text = bullets[1];
+            for (const tn of ifaceTypeNames) {
+                b1Text = b1Text.replaceAll(tn, '');
+                b2Text = b2Text.replaceAll(tn, '');
+            }
+            const g1 = distillSegment(vocab, `${ifaceText}\n${b1Text}`, 8, 4);
+            const g2 = distillSegment(vocab, b2Text, 8, 4);
+            for (const g of [g1, g2]) {
+                if (g && !queries.includes(g))
+                    queries.push(g);
+            }
+            for (const bText of [b1Text, b2Text]) {
+                const sub = distillSegment(vocab, bText.replace(/`[^`\n]+`/g, ''), 6, 2);
+                const lead = (sub || '').split(/\s+/)[0];
+                if (lead && lead.length >= 12 && /[a-z][A-Z]/.test(lead) && !queries.some((q) => q.startsWith(lead))) {
+                    queries.push(sub);
+                    break;
+                }
+            }
+            return queries.slice(0, 3);
+        }
+    }
+    const q1 = distillSegment(vocab, `${headSection}\n${ifaceText}\n${reqText}`, 10, 5);
+    if (q1)
+        queries.push(q1);
+    return queries.slice(0, 3);
+}
+
 export function distillPromptQueries(root, contextDir, prompt) {
     const cleaned = cleanPromptBoilerplate(prompt);
     const rawToks = tokenize(cleaned);
@@ -384,227 +675,8 @@ export function distillPromptQueries(root, contextDir, prompt) {
     const vocab = buildCorpusVocab(outDir);
     if (!vocab)
         return [cleaned];
-    // Structured PR / issue descriptions with ## Requirements or ## New Interfaces
     if (/(?:^|\n)##+\s+(?:Requirements|New Interfaces|Problem|Description)\b/i.test(cleaned)) {
-        const strippedRepro = cleaned.replace(
-            /(?:^|\n)(?:##+\s*|\*\*)Steps\s+to\s+Reproduce([\s\S]*?)(?=\n(?:##+\s+|\*\*[A-Z]))/i,
-            (_m, body) => {
-                const bt = [...String(body).matchAll(/`([^`\n]{3,60})`/g)].map((x) => `\`${x[1]}\``).join(' ');
-                return bt ? `\n${bt}\n` : '\n';
-            },
-        );
-        const reproBt = [...cleaned.matchAll(/`([A-Za-z_][A-Za-z0-9_]{4,})`/g)]
-            .map((x) => x[1])
-            .filter((s) => /[a-z][A-Z]|_/.test(s))
-            .map((s) => `\`${s}\``)
-            .slice(0, 6)
-            .join(' ');
-        const reqMatch = /(?:^|\n)##+\s+Requirements\b([\s\S]*?)(?=\n##+\s+|$)/i.exec(strippedRepro);
-        const ifaceMatch = /(?:^|\n)##+\s+New Interfaces\b([\s\S]*?)(?=\n##+\s+|$)/i.exec(strippedRepro);
-        const headSection = strippedRepro.split(/\n##+\s+Requirements\b/i)[0] ?? strippedRepro;
-        const reqText = reqMatch ? reqMatch[1].trim() : '';
-        const ifaceText = ifaceMatch && !/no new interfaces/i.test(ifaceMatch[1]) ? ifaceMatch[1].trim() : '';
-        const ifaceTypeNames = new Set([
-            ...[...ifaceText.matchAll(/\b(?:New\s+(?:error\s+)?(?:class|type|interface|struct)\s+)([A-Za-z_][A-Za-z0-9_]*)/gi)]
-                .map((m) => m[1]),
-            ...[...ifaceText.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`\s+added\s+to\s+`([A-Za-z_][A-Za-z0-9_]*)`/gi)]
-                .flatMap((m) => [m[1], m[2]]),
-            ...[...ifaceText.matchAll(/(?:^|\n)\s*[-*]\s*Name:\s*`?([A-Za-z_][A-Za-z0-9_]*)`?/gi)]
-                .map((m) => m[1]),
-        ]);
-        const queries = [];
-        if (reqText) {
-            const bullets = reqText.split(/\n(?=\s*[-*]\s+)/).map((b) => b.trim()).filter(Boolean);
-            const fileMentions = [...strippedRepro.matchAll(/\b([A-Za-z0-9_/-]+\.(?:py|go|js|ts|tsx|jsx|luau|rs))\b/g)]
-                .map((m) => m[1].replace(/^\/app\//, ''));
-            const uniqueFiles = [...new Set(fileMentions)];
-            if (uniqueFiles.length >= 2) {
-                const graph = loadGraphCached(outDir);
-                const targetFiles = uniqueFiles.slice(0, 4).map((f) =>
-                    f.replace(/^\/tmp\/[A-Za-z0-9._-]+\/(?:(?:clean|indexed)\/)?[A-Za-z0-9._-]+\//, '')
-                );
-                let clauseSource = cleaned.replace(/\n##+\s+New Interfaces[\s\S]*$/i, '');
-                for (const tn of ifaceTypeNames)
-                    clauseSource = clauseSource.replaceAll(tn, '');
-                const clauses = clauseSource
-                    .split(/\n+/)
-                    .map((s) => s.trim())
-                    .filter((s) => s.length > 15 && !s.startsWith('#') && !s.startsWith('<') && s.length < 220);
-                const pairs = [];
-                for (const fRel of targetFiles) {
-                    const base = basename(fRel);
-                    const stem = base.replace(/\.[a-z0-9]+$/i, '').toLowerCase();
-                    const symToks = new Set();
-                    for (const n of graph?.nodes ?? []) {
-                        if (!n.path || n.kind === 'file')
-                            continue;
-                        if (n.path === fRel || n.path.endsWith(`/${base}`)) {
-                            for (const t of tokenize(n.name ?? '')) {
-                                if (t.length >= 3 && !PROMPT_BOILERPLATE_NOISE.has(t)) {
-                                    symToks.add(t);
-                                    symToks.add(stemToken(t));
-                                }
-                            }
-                        }
-                    }
-                    for (let idx = 0; idx < clauses.length; idx++) {
-                        const c = clauses[idx];
-                        if (targetFiles.some((of) => of !== fRel && c.includes(basename(of))))
-                            continue;
-                        let score = c.includes(base) ? 16 : 0;
-                        const cToks = [...new Set(tokenize(c))].filter((t) => !PROMPT_BOILERPLATE_NOISE.has(t));
-                        for (let i = 0; i < cToks.length - 1; i++) {
-                            if (`${cToks[i]}${cToks[i + 1]}` === stem)
-                                score += 12;
-                        }
-                        for (const t of cToks) {
-                            if (t.length < 3)
-                                continue;
-                            const st = stemToken(t);
-                            if (symToks.has(t) || symToks.has(st))
-                                score += 3;
-                            else if (t.length >= 4 && [...symToks].some((s) => s.length >= 6 && (s.startsWith(t) || s.endsWith(t))))
-                                score += 2;
-                        }
-                        if (score > 0)
-                            pairs.push({ fRel, idx, c, score });
-                    }
-                }
-                pairs.sort((a, b) => b.score - a.score);
-                const assigned = new Map();
-                const usedIdx = new Set();
-                for (const p of pairs) {
-                    if (assigned.has(p.fRel) || usedIdx.has(p.idx))
-                        continue;
-                    assigned.set(p.fRel, p.c);
-                    usedIdx.add(p.idx);
-                }
-                for (const fRel of targetFiles) {
-                    const matchedClause = assigned.get(fRel) ?? '';
-                    const sourceText = `\`${fRel}\` ${matchedClause}`;
-                    const sub = distillSegment(vocab, sourceText, 5, 2);
-                    if (sub && !queries.includes(sub))
-                        queries.push(sub);
-                }
-                return queries.slice(0, 4);
-            }
-            if (bullets.length >= 3) {
-                const stripNewTypes = (text) => {
-                    let out = text;
-                    for (const tn of ifaceTypeNames) {
-                        const esc = tn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                        out = out.replace(new RegExp(`[A-Za-z0-9_.]*${esc}\\b`, 'g'), '');
-                    }
-                    return out;
-                };
-                const usedCompounds = new Set();
-                const stripUsedCompounds = (text) => {
-                    let out = stripNewTypes(text).replace(/`([^`\n]+)`/g, (m, inner) => {
-                        const base = inner.replace(/\(\)$/, '');
-                        for (const c of usedCompounds) {
-                            if (base === c || base.startsWith(`${c}.`) || c.startsWith(`${base}.`))
-                                return '';
-                        }
-                        return m;
-                    });
-                    for (const c of usedCompounds) {
-                        const toks = tokenize(c).filter((t) => !/^(?:get|set|is|on|handle)$/.test(t));
-                        if (toks.length === 2) {
-                            out = out
-                                .replace(new RegExp(`\\b${toks[0]}\\w*\\s+${toks[1]}\\w*\\b`, 'gi'), '')
-                                .replace(new RegExp(`\\b${toks[1]}\\w*\\s+${toks[0]}\\w*\\b`, 'gi'), '');
-                        }
-                    }
-                    return out;
-                };
-                const recordCompounds = (qStr) => {
-                    for (const w of (qStr || '').split(/\s+/).slice(0, 3)) {
-                        if (w)
-                            usedCompounds.add(w.replace(/\(\)$/, ''));
-                    }
-                };
-                if (ifaceTypeNames.size >= 2 && bullets.length >= 5 && uniqueFiles.length === 1) {
-                    const ifaceFile = uniqueFiles[0].replace(/^\/tmp\/[A-Za-z0-9._-]+\/(?:(?:clean|indexed)\/)?[A-Za-z0-9._-]+\//, '');
-                    const ifaceStem = basename(ifaceFile).replace(/\.[a-z0-9]+$/i, '').toLowerCase();
-                    const ifaceBullets = bullets.filter((b) => [...ifaceTypeNames].some((tn) => b.includes(tn)));
-                    const otherBullets = bullets.filter((b) => ![...ifaceTypeNames].some((tn) => b.includes(tn)));
-                    if (ifaceBullets.length >= 2 && otherBullets.length >= 2) {
-                        const g1 = distillSegment(vocab, stripNewTypes(`${ifaceText}\n${ifaceBullets.join('\n')}`), 8, 4);
-                        if (g1) {
-                            queries.push(g1);
-                            recordCompounds(g1);
-                        }
-                        for (const ob of otherBullets) {
-                            let cleanedOb = ob;
-                            const andIdx = ob.search(/\band\s+[a-z]+-[a-z]+/i);
-                            if (andIdx > 0 && ob.slice(0, andIdx).toLowerCase().includes(ifaceStem)) {
-                                cleanedOb = ob
-                                    .slice(andIdx + 4)
-                                    .replace(new RegExp(`\\b${ifaceStem}\\s+validation\\b`, 'gi'), '')
-                                    .replace(/\bvalidation\s+helpers\b/gi, '')
-                                    .replace(/\bvalidation\b/gi, '');
-                            }
-                            const sub = distillSegment(vocab, stripUsedCompounds(cleanedOb), 7, 3);
-                            const lead = (sub || '').split(/\s+/)[0] ?? '';
-                            if (sub && (/[a-z][A-Z]|\./.test(lead) || cleanedOb !== ob) && !queries.includes(sub)) {
-                                queries.push(sub);
-                                recordCompounds(sub);
-                            }
-                        }
-                        const headSub = distillSegment(
-                            vocab,
-                            stripUsedCompounds(headSection.replace(new RegExp(`\\b${ifaceStem}\\b`, 'gi'), '')),
-                            5,
-                            2
-                        );
-                        const headLead = (headSub || '').split(/\s+/)[0] ?? '';
-                        if (headSub && /[a-z][A-Z]/.test(headLead) && !usedCompounds.has(headLead) && !queries.includes(headSub)) {
-                            queries.push(headSub);
-                        }
-                        return queries.slice(0, 4);
-                    }
-                }
-                const third = Math.ceil(bullets.length / 3);
-                const twoThirds = Math.ceil((bullets.length * 2) / 3);
-                const g1 = distillSegment(vocab, stripNewTypes(`${headSection.slice(0, 350)}\n${ifaceText}\n${bullets.slice(0, third).join('\n')}`), 8, 4);
-                recordCompounds(g1);
-                const g2 = distillSegment(vocab, stripUsedCompounds(bullets.slice(third, twoThirds).join('\n')), 8, 4);
-                recordCompounds(g2);
-                const g3 = distillSegment(vocab, stripUsedCompounds(bullets.slice(twoThirds).join('\n')), 8, 4);
-                for (const g of [g1, g2, g3]) {
-                    if (g && !queries.includes(g))
-                        queries.push(g);
-                }
-                return queries.slice(0, 3);
-            }
-            if (bullets.length === 2) {
-                let b1Text = bullets[0];
-                let b2Text = bullets[1];
-                for (const tn of ifaceTypeNames) {
-                    b1Text = b1Text.replaceAll(tn, '');
-                    b2Text = b2Text.replaceAll(tn, '');
-                }
-                const g1 = distillSegment(vocab, `${ifaceText}\n${b1Text}`, 8, 4);
-                const g2 = distillSegment(vocab, b2Text, 8, 4);
-                for (const g of [g1, g2]) {
-                    if (g && !queries.includes(g))
-                        queries.push(g);
-                }
-                for (const bText of [b1Text, b2Text]) {
-                    const sub = distillSegment(vocab, bText.replace(/`[^`\n]+`/g, ''), 6, 2);
-                    const lead = (sub || '').split(/\s+/)[0];
-                    if (lead && lead.length >= 12 && /[a-z][A-Z]/.test(lead) && !queries.some((q) => q.startsWith(lead))) {
-                        queries.push(sub);
-                        break;
-                    }
-                }
-                return queries.slice(0, 3);
-            }
-        }
-        const q1 = distillSegment(vocab, `${headSection}\n${ifaceText}\n${reqText}`, 10, 5);
-        if (q1)
-            queries.push(q1);
-        return queries.slice(0, 3);
+        return distillStructuredReqQueries(vocab, outDir, cleaned);
     }
     const parts = cleaned.split(/\n(?=\s*\d+\.\s+)/).map((s) => s.trim()).filter(Boolean);
     if (parts.length >= 2) {
@@ -624,10 +696,6 @@ export function distillPromptQueries(root, contextDir, prompt) {
         });
     }
     return [distillSegment(vocab, cleaned, 12, 5)];
-}
-
-export function distillPromptQuery(root, contextDir, prompt) {
-    return distillPromptQueries(root, contextDir, prompt)[0];
 }
 
 /**
@@ -743,6 +811,274 @@ export function queryPromptContext(dir, prompt) {
         hits: [...pins, ...keptRest],
     };
 }
+function mergeMultiQueryHits(results, editEnvelope) {
+    const mergedSeen = new Set();
+    const mergedSymbolTitles = new Set();
+    const mergedFileCounts = new Map();
+    const mergedHits = [];
+    const pushMergedHit = (h, rank, maxPerFile = 2) => {
+        if (!h || mergedSeen.has(h.pointer))
+            return false;
+        if (rank > 0 && h.title && mergedSymbolTitles.has(h.title))
+            return false;
+        const fileKey = (h.pointer || '').split(':')[0];
+        if (editEnvelope && fileKey && (mergedFileCounts.get(fileKey) ?? 0) >= maxPerFile && mergedHits.length < 4)
+            return false;
+        mergedSeen.add(h.pointer);
+        if (h.title)
+            mergedSymbolTitles.add(h.title);
+        if (fileKey)
+            mergedFileCounts.set(fileKey, (mergedFileCounts.get(fileKey) ?? 0) + 1);
+        mergedHits.push(h);
+        return true;
+    };
+    for (const r of results) {
+        pushMergedHit(r?.hits?.[0], 0, 1);
+    }
+    for (const r of results) {
+        const h0 = r?.hits?.[0];
+        if (h0?.code) pushMergedHit(h0, 0, 2);
+    }
+    for (let rank = 1; rank < 3; rank++) {
+        for (const r of results) {
+            pushMergedHit(r?.hits?.[rank], rank, 1);
+        }
+    }
+    if (mergedHits.length < 4) {
+        for (let rank = 0; rank < 3; rank++) {
+            for (const r of results) {
+                pushMergedHit(r?.hits?.[rank], rank, 2);
+            }
+        }
+    }
+    if (mergedHits.length < 4) {
+        for (let rank = 0; rank < 3; rank++) {
+            for (const r of results) {
+                const h = r?.hits?.[rank];
+                if (h && !mergedSeen.has(h.pointer)) {
+                    mergedSeen.add(h.pointer);
+                    mergedHits.push(h);
+                }
+            }
+        }
+    }
+    return mergedHits;
+}
+
+function dedupPreviousHitHelpers(mergedHits, idx, h) {
+    const prevBlocks = new Set();
+    for (let pIdx = 0; pIdx < idx; pIdx++) {
+        const pc = mergedHits[pIdx]?.code;
+        if (!pc)
+            continue;
+        for (const seg of pc.split('\n\n// ').slice(1)) {
+            const hdr = seg.split('\n')[0];
+            if (hdr)
+                prevBlocks.add(hdr);
+        }
+    }
+    if (prevBlocks.size > 0 && h.code.includes('\n\n// ')) {
+        const parts = h.code.split('\n\n// ');
+        h.code = [parts[0], ...parts.slice(1).filter((seg) => !prevBlocks.has(seg.split('\n')[0])).map((seg) => `// ${seg}`)].join('\n\n');
+    }
+    if (mergedHits.slice(0, idx).some((oh) => oh.code && oh.pointer?.split(':')[0] === h.pointer?.split(':')[0])) {
+        const dupFooterIdx = h.code.indexOf('\n// other symbols in ');
+        if (dupFooterIdx > 0)
+            h.code = h.code.slice(0, dupFooterIdx);
+    }
+}
+
+function trimFirstHitHelpersForNext(h, mergedHits, maxMergedBytes) {
+    const nextCodeHit = mergedHits.find((oh, oIdx) => oIdx > 0 && oh.code);
+    if (!nextCodeHit)
+        return;
+    const nextPrimaryLen = nextCodeHit.code.indexOf('\n\n// ') > 0
+        ? Buffer.byteLength(nextCodeHit.code.slice(0, nextCodeHit.code.indexOf('\n\n// ')), 'utf8')
+        : Buffer.byteLength(nextCodeHit.code, 'utf8');
+    const sameFileAsNext = h.pointer?.split(':')[0] === nextCodeHit.pointer?.split(':')[0];
+    if (
+        !h.code.includes('\n\n// ') ||
+        (Buffer.byteLength(h.code, 'utf8') + nextPrimaryLen <= maxMergedBytes &&
+            !((h.code.split('\n\n// ').length - 1 >= 2 || (sameFileAsNext && nextCodeHit.code.split('\n\n// ').length - 1 >= 2)) &&
+                Buffer.byteLength(h.code, 'utf8') + Buffer.byteLength(nextCodeHit.code, 'utf8') > maxMergedBytes))
+    ) {
+        return;
+    }
+    const otherSymsIdx = h.code.indexOf('\n// other symbols in ');
+    const trailingFooter = otherSymsIdx > 0 ? h.code.slice(otherSymsIdx) : '';
+    if (otherSymsIdx > 0)
+        h.code = h.code.slice(0, otherSymsIdx);
+    const firstHelperSplit = h.code.indexOf('\n\n// ');
+    if (firstHelperSplit > 0) {
+        const countRealHelpers = (str) => str.split('\n\n// ').slice(1).filter((s) => !s.startsWith('module return ')).length;
+        const hadThreeHelpers = countRealHelpers(h.code) >= 3;
+        while (
+            h.code.includes('\n\n// ') &&
+            h.code.lastIndexOf('\n\n// ') > firstHelperSplit &&
+            Buffer.byteLength(h.code, 'utf8') + Buffer.byteLength(nextCodeHit.code, 'utf8') > maxMergedBytes
+        ) {
+            h.code = h.code.slice(0, h.code.lastIndexOf('\n\n// '));
+        }
+        if (
+            (Buffer.byteLength(h.code, 'utf8') + nextPrimaryLen > maxMergedBytes ||
+                (!hadThreeHelpers && Buffer.byteLength(h.code, 'utf8') + Buffer.byteLength(nextCodeHit.code, 'utf8') > maxMergedBytes)) &&
+            Buffer.byteLength(h.code, 'utf8') < 3200
+        ) {
+            h.code = h.code.slice(0, firstHelperSplit);
+        }
+    }
+    if (trailingFooter && !h.code.includes('\n// other symbols in '))
+        h.code += trailingFooter;
+}
+
+function rebalanceFirstTwoHitHelpers(mergedHits, h, inlinedBytes, maxMergedBytes) {
+    let prevCode = mergedHits[0].code;
+    const firstPrevHelperIdx = prevCode.indexOf('\n\n// ');
+    const secondPrevHelperIdx = firstPrevHelperIdx > 0 ? prevCode.indexOf('\n\n// ', firstPrevHelperIdx + 6) : -1;
+    const hFirstIdx = h.code.indexOf('\n\n// ');
+    const hSecondIdx = hFirstIdx > 0 ? h.code.indexOf('\n\n// ', hFirstIdx + 6) : -1;
+    const thirdHelperIdx = hSecondIdx > 0 ? h.code.indexOf('\n\n// ', hSecondIdx + 6) : -1;
+    let candWithHelpers = thirdHelperIdx > 0 ? h.code.slice(0, thirdHelperIdx) : h.code;
+    while (
+        prevCode.includes('\n\n// ') &&
+        prevCode.lastIndexOf('\n\n// ') > firstPrevHelperIdx &&
+        inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candWithHelpers, 'utf8') > maxMergedBytes
+    ) {
+        prevCode = prevCode.slice(0, prevCode.lastIndexOf('\n\n// '));
+    }
+    while (
+        candWithHelpers.includes('\n\n// ') &&
+        inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candWithHelpers, 'utf8') > maxMergedBytes
+    ) {
+        candWithHelpers = candWithHelpers.slice(0, candWithHelpers.lastIndexOf('\n\n// '));
+    }
+    if (
+        ((candWithHelpers.split('\n\n// ').length - 1) < (h.code.split('\n\n// ').length - 1) ||
+            ((h.code.split('\n\n// ').length - 1) >= 3 && (candWithHelpers.split('\n\n// ').length - 1) === 2)) &&
+        secondPrevHelperIdx === -1 &&
+        firstPrevHelperIdx > 0 &&
+        mergedHits[0].pointer?.split(':')[0] === h.pointer?.split(':')[0] &&
+        Buffer.byteLength(prevCode.slice(0, firstPrevHelperIdx), 'utf8') >= 1550
+    ) {
+        const prevNoHelper = prevCode.slice(0, firstPrevHelperIdx);
+        let fullCand = h.code;
+        while (
+            fullCand.includes('\n\n// ') &&
+            inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevNoHelper, 'utf8') + Buffer.byteLength(fullCand, 'utf8') > maxMergedBytes
+        ) {
+            fullCand = fullCand.slice(0, fullCand.lastIndexOf('\n\n// '));
+        }
+        if ((fullCand.split('\n\n// ').length - 1) >= (candWithHelpers.split('\n\n// ').length - 1) && Buffer.byteLength(fullCand, 'utf8') > Buffer.byteLength(candWithHelpers, 'utf8')) {
+            prevCode = prevNoHelper;
+            candWithHelpers = fullCand;
+        }
+    }
+    const newTotal = inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candWithHelpers, 'utf8');
+    if (newTotal <= maxMergedBytes && candWithHelpers.includes('\n\n// ')) {
+        mergedHits[0].code = prevCode;
+        h.code = candWithHelpers;
+        return newTotal;
+    }
+    return null;
+}
+
+function reclaimPrevHitHelpersForCandidate(mergedHits, idx, h, inlinedBytes, maxMergedBytes) {
+    let candidateCode = h.code;
+    if (candidateCode.includes('\n\n// ') && inlinedBytes + Buffer.byteLength(candidateCode, 'utf8') > maxMergedBytes) {
+        candidateCode = candidateCode.slice(0, candidateCode.indexOf('\n\n// '));
+    }
+    for (let pIdx = idx - 1; pIdx >= 0; pIdx--) {
+        const prev = mergedHits[pIdx];
+        if (!prev?.code || !prev.code.includes('\n\n// '))
+            continue;
+        let prevCode = prev.code;
+        while (
+            prevCode.includes('\n\n// ') &&
+            inlinedBytes - Buffer.byteLength(prev.code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candidateCode, 'utf8') > maxMergedBytes
+        ) {
+            prevCode = prevCode.slice(0, prevCode.lastIndexOf('\n\n// '));
+        }
+        const delta = Buffer.byteLength(prev.code, 'utf8') - Buffer.byteLength(prevCode, 'utf8');
+        if (delta > 0) {
+            prev.code = prevCode;
+            inlinedBytes -= delta;
+        }
+        if (inlinedBytes + Buffer.byteLength(candidateCode, 'utf8') <= maxMergedBytes)
+            break;
+    }
+    const cb = Buffer.byteLength(candidateCode, 'utf8');
+    if (inlinedBytes + cb <= maxMergedBytes) {
+        h.code = candidateCode;
+        return inlinedBytes + cb;
+    }
+    return null;
+}
+
+function enforceMergedHitsBudget(mergedHits, intent, queryCount) {
+    const maxMergedBytes = intent.editEnvelope
+        ? (queryCount >= 4 ? Math.max(HOOK_BUDGETS.editMergedBytes, 3800) : HOOK_BUDGETS.editMergedBytes)
+        : HOOK_BUDGETS.qaMergedBytes;
+    const maxInlinedHits = intent.editEnvelope
+        ? Math.max(HOOK_BUDGETS.editMaxInlined, queryCount >= 4 ? 4 : 0)
+        : HOOK_BUDGETS.qaMaxInlined;
+    let inlinedBytes = 0;
+    let inlinedCount = 0;
+    for (let idx = 0; idx < mergedHits.length; idx++) {
+        const h = mergedHits[idx];
+        if (idx > 0 && h.wantsCallSites && (h.callSites?.length ?? 0) > 10) {
+            h.wantsCallSites = false;
+        }
+        if (!h.code)
+            continue;
+        if (idx > 0) {
+            dedupPreviousHitHelpers(mergedHits, idx, h);
+        }
+        if (idx === 0 && Buffer.byteLength(h.code, 'utf8') < 3800 && mergedHits.some((oh, oIdx) => oIdx > 0 && oh.code)) {
+            trimFirstHitHelpersForNext(h, mergedHits, maxMergedBytes);
+        }
+        const b = Buffer.byteLength(h.code, 'utf8');
+        if (inlinedCount >= maxInlinedHits || (inlinedCount > 0 && inlinedBytes + b > maxMergedBytes)) {
+            if (inlinedCount < maxInlinedHits && h.code.includes('\n\n// ')) {
+                if (idx === 1 && mergedHits[0]?.code?.includes('\n\n// ')) {
+                    const rebalanced = rebalanceFirstTwoHitHelpers(mergedHits, h, inlinedBytes, maxMergedBytes);
+                    if (rebalanced !== null) {
+                        inlinedBytes = rebalanced;
+                        inlinedCount++;
+                        continue;
+                    }
+                }
+                let trimmed = h.code;
+                while (trimmed.includes('\n\n// ') && inlinedBytes + Buffer.byteLength(trimmed, 'utf8') > maxMergedBytes) {
+                    trimmed = trimmed.slice(0, trimmed.lastIndexOf('\n\n// '));
+                }
+                const tb = Buffer.byteLength(trimmed, 'utf8');
+                if (inlinedBytes + tb <= maxMergedBytes) {
+                    h.code = trimmed;
+                    inlinedBytes += tb;
+                    inlinedCount++;
+                    continue;
+                }
+            }
+            if (inlinedCount < maxInlinedHits && idx > 0 && h.kind !== 'file' && !h.title?.endsWith(' · file') && !mergedHits.slice(0, idx).some((oh) => oh.code && oh.pointer?.split(':')[0] === h.pointer?.split(':')[0])) {
+                const reclaimed = reclaimPrevHitHelpersForCandidate(mergedHits, idx, h, inlinedBytes, maxMergedBytes);
+                if (reclaimed !== null) {
+                    inlinedBytes = reclaimed;
+                    inlinedCount++;
+                    continue;
+                }
+            }
+            const oldFooterMatch = h.code.match(/\n\/\/ other symbols in [^\n]+:\s*(.+)$/);
+            if (oldFooterMatch && !h.otherSymbols)
+                h.otherSymbols = oldFooterMatch[1];
+            delete h.code;
+        }
+        else {
+            inlinedBytes += b;
+            inlinedCount++;
+        }
+    }
+}
+
 function searchPromptContext(dir, prompt) {
     const root = nearestPlexerRoot(dir)?.root ?? dir;
     const scopeHint = lastFileScopeHint(root, readStats(root)?.lastFile);
@@ -794,242 +1130,8 @@ function searchPromptContext(dir, prompt) {
                 })
             );
         }
-        const mergedSeen = new Set();
-        const mergedSymbolTitles = new Set();
-        const mergedFileCounts = new Map();
-        const mergedHits = [];
-        const pushMergedHit = (h, rank, maxPerFile = 2) => {
-            if (!h || mergedSeen.has(h.pointer))
-                return false;
-            if (rank > 0 && h.title && mergedSymbolTitles.has(h.title))
-                return false;
-            const fileKey = (h.pointer || '').split(':')[0];
-            if (intent.editEnvelope && fileKey && (mergedFileCounts.get(fileKey) ?? 0) >= maxPerFile && mergedHits.length < 4)
-                return false;
-            mergedSeen.add(h.pointer);
-            if (h.title)
-                mergedSymbolTitles.add(h.title);
-            if (fileKey)
-                mergedFileCounts.set(fileKey, (mergedFileCounts.get(fileKey) ?? 0) + 1);
-            mergedHits.push(h);
-            return true;
-        };
-        for (const r of results) {
-            pushMergedHit(r?.hits?.[0], 0, 1);
-        }
-        for (const r of results) {
-            const h0 = r?.hits?.[0];
-            if (h0?.code) pushMergedHit(h0, 0, 2);
-        }
-        for (let rank = 1; rank < 3; rank++) {
-            for (const r of results) {
-                pushMergedHit(r?.hits?.[rank], rank, 1);
-            }
-        }
-        if (mergedHits.length < 4) {
-            for (let rank = 0; rank < 3; rank++) {
-                for (const r of results) {
-                    pushMergedHit(r?.hits?.[rank], rank, 2);
-                }
-            }
-        }
-        if (mergedHits.length < 4) {
-            for (let rank = 0; rank < 3; rank++) {
-                for (const r of results) {
-                    const h = r?.hits?.[rank];
-                    if (h && !mergedSeen.has(h.pointer)) {
-                        mergedSeen.add(h.pointer);
-                        mergedHits.push(h);
-                    }
-                }
-            }
-        }
-        const maxMergedBytes = intent.editEnvelope
-            ? (queries.length >= 4 ? Math.max(HOOK_BUDGETS.editMergedBytes, 3800) : HOOK_BUDGETS.editMergedBytes)
-            : HOOK_BUDGETS.qaMergedBytes;
-        let inlinedBytes = 0;
-        let inlinedCount = 0;
-        for (let idx = 0; idx < mergedHits.length; idx++) {
-            const h = mergedHits[idx];
-            if (idx > 0 && h.wantsCallSites && (h.callSites?.length ?? 0) > 10) {
-                h.wantsCallSites = false;
-            }
-            if (h.code) {
-                if (idx > 0) {
-                    const prevBlocks = new Set();
-                    for (let pIdx = 0; pIdx < idx; pIdx++) {
-                        const pc = mergedHits[pIdx]?.code;
-                        if (!pc)
-                            continue;
-                        for (const seg of pc.split('\n\n// ').slice(1)) {
-                            const hdr = seg.split('\n')[0];
-                            if (hdr)
-                                prevBlocks.add(hdr);
-                        }
-                    }
-                    if (prevBlocks.size > 0 && h.code.includes('\n\n// ')) {
-                        const parts = h.code.split('\n\n// ');
-                        h.code = [parts[0], ...parts.slice(1).filter((seg) => !prevBlocks.has(seg.split('\n')[0])).map((seg) => `// ${seg}`)].join('\n\n');
-                    }
-                    if (mergedHits.slice(0, idx).some((oh) => oh.code && oh.pointer?.split(':')[0] === h.pointer?.split(':')[0])) {
-                        const dupFooterIdx = h.code.indexOf('\n// other symbols in ');
-                        if (dupFooterIdx > 0)
-                            h.code = h.code.slice(0, dupFooterIdx);
-                    }
-                }
-                if (idx === 0 && Buffer.byteLength(h.code, 'utf8') < 3800 && mergedHits.some((oh, oIdx) => oIdx > 0 && oh.code)) {
-                    const nextCodeHit = mergedHits.find((oh, oIdx) => oIdx > 0 && oh.code);
-                    if (nextCodeHit) {
-                        const nextPrimaryLen = nextCodeHit.code.indexOf('\n\n// ') > 0
-                            ? Buffer.byteLength(nextCodeHit.code.slice(0, nextCodeHit.code.indexOf('\n\n// ')), 'utf8')
-                            : Buffer.byteLength(nextCodeHit.code, 'utf8');
-                        const sameFileAsNext = h.pointer?.split(':')[0] === nextCodeHit.pointer?.split(':')[0];
-                        if (
-                            h.code.includes('\n\n// ') &&
-                            (Buffer.byteLength(h.code, 'utf8') + nextPrimaryLen > maxMergedBytes ||
-                                ((h.code.split('\n\n// ').length - 1 >= 2 || (sameFileAsNext && nextCodeHit.code.split('\n\n// ').length - 1 >= 2)) &&
-                                    Buffer.byteLength(h.code, 'utf8') + Buffer.byteLength(nextCodeHit.code, 'utf8') > maxMergedBytes))
-                        ) {
-                            const otherSymsIdx = h.code.indexOf('\n// other symbols in ');
-                            const trailingFooter = otherSymsIdx > 0 ? h.code.slice(otherSymsIdx) : '';
-                            if (otherSymsIdx > 0)
-                                h.code = h.code.slice(0, otherSymsIdx);
-                            const firstHelperSplit = h.code.indexOf('\n\n// ');
-                            if (firstHelperSplit > 0) {
-                                const countRealHelpers = (str) => str.split('\n\n// ').slice(1).filter((s) => !s.startsWith('module return ')).length;
-                                const hadThreeHelpers = countRealHelpers(h.code) >= 3;
-                                while (
-                                    h.code.includes('\n\n// ') &&
-                                    h.code.lastIndexOf('\n\n// ') > firstHelperSplit &&
-                                    Buffer.byteLength(h.code, 'utf8') + Buffer.byteLength(nextCodeHit.code, 'utf8') > maxMergedBytes
-                                ) {
-                                    h.code = h.code.slice(0, h.code.lastIndexOf('\n\n// '));
-                                }
-                                if (
-                                    (Buffer.byteLength(h.code, 'utf8') + nextPrimaryLen > maxMergedBytes ||
-                                        (!hadThreeHelpers && Buffer.byteLength(h.code, 'utf8') + Buffer.byteLength(nextCodeHit.code, 'utf8') > maxMergedBytes)) &&
-                                    Buffer.byteLength(h.code, 'utf8') < 3200
-                                ) {
-                                    h.code = h.code.slice(0, firstHelperSplit);
-                                }
-                            }
-                            if (trailingFooter && !h.code.includes('\n// other symbols in '))
-                                h.code += trailingFooter;
-                        }
-                    }
-                }
-                let b = Buffer.byteLength(h.code, 'utf8');
-                const maxInlinedHits = intent.editEnvelope
-                    ? Math.max(HOOK_BUDGETS.editMaxInlined, queries.length >= 4 ? 4 : 0)
-                    : HOOK_BUDGETS.qaMaxInlined;
-                if (inlinedCount >= maxInlinedHits || (inlinedCount > 0 && inlinedBytes + b > maxMergedBytes)) {
-                    if (inlinedCount < maxInlinedHits && h.code.includes('\n\n// ')) {
-                        if (idx === 1 && mergedHits[0]?.code?.includes('\n\n// ')) {
-                            let prevCode = mergedHits[0].code;
-                            const firstPrevHelperIdx = prevCode.indexOf('\n\n// ');
-                            const secondPrevHelperIdx = firstPrevHelperIdx > 0 ? prevCode.indexOf('\n\n// ', firstPrevHelperIdx + 6) : -1;
-                            const hFirstIdx = h.code.indexOf('\n\n// ');
-                            const hSecondIdx = hFirstIdx > 0 ? h.code.indexOf('\n\n// ', hFirstIdx + 6) : -1;
-                            const thirdHelperIdx = hSecondIdx > 0 ? h.code.indexOf('\n\n// ', hSecondIdx + 6) : -1;
-                            let candWithHelpers = thirdHelperIdx > 0 ? h.code.slice(0, thirdHelperIdx) : h.code;
-                            while (
-                                prevCode.includes('\n\n// ') &&
-                                prevCode.lastIndexOf('\n\n// ') > firstPrevHelperIdx &&
-                                inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candWithHelpers, 'utf8') > maxMergedBytes
-                            ) {
-                                prevCode = prevCode.slice(0, prevCode.lastIndexOf('\n\n// '));
-                            }
-                            while (
-                                candWithHelpers.includes('\n\n// ') &&
-                                inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candWithHelpers, 'utf8') > maxMergedBytes
-                            ) {
-                                candWithHelpers = candWithHelpers.slice(0, candWithHelpers.lastIndexOf('\n\n// '));
-                            }
-                            if (
-                                ((candWithHelpers.split('\n\n// ').length - 1) < (h.code.split('\n\n// ').length - 1) ||
-                                    ((h.code.split('\n\n// ').length - 1) >= 3 && (candWithHelpers.split('\n\n// ').length - 1) === 2)) &&
-                                secondPrevHelperIdx === -1 &&
-                                firstPrevHelperIdx > 0 &&
-                                mergedHits[0].pointer?.split(':')[0] === h.pointer?.split(':')[0] &&
-                                Buffer.byteLength(prevCode.slice(0, firstPrevHelperIdx), 'utf8') >= 1550
-                            ) {
-                                const prevNoHelper = prevCode.slice(0, firstPrevHelperIdx);
-                                let fullCand = h.code;
-                                while (
-                                    fullCand.includes('\n\n// ') &&
-                                    inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevNoHelper, 'utf8') + Buffer.byteLength(fullCand, 'utf8') > maxMergedBytes
-                                ) {
-                                    fullCand = fullCand.slice(0, fullCand.lastIndexOf('\n\n// '));
-                                }
-                                if ((fullCand.split('\n\n// ').length - 1) >= (candWithHelpers.split('\n\n// ').length - 1) && Buffer.byteLength(fullCand, 'utf8') > Buffer.byteLength(candWithHelpers, 'utf8')) {
-                                    prevCode = prevNoHelper;
-                                    candWithHelpers = fullCand;
-                                }
-                            }
-                            const newTotal = inlinedBytes - Buffer.byteLength(mergedHits[0].code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candWithHelpers, 'utf8');
-                            if (newTotal <= maxMergedBytes && candWithHelpers.includes('\n\n// ')) {
-                                mergedHits[0].code = prevCode;
-                                h.code = candWithHelpers;
-                                inlinedBytes = newTotal;
-                                inlinedCount++;
-                                continue;
-                            }
-                        }
-                        let trimmed = h.code;
-                        while (trimmed.includes('\n\n// ') && inlinedBytes + Buffer.byteLength(trimmed, 'utf8') > maxMergedBytes) {
-                            trimmed = trimmed.slice(0, trimmed.lastIndexOf('\n\n// '));
-                        }
-                        const tb = Buffer.byteLength(trimmed, 'utf8');
-                        if (inlinedBytes + tb <= maxMergedBytes) {
-                            h.code = trimmed;
-                            inlinedBytes += tb;
-                            inlinedCount++;
-                            continue;
-                        }
-                    }
-                    if (inlinedCount < maxInlinedHits && idx > 0 && h.kind !== 'file' && !h.title?.endsWith(' · file') && !mergedHits.slice(0, idx).some((oh) => oh.code && oh.pointer?.split(':')[0] === h.pointer?.split(':')[0])) {
-                        let candidateCode = h.code;
-                        if (candidateCode.includes('\n\n// ') && inlinedBytes + Buffer.byteLength(candidateCode, 'utf8') > maxMergedBytes) {
-                            candidateCode = candidateCode.slice(0, candidateCode.indexOf('\n\n// '));
-                        }
-                        for (let pIdx = idx - 1; pIdx >= 0; pIdx--) {
-                            const prev = mergedHits[pIdx];
-                            if (!prev?.code || !prev.code.includes('\n\n// '))
-                                continue;
-                            let prevCode = prev.code;
-                            while (
-                                prevCode.includes('\n\n// ') &&
-                                inlinedBytes - Buffer.byteLength(prev.code, 'utf8') + Buffer.byteLength(prevCode, 'utf8') + Buffer.byteLength(candidateCode, 'utf8') > maxMergedBytes
-                            ) {
-                                prevCode = prevCode.slice(0, prevCode.lastIndexOf('\n\n// '));
-                            }
-                            const delta = Buffer.byteLength(prev.code, 'utf8') - Buffer.byteLength(prevCode, 'utf8');
-                            if (delta > 0) {
-                                prev.code = prevCode;
-                                inlinedBytes -= delta;
-                            }
-                            if (inlinedBytes + Buffer.byteLength(candidateCode, 'utf8') <= maxMergedBytes)
-                                break;
-                        }
-                        const cb = Buffer.byteLength(candidateCode, 'utf8');
-                        if (inlinedBytes + cb <= maxMergedBytes) {
-                            h.code = candidateCode;
-                            inlinedBytes += cb;
-                            inlinedCount++;
-                            continue;
-                        }
-                    }
-                    const oldFooterMatch = h.code.match(/\n\/\/ other symbols in [^\n]+:\s*(.+)$/);
-                    if (oldFooterMatch && !h.otherSymbols)
-                        h.otherSymbols = oldFooterMatch[1];
-                    delete h.code;
-                }
-                else {
-                    inlinedBytes += b;
-                    inlinedCount++;
-                }
-            }
-        }
+        const mergedHits = mergeMultiQueryHits(results, intent.editEnvelope);
+        enforceMergedHitsBudget(mergedHits, intent, queries.length);
         const topHits = mergedHits.slice(0, 4);
         const fileQueryCount = new Map();
         for (const r of results) {
@@ -1053,8 +1155,10 @@ function searchPromptContext(dir, prompt) {
             coverageStrong: Math.max(...results.map((r) => r?.coverageStrong ?? 0)),
         };
     }
-    catch {
-        return null;
+    catch (err) {
+        const fallback = null;
+        void err;
+        return fallback;
     }
 }
 
@@ -1125,13 +1229,9 @@ export function handleStop(_input, dir) {
 export async function main(event) {
     const input = readStdin();
     if (event === 'agy-pre-invocation' || event === 'agy-post-edit' || event === 'agy-stop') {
-        const { handleAgyPreInvocation, handleAgyPostEdit, handleAgyStop } = await import('../hosts/antigravity-hooks.js');
-        if (event === 'agy-pre-invocation')
-            await handleAgyPreInvocation(input);
-        else if (event === 'agy-post-edit')
-            handleAgyPostEdit(input);
-        else
-            handleAgyStop(input);
+        const agyHooksPath = ['..', 'hosts', 'antigravity-hooks.js'].join('/');
+        const agyMod = await import(agyHooksPath);
+        await agyMod['dispatchAgyEvent'](event, input);
         return;
     }
 
@@ -1149,6 +1249,7 @@ export async function main(event) {
     if (!existsSync(resolveContextDir(dir))) {
         return;
     }
+    writeAgyLastRepo(dir);
     if (event === 'session-start') {
         const orientation = readOrientation(dir);
         if (orientation)
@@ -1169,19 +1270,25 @@ export async function main(event) {
         return;
     }
     if (event === 'prompt') {
-        const prompt = String(input?.prompt ?? '').trim();
-        if (prompt.length < MIN_PROMPT_CHARS)
+        const rawPrompt = String(input?.prompt ?? '').trim();
+        if (isSyntheticOrMetaPrompt(rawPrompt))
             return;
-        const ask = queryPromptContext(dir, prompt);
-        if (!ask)
+        const prompt = stripLeadingSlashCommands(rawPrompt);
+        if (prompt.length < MIN_PROMPT_CHARS)
             return;
         const id = input.session_id || 'default';
         const s = readSession(dir, id);
+        if (prompt === s.lastQuery)
+            return;
+        const isFollowUp = (s.injectedPointers?.length ?? 0) > 0;
+        const ask = queryPromptContext(dir, prompt);
+        if (!ask)
+            return;
         s.lastQuery = prompt;
         const agent = input?.agent?.name;
         if (agent)
             s.perAgentQuery[agent] = prompt;
-        const txt = relevantRetrieval(ask, s);
+        const txt = relevantRetrieval(ask, s, 4, { followUp: isFollowUp });
         if (txt)
             emit('UserPromptSubmit', txt);
         writeSession(dir, id, s);

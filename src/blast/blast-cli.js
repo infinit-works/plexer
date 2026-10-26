@@ -7,23 +7,16 @@
 import { basename, resolve } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached } from "../graph/load.js";
-import { resolveCliDepth } from "../graph/traverse-cli.js";
+import { resolveCliChoice, resolveCliDepth } from "../graph/traverse-cli.js";
 import { blastRadiusIn } from "./blast.js";
 import { changedFiles, git, refExists } from "./diff.js";
 import { markdownReport, mermaidDiagram, textReport } from "./render.js";
 const DEFAULT_DEPTH = 2;
-function resolveFormat(raw) {
-    if (raw === undefined)
-        return "text";
-    if (raw === "text" || raw === "markdown" || raw === "mermaid" || raw === "json")
-        return raw;
-    console.error(`✗ --format must be text, markdown, mermaid or json, got "${raw}"`);
-    process.exit(1);
-}
+const ALLOWED_FORMATS = ["text", "markdown", "mermaid", "json"];
 export async function runBlastCommand(dir, opts) {
     const root = resolve(dir);
     const contextDir = contextDirFor(root, opts.globalDir);
-    const format = resolveFormat(opts.format);
+    const format = resolveCliChoice(opts.format, "--format", ALLOWED_FORMATS, "text");
     const depth = resolveCliDepth(opts.depth, DEFAULT_DEPTH);
     const graph = loadGraphCached(contextDir);
     if (!graph) {

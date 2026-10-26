@@ -4,15 +4,15 @@
  * This is the one piece of plexer prose that survives **tool deferral**. When a
  * host has more tools than its schema budget allows, it sends tool *names* only
  * and withholds the JSONSchemas until a `ToolSearch`-style lookup fetches them —
- * measured in a real session: 111 tools deferred, of which plexer's six arrived as
- * six bare strings with no descriptions at all. The MCP spec's `instructions`
+ * measured in a real session: 111 tools deferred, of which plexer's eight arrived as
+ * eight bare strings with no descriptions at all. The MCP spec's `instructions`
  * field is delivered on a separate track (Claude Code records it as its own
  * `mcp_instructions_delta` context layer), so it lands whole even then. Other
  * servers already rely on this — `claude-in-chrome` uses it for exactly the
  * batch-your-ToolSearch instruction below; plexer used to send nothing.
  *
  * Two jobs, in this order:
- *   1. Defuse the deferral tax. One lookup loads all six tools for the whole
+ *   1. Defuse the deferral tax. One lookup loads all eight tools for the whole
  *      session, so the cost is a single round trip, not two calls per use. An
  *      agent that doesn't know this can only assume the worse reading.
  *   2. Say what each tool is FOR as a decision rule, not a feature summary —
@@ -30,15 +30,16 @@ export function toolSearchQuery() {
 }
 export function mcpInstructions() {
     return [
-        'This repo is indexed by plexer (exact file:line spans + call/import/type edges; auto-refreshes uncommitted edits). Use plexer to get inlined L<n>: source and call edges first; do not re-read spans already shown in tool output.',
-        '',
-        `**If these tools are deferred (names shown, schemas withheld), load them all in ONE lookup:** ToolSearch "${toolSearchQuery()}" — never one at a time.`,
-        '',
-        '- plexer_find_code — locate + understand a flow: ranked hits with L<n>: source, same-file helpers, and constants inlined.',
-        '- plexer_trace_calls — callers, callees (direction:"out"), and blast radius (depth:2 or "all", source:true for call-site source).',
-        '- plexer_find_all — regex/literal search grouped by symbol (fixed:true, context:3 or source:true).',
-        '- plexer_file_api — signatures-only file API in ~200 tokens.',
-        '- plexer_repo_map — directory clusters, hubs, and hotspots.',
-        '- plexer_check_freshness — report whether the graph is in sync with the working tree.',
+        'Repo indexed by plexer (file:line spans + call/import/type edges; auto-refreshes). Use plexer first; never re-read spans already shown.',
+        `**If deferred, load all in ONE lookup:** ToolSearch "${toolSearchQuery()}"`,
+        '- plexer_find_code — rank symbols with L<n>: source, helpers, constants.',
+        '- plexer_read — exact <file:symbol> or <file:Lx-Ly> spans.',
+        '- plexer_trace_calls — callers/callees (direction:"out", depth:2/"all").',
+        '- plexer_find_all — regex/literal search by symbol (fixed:true).',
+        '- plexer_file_api — file signatures (~200 tokens).',
+        '- plexer_repo_map — directory clusters, hubs, hotspots.',
+        '- plexer_blast — git diff blast radius (base, depth, format).',
+        '- plexer_health — health scan, queue (next/resolve), scores.',
+        '- plexer_check_freshness — check graph sync with working tree.',
     ].join('\n');
 }

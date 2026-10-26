@@ -2,10 +2,12 @@
  * The `plexer/.cache/` sidecar state: statusline stats snapshot, per-session state,
  * persisted repository walk settings (`config.json`), and the build lock that serializes rebuilds.
  */
-import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
 
 const LOCK_STALE_MS = 300000;
+const SESSION_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCK_FILE = ".sync.lock";
 
 export function emptyStats() {
@@ -42,12 +44,14 @@ function statsPath(d) {
 }
 
 export function readJson(p) {
+    let parsed = null;
     try {
-        return JSON.parse(readFileSync(p, "utf8"));
+        parsed = JSON.parse(readFileSync(p, "utf8"));
     }
     catch {
-        return null;
+        /* absent or invalid JSON */
     }
+    return parsed;
 }
 
 /**
@@ -118,6 +122,21 @@ export function readSession(d, id) {
 }
 
 export function writeSession(d, id, s) {
+    const dir = sessionDir(d);
+    try {
+        const now = Date.now();
+        for (const name of readdirSync(dir)) {
+            if (!name.endsWith(".json"))
+                continue;
+            const full = join(dir, name);
+            try {
+                if (now - statSync(full).mtimeMs > SESSION_STALE_MS)
+                    rmSync(full, { force: true });
+            }
+            catch { /* ignore */ }
+        }
+    }
+    catch { /* session dir may not exist yet */ }
     writeJsonAtomic(sessionPath(d, id), s);
 }
 
@@ -132,12 +151,14 @@ export function readStdin() {
             raw = "";
         }
     }
+    let parsed = {};
     try {
-        return JSON.parse(raw);
+        parsed = JSON.parse(raw);
     }
     catch {
-        return {};
+        /* empty or non-JSON stdin */
     }
+    return parsed;
 }
 
 export function projectDir(input) {
@@ -276,4 +297,109 @@ export function releaseLockIn(cache) {
         rmSync(join(cache, LOCK_FILE));
     }
     catch { /* already gone */ }
+}
+
+export function agyLastRepoPath() {
+    return join(tmpdir(), "plexer-agy-last-repo.json");
+}
+
+export function readAgyLastRepo() {
+    const data = readJson(agyLastRepoPath());
+    return typeof data?.repoDir === "string" && existsSync(data.repoDir) ? data.repoDir : null;
+}
+
+export function writeAgyLastRepo(repoDir) {
+    if (process.env.PLEXER_TEST_STDIN !== undefined)
+        return;
+    const norm = String(repoDir ?? "").replace(/\\/g, "/");
+    if (norm.includes("/plexer-agy-") || norm.includes("/plexer-test-") || norm.includes("/plexer-ws-") || norm.includes("/plexer-repo-"))
+        return;
+    try {
+        writeJsonAtomic(agyLastRepoPath(), { repoDir, updatedAt: Date.now() }, true);
+    }
+    catch { /* best-effort */ }
+}
+
+export function writeOwned(id, path, content, mode) {
+    const existed = existsSync(path);
+    if (existed && readFileSync(path, "utf8") === content) {
+        if (mode !== undefined && (statSync(path).mode & 0o777) !== mode)
+            chmodSync(path, mode);
+        return { id, path, action: "unchanged" };
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+    if (mode !== undefined)
+        chmodSync(path, mode);
+    return { id, path, action: existed ? "updated" : "created" };
+}
+
+export function isPlexerEntry(entry) {
+    return JSON.stringify(entry ?? "").includes("plexer-hooks.cjs");
+}
+
+export function readJsonObject(path) {
+    if (!existsSync(path))
+        return { root: {}, existed: false };
+    let root;
+    try {
+        root = JSON.parse(readFileSync(path, "utf8"));
+    }
+    catch {
+        return "unparseable";
+    }
+    if (typeof root !== "object" || root === null || Array.isArray(root))
+        return "unparseable";
+    return { root, existed: true };
+}
+
+export function dirExists(p) {
+    try {
+        return statSync(p).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
+
+export function updateJsonConfig(id, path, mutate) {
+    const loaded = readJsonObject(path);
+    if (loaded === "unparseable")
+        return { id, path, action: "skipped-unparseable" };
+    const { root, existed } = loaded;
+    const before = JSON.stringify(root);
+    const next = mutate(root);
+    if (next === "unparseable")
+        return { id, path, action: "skipped-unparseable" };
+    const target = next ?? root;
+    if (JSON.stringify(target) === before)
+        return { id, path, action: "unchanged" };
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(target, null, 2)}\n`);
+    return { id, path, action: existed ? "updated" : "created" };
+}
+
+export function upsertHookEvents(id, path, entries, buildEntry) {
+    return updateJsonConfig(id, path, (root) => {
+        const hooks = (root.hooks ??= {});
+        if (typeof hooks !== "object" || hooks === null || Array.isArray(hooks))
+            return "unparseable";
+        for (const d of entries) {
+            if (hooks[d.event] !== undefined && !Array.isArray(hooks[d.event]))
+                return "unparseable";
+            const prior = Array.isArray(hooks[d.event]) ? hooks[d.event] : [];
+            hooks[d.event] = [...prior.filter((e) => !isPlexerEntry(e)), buildEntry(d)];
+        }
+    });
+}
+
+export const BIN_LAUNCH = { command: "plexer", args: ["mcp"] };
+
+export function mergeJsonKey(id, path, topKey, entry) {
+    return updateJsonConfig(id, path, (root) => {
+        const bucket = (root[topKey] ??= {});
+        if (typeof bucket !== "object" || bucket === null || Array.isArray(bucket))
+            return "unparseable";
+        bucket.plexer = entry;
+    });
 }

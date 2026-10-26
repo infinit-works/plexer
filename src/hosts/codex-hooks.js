@@ -30,11 +30,12 @@ export function hookTargets(home) {
         },
     ];
 }
+/** Codex reads `timeout` (an alias of its `timeoutSec` field) in seconds, not milliseconds. */
 const DESIRED_ENTRIES = [
-    { event: 'SessionStart', matcher: 'startup|resume|compact', sub: 'session-start', timeout: 10000 },
-    { event: 'UserPromptSubmit', sub: 'prompt', timeout: 15000 },
-    { event: 'PostToolUse', matcher: 'apply_patch|Write|Edit|MultiEdit', sub: 'post-edit', timeout: 10000 },
-    { event: 'Stop', sub: 'stop', timeout: 10000 },
+    { event: 'SessionStart', matcher: 'startup|resume|compact', sub: 'session-start', timeout: 10 },
+    { event: 'UserPromptSubmit', sub: 'prompt', timeout: 15 },
+    { event: 'PostToolUse', matcher: 'apply_patch|Write|Edit|MultiEdit', sub: 'post-edit', timeout: 10 },
+    { event: 'Stop', sub: 'stop', timeout: 10 },
 ];
 export function installCodexHooks(home) {
     const targets = hookTargets(home);

@@ -1,7 +1,7 @@
-import { matchLuauSymbol } from "./luau.js";
-import { WALK_RELATIONS } from "./relations.js";
-import { assertPrefixIndexed, pathUnderPrefix } from "./scopes.js";
-import { normalizePathPrefix, pushMap } from "../util/paths.js";
+import { WALK_RELATIONS, resolveSymbol, stripNodeOrdinals, stripOrdinals } from "../util/id.js";
+import { pushMap } from "../util/paths.js";
+
+export { resolveSymbol, stripNodeOrdinals, stripOrdinals };
 
 /**
  * Parse a walk depth (`number | "all" | "full" | "max" | undefined`) into a positive
@@ -16,89 +16,6 @@ export function parseWalkDepth(raw, defaultDepth = 1) {
         return Number.POSITIVE_INFINITY;
     const d = Number(raw);
     return Number.isFinite(d) && d >= 1 ? Math.floor(d) : Number.NaN;
-}
-
-/**
- * Resolve a query string to every matching node in the graph.
- */
-export function resolveSymbol(graph, query, opts = {}) {
-    const trimmed = query.trim();
-    const lowerQuery = trimmed.toLowerCase();
-    const looksLikeFilename = trimmed.includes(".") && !trimmed.includes("#") && !trimmed.includes(":");
-    let matches = symbolMatches(graph.nodes, lowerQuery);
-    if (matches.length === 0 && trimmed.includes(":") && !trimmed.includes("#")) {
-        const colonIdx = lowerQuery.lastIndexOf(":");
-        const left = lowerQuery.slice(0, colonIdx).replace(/:$/, "");
-        const right = lowerQuery.slice(colonIdx + 1);
-        if (left && right) {
-            if (left.includes("/") || /\.[a-z0-9]+$/.test(left)) {
-                matches = graph.nodes.filter((n) => n.kind !== "file" &&
-                    (n.path.toLowerCase() === left || n.path.toLowerCase().endsWith("/" + left)) &&
-                    (n.name.toLowerCase() === right || n.id.toLowerCase().endsWith("#" + right) || n.id.toLowerCase().endsWith("." + right)));
-            }
-            if (matches.length === 0) {
-                matches = symbolMatches(graph.nodes, `${left}.${right}`);
-            }
-        }
-    }
-    const hasLuau = !graph.meta?.languages || graph.meta.languages.includes("luau");
-    if (hasLuau && (matches.length === 0 || lowerQuery.includes(".") || lowerQuery.includes(":"))) {
-        const luauMatches = matchLuauSymbol(graph.nodes, lowerQuery, graph.edges);
-        if (luauMatches.length > 0 && (matches.length === 0 || luauMatches.some((m) => m.exported)))
-            matches = luauMatches;
-    }
-    if (matches.length === 0 && looksLikeFilename) {
-        matches = graph.nodes.filter((n) => n.kind === "file" &&
-            (n.name.toLowerCase() === lowerQuery ||
-                n.path.toLowerCase() === lowerQuery ||
-                n.path.toLowerCase().endsWith("/" + lowerQuery)));
-    }
-    if (matches.length === 0 && (trimmed.includes(".") || trimmed.includes(":"))) {
-        const lastSep = Math.max(trimmed.lastIndexOf("."), trimmed.lastIndexOf(":"));
-        const lastSegment = trimmed.slice(lastSep + 1).toLowerCase();
-        if (lastSegment) {
-            matches = graph.nodes.filter((n) => n.kind !== "file" && n.name.toLowerCase() === lastSegment);
-        }
-    }
-    if (opts.in) {
-        const prefix = normalizePathPrefix(opts.in);
-        assertPrefixIndexed(graph, prefix);
-        matches = matches.filter((n) => pathUnderPrefix(n.path, prefix));
-    }
-    if (matches.length > 1) {
-        matches = [...matches].sort((a, b) => Number(Boolean(b.exported)) - Number(Boolean(a.exported)));
-    }
-    return matches;
-}
-
-/** Strips mint-time disambiguation ordinals (`~2`, `~3`, ...) from segment ends in a dotted id-tail. */
-export function stripOrdinals(idTail) {
-    return idTail.replace(/~\d+(?=\.|$)/g, "");
-}
-
-/** Lowercase `n.id` with mint-time disambiguation ordinals stripped from the symbol tail. */
-export function stripNodeOrdinals(n) {
-    if (n._strippedId !== undefined)
-        return n._strippedId;
-    const lowerId = n.id.toLowerCase();
-    const hashIdx = lowerId.indexOf("#");
-    const stripped = hashIdx === -1 ? lowerId : lowerId.slice(0, hashIdx + 1) + stripOrdinals(lowerId.slice(hashIdx + 1));
-    Object.defineProperty(n, "_strippedId", { value: stripped, enumerable: false, configurable: true, writable: true });
-    return stripped;
-}
-
-function symbolMatches(nodes, lowerQuery) {
-    const suffixHash = "#" + lowerQuery;
-    const suffixDot = "." + lowerQuery;
-    return nodes.filter((n) => {
-        if (n.kind === "file")
-            return false;
-        const lowerName = n._lowerName ?? (Object.defineProperty(n, "_lowerName", { value: n.name.toLowerCase(), enumerable: false, configurable: true, writable: true }), n._lowerName);
-        if (lowerName === lowerQuery)
-            return true;
-        const candidateId = stripNodeOrdinals(n);
-        return candidateId.endsWith(suffixHash) || candidateId.endsWith(suffixDot);
-    });
 }
 
 function walkAdjacency(graph, direction) {

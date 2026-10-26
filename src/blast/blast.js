@@ -13,7 +13,8 @@
  * not of everything the file happens to define. The file node is seeded too, so
  * importers (whose edge targets the file, not the symbol) are still found.
  */
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { isTestPath } from "../ask/ask.js";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached } from "../graph/load.js";
@@ -46,24 +47,23 @@ function seedsForFile(symbols, ranges) {
     }
     return [...hit.values()];
 }
-/** Compute the blast radius of `changed` against `graph`, or from a repo `dir` and `opts`. */
-export function blastRadius(graph, changed, basis = "working tree", opts = { depth: 2 }) {
-    if (typeof graph === "string") {
-        const root = resolve(graph);
-        const dirOpts = changed && typeof changed === "object" && !Array.isArray(changed) ? changed : {};
-        const contextDir = contextDirFor(root, dirOpts.contextDir);
-        const loaded = loadGraphCached(contextDir);
-        if (!loaded)
-            throw new Error(`no graph found at ${contextDir} — run \`plexer build\` first`);
-        if (dirOpts.base !== undefined && !refExists(root, dirOpts.base))
-            throw new Error(`base ref "${dirOpts.base}" is not in this checkout`);
-        const diff = changedFiles(root, dirOpts.base);
-        if (!diff)
-            throw new Error(`could not read a diff in ${root} — is this a git repository?`);
-        const parsedDepth = parseWalkDepth(dirOpts.depth, 2);
-        const depth = Number.isNaN(parsedDepth) ? 2 : parsedDepth;
-        return blastRadiusIn(loaded, contextDir, diff.files, diff.basis, depth);
-    }
+function blastRadiusFromDir(dir, rawOpts) {
+    const root = resolve(dir);
+    const dirOpts = rawOpts && typeof rawOpts === "object" && !Array.isArray(rawOpts) ? rawOpts : {};
+    const contextDir = contextDirFor(root, dirOpts.contextDir);
+    const loaded = loadGraphCached(contextDir);
+    if (!loaded)
+        throw new Error(`no graph found at ${contextDir} — run \`plexer build\` first`);
+    if (dirOpts.base !== undefined && !refExists(root, dirOpts.base))
+        throw new Error(`base ref "${dirOpts.base}" is not in this checkout`);
+    const diff = changedFiles(root, dirOpts.base);
+    if (!diff)
+        throw new Error(`could not read a diff in ${root} — is this a git repository?`);
+    const parsedDepth = parseWalkDepth(dirOpts.depth, 2);
+    const depth = Number.isNaN(parsedDepth) ? 2 : parsedDepth;
+    return blastRadiusIn(loaded, contextDir, diff.files, diff.basis, depth);
+}
+function indexBlastGraphNodes(graph) {
     const fileNodes = new Map();
     const symbolsByFile = new Map();
     for (const n of graph.nodes) {
@@ -76,6 +76,10 @@ export function blastRadius(graph, changed, basis = "working tree", opts = { dep
             continue;
         pushMap(symbolsByFile, n.path, { node: n, ...b });
     }
+    return { fileNodes, symbolsByFile };
+}
+function collectBlastSeedsAndImpacts(graph, changed, depth) {
+    const { fileNodes, symbolsByFile } = indexBlastGraphNodes(graph);
     const seeds = [];
     const unindexed = [];
     const deleted = [];
@@ -106,23 +110,11 @@ export function blastRadius(graph, changed, basis = "working tree", opts = { dep
                 path: fileNode.path, span: fileNode.span, wholeFile: true,
             });
         }
-        // One walk PER CHANGED FILE, not one walk over every seed at once. A combined
-        // walk records the depth a node was first reached at but not by which seed, so
-        // the diagram could only draw "every changed file reaches every module" — a
-        // cross-product that tells a reviewer nothing. Walking per file costs one
-        // adjacency build each (cheap: the graph is already in memory) and buys arrows
-        // that are true.
-        //
-        // The FILE node is a seed only when no symbol matched. `imports` edges target
-        // the file id, so seeding it alongside symbols would pull in every importer of
-        // the file — a one-line edit to one function would report every module that
-        // imports the module, which is the noise this command exists to avoid. With no
-        // symbol seeds (a change to a top-level constant, a new import, a file with no
-        // extracted symbols) the file IS the unit of change, and its importers are the
-        // only dependents there are.
+        // One walk PER CHANGED FILE, not one walk over every seed at once.
+        // The FILE node is a seed only when no symbol matched.
         const walkSeeds = symbolSeeds.length > 0 ? symbolSeeds : [fileNode];
         seedNodes.set(file.path, walkSeeds);
-        const hits = impactOfMany(graph, walkSeeds, opts?.depth ?? 2, "in");
+        const hits = impactOfMany(graph, walkSeeds, depth, "in");
         for (const h of hits) {
             if (!hasNode(h))
                 continue;
@@ -132,13 +124,18 @@ export function blastRadius(graph, changed, basis = "working tree", opts = { dep
                 merged.set(hit.id, { hit, from: new Set([file.path]) });
             else {
                 prev.from.add(file.path);
-                // Keep the shallowest reach: a symbol two hops from one changed file and one
-                // hop from another is one hop away from this PR.
                 if (hit.depth < prev.hit.depth)
                     prev.hit = hit;
             }
         }
     }
+    return { seeds, unindexed, deleted, seedNodes, merged };
+}
+/** Compute the blast radius of `changed` against `graph`, or from a repo `dir` and `opts`. */
+export function blastRadius(graph, changed, basis = "working tree", opts = { depth: 2 }) {
+    if (typeof graph === "string")
+        return blastRadiusFromDir(graph, changed);
+    const { seeds, unindexed, deleted, seedNodes, merged } = collectBlastSeedsAndImpacts(graph, changed, opts?.depth ?? 2);
     const impacted = [...merged.values()].map((m) => m.hit);
     const origins = new Map([...merged].map(([id, m]) => [id, m.from]));
     const index = opts.modules ?? emptyIndex();
@@ -156,17 +153,7 @@ export function blastRadius(graph, changed, basis = "working tree", opts = { dep
         areas: changedAreas(graph, changed, seedNodes, index, grouped.modules),
     };
 }
-/**
- * Group the changed files into areas, and work out whether each one's tests moved.
- *
- * The diff's own side of the diagram used to be one box per changed file, which can
- * never fit: a 24-file PR drew ten arbitrary paths. Grouped by the same concept
- * labels the dependents use, the same PR is three or four circles — and once the
- * files are grouped, "did a test that reaches this move too?" is one question per
- * circle instead of per file.
- */
-function changedAreas(graph, changed, seedNodes, index, modules) {
-    const changedTests = new Set(changed.filter((c) => isTestPath(c.path)).map((c) => c.path));
+function collectBlastTestIncoming(graph) {
     const nodeById = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
     /** How many edges point AT each node — how central it is in the graph. */
     const inDegree = new Map();
@@ -181,16 +168,51 @@ function changedAreas(graph, changed, seedNodes, index, modules) {
         at.add(path);
         incoming.set(e.target, at);
     }
-    // Group by DIRECTORY, not by concept. Concepts in a well-summarised repo are
-    // near-file-grained — plexer's own PR produced nine of them, one file each — so
-    // grouping the diff by concept groups nothing: the left side was nine circles
-    // with near-identical truncated names. A directory is the coarser unit reviewers
-    // already use, and a concept name is only worth borrowing when one concept
-    // happens to claim the whole group.
+    return { inDegree, incoming };
+}
+function buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegree) {
+    const area = {
+        label: dir, labelSource: "symbol", key: dir,
+        files: [], seeds: 0, tests: "none", testFiles: [], changedTestFiles: [],
+        reached: 0, behavioural: 0, unreached: [], seedNames: [],
+    };
+    const areaCandidates = [];
+    for (const path of paths) {
+        const nodes = seedNodes.get(path) ?? [];
+        area.files.push(path);
+        area.seeds += nodes.length;
+        for (const node of nodes) {
+            const behavioural = node.kind === "function" || node.kind === "method" || node.kind === "class";
+            const from = incoming.get(node.id) ?? new Set();
+            for (const t of from) {
+                if (!area.testFiles.includes(t))
+                    area.testFiles.push(t);
+                if (changedTests.has(t) && !area.changedTestFiles.includes(t))
+                    area.changedTestFiles.push(t);
+            }
+            areaCandidates.push({ name: node.name, behavioural, degree: inDegree.get(node.id) ?? 0 });
+            if (!behavioural)
+                continue;
+            area.behavioural++;
+            if (from.size > 0)
+                area.reached++;
+            else
+                area.unreached.push(node.name);
+        }
+    }
+    area.seedNames = areaCandidates
+        .sort((a, b) => Number(b.behavioural) - Number(a.behavioural) || b.degree - a.degree || a.name.localeCompare(b.name))
+        .map((c) => c.name);
+    return area;
+}
+/**
+ * Group the changed files into areas, and work out whether each one's tests moved.
+ */
+function changedAreas(graph, changed, seedNodes, index, modules) {
+    const changedTests = new Set(changed.filter((c) => isTestPath(c.path)).map((c) => c.path));
+    const { inDegree, incoming } = collectBlastTestIncoming(graph);
     const groups = new Map();
     for (const path of seedNodes.keys()) {
-        // A changed test file is the signal, not the source of a blast radius. Drawing
-        // it as an area would put "your tests changed" on both sides of the arrow.
         if (isTestPath(path))
             continue;
         const dir = dirLabel(path);
@@ -198,52 +220,10 @@ function changedAreas(graph, changed, seedNodes, index, modules) {
     }
     coarsen(groups, MAX_AREAS);
     const byKey = new Map();
-    /** Hub candidates per area, ranked once every seed has been seen. */
-    const candidates = new Map();
-    for (const [dir, paths] of groups) {
-        const area = {
-            label: dir, labelSource: "symbol", key: dir,
-            files: [], seeds: 0, tests: "none", testFiles: [], changedTestFiles: [],
-            reached: 0, behavioural: 0, unreached: [], seedNames: [],
-        };
-        byKey.set(dir, area);
-        const areaCandidates = [];
-        candidates.set(area, areaCandidates);
-        for (const path of paths) {
-            const nodes = seedNodes.get(path) ?? [];
-            area.files.push(path);
-            area.seeds += nodes.length;
-            for (const node of nodes) {
-                // Reach is measured over behaviour only. Counting interfaces and type aliases
-                // would sink every ratio: nothing "calls" a type, so a fully tested area of
-                // typed code would report a third of its symbols as unreached.
-                const behavioural = node.kind === "function" || node.kind === "method" || node.kind === "class";
-                const from = incoming.get(node.id) ?? new Set();
-                for (const t of from) {
-                    if (!area.testFiles.includes(t))
-                        area.testFiles.push(t);
-                    if (changedTests.has(t) && !area.changedTestFiles.includes(t))
-                        area.changedTestFiles.push(t);
-                }
-                areaCandidates.push({ name: node.name, behavioural, degree: inDegree.get(node.id) ?? 0 });
-                if (!behavioural)
-                    continue;
-                area.behavioural++;
-                if (from.size > 0)
-                    area.reached++;
-                else
-                    area.unreached.push(node.name);
-            }
-        }
-    }
     const reachByArea = new Map();
-    for (const area of byKey.values()) {
-        // The hub is the most-depended-on function in the area, not whichever symbol the
-        // file walk happened to end on: `LlmFailureGate` rather than `transportRetries`.
-        // Behaviour outranks types, since nothing calls an interface.
-        area.seedNames = (candidates.get(area) ?? [])
-            .sort((a, b) => Number(b.behavioural) - Number(a.behavioural) || b.degree - a.degree || a.name.localeCompare(b.name))
-            .map((c) => c.name);
+    for (const [dir, paths] of groups) {
+        const area = buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegree);
+        byKey.set(dir, area);
         const concept = sharedConcept(area.files, index);
         area.label = concept ?? hubLabel(area.seedNames, area.key);
         area.labelSource = concept ? "concept" : "symbol";
@@ -258,15 +238,61 @@ function changedAreas(graph, changed, seedNodes, index, modules) {
         const fileSet = new Set(area.files);
         reachByArea.set(area, modules.filter((m) => m.from.some((f) => fileSet.has(f))).length);
     }
-    // Ordered by how much each area actually reaches, because the diagram caps this
-    // list and folds the rest into one circle. Ordered by size instead, the fold ends
-    // up holding the best-connected areas and the tail circle collects every arrow —
-    // the same mistake, one level up, as capping changed FILES in diff order.
     return [...byKey.values()].sort((a, b) => (reachByArea.get(b) ?? 0) - (reachByArea.get(a) ?? 0) || b.files.length - a.files.length || a.label.localeCompare(b.label));
 }
+function collectBlastHealthHotspots(contextDir, changed, impacted) {
+    const stateFile = contextDir ? join(contextDir, ".health", "state.json") : "";
+    if (!stateFile || !existsSync(stateFile)) return [];
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    const changedSet = new Set(changed.map((c) => c.path));
+    const impactedSet = new Set(
+        impacted.filter((i) => i.depth === 1 && !changedSet.has(i.path)).map((i) => i.path),
+    );
+    const byFile = new Map();
+    for (const iss of Object.values(state.issues || {})) {
+        if (iss.status !== "open" || iss.suppressed || !iss.file) continue;
+        const role = changedSet.has(iss.file)
+            ? "changed"
+            : impactedSet.has(iss.file)
+              ? "impacted"
+              : null;
+        if (!role) continue;
+        let entry = byFile.get(iss.file);
+        if (!entry) {
+            entry = { file: iss.file, role, count: 0, max_tier: "T1", issues: [] };
+            byFile.set(iss.file, entry);
+        }
+        entry.count += 1;
+        if (String(iss.tier || "T1") > String(entry.max_tier || "T1")) {
+            entry.max_tier = iss.tier || "T2";
+        }
+        if (entry.issues.length < 5) {
+            entry.issues.push({
+                id: iss.id,
+                detector: iss.detector,
+                tier: iss.tier,
+                severity: iss.severity,
+                span: iss.span,
+                summary: iss.summary,
+            });
+        }
+    }
+    return [...byFile.values()].sort(
+        (a, b) =>
+            (a.role === "changed" ? 0 : 1) - (b.role === "changed" ? 0 : 1) ||
+            b.count - a.count ||
+            a.file.localeCompare(b.file),
+    );
+}
+
 /** Convenience wrapper: build the module index from a context dir. */
 export function blastRadiusIn(graph, contextDir, changed, basis, depth) {
-    return blastRadius(graph, changed, basis, { depth, modules: moduleIndex(contextDir) });
+    const res = blastRadius(graph, changed, basis, { depth, modules: moduleIndex(contextDir) });
+    const hotspots = collectBlastHealthHotspots(contextDir, changed, res.impacted);
+    if (hotspots.length > 0) {
+        res.healthHotspots = hotspots;
+    }
+    return res;
 }
 function hasNode(h) {
     // Unresolved endpoints (an import module string no node exists for) carry no

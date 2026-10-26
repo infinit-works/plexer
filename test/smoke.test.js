@@ -1,10 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, lstatSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { installAntigravitySkill } from "../src/hosts/antigravity.js";
+import { installCodexHooks } from "../src/hosts/codex-hooks.js";
+import { mergePlexerHooks } from "../src/claude/settings-merge.js";
 import { runRetract } from "../src/hosts/retract.js";
 import { runGlobalSetup } from "../src/hosts/setup.js";
 import { buildGraph } from "../src/index.js";
@@ -53,6 +55,25 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
         } finally {
             rmSync(home, { recursive: true, force: true });
             rmSync(repo, { recursive: true, force: true });
+        }
+    });
+
+    it("writes Claude Code and Codex hook timeouts in seconds", () => {
+        // Both hosts read `timeout` in seconds; 10000 there is ~2.8 hours, not 10s.
+        const timeoutsOf = (hooks) => Object.values(hooks).flat().flatMap((block) => block.hooks.map((h) => h.timeout));
+        const assertSeconds = (timeouts, host) => {
+            assert.ok(timeouts.length > 0, `${host}: no hook timeouts written`);
+            for (const t of timeouts) assert.ok(Number.isInteger(t) && t > 0 && t <= 60, `${host}: timeout ${t} is not seconds-scale`);
+        };
+        assertSeconds(timeoutsOf(mergePlexerHooks({}).merged.hooks), "Claude Code");
+
+        const home = mkdtempSync(join(tmpdir(), "plexer-codex-home-"));
+        try {
+            mkdirSync(join(home, ".codex"), { recursive: true });
+            installCodexHooks(home);
+            assertSeconds(timeoutsOf(JSON.parse(readFileSync(join(home, ".codex", "hooks.json"), "utf8")).hooks), "Codex");
+        } finally {
+            rmSync(home, { recursive: true, force: true });
         }
     });
 
@@ -119,11 +140,15 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
 
             // 4. agy-stop returns decision: allow
             const stopOut = JSON.parse(
-                runHookEvent("agy-stop", {
-                    sessionId,
-                    workspacePaths: [repo],
-                    transcriptPath,
-                }),
+                runHookEvent(
+                    "agy-stop",
+                    {
+                        sessionId,
+                        workspacePaths: [repo],
+                        transcriptPath,
+                    },
+                    { PLEXER_TEST_SYNC_RUN: "/nonexistent-sync-run" },
+                ),
             );
             assert.equal(stopOut.decision, "allow");
         } finally {
@@ -132,7 +157,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
         }
     });
 
-    it("runs runGlobalSetup against a temp home and binDir", () => {
+    it("runs runGlobalSetup against a temp home and binDir (MCP opt-in on CLI/skill hosts)", () => {
         const home = mkdtempSync(join(tmpdir(), "plexer-setup-home-"));
         const binDir = mkdtempSync(join(tmpdir(), "plexer-setup-bin-"));
         try {
@@ -147,7 +172,13 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             assert.ok(lstatSync(join(home, ".claude", "skills", "plexer")).isSymbolicLink());
             assert.ok(lstatSync(join(home, ".gemini", "skills", "plexer")).isSymbolicLink());
             assert.ok(existsSync(join(home, ".gemini", "config", "hooks.json")));
-            assert.ok(existsSync(join(home, ".gemini", "config", "mcp_config.json")));
+            assert.equal(existsSync(join(home, ".gemini", "config", "mcp_config.json")), false, "MCP must be opt-in by default on CLI/skill hosts");
+            assert.equal(existsSync(join(home, ".claude.json")), false, "Claude global MCP must be opt-in by default");
+
+            const resOptIn = runGlobalSetup({ home, binDir, mcp: true });
+            assert.ok(resOptIn.mcp.length >= 2);
+            assert.ok(existsSync(join(home, ".gemini", "config", "mcp_config.json")), "mcp: true must register Antigravity MCP");
+            assert.ok(existsSync(join(home, ".claude.json")), "mcp: true must register Claude global MCP");
         } finally {
             rmSync(home, { recursive: true, force: true });
             rmSync(binDir, { recursive: true, force: true });
@@ -209,7 +240,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
                 // Reading a skill/config file under ~/.gemini or ~/.agents must not hijack workspacePaths[0]
                 const resolvedWithSkillRead = resolveAgyRepoDir(
                     { workspacePaths: [unindexedRepo] },
-                    { lastTouchedPath: "/home/kohl/.gemini/config/skills/review/SKILL.md" },
+                    { lastTouchedPath: join(homedir(), ".gemini/config/skills/review/SKILL.md") },
                 );
                 assert.equal(resolvedWithSkillRead, unindexedRepo, "skill path under .gemini must not hijack workspace root");
             } finally {

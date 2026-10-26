@@ -10,6 +10,7 @@
  *     (4 queries per repository, including holdout repos `building-tools` and `z`).
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
@@ -28,6 +29,8 @@ import {
 } from "../src/index.js";
 import { loadGraphCached } from "../src/graph/load.js";
 
+const BENCH_REPOS_DIR = process.env.PLEXER_BENCH_REPOS_DIR || join(homedir(), "Projects", "roblox", "libraries");
+
 const REPOS = [
     {
         name: "plexer",
@@ -39,7 +42,7 @@ const REPOS = [
     },
     {
         name: "kohls-admin",
-        dir: "/home/kohl/Projects/roblox/libraries/kohls-admin",
+        dir: join(BENCH_REPOS_DIR, "kohls-admin"),
         query: "how are player command arguments parsed and validated before running",
         grep: "registerCommand",
         sym: "Auth.hasPermission",
@@ -47,7 +50,7 @@ const REPOS = [
     },
     {
         name: "flux",
-        dir: "/home/kohl/Projects/roblox/libraries/flux",
+        dir: join(BENCH_REPOS_DIR, "flux"),
         query: "how do derived reactive computations track dependencies and clean up",
         grep: "spring",
         sym: "Graph.effect",
@@ -55,7 +58,7 @@ const REPOS = [
     },
     {
         name: "sert",
-        dir: "/home/kohl/Projects/roblox/libraries/sert",
+        dir: join(BENCH_REPOS_DIR, "sert"),
         query: "how does property testing shrink failing counterexamples",
         grep: "afterEach",
         sym: "prop.check",
@@ -63,7 +66,7 @@ const REPOS = [
     },
     {
         name: "building-tools",
-        dir: "/home/kohl/Projects/roblox/libraries/building-tools",
+        dir: join(BENCH_REPOS_DIR, "building-tools"),
         query: "how are undo and redo history entries recorded for part edits",
         grep: "History",
         sym: "History.record",
@@ -71,7 +74,7 @@ const REPOS = [
     },
     {
         name: "z",
-        dir: "/home/kohl/Projects/roblox/libraries/z",
+        dir: join(BENCH_REPOS_DIR, "z"),
         query: "how does the compiler resolve schema type references and wire bitwidths",
         grep: "resolve",
         sym: "resolve_schema",
@@ -422,7 +425,7 @@ async function benchTrailComparison() {
     const tBuildMod = await import(`${trailDist}/graph/build.js`);
     const tCheckMod = await import(`${trailDist}/graph/check.js`);
     const tSkillMod = await import(`${trailDist}/claude/skill-template.js`);
-    const { skillTemplate: plexerSkillTemplate } = await import("../src/claude/skill-template.js");
+    const { skillTemplate: plexerSkillTemplate } = await import("../src/hosts/skill-template.js");
 
     const pRaw = typeof plexerSkillTemplate === "function" ? plexerSkillTemplate() : String(plexerSkillTemplate || "");
     const tRaw = typeof tSkillMod.skillTemplate === "function" ? tSkillMod.skillTemplate() : String(tSkillMod.skillTemplate || "");

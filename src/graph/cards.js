@@ -10,10 +10,9 @@
 import { mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pushMap, relPosix } from "../util/paths.js";
-import { CACHE_DIR } from "../context/node-file.js";
-import { spanStart } from "../blast/evidence.js";
+import { CACHE_DIR, GRAPH_DIR } from "../context/node-file.js";
+import { spanStart } from "../util/span.js";
 import { buildRepoMap, formatRepoMap } from "./map.js";
-import { GRAPH_DIR } from "./write.js";
 const INDEX_FILE = "INDEX.md";
 /** The card path for a source path: mirror the tree, swap the extension for .md. */
 function cardPathFor(outDir, sourcePath) {
@@ -46,12 +45,12 @@ function renderCard(sourcePath, fileNode, symbols) {
 /** Every existing card file (`.md` inside outDir, excluding INDEX.md). */
 function listExistingCards(outDir) {
     const out = [];
-    const walk = (dir) => {
+    const collectCardFiles = (dir) => {
         for (const e of readdirSync(dir, { withFileTypes: true })) {
             if (e.isDirectory()) {
                 if (dir === outDir && (e.name === CACHE_DIR || e.name === GRAPH_DIR))
                     continue;
-                walk(join(dir, e.name));
+                collectCardFiles(join(dir, e.name));
             }
             else if (e.isFile() && e.name.endsWith(".md")) {
                 if (dir === outDir && e.name === INDEX_FILE)
@@ -61,12 +60,12 @@ function listExistingCards(outDir) {
         }
     };
     if (existsSync(outDir))
-        walk(outDir);
+        collectCardFiles(outDir);
     return out;
 }
 /** Remove now-empty directories under outDir (bottom-up), skipping .cache/.graph. */
 function pruneEmptyDirs(outDir) {
-    const visit = (dir) => {
+    const pruneDir = (dir) => {
         let empty = true;
         for (const e of readdirSync(dir, { withFileTypes: true })) {
             if (dir === outDir && (e.name === CACHE_DIR || e.name === GRAPH_DIR)) {
@@ -75,7 +74,7 @@ function pruneEmptyDirs(outDir) {
             }
             const child = join(dir, e.name);
             if (e.isDirectory()) {
-                if (visit(child))
+                if (pruneDir(child))
                     rmSync(child, { recursive: true, force: true });
                 else
                     empty = false;
@@ -87,7 +86,7 @@ function pruneEmptyDirs(outDir) {
         return empty;
     };
     if (existsSync(outDir))
-        visit(outDir);
+        pruneDir(outDir);
 }
 /**
  * Write one wiring card per source file into `outDir`, mirroring the source tree,

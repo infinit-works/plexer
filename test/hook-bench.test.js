@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { namedIdentifiers, pinnedHits, pointerCovers, resolveNamedDefinitions } from "../src/claude/pin.js";
+import { isSyntheticOrMetaPrompt } from "../src/claude/hooks.js";
 import { relevantRetrieval } from "../src/claude/format.js";
 import { parseInjection, needCoverage } from "../bench/needcov.js";
 import { readsFromBash, hitsFromResult, goldRanges } from "../bench/replay.js";
@@ -92,6 +93,71 @@ describe("bench: replay + NeedCov parsing", () => {
         const nc = needCoverage(ctx, graph, need);
         assert.equal(nc.needCov, 0.25); // skeleton 2/4 lines inlined, helper 0/2 → (0.5 + 0) / 2
         assert.equal(nc.locCov, 1); // both symbols are named by a pointer
+    });
+
+    it("filters synthetic harness notifications, slash-only commands, and short operational follow-ups", () => {
+        assert.equal(isSyntheticOrMetaPrompt("<task-notification>\n<task-id>wio2w1n2j</task-id>\nDone `skeleton()`"), true);
+        assert.equal(isSyntheticOrMetaPrompt("Another Claude session sent a message: <agent-message from=\"abc\">Report</agent-message>"), true);
+        assert.equal(isSyntheticOrMetaPrompt("<system-reminder>\n## The user forked this session from another session"), true);
+        assert.equal(isSyntheticOrMetaPrompt("[Request interrupted by user]"), true);
+        assert.equal(isSyntheticOrMetaPrompt("/plan /grill-me"), true);
+        assert.equal(isSyntheticOrMetaPrompt("Commit steps 1 and 2."), true);
+        assert.equal(isSyntheticOrMetaPrompt("Tested, commit Stage 1."), true);
+        assert.equal(isSyntheticOrMetaPrompt("yes, go ahead and push"), true);
+        assert.equal(isSyntheticOrMetaPrompt("Commit changes to `src/claude/hooks.js` and update `relevantRetrieval`"), false);
+        assert.equal(isSyntheticOrMetaPrompt("How does `queryPromptContext` rank multi-clause edit prompts?"), false);
+    });
+
+    it("blocks short body-only collisions and prevents Turn 2+ tail promotion while allowing new symbols", () => {
+        // Short 4-word conversational prompt with a single body-only collision (broad=0.33, strong=0) must not pass
+        const session1 = {};
+        const weakShort = relevantRetrieval(
+            {
+                query: "create random password",
+                coverage: 0.33,
+                coverageStrong: 0,
+                hits: [{ kind: "symbol", title: "create_pool · function", pointer: "src/db.py:L4-L5", code: "L4: def create_pool(): pass" }],
+            },
+            session1,
+        );
+        assert.match(weakShort, /^\[plexer\] no strong match/);
+
+        // Turn 1 injects top hit; Turn 2 with the same top hit already seen must NOT promote tail hits[1..3]
+        const session2 = { injectedPointers: ["src/a.js:L1-L10"] };
+        const tailAttempt = relevantRetrieval(
+            {
+                query: "follow up on the same flow",
+                coverage: 0.45,
+                coverageStrong: 0.25,
+                hits: [
+                    { kind: "symbol", title: "topHit · function", pointer: "src/a.js:L1-L10", code: "L1: function topHit() {}" },
+                    { kind: "symbol", title: "tailHit · function", pointer: "src/b.js:L1-L10", code: "L1: function tailHit() {}" },
+                ],
+            },
+            session2,
+            4,
+            { followUp: true },
+        );
+        assert.equal(tailAttempt, null, "Turn 2+ must not promote tail hits when topRanked was already injected");
+
+        // Turn 2+ with a brand-new pinned symbol DOES inject and caps code to <= 1500B
+        const longCode = Array.from({ length: 60 }, (_, i) => `L${i + 1}: const line_${i} = "${"x".repeat(35)}";`).join("\n");
+        const followUpPin = relevantRetrieval(
+            {
+                query: "update newTarget",
+                coverage: 0.5,
+                coverageStrong: 0.4,
+                isEditPrompt: true,
+                hits: [
+                    { kind: "symbol", title: "newTarget · function (named in prompt)", pointer: "src/c.js:L1-L60", pinned: true, code: longCode },
+                ],
+            },
+            session2,
+            4,
+            { followUp: true },
+        );
+        assert.ok(followUpPin && followUpPin.includes("newTarget"), "Turn 2+ must inject newly named pin");
+        assert.ok(Buffer.byteLength(followUpPin, "utf8") < 1800, "Turn 2+ injection must respect compact follow-up budget");
     });
 });
 

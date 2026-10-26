@@ -150,18 +150,63 @@ export function weakMatchNudge(s, strong) {
     return (`[plexer] no strong match for this prompt (name-field match ${strong.toFixed(2)}) — the graph ` +
         `has more than this probe found. Run \`plexer ask "<your task>" --source\` before grepping.`);
 }
-export function relevantRetrieval(ask, s, cap = 4) {
+export function relevantRetrieval(ask, s, cap = 4, opts = {}) {
     if (!(ask.hits ?? []).length)
         return null;
+    const isFollowUp = Boolean(opts.followUp ?? ((s?.injectedPointers?.length ?? 0) > 0 && opts.followUp !== false));
     const lexical = typeof ask.coverage === 'number' || typeof ask.coverageStrong === 'number';
-    if (lexical && !ask.hits.some((h) => h.pinned)) {
+    const hasPinned = ask.hits.some((h) => h.pinned);
+    if (lexical && !hasPinned) {
         const strong = ask.coverageStrong ?? 0;
         const broad = ask.coverage ?? 0;
-        const hasSubstantialMatch = strong >= STRONG_FLOOR || broad >= HIGH_FLOOR || (strong >= 0.04 && broad >= 0.14) || broad >= 0.28;
+        const qLen = String(ask.query ?? '').trim().split(/\s+/).filter(Boolean).length;
+        // A single body-only word collision on a short 2–5 word conversational prompt
+        // measures broad ~0.29–0.35; only allow body-only broad >= 0.28 on multi-term
+        // Turn-1 technical queries (qLen >= 6).
+        const hasSubstantialMatch = strong >= STRONG_FLOOR ||
+            broad >= HIGH_FLOOR ||
+            (strong >= 0.04 && broad >= 0.14) ||
+            (!isFollowUp && qLen >= 6 && broad >= 0.28);
         if (!hasSubstantialMatch)
-            return weakMatchNudge(s, strong);
+            return isFollowUp ? null : weakMatchNudge(s, strong);
     }
     const seen = new Set(s.injectedPointers ?? []);
+    if (isFollowUp) {
+        const freshPins = ask.hits.filter((h) => h.pinned && !seen.has(h.pointer));
+        const rankedHits = ask.hits.filter((h) => !h.pinned);
+        const topRanked = rankedHits[0];
+        const strong = ask.coverageStrong ?? 0;
+        const freshTopRanked = topRanked && !seen.has(topRanked.pointer) && (!lexical || strong >= 0.20)
+            ? [topRanked]
+            : [];
+        const followUpHits = [...freshPins, ...freshTopRanked].slice(0, 2).map((h, idx) => {
+            if (!h.code)
+                return h;
+            if (idx > 0)
+                return { ...h, code: undefined };
+            if (Buffer.byteLength(h.code, 'utf8') <= 1500)
+                return h;
+            const lines = h.code.split('\n');
+            let acc = [];
+            let bytes = 0;
+            for (const line of lines) {
+                const lb = Buffer.byteLength(line, 'utf8') + 1;
+                if (bytes + lb > 1500 && acc.length > 0)
+                    break;
+                acc.push(line);
+                bytes += lb;
+            }
+            return { ...h, code: acc.join('\n') };
+        });
+        if (!followUpHits.length)
+            return null;
+        const txt = formatRetrieval({ ...ask, hits: followUpHits }, 2);
+        if (!txt)
+            return null;
+        s.injectedPointers = [...(s.injectedPointers ?? []), ...followUpHits.map((h) => h.pointer)]
+            .slice(-INJECTED_POINTERS_CAP);
+        return txt;
+    }
     const fresh = ask.hits.filter((h) => !seen.has(h.pointer));
     if (!fresh.length)
         return null;

@@ -21,7 +21,7 @@
  * to the wrong place. `test/plexer.test.js` pins this against
  * fixtures whose true line numbers are known.
  */
-import { spanRange } from "../blast/evidence.js";
+import { spanRange } from "../util/span.js";
 import { extractFile, mintId, warmDepthGrammars } from "./extract.js";
 import { loadWasmLanguage, parseWasm } from "./generic.js";
 import { contentHash } from "../util/id.js";

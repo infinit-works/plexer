@@ -19,8 +19,9 @@
  * contribution is folded into the stored `df` at query time (see `ask.js`),
  * which is why `df` here counts symbol/file nodes only.
  */
+import { statSync } from "node:fs";
 import { join } from "node:path";
-import { CACHE_DIR } from "../context/node-file.js";
+import { CACHE_DIR, readGraph, wiringPath } from "../context/node-file.js";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 /** Words too common/short to carry query intent — dropped before scoring. */
 const STOP = new Set([
@@ -209,4 +210,89 @@ export function readAskIndex(outDir) {
         return null;
     }
     return raw;
+}
+
+const graphCache = new Map();
+const askIndexCache = new Map();
+function statOf(path) {
+    let st = null;
+    try {
+        const s = statSync(path);
+        st = { mtimeMs: s.mtimeMs, size: s.size };
+    }
+    catch {
+        /* file absent or unreadable */
+    }
+    return st;
+}
+function loadCached(cache, path, parse) {
+    const st = statOf(path);
+    if (!st) {
+        cache.delete(path);
+        return null;
+    }
+    const cached = cache.get(path);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        return cached.value;
+    }
+    const value = parse();
+    cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, value });
+    return value;
+}
+function hydrateAskIndex(raw) {
+    if (!raw)
+        return null;
+    const dfMap = new Map(raw.df);
+    const stemDfMap = new Map();
+    const byId = new Map();
+    for (const d of raw.docs) {
+        const name = new Map(d.name);
+        const path = new Map(d.path);
+        const body = new Map(d.body);
+        const nameStems = stemCounts(name);
+        const pathStems = stemCounts(path);
+        const bodyStems = stemCounts(body);
+        const docStems = new Set([...nameStems.keys(), ...pathStems.keys(), ...bodyStems.keys()]);
+        for (const st of docStems) {
+            stemDfMap.set(st, (stemDfMap.get(st) ?? 0) + 1);
+        }
+        byId.set(d.id, {
+            id: d.id,
+            name,
+            path,
+            body,
+            nameStems,
+            pathStems,
+            bodyStems,
+            bodyLen: bagLen(d.body),
+        });
+    }
+    Object.defineProperty(raw, "_hydrated", {
+        value: { dfMap, stemDfMap, byId },
+        enumerable: false,
+        configurable: true,
+    });
+    return raw;
+}
+export function loadGraphCached(outDir) {
+    const path = wiringPath(outDir);
+    return loadCached(graphCache, path, () => {
+        const g = readGraph(path);
+        if (g && Array.isArray(g.nodes)) {
+            Object.defineProperty(g, "_byId", {
+                value: new Map(g.nodes.map((n) => [n.id, n])),
+                enumerable: false,
+                configurable: true,
+            });
+        }
+        return g;
+    });
+}
+export function loadAskIndexCached(outDir) {
+    const path = askIndexPath(outDir);
+    return loadCached(askIndexCache, path, () => hydrateAskIndex(readAskIndex(outDir)));
+}
+export function invalidateGraphCaches(outDir) {
+    graphCache.delete(wiringPath(outDir));
+    askIndexCache.delete(askIndexPath(outDir));
 }

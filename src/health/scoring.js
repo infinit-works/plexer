@@ -1,0 +1,477 @@
+/**
+ * Codebase health scoring engine:
+ * - 5 Mechanical dimensions + 20 Subjective dimensions (25% / 75% split once subjective scores exist)
+ * - Sample dampening (< 200 checks)
+ * - Per-file failure caps (1.0 for 1-2 issues, 1.5 for 3-5, 2.0 for 6+) on file-based dimensions
+ * - Issue-penalized subjective dimension scores in `strict`/`verified` modes when open `review` issues exist
+ * - 4 Score variants: `strict` (North Star), `overall` (lenient), `objective` (mechanical), `verified`
+ * - Scorecard SVG badge generator (`scorecard.svg`)
+ */
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+    BADGE_FILE,
+    CONFIDENCE_WEIGHTS,
+    MECHANICAL_DIMENSIONS,
+    MECHANICAL_POOL_WEIGHT,
+    SAMPLE_DAMPENING_THRESHOLD,
+    SCORECARD_FILE,
+    SUBJECTIVE_DIMENSIONS,
+    SUBJECTIVE_POOL_WEIGHT,
+    normalizeDimensionKey,
+} from "./constants.js";
+import { healthDir } from "./state.js";
+
+const MAX_REVIEW_ISSUES_FOR_SPAN = 15;
+const REVIEW_ISSUE_PENALTY_SPAN = 40.0;
+
+function fileCappedFailureUnits(weightedCount) {
+    if (weightedCount <= 0) return 0;
+    if (weightedCount <= 2.0) return Math.min(1.0, weightedCount * 0.5);
+    if (weightedCount <= 5.0) return 1.5;
+    return 2.0;
+}
+
+function countsTowardVariant(issue, variant) {
+    if (issue.suppressed) return false;
+    const st = issue.status || "open";
+    if (st === "false_positive") return false;
+    if (variant === "lenient") {
+        // `open`, `deferred`, `triaged_out` count as failures; `wontfix`, `fixed`, `auto_resolved` do not
+        return st === "open" || st === "deferred" || st === "triaged_out";
+    }
+    if (variant === "strict") {
+        // `wontfix` also counts as failure in strict mode!
+        return st === "open" || st === "deferred" || st === "triaged_out" || st === "wontfix";
+    }
+    if (variant === "verified") {
+        // Like strict, plus unverified `fixed` items still count as failure until rescan confirms them!
+        if (st === "fixed" && !issue.verified) return true;
+        return st === "open" || st === "deferred" || st === "triaged_out" || st === "wontfix";
+    }
+    return st === "open";
+}
+
+function computeMechanicalDimensionScore(dimDef, allIssues, potentials, variant) {
+    const detSet = new Set(dimDef.detectors);
+    let potential = 0;
+    for (const det of dimDef.detectors) {
+        potential += Number(potentials[det] || 0);
+    }
+    if (potential <= 0) potential = 20;
+
+    const matchingIssues = allIssues.filter(
+        (iss) =>
+            iss.detector !== "review" &&
+            (iss.dimension === dimDef.id || detSet.has(iss.detector)) &&
+            countsTowardVariant(iss, variant),
+    );
+
+    let weightedFailures = 0;
+    if (dimDef.fileBased) {
+        const byFile = new Map();
+        for (const iss of matchingIssues) {
+            const w = CONFIDENCE_WEIGHTS[iss.confidence] ?? 0.7;
+            const f = iss.file || "repo";
+            byFile.set(f, (byFile.get(f) || 0) + w);
+        }
+        for (const rawFileWeight of byFile.values()) {
+            weightedFailures += fileCappedFailureUnits(rawFileWeight);
+        }
+    } else {
+        for (const iss of matchingIssues) {
+            const w = CONFIDENCE_WEIGHTS[iss.confidence] ?? 0.7;
+            weightedFailures += w;
+        }
+    }
+
+    const rawScore = Math.max(0, Math.min(100, ((potential - weightedFailures) / potential) * 100));
+    const dampening = Math.min(1.0, potential / SAMPLE_DAMPENING_THRESHOLD);
+    const effectiveWeight = dimDef.weight * Math.max(0.25, dampening);
+
+    return {
+        id: dimDef.id,
+        name: dimDef.name,
+        pool: "mechanical",
+        potential,
+        failures: Number(weightedFailures.toFixed(2)),
+        open_count: matchingIssues.length,
+        score: Number(rawScore.toFixed(1)),
+        effective_weight: Number(effectiveWeight.toFixed(3)),
+    };
+}
+
+function calcMechanicalPool(allIssues, potentials, variant) {
+    const dims = {};
+    let weightedSum = 0;
+    let totalWeight = 0;
+    for (const dimDef of Object.values(MECHANICAL_DIMENSIONS)) {
+        const res = computeMechanicalDimensionScore(dimDef, allIssues, potentials, variant);
+        dims[dimDef.id] = res;
+        weightedSum += res.score * res.effective_weight;
+        totalWeight += res.effective_weight;
+    }
+    const poolScore = totalWeight > 0 ? weightedSum / totalWeight : 100.0;
+    return { poolScore: Number(poolScore.toFixed(1)), dims };
+}
+
+function reviewIssuesByDim(allIssues, variant) {
+    const counts = new Map();
+    for (const iss of allIssues) {
+        if (iss.detector !== "review") continue;
+        if (!countsTowardVariant(iss, variant)) continue;
+        const dKey = normalizeDimensionKey(iss.dimension);
+        if (!dKey) continue;
+        const weight = CONFIDENCE_WEIGHTS[iss.confidence] ?? 0.7;
+        counts.set(dKey, (counts.get(dKey) || 0) + weight);
+    }
+    return counts;
+}
+
+function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
+    const isPlaceholder = Boolean(entry?.placeholder || entry?.reset_by === "scan_reset_subjective");
+    const hasScore =
+        entry &&
+        !isPlaceholder &&
+        typeof entry.score === "number" &&
+        Number.isFinite(entry.score);
+    if (!hasScore) {
+        return {
+            hasScore: false,
+            dimObj: {
+                id: sDef.id,
+                short_id: sDef.short_id,
+                name: sDef.name,
+                pool: "subjective",
+                score: null,
+                lenient_score: null,
+                assessment_score: null,
+                open_review_issues: Math.ceil(openRevWeight),
+                weight: sDef.weight,
+                assessed_at: null,
+                stale: false,
+                stale_reason: null,
+                judgment: null,
+            },
+        };
+    }
+
+    const rawAssessment = Math.max(0, Math.min(100, Number(entry.score)));
+    const strictPenalty =
+        openRevWeight > 0
+            ? Math.min(
+                  REVIEW_ISSUE_PENALTY_SPAN,
+                  (openRevWeight / MAX_REVIEW_ISSUES_FOR_SPAN) * REVIEW_ISSUE_PENALTY_SPAN,
+              )
+            : 0;
+    const lenientPenalty =
+        lenientRevWeight > 0
+            ? Math.min(
+                  REVIEW_ISSUE_PENALTY_SPAN * 0.5,
+                  (lenientRevWeight / MAX_REVIEW_ISSUES_FOR_SPAN) *
+                      (REVIEW_ISSUE_PENALTY_SPAN * 0.5),
+              )
+            : 0;
+
+    const strictDimScore = Math.max(0, Number((rawAssessment - strictPenalty).toFixed(1)));
+    const lenientDimScore = Math.max(0, Number((rawAssessment - lenientPenalty).toFixed(1)));
+
+    return {
+        hasScore: true,
+        strictDimScore,
+        lenientDimScore,
+        dimObj: {
+            id: sDef.id,
+            short_id: sDef.short_id,
+            name: sDef.name,
+            pool: "subjective",
+            score: strictDimScore,
+            lenient_score: lenientDimScore,
+            assessment_score: Number(rawAssessment.toFixed(1)),
+            open_review_issues: Math.ceil(openRevWeight),
+            weight: sDef.weight,
+            assessed_at: entry.assessed_at || null,
+            stale: Boolean(entry.stale),
+            stale_reason: entry.stale_reason || null,
+            judgment: entry.judgment || null,
+        },
+    };
+}
+
+/**
+ * Compute full score snapshot (`strict`, `overall`, `objective`, `verified`) + dimension breakdown.
+ */
+export function computeScoreSnapshot(state) {
+    const allIssues = Object.values(state.issues || {});
+    const potentials = state.potentials || {};
+    const rawSubjAssessments = state.subjective_assessments || {};
+
+    const subjAssessments = {};
+    for (const [k, v] of Object.entries(rawSubjAssessments)) {
+        const norm = normalizeDimensionKey(k);
+        if (norm) subjAssessments[norm] = v;
+    }
+
+    const lenientMech = calcMechanicalPool(allIssues, potentials, "lenient");
+    const strictMech = calcMechanicalPool(allIssues, potentials, "strict");
+    const verifiedMech = calcMechanicalPool(allIssues, potentials, "verified");
+
+    const lenientReviewIssues = reviewIssuesByDim(allIssues, "lenient");
+    const strictReviewIssues = reviewIssuesByDim(allIssues, "strict");
+
+    const subjDims = {};
+    let subjLenientWeightedSum = 0;
+    let subjStrictWeightedSum = 0;
+    let subjTotalWeight = 0;
+    let hasSubjectiveScores = false;
+
+    for (const sDef of Object.values(SUBJECTIVE_DIMENSIONS)) {
+        const built = buildSubjectiveDimEntry(
+            sDef,
+            subjAssessments[sDef.id],
+            strictReviewIssues.get(sDef.id) || 0,
+            lenientReviewIssues.get(sDef.id) || 0,
+        );
+        subjDims[sDef.id] = built.dimObj;
+        if (sDef.short_id && sDef.short_id !== sDef.id) {
+            Object.defineProperty(subjDims, sDef.short_id, {
+                value: built.dimObj,
+                enumerable: false,
+                configurable: true,
+            });
+        }
+        if (built.hasScore) {
+            hasSubjectiveScores = true;
+            subjLenientWeightedSum += built.lenientDimScore * sDef.weight;
+            subjStrictWeightedSum += built.strictDimScore * sDef.weight;
+            subjTotalWeight += sDef.weight;
+        }
+    }
+
+    const subjectiveStrictPoolScore =
+        hasSubjectiveScores && subjTotalWeight > 0
+            ? Number((subjStrictWeightedSum / subjTotalWeight).toFixed(1))
+            : null;
+    const subjectiveLenientPoolScore =
+        hasSubjectiveScores && subjTotalWeight > 0
+            ? Number((subjLenientWeightedSum / subjTotalWeight).toFixed(1))
+            : null;
+
+    const blend = (mechScore, subjScore) =>
+        subjScore === null
+            ? mechScore
+            : Number((mechScore * MECHANICAL_POOL_WEIGHT + subjScore * SUBJECTIVE_POOL_WEIGHT).toFixed(1));
+
+    const overall = blend(lenientMech.poolScore, subjectiveLenientPoolScore);
+    const strict = blend(strictMech.poolScore, subjectiveStrictPoolScore);
+    const verified = blend(verifiedMech.poolScore, subjectiveStrictPoolScore);
+    const objective = strictMech.poolScore;
+    const wontfixCount = allIssues.filter((i) => i.status === "wontfix").length;
+    const staleDimensions = Object.values(subjDims)
+        .filter((d) => d.stale)
+        .map((d) => d.id);
+
+    return {
+        strict,
+        overall,
+        objective,
+        verified,
+        wontfix_gap: Number(Math.max(0, overall - strict).toFixed(1)),
+        wontfix_count: wontfixCount,
+        has_subjective: hasSubjectiveScores,
+        subjective_pool_score: subjectiveStrictPoolScore,
+        stale_dimensions: staleDimensions,
+        mechanical_dimensions: strictMech.dims,
+        subjective_dimensions: subjDims,
+    };
+}
+
+/**
+ * Auto-cluster open issues by `<detector>:<top-dir>` when >= 3 issues share the same pattern.
+ */
+export function buildAutoClusters(issues) {
+    const openIssues = Object.values(issues || {}).filter(
+        (i) => i.status === "open" && !i.suppressed,
+    );
+    const groups = new Map();
+    for (const iss of openIssues) {
+        const topDir = (iss.file || "repo").split("/")[0] || "repo";
+        const key = `auto:${iss.detector}:${topDir}`;
+        let list = groups.get(key);
+        if (!list) {
+            list = [];
+            groups.set(key, list);
+        }
+        list.push(iss.id);
+    }
+    const autoClusters = {};
+    for (const [name, ids] of groups.entries()) {
+        if (ids.length >= 3) {
+            autoClusters[name] = {
+                name,
+                auto: true,
+                issue_ids: ids,
+                depends_on: [],
+            };
+        }
+    }
+    return autoClusters;
+}
+
+function scoreColorHex(val) {
+    if (val === null || val === undefined || !Number.isFinite(val)) return "#64748b";
+    if (val >= 95) return "#10b981";
+    if (val >= 85) return "#3b82f6";
+    if (val >= 70) return "#f59e0b";
+    return "#ef4444";
+}
+
+function escapeXml(str) {
+    return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+}
+
+function renderScorecardBarRow(label, score, y, xOffset, barWidth = 175) {
+    const hasScore = score !== null && score !== undefined && Number.isFinite(score);
+    const pct = hasScore ? Math.max(0, Math.min(100, Number(score))) : 0;
+    const fillW = Math.round((pct / 100) * barWidth);
+    const col = scoreColorHex(hasScore ? pct : null);
+    const valText = hasScore ? `${pct.toFixed(1)}%` : "unassessed";
+    return [
+        `  <text x="${xOffset}" y="${y + 10}" fill="#cbd5e1" font-family="monospace,sans-serif" font-size="11">${escapeXml(label)}</text>`,
+        `  <rect x="${xOffset + 140}" y="${y}" width="${barWidth}" height="12" rx="3" fill="#1e293b"/>`,
+        fillW > 0
+            ? `  <rect x="${xOffset + 140}" y="${y}" width="${fillW}" height="12" rx="3" fill="${col}"/>`
+            : "",
+        `  <text x="${xOffset + 140 + barWidth + 8}" y="${y + 10}" fill="${hasScore ? "#f8fafc" : "#64748b"}" font-family="monospace,sans-serif" font-size="11" font-weight="bold">${valText}</text>`,
+    ]
+        .filter(Boolean)
+        .join("\n");
+}
+
+function renderSparklineSvg(history, x, y, width, height) {
+    const entries = Array.isArray(history)
+        ? history.filter((h) => typeof h?.strict === "number" && Number.isFinite(h.strict))
+        : [];
+    if (entries.length < 2) {
+        return `  <text x="${x}" y="${y + 14}" fill="#64748b" font-family="monospace,sans-serif" font-size="10">Trajectory: ${entries.length === 1 ? `baseline ${entries[0].strict.toFixed(1)}% (1 scan)` : "run scans over time to plot strict score trajectory"}</text>`;
+    }
+    const pts = entries.slice(-25);
+    const minVal = Math.min(50, ...pts.map((p) => p.strict));
+    const maxVal = 100;
+    const span = Math.max(1, maxVal - minVal);
+    const coords = pts.map((p, idx) => {
+        const px = x + Math.round((idx / (pts.length - 1)) * width);
+        const py = y + height - Math.round(((p.strict - minVal) / span) * height);
+        return `${px},${py}`;
+    });
+    const first = pts[0].strict;
+    const last = pts[pts.length - 1].strict;
+    const delta = last - first;
+    const deltaSign = delta >= 0 ? "+" : "";
+    const stroke = delta >= 0 ? "#10b981" : "#f59e0b";
+    return [
+        `  <rect x="${x}" y="${y}" width="${width}" height="${height}" rx="3" fill="#0f172a" stroke="#1e293b"/>`,
+        `  <polyline fill="none" stroke="${stroke}" stroke-width="2" points="${coords.join(" ")}"/>`,
+        `  <text x="${x + width + 10}" y="${y + 15}" fill="${stroke}" font-family="monospace,sans-serif" font-size="11" font-weight="bold">${deltaSign}${delta.toFixed(1)}% (${pts.length} pts)</text>`,
+    ].join("\n");
+}
+
+/**
+ * Emit both the full multi-dimension README scorecard (`plexer/.health/scorecard.svg`)
+ * and the compact shield pill (`plexer/.health/badge.svg`).
+ */
+export function emitScorecardBadge(contextDir, scores, state = null) {
+    const strict = scores.strict.toFixed(1);
+    const color = scoreColorHex(scores.strict);
+    const badgeSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="210" height="28" role="img" aria-label="plexer health: ${strict}">
+  <rect width="125" height="28" rx="4" fill="#1e293b"/>
+  <rect x="125" width="85" height="28" rx="4" fill="${color}"/>
+  <text x="62" y="18" fill="#f8fafc" font-family="monospace,sans-serif" font-size="12" text-anchor="middle">plexer health</text>
+  <text x="167" y="18" fill="#ffffff" font-family="monospace,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">${strict} / 100</text>
+</svg>\n`;
+
+    const mechOrder = ["file_health", "code_quality", "duplication", "test_health", "security"];
+    const mechRows = mechOrder.map((id, idx) => {
+        const d = scores.mechanical_dimensions?.[id];
+        return renderScorecardBarRow(d?.name || id, d?.score ?? 100, 128 + idx * 24, 24, 165);
+    });
+
+    const subjDims = scores.subjective_dimensions || {};
+    const hiEl = subjDims.high_level_elegance?.score;
+    const midEl = subjDims.mid_level_elegance?.score;
+    const lowEl = subjDims.low_level_elegance?.score;
+    const elScores = [hiEl, midEl, lowEl].filter((v) => typeof v === "number" && Number.isFinite(v));
+    const combinedElegance =
+        elScores.length > 0
+            ? Number((elScores.reduce((a, b) => a + b, 0) / elScores.length).toFixed(1))
+            : null;
+
+    const rightItems = [
+        { label: "Elegance (combined)", score: combinedElegance },
+        { label: "Contracts", score: subjDims.contract_coherence?.score ?? null },
+        { label: "Type safety", score: subjDims.type_safety?.score ?? null },
+        { label: "Design coherence", score: subjDims.design_coherence?.score ?? null },
+        { label: "Abstraction fit", score: subjDims.abstraction_fitness?.score ?? null },
+        { label: "Cross-module arch", score: subjDims.cross_module_architecture?.score ?? null },
+        { label: "Test strategy", score: subjDims.test_strategy?.score ?? null },
+    ];
+    const subjRows = rightItems.map((it, idx) =>
+        renderScorecardBarRow(it.label, it.score, 128 + idx * 22, 420, 165),
+    );
+
+    const allIssues = Object.values(state?.issues || {});
+    const openCount = allIssues.filter((i) => i.status === "open" && !i.suppressed).length;
+    const fixedCount = allIssues.filter((i) => i.status === "fixed" || i.status === "auto_resolved").length;
+    const wontfixCount = scores.wontfix_count || 0;
+
+    const scorecardSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="820" height="350" viewBox="0 0 820 350" role="img" aria-label="plexer health scorecard: strict ${strict}/100">
+  <rect width="820" height="350" rx="10" fill="#0b0f19" stroke="#1e293b" stroke-width="2"/>
+  <text x="24" y="34" fill="#f8fafc" font-family="monospace,sans-serif" font-size="16" font-weight="bold">plexer health scorecard</text>
+  <text x="24" y="52" fill="#94a3b8" font-family="monospace,sans-serif" font-size="11">25% Mechanical AST/Graph · 75% Blind Subjective Review · Anti-Gaming North Star</text>
+
+  <!-- Headline Gauges -->
+  <rect x="24" y="64" width="182" height="40" rx="6" fill="#111827" stroke="${color}" stroke-width="1.5"/>
+  <text x="36" y="81" fill="#94a3b8" font-family="monospace,sans-serif" font-size="10">STRICT (NORTH STAR)</text>
+  <text x="36" y="97" fill="${color}" font-family="monospace,sans-serif" font-size="15" font-weight="bold">${strict} / 100</text>
+
+  <rect x="218" y="64" width="182" height="40" rx="6" fill="#111827" stroke="#1e293b"/>
+  <text x="230" y="81" fill="#94a3b8" font-family="monospace,sans-serif" font-size="10">OVERALL (LENIENT)</text>
+  <text x="230" y="97" fill="${scoreColorHex(scores.overall)}" font-family="monospace,sans-serif" font-size="15" font-weight="bold">${scores.overall.toFixed(1)}%</text>
+
+  <rect x="412" y="64" width="182" height="40" rx="6" fill="#111827" stroke="#1e293b"/>
+  <text x="424" y="81" fill="#94a3b8" font-family="monospace,sans-serif" font-size="10">OBJECTIVE (MECHANICAL)</text>
+  <text x="424" y="97" fill="${scoreColorHex(scores.objective)}" font-family="monospace,sans-serif" font-size="15" font-weight="bold">${scores.objective.toFixed(1)}%</text>
+
+  <rect x="606" y="64" width="190" height="40" rx="6" fill="#111827" stroke="#1e293b"/>
+  <text x="618" y="81" fill="#94a3b8" font-family="monospace,sans-serif" font-size="10">VERIFIED / WONTFIX GAP</text>
+  <text x="618" y="97" fill="#e2e8f0" font-family="monospace,sans-serif" font-size="13" font-weight="bold">${scores.verified.toFixed(1)}% · gap ${scores.wontfix_gap.toFixed(1)}%</text>
+
+  <!-- Dimension Columns -->
+  <text x="24" y="120" fill="#94a3b8" font-family="monospace,sans-serif" font-size="11" font-weight="bold">MECHANICAL DIMENSIONS (25%)</text>
+${mechRows.join("\n")}
+
+  <text x="420" y="120" fill="#94a3b8" font-family="monospace,sans-serif" font-size="11" font-weight="bold">SUBJECTIVE DIMENSIONS (75%)</text>
+${subjRows.join("\n")}
+
+  <!-- Footer & Trajectory -->
+  <line x1="24" y1="296" x2="796" y2="296" stroke="#1e293b" stroke-width="1"/>
+  <text x="24" y="324" fill="#94a3b8" font-family="monospace,sans-serif" font-size="11">Issues: ${openCount} open · ${fixedCount} resolved · ${wontfixCount} wontfix</text>
+${renderSparklineSvg(state?.history, 420, 308, 220, 24)}
+</svg>\n`;
+
+    const hDir = healthDir(contextDir);
+    const scorecardPath = join(hDir, SCORECARD_FILE);
+    const badgePath = join(hDir, BADGE_FILE);
+    try {
+        mkdirSync(hDir, { recursive: true });
+        writeFileSync(scorecardPath, scorecardSvg, "utf8");
+        writeFileSync(badgePath, badgeSvg, "utf8");
+    } catch {
+        // Ignore if directory is read-only
+    }
+    return scorecardPath;
+}

@@ -300,23 +300,7 @@ function removeDir(path, apply) {
     }
     return 'deleted';
 }
-/**
- * Every target plexer could have written, in removal order.
- *
- * Derived from the live registries, NOT hand-listed: `HOSTS` gives the
- * instruction files, `mcpTargets` over *all* host ids gives the MCP configs
- * (with the format and top-level key each one needs), and `claudeTargets`
- * gives the Claude Code layer. That's what keeps this complete as hosts are
- * added — see the module note.
- */
-function targets(repo, opts) {
-    const home = opts.home ?? homedir();
-    const exclude = new Set(opts.exclude ?? []);
-    const out = [];
-    const repoClaudeTargets = claudeTargets(repo);
-    const globalClaudeTargets = claudeGlobalTargets(home);
-    const codexHookTargets = hookTargets(home);
-    const agySkillTargets = antigravitySkillTargets(home);
+function collectKeptRetractPaths(repo, home, exclude, targetSets) {
     /**
      * Paths a *kept* host also writes, which must survive even though some other,
      * unselected host names them too.
@@ -335,20 +319,81 @@ function targets(repo, opts) {
     for (const t of mcpTargets(repo, [...exclude], { home }))
         keptPaths.add(t.path);
     if (exclude.has('claude')) {
-        for (const t of repoClaudeTargets)
+        for (const t of targetSets.repoClaudeTargets)
             keptPaths.add(t.path);
-        for (const t of globalClaudeTargets)
+        for (const t of targetSets.globalClaudeTargets)
             keptPaths.add(t.path);
     }
     if (exclude.has('agents'))
-        for (const t of codexHookTargets)
+        for (const t of targetSets.codexHookTargets)
             keptPaths.add(t.path);
     if (exclude.has('antigravity'))
-        for (const t of agySkillTargets)
+        for (const t of targetSets.agySkillTargets)
             keptPaths.add(t.path);
+    return keptPaths;
+}
+
+function enqueueGlobalRetractTargets(home, exclude, targetSets, enqueueTarget) {
+    if (exclude.size === 0) {
+        const binLink = join(home, '.local', 'bin', 'plexer');
+        enqueueTarget({ hostId: 'global', path: binLink, what: 'plexer CLI symlink', scope: 'global', run: (a) => removeSymlink(binLink, a) });
+    }
+    if (!exclude.has('claude')) {
+        const [shim, settings, mcp] = targetSets.globalClaudeTargets;
+        for (const t of [
+            { hostId: 'claude', path: shim.path, what: shim.what, scope: 'global', run: (a) => removeFile(shim.path, a) },
+            { hostId: 'claude', path: settings.path, what: settings.what, scope: 'global', run: (a) => stripClaudeSettings(settings.path, a) },
+            { hostId: 'claude', path: mcp.path, what: mcp.what, scope: 'global', run: (a) => removeJsonKey(mcp.path, 'mcpServers', a) },
+        ])
+            enqueueTarget(t);
+        const claudeSkillLink = join(home, '.claude', 'skills', 'plexer');
+        enqueueTarget({ hostId: 'claude', path: claudeSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(claudeSkillLink, a) });
+    }
+    if (!exclude.has('agents')) {
+        for (const t of targetSets.codexHookTargets) {
+            enqueueTarget({
+                hostId: t.hostId, path: t.path, what: t.what, scope: 'global',
+                run: (a) => (t.path.endsWith('.json') ? stripCodexHooks(t.path, a) : removeFile(t.path, a)),
+            });
+        }
+        const agentsSkillLink = join(home, '.agents', 'skills', 'plexer');
+        enqueueTarget({ hostId: 'agents', path: agentsSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(agentsSkillLink, a) });
+    }
+    if (!exclude.has('antigravity')) {
+        for (const t of targetSets.agySkillTargets) {
+            enqueueTarget({
+                hostId: t.hostId, path: t.path, what: t.what, scope: 'global',
+                run: (a) => (t.path.endsWith('hooks.json') ? removeTopLevelJsonKey(t.path, 'plexer-hooks', a) : removeFile(t.path, a)),
+            });
+        }
+        const geminiSkillLink = join(home, '.gemini', 'skills', 'plexer');
+        enqueueTarget({ hostId: 'antigravity', path: geminiSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(geminiSkillLink, a) });
+    }
+}
+
+/**
+ * Every target plexer could have written, in removal order.
+ *
+ * Derived from the live registries, NOT hand-listed: `HOSTS` gives the
+ * instruction files, `mcpTargets` over *all* host ids gives the MCP configs
+ * (with the format and top-level key each one needs), and `claudeTargets`
+ * gives the Claude Code layer. That's what keeps this complete as hosts are
+ * added — see the module note.
+ */
+function targets(repo, opts) {
+    const home = opts.home ?? homedir();
+    const exclude = new Set(opts.exclude ?? []);
+    const out = [];
+    const targetSets = {
+        repoClaudeTargets: claudeTargets(repo),
+        globalClaudeTargets: claudeGlobalTargets(home),
+        codexHookTargets: hookTargets(home),
+        agySkillTargets: antigravitySkillTargets(home),
+    };
+    const keptPaths = collectKeptRetractPaths(repo, home, exclude, targetSets);
     /** Queue a target unless a kept host owns that path, or it's already queued. */
     const seen = new Set();
-    const add = (t) => {
+    const enqueueTarget = (t) => {
         if (keptPaths.has(t.path) || seen.has(t.path))
             return;
         seen.add(t.path);
@@ -360,7 +405,7 @@ function targets(repo, opts) {
         if (exclude.has(host.id))
             continue;
         const path = join(repo, host.relPath);
-        add(host.kind === 'owned'
+        enqueueTarget(host.kind === 'owned'
             ? { hostId: host.id, path, what: 'plexer-owned instruction file', scope: 'repo', run: (a) => removeFile(path, a) }
             : { hostId: host.id, path, what: 'fenced plexer section', scope: 'repo', run: (a) => stripSection(path, a) });
     }
@@ -370,14 +415,14 @@ function targets(repo, opts) {
     for (const t of mcpTargets(repo, allIds, { home })) {
         if (opts.global === false && t.scope === 'global')
             continue;
-        add({
+        enqueueTarget({
             hostId: t.hostId, path: t.path, what: t.what, scope: t.scope,
             run: (a) => (t.format === 'toml' ? removeTomlSection(t.path, a) : removeJsonKey(t.path, t.topKey, a)),
         });
     }
     // 3. Claude Code: settings fragments, both shims, the skill, and the .mcp.json key.
     if (!exclude.has('claude')) {
-        const [settings, statusline, hooks, skill, mcp] = repoClaudeTargets.map((t) => t.path);
+        const [settings, statusline, hooks, skill, mcp] = targetSets.repoClaudeTargets.map((t) => t.path);
         for (const t of [
             { hostId: 'claude', path: settings, what: 'statusline + hooks + allowlist + footer regex', scope: 'repo', run: (a) => stripClaudeSettings(settings, a) },
             { hostId: 'claude', path: statusline, what: 'statusline shim', scope: 'repo', run: (a) => removeFile(statusline, a) },
@@ -385,46 +430,12 @@ function targets(repo, opts) {
             { hostId: 'claude', path: skill, what: 'plexer skill', scope: 'repo', run: (a) => removeFile(skill, a) },
             { hostId: 'claude', path: mcp, what: 'mcpServers.plexer', scope: 'repo', run: (a) => removeJsonKey(mcp, 'mcpServers', a) },
         ])
-            add(t);
+            enqueueTarget(t);
     }
     // 4. Global: Claude Code's user-level copy, Codex's hook shim + entries,
     //    Antigravity's shared skill + hooks, and global bin/skill symlinks.
     if (opts.global !== false) {
-        if (exclude.size === 0) {
-            const binLink = join(home, '.local', 'bin', 'plexer');
-            add({ hostId: 'global', path: binLink, what: 'plexer CLI symlink', scope: 'global', run: (a) => removeSymlink(binLink, a) });
-        }
-        if (!exclude.has('claude')) {
-            const [shim, settings, mcp] = globalClaudeTargets;
-            for (const t of [
-                { hostId: 'claude', path: shim.path, what: shim.what, scope: 'global', run: (a) => removeFile(shim.path, a) },
-                { hostId: 'claude', path: settings.path, what: settings.what, scope: 'global', run: (a) => stripClaudeSettings(settings.path, a) },
-                { hostId: 'claude', path: mcp.path, what: mcp.what, scope: 'global', run: (a) => removeJsonKey(mcp.path, 'mcpServers', a) },
-            ])
-                add(t);
-            const claudeSkillLink = join(home, '.claude', 'skills', 'plexer');
-            add({ hostId: 'claude', path: claudeSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(claudeSkillLink, a) });
-        }
-        if (!exclude.has('agents')) {
-            for (const t of codexHookTargets) {
-                add({
-                    hostId: t.hostId, path: t.path, what: t.what, scope: 'global',
-                    run: (a) => (t.path.endsWith('.json') ? stripCodexHooks(t.path, a) : removeFile(t.path, a)),
-                });
-            }
-            const agentsSkillLink = join(home, '.agents', 'skills', 'plexer');
-            add({ hostId: 'agents', path: agentsSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(agentsSkillLink, a) });
-        }
-        if (!exclude.has('antigravity')) {
-            for (const t of agySkillTargets) {
-                add({
-                    hostId: t.hostId, path: t.path, what: t.what, scope: 'global',
-                    run: (a) => (t.path.endsWith('hooks.json') ? removeTopLevelJsonKey(t.path, 'plexer-hooks', a) : removeFile(t.path, a)),
-                });
-            }
-            const geminiSkillLink = join(home, '.gemini', 'skills', 'plexer');
-            add({ hostId: 'antigravity', path: geminiSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(geminiSkillLink, a) });
-        }
+        enqueueGlobalRetractTargets(home, exclude, targetSets, enqueueTarget);
     }
     // 5. The graph cache and the ignore entries that admit it. Last, so a failure
     //    here can't strand the wiring half-retracted.
@@ -437,7 +448,7 @@ function targets(repo, opts) {
             { hostId: 'graph', path: gitignore, what: 'plexer/ ignore entry', scope: 'repo', run: (a) => stripIgnoreEntries(gitignore, [/^\/?plexer\/?$/], a) },
             { hostId: 'graph', path: ignore, what: 'plexer/ search re-admit entries', scope: 'repo', run: (a) => stripIgnoreEntries(ignore, [/^!?plexer\/?$/, /^plexer\/\.(cache|graph)\/?$/], a) },
         ])
-            add(t);
+            enqueueTarget(t);
     }
     return out;
 }

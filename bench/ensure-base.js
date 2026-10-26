@@ -8,19 +8,22 @@
  */
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildGraph } from "../src/graph/build.js";
 
 export const AB_BASE_DIR = "/tmp/plexer-ab-base";
 export const SWEBENCH_BASE_DIR = "/tmp/plexer-swebench-base";
 
+const BENCH_REPOS_DIR = process.env.PLEXER_BENCH_REPOS_DIR || join(homedir(), "Projects", "roblox", "libraries");
+
 const REPOS = [
     { name: "plexer", src: resolve(import.meta.dirname, ".."), ref: "0362ee2" },
-    { name: "kohls-admin", src: "/home/kohl/Projects/roblox/libraries/kohls-admin" },
-    { name: "flux", src: "/home/kohl/Projects/roblox/libraries/flux" },
-    { name: "sert", src: "/home/kohl/Projects/roblox/libraries/sert" },
-    { name: "building-tools", src: "/home/kohl/Projects/roblox/libraries/building-tools" },
-    { name: "z", src: "/home/kohl/Projects/roblox/libraries/z" },
+    { name: "kohls-admin", src: join(BENCH_REPOS_DIR, "kohls-admin") },
+    { name: "flux", src: join(BENCH_REPOS_DIR, "flux") },
+    { name: "sert", src: join(BENCH_REPOS_DIR, "sert") },
+    { name: "building-tools", src: join(BENCH_REPOS_DIR, "building-tools") },
+    { name: "z", src: join(BENCH_REPOS_DIR, "z") },
 ];
 
 const STRIP = [

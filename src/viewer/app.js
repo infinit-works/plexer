@@ -23,6 +23,7 @@ const KIND_COLORS = {
 const state = {
   contextGraph: null,
   codeGraph: null,
+  health: null,
   activeTab: "modules",
   outlineOpen: typeof window !== "undefined" ? window.innerWidth > 900 : true,
   collapsedDirs: new Set(),
@@ -413,6 +414,88 @@ function buildContextView() {
   return { nodes, edges, legend, empty: nodes.length === 0 ? "No nodes match filter." : null };
 }
 
+function findBestCirclePlacement(items, k, pad, overlapsAny) {
+  const item = items[k];
+  const r = item.r;
+  let bestX = 0;
+  let bestY = 0;
+  let bestScore = Infinity;
+  let found = false;
+
+  const startIdx = Math.max(0, k - 18);
+  for (let i = startIdx; i < k; i++) {
+    const a = items[i];
+    const ra = a.r + r + pad;
+    for (let j = i + 1; j < k; j++) {
+      const b = items[j];
+      const rb = b.r + r + pad;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const d2 = dx * dx + dy * dy;
+      const d = Math.sqrt(d2);
+      if (d <= 0.001 || d > ra + rb || d < Math.abs(ra - rb)) continue;
+
+      const u = (ra * ra - rb * rb + d2) / (2 * d);
+      const h2 = Math.max(0, ra * ra - u * u);
+      const h = Math.sqrt(h2);
+      const mx = a.x + (u * dx) / d;
+      const my = a.y + (u * dy) / d;
+      const ox = (-dy * h) / d;
+      const oy = (dx * h) / d;
+
+      for (let sign = -1; sign <= 1; sign += 2) {
+        const cx = mx + sign * ox;
+        const cy = my + sign * oy;
+        const score = cx * cx + cy * cy;
+        if (score < bestScore && !overlapsAny(cx, cy, r, k)) {
+          bestScore = score;
+          bestX = cx;
+          bestY = cy;
+          found = true;
+        }
+      }
+    }
+  }
+
+  if (!found) {
+    const angle = k * 2.399963229728653;
+    const ux = Math.cos(angle);
+    const uy = Math.sin(angle);
+    let stepR = items[0].r + r + pad;
+    while (overlapsAny(ux * stepR, uy * stepR, r, k)) {
+      stepR += Math.max(6, r * 0.55);
+    }
+    bestX = ux * stepR;
+    bestY = uy * stepR;
+  }
+
+  item.x = bestX;
+  item.y = bestY;
+}
+
+function centerPackedCircles(items, pad) {
+  const M = items.length;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < M; i++) {
+    const it = items[i];
+    minX = Math.min(minX, it.x - it.r);
+    maxX = Math.max(maxX, it.x + it.r);
+    minY = Math.min(minY, it.y - it.r);
+    maxY = Math.max(maxY, it.y + it.r);
+  }
+  const shiftX = (minX + maxX) * 0.5;
+  const shiftY = (minY + maxY) * 0.5;
+  let maxExtent = 0;
+  for (let i = 0; i < M; i++) {
+    const it = items[i];
+    it.x -= shiftX;
+    it.y -= shiftY;
+    const ext = Math.hypot(it.x, it.y) + it.r;
+    if (ext > maxExtent) maxExtent = ext;
+  }
+  return { enclosingRadius: maxExtent + pad * 0.5 };
+}
+
 /**
  * Front-chain / tangent circle packing for a list of circular items `{ r, weight }`.
  * Places highest-weight items near the center and packs remaining items tightly without overlap.
@@ -446,91 +529,13 @@ function packCircles(items, pad = 12) {
   };
 
   for (let k = 2; k < M; k++) {
-    const item = items[k];
-    const r = item.r;
-    let bestX = 0;
-    let bestY = 0;
-    let bestScore = Infinity;
-    let found = false;
-
-    const startIdx = Math.max(0, k - 18);
-    for (let i = startIdx; i < k; i++) {
-      const a = items[i];
-      const ra = a.r + r + pad;
-      for (let j = i + 1; j < k; j++) {
-        const b = items[j];
-        const rb = b.r + r + pad;
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const d2 = dx * dx + dy * dy;
-        const d = Math.sqrt(d2);
-        if (d <= 0.001 || d > ra + rb || d < Math.abs(ra - rb)) continue;
-
-        const u = (ra * ra - rb * rb + d2) / (2 * d);
-        const h2 = Math.max(0, ra * ra - u * u);
-        const h = Math.sqrt(h2);
-        const mx = a.x + (u * dx) / d;
-        const my = a.y + (u * dy) / d;
-        const ox = (-dy * h) / d;
-        const oy = (dx * h) / d;
-
-        for (let sign = -1; sign <= 1; sign += 2) {
-          const cx = mx + sign * ox;
-          const cy = my + sign * oy;
-          const score = cx * cx + cy * cy;
-          if (score < bestScore && !overlapsAny(cx, cy, r, k)) {
-            bestScore = score;
-            bestX = cx;
-            bestY = cy;
-            found = true;
-          }
-        }
-      }
-    }
-
-    if (!found) {
-      const angle = k * 2.399963229728653;
-      const ux = Math.cos(angle);
-      const uy = Math.sin(angle);
-      let stepR = items[0].r + r + pad;
-      while (overlapsAny(ux * stepR, uy * stepR, r, k)) {
-        stepR += Math.max(6, r * 0.55);
-      }
-      bestX = ux * stepR;
-      bestY = uy * stepR;
-    }
-
-    item.x = bestX;
-    item.y = bestY;
+    findBestCirclePlacement(items, k, pad, overlapsAny);
   }
 
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (let i = 0; i < M; i++) {
-    const it = items[i];
-    minX = Math.min(minX, it.x - it.r);
-    maxX = Math.max(maxX, it.x + it.r);
-    minY = Math.min(minY, it.y - it.r);
-    maxY = Math.max(maxY, it.y + it.r);
-  }
-  const shiftX = (minX + maxX) * 0.5;
-  const shiftY = (minY + maxY) * 0.5;
-  let maxExtent = 0;
-  for (let i = 0; i < M; i++) {
-    const it = items[i];
-    it.x -= shiftX;
-    it.y -= shiftY;
-    const ext = Math.hypot(it.x, it.y) + it.r;
-    if (ext > maxExtent) maxExtent = ext;
-  }
-
-  return { enclosingRadius: maxExtent + pad * 0.5 };
+  return centerPackedCircles(items, pad);
 }
 
-function layoutGraph(nodes) {
-  const N = nodes.length;
-  if (N === 0) return;
-
-  // 3-Tier Hierarchical Circle-Packing: Symbols -> Files -> Directories
+function groupNodesByDirAndFile(nodes) {
   const dirMap = new Map();
   for (const n of nodes) {
     const d = n.dirGroup ?? n.sublabel ?? "default";
@@ -547,7 +552,36 @@ function layoutGraph(nodes) {
     }
     list.push(n);
   }
+  return dirMap;
+}
 
+function applyPackedClusterLayout(dirClusters) {
+  for (const dCluster of dirClusters) {
+    for (const fCluster of dCluster.fileClusters) {
+      const fCx = dCluster.x + fCluster.x;
+      const fCy = dCluster.y + fCluster.y;
+      for (const n of fCluster.members) {
+        n.x = fCx + (n.homeOffsetX ?? 0);
+        n.y = fCy + (n.homeOffsetY ?? 0);
+        n.anchorX = fCx;
+        n.anchorY = fCy;
+        n.dirAnchorX = dCluster.x;
+        n.dirAnchorY = dCluster.y;
+        n.clusterRadius = fCluster.r;
+        n.dirRadius = dCluster.r;
+        n.vx = 0;
+        n.vy = 0;
+      }
+    }
+  }
+}
+
+function layoutGraph(nodes) {
+  const N = nodes.length;
+  if (N === 0) return;
+
+  // 3-Tier Hierarchical Circle-Packing: Symbols -> Files -> Directories
+  const dirMap = groupNodesByDirAndFile(nodes);
   const isSymbols = state.activeTab === "symbols";
   const nodePad = N > 150 ? 10 : 14;
   const dirClusters = [];
@@ -602,25 +636,7 @@ function layoutGraph(nodes) {
   }
 
   packCircles(dirClusters, isSymbols ? 48 : 36);
-
-  for (const dCluster of dirClusters) {
-    for (const fCluster of dCluster.fileClusters) {
-      const fCx = dCluster.x + fCluster.x;
-      const fCy = dCluster.y + fCluster.y;
-      for (const n of fCluster.members) {
-        n.x = fCx + (n.homeOffsetX ?? 0);
-        n.y = fCy + (n.homeOffsetY ?? 0);
-        n.anchorX = fCx;
-        n.anchorY = fCy;
-        n.dirAnchorX = dCluster.x;
-        n.dirAnchorY = dCluster.y;
-        n.clusterRadius = fCluster.r;
-        n.dirRadius = dCluster.r;
-        n.vx = 0;
-        n.vy = 0;
-      }
-    }
-  }
+  applyPackedClusterLayout(dirClusters);
 
   state.hullsDirty = true;
   state.edgeCacheDirty = true;
@@ -715,30 +731,8 @@ function rebuildPhysicsClusters() {
   }
 }
 
-function stepPhysics() {
-  const nodes = state.nodes;
-  const edges = state.edges;
+function applySpatialRepulsionForces(nodes, cellSize, maxDist2, kRepel, alpha) {
   const N = nodes.length;
-  if (N <= 1 || state.alpha <= 0.005) {
-    state.alpha = 0;
-    return false;
-  }
-
-  const alpha = state.alpha;
-  const isSymbols = state.activeTab === "symbols";
-  const kRepel = 920;
-  const kSpring = 0.036;
-  const kCenter = 0.006;
-  const kHome = isSymbols ? 0.068 : 0.048;
-  const cellSize = SPATIAL_CELL_SIZE;
-  const maxDist2 = cellSize * cellSize;
-
-  // 1. Ensure uniform spatial hash grid is populated
-  if (spatialGrid.size === 0) {
-    populateSpatialGrid();
-  }
-
-  // 2. Repulsion across 3x3 neighboring cells with extra clearance across different clusters
   for (let i = 0; i < N; i++) {
     const a = nodes[i];
     const cx = Math.floor(a.x / cellSize);
@@ -779,8 +773,9 @@ function stepPhysics() {
       }
     }
   }
+}
 
-  // 3. Springs along pre-resolved edges (damped across cluster boundaries so hulls stay compact)
+function applyEdgeSpringForces(edges, kSpring, alpha) {
   for (let i = 0; i < edges.length; i++) {
     const e = edges[i];
     const s = e.sourceNode;
@@ -801,9 +796,9 @@ function stepPhysics() {
     t.vx -= fx;
     t.vy -= fy;
   }
+}
 
-  // 4. Compute live cluster centroids & bounding radii using pre-indexed physicsClusters
-  const clusters = state.physicsClusters;
+function applyClusterSeparationForces(clusters, isSymbols, alpha) {
   const C = clusters.length;
   for (let i = 0; i < C; i++) {
     const c = clusters[i];
@@ -821,7 +816,6 @@ function stepPhysics() {
     c.pushY = 0;
   }
 
-  // 5. Inter-cluster bounding repulsion so cluster hulls never collide or overlap
   const clusterGap = isSymbols ? 26 : 34;
   for (let i = 0; i < C; i++) {
     const cA = clusters[i];
@@ -848,8 +842,10 @@ function stepPhysics() {
       }
     }
   }
+}
 
-  // 6. Elastic tether toward packed cluster home + cluster separation + velocity integration
+function integrateNodePhysicsVelocities(nodes, isSymbols, kHome, kCenter, alpha) {
+  const N = nodes.length;
   for (let i = 0; i < N; i++) {
     const n = nodes[i];
     if (n === state.draggingNode) {
@@ -879,6 +875,34 @@ function stepPhysics() {
     n.x += n.vx;
     n.y += n.vy;
   }
+}
+
+function stepPhysics() {
+  const nodes = state.nodes;
+  const edges = state.edges;
+  const N = nodes.length;
+  if (N <= 1 || state.alpha <= 0.005) {
+    state.alpha = 0;
+    return false;
+  }
+
+  const alpha = state.alpha;
+  const isSymbols = state.activeTab === "symbols";
+  const kRepel = 920;
+  const kSpring = 0.036;
+  const kCenter = 0.006;
+  const kHome = isSymbols ? 0.068 : 0.048;
+  const cellSize = SPATIAL_CELL_SIZE;
+  const maxDist2 = cellSize * cellSize;
+
+  if (spatialGrid.size === 0) {
+    populateSpatialGrid();
+  }
+
+  applySpatialRepulsionForces(nodes, cellSize, maxDist2, kRepel, alpha);
+  applyEdgeSpringForces(edges, kSpring, alpha);
+  applyClusterSeparationForces(state.physicsClusters, isSymbols, alpha);
+  integrateNodePhysicsVelocities(nodes, isSymbols, kHome, kCenter, alpha);
 
   state.hullsDirty = true;
   populateSpatialGrid();
@@ -1582,12 +1606,10 @@ function stepChannel(obj, key, target, rate, snap) {
   return false;
 }
 
-function syncNodeVisualTargets(snap = false, dt = 16) {
-  const now = performance.now();
+function stepCameraAndEffects(snap, dt, now) {
   const hasPath = state.pathNodeIds.size > 0;
   const isPinned = Boolean(state.selectedId);
 
-  // Bounded 4-second directional edge flow auto-sleep so idle CPU drops to 0%
   let flowRunning = false;
   if ((isPinned || hasPath) && now < state.flowUntil) {
     state.flowPhase = (state.flowPhase + dt * 0.00052) % 1;
@@ -1597,7 +1619,6 @@ function syncNodeVisualTargets(snap = false, dt = 16) {
     state.flowIntensity = 0;
   }
 
-  // Prune completed selection ripples
   let ripplesRunning = false;
   if (state.selectionRipples.length > 0) {
     for (let i = state.selectionRipples.length - 1; i >= 0; i--) {
@@ -1635,45 +1656,41 @@ function syncNodeVisualTargets(snap = false, dt = 16) {
     state.visualDirty = true;
   }
 
-  // Fast-path: skip O(V + E) channel sweeps when all transitions have converged
-  if (!snap && !state.visualDirty && state.channelsSettled && !state.hullsDirty && !state.isMorphingPositions) {
-    return flowRunning || ripplesRunning || camRunning;
-  }
+  return { flowRunning, ripplesRunning, camRunning };
+}
 
-  const { hasFocus, isPinned: focusPinned, focusIds, inSet, outSet, inDist, outDist } = resolveFocusState();
-  const hasSearch = Boolean(state.search);
-  const hasCycleMode = state.highlightCycles && state.cycleNodeIds.size > 0;
-  const blend = snap ? 1 : 1 - Math.exp(-dt / 95);
-  const fastBlend = snap ? 1 : 1 - Math.exp(-dt / 52);
-  const posBlend = snap ? 1 : 1 - Math.exp(-dt / 76);
-  const dtSec = Math.min(0.032, dt * 0.001);
+function stepNodeSpringScale(n, targetScaleOffset, dtSec, snap) {
+  if (snap) {
+    n.scaleOffset = targetScaleOffset;
+    n.scaleVel = 0;
+    return false;
+  }
+  const currScale = n.scaleOffset ?? 0;
+  const currVel = n.scaleVel ?? 0;
+  const disp = currScale - targetScaleOffset;
+  const accel = -420 * disp - 22 * currVel;
+  const nextVel = currVel + accel * dtSec;
+  const nextScale = currScale + nextVel * dtSec;
+  if (Math.abs(nextScale - targetScaleOffset) > 0.002 || Math.abs(nextVel) > 0.01) {
+    n.scaleOffset = nextScale;
+    n.scaleVel = nextVel;
+    return true;
+  }
+  n.scaleOffset = targetScaleOffset;
+  n.scaleVel = 0;
+  return false;
+}
+
+function stepAllNodeVisualChannels(focusCtx, snap, blend, fastBlend, posBlend, dtSec) {
+  const { hasPath, hasSearch, hasCycleMode, hasFocus, focusPinned, focusIds, inSet, outSet, inDist, outDist, hoveredId, hoverConnectedIds } = focusCtx;
+  const k = state.cam.k;
   let channelsMoving = false;
   let positionsMoved = false;
   let stillMorphing = false;
 
-  const targetGlobalFocus =
-    hasPath || hasSearch || hasCycleMode || (hasFocus && focusPinned)
-      ? 1.0
-      : hasFocus
-        ? 0.52
-        : 0.0;
-  if (stepChannel(state, "focusMix", targetGlobalFocus, blend, snap)) {
-    channelsMoving = true;
-  }
-
-  const k = state.cam.k;
-  const hoveredId = state.hoveredId;
-  const hoverConnectedIds = new Set();
-  if (hoveredId) {
-    hoverConnectedIds.add(hoveredId);
-    for (const s of state.adjIn.get(hoveredId) ?? []) hoverConnectedIds.add(s);
-    for (const t of state.adjOut.get(hoveredId) ?? []) hoverConnectedIds.add(t);
-  }
-
   for (let i = 0; i < state.nodes.length; i++) {
     const n = state.nodes[i];
 
-    // Smooth position morphing across tabs/filters/layouts when physics is settled
     if (n.targetX !== undefined && state.alpha === 0 && n !== state.draggingNode) {
       const dx = n.targetX - n.x;
       const dy = n.targetY - n.y;
@@ -1722,51 +1739,16 @@ function syncNodeVisualTargets(snap = false, dt = 16) {
       targetBody = isCycleNode || isHovered ? 1.0 : 0.18;
     }
 
-    const targetLabel = computeTargetLabelAlpha(
-      n,
-      k,
-      hasFocus,
-      focusPinned,
-      isFocus,
-      isHovered || isClusterHovered,
-      isNeighbor,
-      minHop
-    );
+    const targetLabel = computeTargetLabelAlpha(n, k, hasFocus, focusPinned, isFocus, isHovered || isClusterHovered, isNeighbor, minHop);
     const targetFocus = isFocus || isPathNode || isSearchHit ? 1.0 : 0.0;
     const targetHover = isHovered || isClusterHovered ? 1.0 : 0.0;
     const targetIn = !isFocus && isIn && hopIn <= hopOut ? 1.0 : 0.0;
     const targetOut = !isFocus && isOut && hopOut < hopIn ? 1.0 : 0.0;
     const targetPath = isPathNode ? 1.0 : 0.0;
     const targetCycle = !isPathNode && isCycleNode ? 1.0 : 0.0;
+    const targetScaleOffset = isFocus ? 0.18 : isHovered ? 0.12 : isNeighbor && minHop === 1 ? 0.05 : 0.0;
 
-    // Underdamped spring scale oscillator for selection & hover kinetic pop
-    const targetScaleOffset = isFocus
-      ? 0.18
-      : isHovered
-        ? 0.12
-        : isNeighbor && minHop === 1
-          ? 0.05
-          : 0.0;
-    if (snap) {
-      n.scaleOffset = targetScaleOffset;
-      n.scaleVel = 0;
-    } else {
-      const currScale = n.scaleOffset ?? 0;
-      const currVel = n.scaleVel ?? 0;
-      const disp = currScale - targetScaleOffset;
-      const accel = -420 * disp - 22 * currVel;
-      const nextVel = currVel + accel * dtSec;
-      const nextScale = currScale + nextVel * dtSec;
-      if (Math.abs(nextScale - targetScaleOffset) > 0.002 || Math.abs(nextVel) > 0.01) {
-        n.scaleOffset = nextScale;
-        n.scaleVel = nextVel;
-        channelsMoving = true;
-      } else {
-        n.scaleOffset = targetScaleOffset;
-        n.scaleVel = 0;
-      }
-    }
-
+    if (stepNodeSpringScale(n, targetScaleOffset, dtSec, snap)) channelsMoving = true;
     if (stepChannel(n, "renderAlpha", targetBody, blend, snap)) channelsMoving = true;
     if (stepChannel(n, "labelAlpha", targetLabel, blend, snap)) channelsMoving = true;
     if (stepChannel(n, "focusMix", targetFocus, blend, snap)) channelsMoving = true;
@@ -1777,9 +1759,14 @@ function syncNodeVisualTargets(snap = false, dt = 16) {
     if (stepChannel(n, "cycleMix", targetCycle, blend, snap)) channelsMoving = true;
   }
 
-  // Per-edge continuous interpolation so switching selection or hover cross-fades edges smoothly
+  return { channelsMoving, positionsMoved, stillMorphing };
+}
+
+function stepAllEdgeVisualChannels(focusCtx, snap, blend, fastBlend) {
+  const { hasPath, hasCycleMode, hasFocus, focusPinned, focusIds, inSet, outSet, inDist, outDist, hoveredId } = focusCtx;
   const inReach = (id) => focusIds?.has(id) || inSet?.has(id);
   const outReach = (id) => focusIds?.has(id) || outSet?.has(id);
+  let channelsMoving = false;
 
   for (let i = 0; i < state.edges.length; i++) {
     const e = state.edges[i];
@@ -1817,25 +1804,11 @@ function syncNodeVisualTargets(snap = false, dt = 16) {
     if (stepChannel(e, "hoverMix", targetHover, fastBlend, snap)) channelsMoving = true;
   }
 
-  if (stillMorphing) {
-    state.isMorphingPositions = true;
-    state.edgeCacheDirty = true;
-    if (state.hullsDirty) {
-      rebuildClusterHulls();
-    } else {
-      updateClusterHullsFast();
-    }
-  } else if (positionsMoved || state.isMorphingPositions) {
-    state.isMorphingPositions = false;
-    state.hullsDirty = true;
-    state.edgeCacheDirty = true;
-    populateSpatialGrid();
-  }
-  if (state.hullsDirty) {
-    rebuildClusterHulls();
-  }
+  return channelsMoving;
+}
 
-  // Per-hull continuous focus interpolation
+function stepAllHullFocusChannels(focusIds, hoveredId, blend, snap) {
+  let channelsMoving = false;
   for (let i = 0; i < state.clusterHulls.length; i++) {
     const h = state.clusterHulls[i];
     let targetHullFocus = state.hoveredClusterKey === h.key ? 0.95 : 0;
@@ -1854,6 +1827,85 @@ function syncNodeVisualTargets(snap = false, dt = 16) {
       channelsMoving = true;
     }
     state.hullFocusByKey.set(h.key, h.focusMix);
+  }
+  return channelsMoving;
+}
+
+function syncNodeVisualTargets(snap = false, dt = 16) {
+  const now = performance.now();
+  const hasPath = state.pathNodeIds.size > 0;
+  const { flowRunning, ripplesRunning, camRunning } = stepCameraAndEffects(snap, dt, now);
+
+  if (!snap && !state.visualDirty && state.channelsSettled && !state.hullsDirty && !state.isMorphingPositions) {
+    return flowRunning || ripplesRunning || camRunning;
+  }
+
+  const { hasFocus, isPinned: focusPinned, focusIds, inSet, outSet, inDist, outDist } = resolveFocusState();
+  const hasSearch = Boolean(state.search);
+  const hasCycleMode = state.highlightCycles && state.cycleNodeIds.size > 0;
+  const blend = snap ? 1 : 1 - Math.exp(-dt / 95);
+  const fastBlend = snap ? 1 : 1 - Math.exp(-dt / 52);
+  const posBlend = snap ? 1 : 1 - Math.exp(-dt / 76);
+  const dtSec = Math.min(0.032, dt * 0.001);
+  let channelsMoving = false;
+
+  const targetGlobalFocus =
+    hasPath || hasSearch || hasCycleMode || (hasFocus && focusPinned)
+      ? 1.0
+      : hasFocus
+        ? 0.52
+        : 0.0;
+  if (stepChannel(state, "focusMix", targetGlobalFocus, blend, snap)) {
+    channelsMoving = true;
+  }
+
+  const hoveredId = state.hoveredId;
+  const hoverConnectedIds = new Set();
+  if (hoveredId) {
+    hoverConnectedIds.add(hoveredId);
+    for (const s of state.adjIn.get(hoveredId) ?? []) hoverConnectedIds.add(s);
+    for (const t of state.adjOut.get(hoveredId) ?? []) hoverConnectedIds.add(t);
+  }
+
+  const focusCtx = {
+    hasPath,
+    hasSearch,
+    hasCycleMode,
+    hasFocus,
+    focusPinned,
+    focusIds,
+    inSet,
+    outSet,
+    inDist,
+    outDist,
+    hoveredId,
+    hoverConnectedIds,
+  };
+
+  const nodeStep = stepAllNodeVisualChannels(focusCtx, snap, blend, fastBlend, posBlend, dtSec);
+  if (nodeStep.channelsMoving) channelsMoving = true;
+  if (stepAllEdgeVisualChannels(focusCtx, snap, blend, fastBlend)) channelsMoving = true;
+
+  if (nodeStep.stillMorphing) {
+    state.isMorphingPositions = true;
+    state.edgeCacheDirty = true;
+    if (state.hullsDirty) {
+      rebuildClusterHulls();
+    } else {
+      updateClusterHullsFast();
+    }
+  } else if (nodeStep.positionsMoved || state.isMorphingPositions) {
+    state.isMorphingPositions = false;
+    state.hullsDirty = true;
+    state.edgeCacheDirty = true;
+    populateSpatialGrid();
+  }
+  if (state.hullsDirty) {
+    rebuildClusterHulls();
+  }
+
+  if (stepAllHullFocusChannels(focusIds, hoveredId, blend, snap)) {
+    channelsMoving = true;
   }
 
   state.visualDirty = false;
@@ -1907,6 +1959,75 @@ function traceSmoothHullPath(pts) {
 const restingHullBuckets = new Map();
 const activeHullsScratch = [];
 const headerHullsScratch = [];
+
+function drawHullHeaderPills(headerHulls, headerFontSize, invSqrtK) {
+  for (let i = 0; i < headerHulls.length; i++) {
+    const h = headerHulls[i];
+    const fMix = h.focusMix ?? 0;
+    const isHoveredHull = state.hoveredClusterKey === h.key;
+    const textAlpha = h._textAlpha;
+    const textW = getCachedLabelWidth(h.label, headerFontSize, 600);
+    const padX = 6.5 * invSqrtK;
+    const padY = 2.6 * invSqrtK;
+    const pillW = textW + padX * 2;
+    const pillH = headerFontSize + padY * 2;
+    const pillX = h.labelX - pillW * 0.5;
+    const pillY = h.minY - pillH - 2 * invSqrtK;
+
+    h.headerBox = {
+      minX: pillX,
+      maxX: pillX + pillW,
+      minY: pillY,
+      maxY: pillY + pillH,
+    };
+
+    ctx.globalAlpha = textAlpha * (0.76 + fMix * 0.22);
+    ctx.fillStyle = isHoveredHull ? "rgba(22, 29, 44, 0.96)" : "rgba(12, 16, 24, 0.88)";
+    drawRoundedPill(pillX, pillY, pillW, pillH, 999);
+    ctx.fill();
+
+    ctx.globalAlpha = textAlpha * (0.35 + fMix * 0.55);
+    ctx.strokeStyle = h.color;
+    ctx.lineWidth = (isHoveredHull ? 1.35 : 0.95) * invSqrtK;
+    ctx.stroke();
+
+    ctx.globalAlpha = Math.min(1, textAlpha * 1.12);
+    ctx.fillStyle = isHoveredHull ? "#ffffff" : h.color;
+    ctx.fillText(h.label, h.labelX, pillY + pillH * 0.52);
+  }
+}
+
+function drawClusterHullShapes(activeHulls, invSqrtK) {
+  ctx.lineWidth = 1.1 * invSqrtK;
+  for (const [color, bucket] of restingHullBuckets) {
+    if (bucket.length === 0) continue;
+    const baseAlpha = bucket[0].alpha ?? 1;
+    ctx.beginPath();
+    for (let i = 0; i < bucket.length; i++) {
+      appendSmoothHullSubpath(bucket[i].hull);
+    }
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.036 * baseAlpha;
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.14 * baseAlpha;
+    ctx.stroke();
+  }
+
+  for (let i = 0; i < activeHulls.length; i++) {
+    const h = activeHulls[i];
+    const fMix = h.focusMix ?? 0;
+    const baseAlpha = h.alpha ?? 1;
+    traceSmoothHullPath(h.hull);
+    ctx.fillStyle = h.color;
+    ctx.globalAlpha = (0.036 + fMix * 0.068) * baseAlpha;
+    ctx.fill();
+    ctx.strokeStyle = h.color;
+    ctx.lineWidth = (1.1 + fMix * 0.75) * invSqrtK;
+    ctx.globalAlpha = (0.14 + fMix * 0.28) * baseAlpha;
+    ctx.stroke();
+  }
+}
 
 function drawClusterHulls(viewMinX, viewMaxX, viewMinY, viewMaxY, k, invSqrtK) {
   if (state.hullsDirty) {
@@ -1969,73 +2090,8 @@ function drawClusterHulls(viewMinX, viewMaxX, viewMinY, viewMaxY, k, invSqrtK) {
     }
   }
 
-  // Batch resting cluster hulls by directory color (1 fill + 1 stroke per color instead of per file)
-  ctx.lineWidth = 1.1 * invSqrtK;
-  for (const [color, bucket] of restingHullBuckets) {
-    if (bucket.length === 0) continue;
-    const baseAlpha = bucket[0].alpha ?? 1;
-    ctx.beginPath();
-    for (let i = 0; i < bucket.length; i++) {
-      appendSmoothHullSubpath(bucket[i].hull);
-    }
-    ctx.fillStyle = color;
-    ctx.globalAlpha = 0.036 * baseAlpha;
-    ctx.fill();
-    ctx.strokeStyle = color;
-    ctx.globalAlpha = 0.14 * baseAlpha;
-    ctx.stroke();
-  }
-
-  // Draw focused / hovered hulls individually
-  for (let i = 0; i < activeHulls.length; i++) {
-    const h = activeHulls[i];
-    const fMix = h.focusMix ?? 0;
-    const baseAlpha = h.alpha ?? 1;
-    traceSmoothHullPath(h.hull);
-    ctx.fillStyle = h.color;
-    ctx.globalAlpha = (0.036 + fMix * 0.068) * baseAlpha;
-    ctx.fill();
-    ctx.strokeStyle = h.color;
-    ctx.lineWidth = (1.1 + fMix * 0.75) * invSqrtK;
-    ctx.globalAlpha = (0.14 + fMix * 0.28) * baseAlpha;
-    ctx.stroke();
-  }
-
-  // Draw visible hull header pills
-  for (let i = 0; i < headerHulls.length; i++) {
-    const h = headerHulls[i];
-    const fMix = h.focusMix ?? 0;
-    const isHoveredHull = state.hoveredClusterKey === h.key;
-    const textAlpha = h._textAlpha;
-    const textW = getCachedLabelWidth(h.label, headerFontSize, 600);
-    const padX = 6.5 * invSqrtK;
-    const padY = 2.6 * invSqrtK;
-    const pillW = textW + padX * 2;
-    const pillH = headerFontSize + padY * 2;
-    const pillX = h.labelX - pillW * 0.5;
-    const pillY = h.minY - pillH - 2 * invSqrtK;
-
-    h.headerBox = {
-      minX: pillX,
-      maxX: pillX + pillW,
-      minY: pillY,
-      maxY: pillY + pillH,
-    };
-
-    ctx.globalAlpha = textAlpha * (0.76 + fMix * 0.22);
-    ctx.fillStyle = isHoveredHull ? "rgba(22, 29, 44, 0.96)" : "rgba(12, 16, 24, 0.88)";
-    drawRoundedPill(pillX, pillY, pillW, pillH, 999);
-    ctx.fill();
-
-    ctx.globalAlpha = textAlpha * (0.35 + fMix * 0.55);
-    ctx.strokeStyle = h.color;
-    ctx.lineWidth = (isHoveredHull ? 1.35 : 0.95) * invSqrtK;
-    ctx.stroke();
-
-    ctx.globalAlpha = Math.min(1, textAlpha * 1.12);
-    ctx.fillStyle = isHoveredHull ? "#ffffff" : h.color;
-    ctx.fillText(h.label, h.labelX, pillY + pillH * 0.52);
-  }
+  drawClusterHullShapes(activeHulls, invSqrtK);
+  drawHullHeaderPills(headerHulls, headerFontSize, invSqrtK);
 }
 
 function hitTestClusterHeader(clientX, clientY, worldPos) {
@@ -2190,42 +2246,7 @@ const featuredNodesScratch = [];
 const restingLabelsScratch = [];
 const activeLabelsScratch = [];
 
-function drawCanvas() {
-  const rect = el.canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const targetW = Math.round(rect.width * dpr);
-  const targetH = Math.round(rect.height * dpr);
-  if (el.canvas.width !== targetW || el.canvas.height !== targetH) {
-    el.canvas.width = targetW;
-    el.canvas.height = targetH;
-  }
-
-  ctx.save();
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, rect.width, rect.height);
-
-  const { x: tx, y: ty, k } = state.cam;
-  ctx.translate(tx, ty);
-  ctx.scale(k, k);
-
-  // World-space viewport frustum bounds with padding
-  const padWorld = 85 / k;
-  const viewMinX = -tx / k - padWorld;
-  const viewMaxX = (rect.width - tx) / k + padWorld;
-  const viewMinY = -ty / k - padWorld;
-  const viewMaxY = (rect.height - ty) / k + padWorld;
-
-  const invSqrtK = 1 / Math.sqrt(k);
-  const arrowLen = Math.min(8.2, Math.max(4.5, 5.8 * invSqrtK));
-  const isDenseSymbols = state.activeTab === "symbols" && state.edges.length > 350;
-  const baseBgAlpha = isDenseSymbols ? 0.24 : 0.34;
-  const bgEdgeAlpha = Math.max(0.06, baseBgAlpha - state.focusMix * (baseBgAlpha - 0.08));
-  const drawBgArrows = !isDenseSymbols
-    ? (state.focusMix < 0.92 && k > 0.22) || k > 0.72
-    : state.focusMix < 0.85 && k > 0.85;
-
-  // 0a. Pre-compute live rendered node radii (_drawR) and outer border radii (_outerR)
-  // so edge curves and arrowheads clip against the exact current-frame node perimeter.
+function refreshNodeRadiiAndEdgeGeometry(invSqrtK, arrowLen, drawBgArrows) {
   for (let i = 0; i < state.nodes.length; i++) {
     const n = state.nodes[i];
     const focusMix = n.focusMix ?? 0;
@@ -2239,8 +2260,6 @@ function drawCanvas() {
     n._outerR = drawR + (0.65 + activeLift * 0.55) * invSqrtK;
   }
 
-  // Recompute base edge control points & clipped geometry only when node positions move
-  // or when zoom changes arrowLen significantly, eliminating per-frame sqrt clipping during pan/hover
   const needClipRefresh =
     state.edgeCacheDirty || Math.abs(arrowLen - state.lastClippedArrowLen) > 0.65;
   if (needClipRefresh) {
@@ -2283,13 +2302,9 @@ function drawCanvas() {
     state.edgeCacheDirty = false;
     state.lastClippedArrowLen = arrowLen;
   }
+}
 
-  // 0b. Subtle world-space dot grid for spatial orientation
-  drawWorldGrid(viewMinX, viewMaxX, viewMinY, viewMaxY, k);
-
-  // 0c. Draw smooth bezier-rounded cluster hulls behind edges and nodes
-  drawClusterHulls(viewMinX, viewMaxX, viewMinY, viewMaxY, k, invSqrtK);
-
+function drawBackgroundAndCollectActiveEdges(viewMinX, viewMaxX, viewMinY, viewMaxY, invSqrtK, arrowLen, bgEdgeAlpha, drawBgArrows) {
   activeEdgesScratch.length = 0;
   bgHeavyEdgesScratch.length = 0;
   bgVisibleEdgesScratch.length = 0;
@@ -2297,7 +2312,6 @@ function drawCanvas() {
   const bgHeavyEdges = bgHeavyEdgesScratch;
   const bgVisibleEdges = bgVisibleEdgesScratch;
 
-  // 1. Batch background curved edges using cached perimeter-clipped coordinates
   ctx.beginPath();
   for (let i = 0; i < state.edges.length; i++) {
     const e = state.edges[i];
@@ -2365,79 +2379,80 @@ function drawCanvas() {
     ctx.fill();
   }
 
-  // 2. Draw per-edge interpolated highlight channels + directional animated flow pulses
-  const strokeEdgeChannel = (e, mix, color, widthBoost, drawFlow) => {
-    if (mix <= 0.01) return;
-    const s = e.sourceNode;
-    const t = e.targetNode;
-    const endAlpha = Math.min(s.renderAlpha ?? 1, t.renderAlpha ?? 1);
-    const alpha = mix * 0.94 * endAlpha;
-    if (alpha <= 0.01) return;
+  return activeEdges;
+}
 
-    const activeArrowLen = arrowLen * (1.02 + mix * 0.14);
-    if (Math.abs((e._clippedArrowLen ?? 0) - activeArrowLen) > 0.15) {
-      computeClippedEdgeGeometry(e, activeArrowLen);
-    }
+function strokeHighlightedEdgeChannel(e, mix, color, widthBoost, drawFlow, arrowLen, invSqrtK) {
+  if (mix <= 0.01) return;
+  const s = e.sourceNode;
+  const t = e.targetNode;
+  const endAlpha = Math.min(s.renderAlpha ?? 1, t.renderAlpha ?? 1);
+  const alpha = mix * 0.94 * endAlpha;
+  if (alpha <= 0.01) return;
 
-    ctx.globalAlpha = alpha;
-    ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    ctx.lineWidth =
-      Math.min(3.4, (1.22 + Math.log2((e.weight ?? 1) + 1) * 0.42) * (0.88 + mix * 0.24) * widthBoost) * invSqrtK;
+  const activeArrowLen = arrowLen * (1.02 + mix * 0.14);
+  if (Math.abs((e._clippedArrowLen ?? 0) - activeArrowLen) > 0.15) {
+    computeClippedEdgeGeometry(e, activeArrowLen);
+  }
 
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth =
+    Math.min(3.4, (1.22 + Math.log2((e.weight ?? 1) + 1) * 0.42) * (0.88 + mix * 0.24) * widthBoost) * invSqrtK;
+
+  ctx.beginPath();
+  ctx.moveTo(e._sx, e._sy);
+  ctx.quadraticCurveTo(e._scx, e._scy, e._bx, e._by);
+  ctx.stroke();
+
+  if (e._hasArrow) {
     ctx.beginPath();
-    ctx.moveTo(e._sx, e._sy);
-    ctx.quadraticCurveTo(e._scx, e._scy, e._bx, e._by);
-    ctx.stroke();
+    appendCurveArrowhead(e, activeArrowLen);
+    ctx.fill();
 
-    if (e._hasArrow) {
-      ctx.beginPath();
-      appendCurveArrowhead(e, activeArrowLen);
-      ctx.fill();
+    if (drawFlow && mix > 0.15 && state.flowIntensity > 0.01) {
+      const pulseCount = e._dist > 110 ? 2 : 1;
+      const dotR = Math.min(3.4, Math.max(1.8, 2.35 * invSqrtK));
+      const uSpan = Math.max(0.05, e._uTip - e._uStart);
+      for (let p = 0; p < pulseCount; p++) {
+        const rawT = (state.flowPhase + p * (1 / pulseCount)) % 1;
+        const u = e._uStart + rawT * uSpan;
+        const invU = 1 - u;
+        const px = invU * invU * s.x + 2 * invU * u * e._cx + u * u * t.x;
+        const py = invU * invU * s.y + 2 * invU * u * e._cy + u * u * t.y;
+        const edgeFade = Math.sin(rawT * Math.PI) * state.flowIntensity;
 
-      // Animated directional flow particles traveling from caller perimeter -> callee arrowhead
-      if (drawFlow && mix > 0.15 && state.flowIntensity > 0.01) {
-        const pulseCount = e._dist > 110 ? 2 : 1;
-        const dotR = Math.min(3.4, Math.max(1.8, 2.35 * invSqrtK));
-        const uSpan = Math.max(0.05, e._uTip - e._uStart);
-        for (let p = 0; p < pulseCount; p++) {
-          const rawT = (state.flowPhase + p * (1 / pulseCount)) % 1;
-          const u = e._uStart + rawT * uSpan;
-          const invU = 1 - u;
-          const px = invU * invU * s.x + 2 * invU * u * e._cx + u * u * t.x;
-          const py = invU * invU * s.y + 2 * invU * u * e._cy + u * u * t.y;
-          const edgeFade = Math.sin(rawT * Math.PI) * state.flowIntensity;
+        ctx.globalAlpha = alpha * edgeFade * 0.36;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(px, py, dotR * 2.1, 0, Math.PI * 2);
+        ctx.fill();
 
-          ctx.globalAlpha = alpha * edgeFade * 0.36;
-          ctx.fillStyle = color;
-          ctx.beginPath();
-          ctx.arc(px, py, dotR * 2.1, 0, Math.PI * 2);
-          ctx.fill();
-
-          ctx.globalAlpha = alpha * edgeFade * 0.95;
-          ctx.fillStyle = "#ffffff";
-          ctx.beginPath();
-          ctx.arc(px, py, dotR * 0.85, 0, Math.PI * 2);
-          ctx.fill();
-        }
+        ctx.globalAlpha = alpha * edgeFade * 0.95;
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(px, py, dotR * 0.85, 0, Math.PI * 2);
+        ctx.fill();
       }
     }
-  };
+  }
+}
 
+function drawActiveEdgesAndSelectionRipples(activeEdges, arrowLen, invSqrtK) {
   const flowActive = state.flowIntensity > 0.01 && (Boolean(state.selectedId) || state.pathNodeIds.size > 0);
   for (let i = 0; i < activeEdges.length; i++) {
     const e = activeEdges[i];
     if ((e.hoverMix ?? 0) > 0.01) {
       const hoverColor = e.source === state.hoveredId ? "#fbbf24" : "#7dd3fc";
-      strokeEdgeChannel(e, e.hoverMix, hoverColor, 1.0, false);
+      strokeHighlightedEdgeChannel(e, e.hoverMix, hoverColor, 1.0, false, arrowLen, invSqrtK);
     }
-    if ((e.inMix ?? 0) > 0.01) strokeEdgeChannel(e, e.inMix, "#38bdf8", 1.05, flowActive);
-    if ((e.outMix ?? 0) > 0.01) strokeEdgeChannel(e, e.outMix, "#f59e0b", 1.05, flowActive);
-    if ((e.cycleMix ?? 0) > 0.01) strokeEdgeChannel(e, e.cycleMix, "#f43f5e", 1.2, false);
-    if ((e.pathMix ?? 0) > 0.01) strokeEdgeChannel(e, e.pathMix, "#34d399", 1.35, flowActive);
+    if ((e.inMix ?? 0) > 0.01) strokeHighlightedEdgeChannel(e, e.inMix, "#38bdf8", 1.05, flowActive, arrowLen, invSqrtK);
+    if ((e.outMix ?? 0) > 0.01) strokeHighlightedEdgeChannel(e, e.outMix, "#f59e0b", 1.05, flowActive, arrowLen, invSqrtK);
+    if ((e.cycleMix ?? 0) > 0.01) strokeHighlightedEdgeChannel(e, e.cycleMix, "#f43f5e", 1.2, false, arrowLen, invSqrtK);
+    if ((e.pathMix ?? 0) > 0.01) strokeHighlightedEdgeChannel(e, e.pathMix, "#34d399", 1.35, flowActive, arrowLen, invSqrtK);
   }
 
-  // 2b. Expanding selection ripple rings behind selected node
   if (state.selectionRipples.length > 0) {
     const now = performance.now();
     for (let i = 0; i < state.selectionRipples.length; i++) {
@@ -2470,8 +2485,9 @@ function drawCanvas() {
       }
     }
   }
+}
 
-  // 3. Draw nodes: color-batch resting background nodes in ~10 draw calls, then draw featured nodes on top
+function partitionVisibleNodesAndLabels(viewMinX, viewMaxX, viewMinY, viewMaxY) {
   for (const bucket of restingNodeBuckets.values()) {
     bucket.length = 0;
   }
@@ -2530,7 +2546,10 @@ function drawCanvas() {
     }
   }
 
-  // 3a. Batched resting node bodies + dark borders by color
+  return { featuredNodes, restingLabels, activeLabels };
+}
+
+function drawBatchedRestingNodes(isDenseSymbols, k, invSqrtK) {
   ctx.lineWidth = 1.15 * invSqrtK;
   ctx.strokeStyle = "#0a0d13";
   const drawRestingSpecular = !isDenseSymbols && k > 0.52;
@@ -2566,8 +2585,9 @@ function drawCanvas() {
       ctx.fill();
     }
   }
+}
 
-  // 3b. Featured / interactive / hub nodes with full multi-ring halos & specular highlights
+function drawFeaturedNodes(featuredNodes, k, invSqrtK) {
   for (let i = 0; i < featuredNodes.length; i++) {
     const n = featuredNodes[i];
     const bodyAlpha = n.renderAlpha ?? 1;
@@ -2586,6 +2606,21 @@ function drawCanvas() {
       ctx.lineWidth = 1.05 * invSqrtK;
       ctx.beginPath();
       ctx.arc(n.x, n.y, drawR + 3.2 * invSqrtK, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    const fileHealth = n.path ? state.health?.by_file?.[n.path] : null;
+    if (fileHealth && fileHealth.count > 0 && bodyAlpha > 0.3) {
+      ctx.globalAlpha = bodyAlpha * 0.78;
+      ctx.strokeStyle =
+        fileHealth.max_severity === "high"
+          ? "#ef4444"
+          : fileHealth.max_severity === "medium"
+            ? "#f59e0b"
+            : "#38bdf8";
+      ctx.lineWidth = 1.35 * invSqrtK;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, drawR + 2.2 * invSqrtK, 0, Math.PI * 2);
       ctx.stroke();
     }
 
@@ -2644,8 +2679,9 @@ function drawCanvas() {
       ctx.stroke();
     }
   }
+}
 
-  // 4. Draw labels: single-pass fillText for resting labels (no slow CPU strokeText), pill backdrops for active/hub labels
+function drawNodeLabels(restingLabels, activeLabels, k, invSqrtK) {
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   const baseFontSize = Math.max(9.5, Math.min(12.5, 10.8 / Math.pow(k, 0.35)));
@@ -2699,6 +2735,66 @@ function drawCanvas() {
     ctx.fillStyle = pillMix > 0.35 ? "#ffffff" : "#f8fafc";
     ctx.fillText(n.label, n.x, labelY);
   }
+}
+
+function drawCanvas() {
+  const rect = el.canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const targetW = Math.round(rect.width * dpr);
+  const targetH = Math.round(rect.height * dpr);
+  if (el.canvas.width !== targetW || el.canvas.height !== targetH) {
+    el.canvas.width = targetW;
+    el.canvas.height = targetH;
+  }
+
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  const { x: tx, y: ty, k } = state.cam;
+  ctx.translate(tx, ty);
+  ctx.scale(k, k);
+
+  const padWorld = 85 / k;
+  const viewMinX = -tx / k - padWorld;
+  const viewMaxX = (rect.width - tx) / k + padWorld;
+  const viewMinY = -ty / k - padWorld;
+  const viewMaxY = (rect.height - ty) / k + padWorld;
+
+  const invSqrtK = 1 / Math.sqrt(k);
+  const arrowLen = Math.min(8.2, Math.max(4.5, 5.8 * invSqrtK));
+  const isDenseSymbols = state.activeTab === "symbols" && state.edges.length > 350;
+  const baseBgAlpha = isDenseSymbols ? 0.24 : 0.34;
+  const bgEdgeAlpha = Math.max(0.06, baseBgAlpha - state.focusMix * (baseBgAlpha - 0.08));
+  const drawBgArrows = !isDenseSymbols
+    ? (state.focusMix < 0.92 && k > 0.22) || k > 0.72
+    : state.focusMix < 0.85 && k > 0.85;
+
+  refreshNodeRadiiAndEdgeGeometry(invSqrtK, arrowLen, drawBgArrows);
+  drawWorldGrid(viewMinX, viewMaxX, viewMinY, viewMaxY, k);
+  drawClusterHulls(viewMinX, viewMaxX, viewMinY, viewMaxY, k, invSqrtK);
+
+  const activeEdges = drawBackgroundAndCollectActiveEdges(
+    viewMinX,
+    viewMaxX,
+    viewMinY,
+    viewMaxY,
+    invSqrtK,
+    arrowLen,
+    bgEdgeAlpha,
+    drawBgArrows
+  );
+  drawActiveEdgesAndSelectionRipples(activeEdges, arrowLen, invSqrtK);
+
+  const { featuredNodes, restingLabels, activeLabels } = partitionVisibleNodesAndLabels(
+    viewMinX,
+    viewMaxX,
+    viewMinY,
+    viewMaxY
+  );
+  drawBatchedRestingNodes(isDenseSymbols, k, invSqrtK);
+  drawFeaturedNodes(featuredNodes, k, invSqrtK);
+  drawNodeLabels(restingLabels, activeLabels, k, invSqrtK);
 
   ctx.restore();
 }
@@ -2735,6 +2831,65 @@ function toggleOutlineSidebar(forceOpen) {
   requestDraw();
 }
 
+function buildOutlineDirHtml(dir, entries, hasSearch) {
+  const html = [];
+  const dirCollapsed = !hasSearch && state.collapsedDirs.has(dir);
+  const dirColor = colorForDir(dir);
+  html.push(`<div class="outline-dir${dirCollapsed ? " collapsed" : ""}" data-dir-group="${escapeHtml(dir)}">`);
+  html.push(
+    `<div class="outline-dir-header" data-toggle-dir="${escapeHtml(dir)}">` +
+      `<div class="outline-dir-left">` +
+        `<span class="outline-chevron">▾</span>` +
+        `<span class="outline-dir-dot" style="background:${dirColor}"></span>` +
+        `<span class="outline-dir-name">${escapeHtml(dir)}/</span>` +
+      `</div>` +
+      `<div class="outline-dir-meta">` +
+        `<button type="button" class="outline-focus-cluster-btn" data-focus-cluster="${escapeHtml(dir)}" title="Zoom to directory cluster">Focus</button>` +
+        `<span>${entries.length}</span>` +
+      `</div>` +
+    `</div>`
+  );
+  html.push(`<div class="outline-dir-body">`);
+  for (const { file, syms } of entries) {
+    const fIn = (state.wiringIn.get(file.id) ?? []).length;
+    const fOut = (state.wiringOut.get(file.id) ?? []).length;
+    const fileSel = state.selectedId === file.id ? " selected" : "";
+    const fileCollapsed = !hasSearch && state.collapsedFiles.has(file.id);
+    const shortName = file.path.startsWith(dir + "/") ? file.path.slice(dir.length + 1) : file.path;
+    html.push(`<div class="outline-file${fileCollapsed ? " collapsed" : ""}" data-file-id="${escapeHtml(file.id)}">`);
+    html.push(
+      `<div class="outline-file-row${fileSel}" data-node-id="${escapeHtml(file.id)}" data-file-path="${escapeHtml(file.path)}">` +
+        `<div class="outline-file-left">` +
+          (syms.length > 0
+            ? `<span class="outline-file-chevron" data-toggle-file="${escapeHtml(file.id)}" title="Expand/collapse symbols">▾</span>`
+            : `<span class="outline-file-chevron" style="opacity:0.25">·</span>`) +
+          `<span class="outline-file-name" title="${escapeHtml(file.path)}">${escapeHtml(shortName)}</span>` +
+        `</div>` +
+        `<span class="outline-sym-meta">${syms.length}s · ←${fIn} →${fOut}</span>` +
+      `</div>`
+    );
+    if (syms.length > 0) {
+      html.push(`<div class="outline-symbols">`);
+      for (const s of syms) {
+        const sIn = (state.wiringIn.get(s.id) ?? []).length;
+        const sOut = (state.wiringOut.get(s.id) ?? []).length;
+        const symSel = state.selectedId === s.id ? " selected" : "";
+        html.push(
+          `<div class="outline-sym-row${symSel}" data-node-id="${escapeHtml(s.id)}" title="${escapeHtml(s.signature || s.name)}">` +
+            `<span class="outline-sym-badge" style="color:${KIND_COLORS[s.kind] ?? "#93a8ff"}">${escapeHtml(s.kind.slice(0, 4))}</span>` +
+            `<span class="outline-sym-name">${escapeHtml(s.name)}</span>` +
+            `<span class="outline-sym-meta">←${sIn} →${sOut}</span>` +
+          `</div>`
+        );
+      }
+      html.push(`</div>`);
+    }
+    html.push(`</div>`);
+  }
+  html.push(`</div></div>`);
+  return html.join("");
+}
+
 function renderOutlineView(preserveScroll = true) {
   if (!el.outlineList) return;
   const prevScrollTop = el.outlineList.scrollTop;
@@ -2750,7 +2905,6 @@ function renderOutlineView(preserveScroll = true) {
     .filter((n) => n.kind === "file")
     .sort((a, b) => a.path.localeCompare(b.path));
 
-  // Initialize default collapsed file state when repository has many files so tree starts scannable
   if (!state.filesCollapseInitialized && files.length > 8) {
     state.filesCollapseInitialized = true;
     for (const f of files) {
@@ -2787,60 +2941,7 @@ function renderOutlineView(preserveScroll = true) {
   const hasSearch = Boolean(state.search);
   const html = [];
   for (const [dir, entries] of byDir) {
-    const dirCollapsed = !hasSearch && state.collapsedDirs.has(dir);
-    const dirColor = colorForDir(dir);
-    html.push(`<div class="outline-dir${dirCollapsed ? " collapsed" : ""}" data-dir-group="${escapeHtml(dir)}">`);
-    html.push(
-      `<div class="outline-dir-header" data-toggle-dir="${escapeHtml(dir)}">` +
-        `<div class="outline-dir-left">` +
-          `<span class="outline-chevron">▾</span>` +
-          `<span class="outline-dir-dot" style="background:${dirColor}"></span>` +
-          `<span class="outline-dir-name">${escapeHtml(dir)}/</span>` +
-        `</div>` +
-        `<div class="outline-dir-meta">` +
-          `<button type="button" class="outline-focus-cluster-btn" data-focus-cluster="${escapeHtml(dir)}" title="Zoom to directory cluster">Focus</button>` +
-          `<span>${entries.length}</span>` +
-        `</div>` +
-      `</div>`
-    );
-    html.push(`<div class="outline-dir-body">`);
-    for (const { file, syms } of entries) {
-      const fIn = (state.wiringIn.get(file.id) ?? []).length;
-      const fOut = (state.wiringOut.get(file.id) ?? []).length;
-      const fileSel = state.selectedId === file.id ? " selected" : "";
-      const fileCollapsed = !hasSearch && state.collapsedFiles.has(file.id);
-      const shortName = file.path.startsWith(dir + "/") ? file.path.slice(dir.length + 1) : file.path;
-      html.push(`<div class="outline-file${fileCollapsed ? " collapsed" : ""}" data-file-id="${escapeHtml(file.id)}">`);
-      html.push(
-        `<div class="outline-file-row${fileSel}" data-node-id="${escapeHtml(file.id)}" data-file-path="${escapeHtml(file.path)}">` +
-          `<div class="outline-file-left">` +
-            (syms.length > 0
-              ? `<span class="outline-file-chevron" data-toggle-file="${escapeHtml(file.id)}" title="Expand/collapse symbols">▾</span>`
-              : `<span class="outline-file-chevron" style="opacity:0.25">·</span>`) +
-            `<span class="outline-file-name" title="${escapeHtml(file.path)}">${escapeHtml(shortName)}</span>` +
-          `</div>` +
-          `<span class="outline-sym-meta">${syms.length}s · ←${fIn} →${fOut}</span>` +
-        `</div>`
-      );
-      if (syms.length > 0) {
-        html.push(`<div class="outline-symbols">`);
-        for (const s of syms) {
-          const sIn = (state.wiringIn.get(s.id) ?? []).length;
-          const sOut = (state.wiringOut.get(s.id) ?? []).length;
-          const symSel = state.selectedId === s.id ? " selected" : "";
-          html.push(
-            `<div class="outline-sym-row${symSel}" data-node-id="${escapeHtml(s.id)}" title="${escapeHtml(s.signature || s.name)}">` +
-              `<span class="outline-sym-badge" style="color:${KIND_COLORS[s.kind] ?? "#93a8ff"}">${escapeHtml(s.kind.slice(0, 4))}</span>` +
-              `<span class="outline-sym-name">${escapeHtml(s.name)}</span>` +
-              `<span class="outline-sym-meta">←${sIn} →${sOut}</span>` +
-            `</div>`
-          );
-        }
-        html.push(`</div>`);
-      }
-      html.push(`</div>`);
-    }
-    html.push(`</div></div>`);
+    html.push(buildOutlineDirHtml(dir, entries, hasSearch));
   }
   el.outlineList.innerHTML = html.join("");
   if (preserveScroll) {
@@ -2963,19 +3064,7 @@ function runWarmLayout() {
   snapshotLayoutToCache();
 }
 
-function rebuildActiveView(resetLayout = true, forceRelayout = false) {
-  clearShortestPath();
-  clearTimeout(state.hoverTimer);
-  state.hoveredId = null;
-  state.activeHoverId = null;
-  state.hoveredClusterKey = null;
-  cachedFocusKey = "";
-  cachedFocusResult = null;
-
-  el.canvasStage.classList.remove("hidden");
-  el.canvasHud?.classList.remove("hidden");
-
-  // Snapshot outgoing node positions and file/directory centroids for smooth view morphing
+function snapshotPreviousNodePositions() {
   const prevPosById = new Map();
   const prevFileAcc = new Map();
   const prevDirAcc = new Map();
@@ -2998,6 +3087,132 @@ function rebuildActiveView(resetLayout = true, forceRelayout = false) {
       prevDirAcc.set(old.dirGroup, da);
     }
   }
+  return { prevPosById, prevFileAcc, prevDirAcc };
+}
+
+function restoreOrComputeLayout(forceRelayout) {
+  const cacheKey = getLayoutCacheKey();
+  const cachedLayout = !forceRelayout ? state.layoutCache.get(cacheKey) : null;
+  if (cachedLayout && cachedLayout.size === state.nodes.length) {
+    for (let i = 0; i < state.nodes.length; i++) {
+      const n = state.nodes[i];
+      const saved = cachedLayout.get(n.id);
+      if (saved) {
+        n.x = saved.x;
+        n.y = saved.y;
+        n.anchorX = saved.anchorX;
+        n.anchorY = saved.anchorY;
+        n.dirAnchorX = saved.dirAnchorX;
+        n.dirAnchorY = saved.dirAnchorY;
+        n.homeOffsetX = saved.homeOffsetX;
+        n.homeOffsetY = saved.homeOffsetY;
+        n.clusterRadius = saved.clusterRadius;
+        n.dirRadius = saved.dirRadius;
+        n.vx = 0;
+        n.vy = 0;
+      }
+    }
+    state.alpha = 0;
+    rebuildPhysicsClusters();
+  } else {
+    runWarmLayout();
+  }
+}
+
+function seedAnimatedNodeMorphPositions(prevPosById, prevFileAcc, prevDirAcc) {
+  rebuildClusterHulls();
+  for (let i = 0; i < state.nodes.length; i++) {
+    const n = state.nodes[i];
+    n.targetX = n.x;
+    n.targetY = n.y;
+    const same = prevPosById.get(n.id);
+    const fAcc = n.fileGroup ? prevFileAcc.get(n.fileGroup) : null;
+    const dAcc = n.dirGroup ? prevDirAcc.get(n.dirGroup) : null;
+
+    if (same) {
+      n.x = same.x;
+      n.y = same.y;
+      n.renderAlpha = same.renderAlpha ?? 0.9;
+      n.labelAlpha = same.labelAlpha ?? 0;
+      n.focusMix = same.focusMix ?? 0;
+    } else if (fAcc && fAcc.count > 0) {
+      const fx = fAcc.sx / fAcc.count;
+      const fy = fAcc.sy / fAcc.count;
+      n.x = fx + (n.targetX - fx) * 0.14;
+      n.y = fy + (n.targetY - fy) * 0.14;
+      n.renderAlpha = 0.08;
+      n.labelAlpha = 0;
+      n.focusMix = 0;
+    } else if (dAcc && dAcc.count > 0) {
+      const dx = dAcc.sx / dAcc.count;
+      const dy = dAcc.sy / dAcc.count;
+      n.x = dx * 0.65 + n.targetX * 0.35;
+      n.y = dy * 0.65 + n.targetY * 0.35;
+      n.renderAlpha = 0.04;
+      n.labelAlpha = 0;
+      n.focusMix = 0;
+    } else {
+      n.x = n.targetX * 0.86;
+      n.y = n.targetY * 0.86;
+      n.renderAlpha = 0.0;
+      n.labelAlpha = 0;
+      n.focusMix = 0;
+    }
+  }
+  updateClusterHullsFast();
+  state.hullsDirty = false;
+  state.isMorphingPositions = true;
+  populateSpatialGrid();
+  fitToScreen(true);
+  requestDraw(false);
+}
+
+function preservePositionsOnLiveReload(prevPosById) {
+  let needsLayout = false;
+  for (const n of state.nodes) {
+    const prev = prevPosById.get(n.id);
+    if (prev) {
+      n.x = prev.x;
+      n.y = prev.y;
+      n.anchorX = prev.anchorX ?? prev.x;
+      n.anchorY = prev.anchorY ?? prev.y;
+      n.homeOffsetX = prev.homeOffsetX ?? 0;
+      n.homeOffsetY = prev.homeOffsetY ?? 0;
+      n.clusterRadius = prev.clusterRadius ?? 32;
+      n.dirRadius = prev.dirRadius ?? 48;
+      n.vx = 0;
+      n.vy = 0;
+      n.renderAlpha = prev.renderAlpha;
+      n.labelAlpha = prev.labelAlpha;
+      n.focusMix = prev.focusMix;
+    } else {
+      needsLayout = true;
+    }
+  }
+  if (needsLayout) {
+    runWarmLayout();
+  } else {
+    rebuildPhysicsClusters();
+  }
+  state.hullsDirty = true;
+  populateSpatialGrid();
+  syncNodeVisualTargets(false);
+  requestDraw(false);
+}
+
+function rebuildActiveView(resetLayout = true, forceRelayout = false) {
+  clearShortestPath();
+  clearTimeout(state.hoverTimer);
+  state.hoveredId = null;
+  state.activeHoverId = null;
+  state.hoveredClusterKey = null;
+  cachedFocusKey = "";
+  cachedFocusResult = null;
+
+  el.canvasStage.classList.remove("hidden");
+  el.canvasHud?.classList.remove("hidden");
+
+  const { prevPosById, prevFileAcc, prevDirAcc } = snapshotPreviousNodePositions();
 
   const built =
     state.activeTab === "modules"
@@ -3015,7 +3230,6 @@ function rebuildActiveView(resetLayout = true, forceRelayout = false) {
 
   assignLabelZoomThresholds(state.nodes);
 
-  // Pre-resolve edge node references once per view build
   for (const e of built.edges) {
     e.sourceNode = state.nodeById.get(e.source) ?? null;
     e.targetNode = state.nodeById.get(e.target) ?? null;
@@ -3047,82 +3261,11 @@ function rebuildActiveView(resetLayout = true, forceRelayout = false) {
   renderLegend();
 
   if (resetLayout) {
-    const cacheKey = getLayoutCacheKey();
-    const cachedLayout = !forceRelayout ? state.layoutCache.get(cacheKey) : null;
-    if (cachedLayout && cachedLayout.size === state.nodes.length) {
-      for (let i = 0; i < state.nodes.length; i++) {
-        const n = state.nodes[i];
-        const saved = cachedLayout.get(n.id);
-        if (saved) {
-          n.x = saved.x;
-          n.y = saved.y;
-          n.anchorX = saved.anchorX;
-          n.anchorY = saved.anchorY;
-          n.dirAnchorX = saved.dirAnchorX;
-          n.dirAnchorY = saved.dirAnchorY;
-          n.homeOffsetX = saved.homeOffsetX;
-          n.homeOffsetY = saved.homeOffsetY;
-          n.clusterRadius = saved.clusterRadius;
-          n.dirRadius = saved.dirRadius;
-          n.vx = 0;
-          n.vy = 0;
-        }
-      }
-      state.alpha = 0;
-      rebuildPhysicsClusters();
-    } else {
-      runWarmLayout();
-    }
-
+    restoreOrComputeLayout(forceRelayout);
     const shouldAnimate = state.hasInitialLoad && prevPosById.size > 0;
     state.hasInitialLoad = true;
-
     if (shouldAnimate) {
-      rebuildClusterHulls();
-      for (let i = 0; i < state.nodes.length; i++) {
-        const n = state.nodes[i];
-        n.targetX = n.x;
-        n.targetY = n.y;
-        const same = prevPosById.get(n.id);
-        const fAcc = n.fileGroup ? prevFileAcc.get(n.fileGroup) : null;
-        const dAcc = n.dirGroup ? prevDirAcc.get(n.dirGroup) : null;
-
-        if (same) {
-          n.x = same.x;
-          n.y = same.y;
-          n.renderAlpha = same.renderAlpha ?? 0.9;
-          n.labelAlpha = same.labelAlpha ?? 0;
-          n.focusMix = same.focusMix ?? 0;
-        } else if (fAcc && fAcc.count > 0) {
-          const fx = fAcc.sx / fAcc.count;
-          const fy = fAcc.sy / fAcc.count;
-          n.x = fx + (n.targetX - fx) * 0.14;
-          n.y = fy + (n.targetY - fy) * 0.14;
-          n.renderAlpha = 0.08;
-          n.labelAlpha = 0;
-          n.focusMix = 0;
-        } else if (dAcc && dAcc.count > 0) {
-          const dx = dAcc.sx / dAcc.count;
-          const dy = dAcc.sy / dAcc.count;
-          n.x = dx * 0.65 + n.targetX * 0.35;
-          n.y = dy * 0.65 + n.targetY * 0.35;
-          n.renderAlpha = 0.04;
-          n.labelAlpha = 0;
-          n.focusMix = 0;
-        } else {
-          n.x = n.targetX * 0.86;
-          n.y = n.targetY * 0.86;
-          n.renderAlpha = 0.0;
-          n.labelAlpha = 0;
-          n.focusMix = 0;
-        }
-      }
-      updateClusterHullsFast();
-      state.hullsDirty = false;
-      state.isMorphingPositions = true;
-      populateSpatialGrid();
-      fitToScreen(true);
-      requestDraw(false);
+      seedAnimatedNodeMorphPositions(prevPosById, prevFileAcc, prevDirAcc);
     } else {
       state.hullsDirty = true;
       populateSpatialGrid();
@@ -3131,37 +3274,7 @@ function rebuildActiveView(resetLayout = true, forceRelayout = false) {
       requestDraw(false);
     }
   } else {
-    // Preserve existing positions on live reload when possible
-    let needsLayout = false;
-    for (const n of state.nodes) {
-      const prev = prevPosById.get(n.id);
-      if (prev) {
-        n.x = prev.x;
-        n.y = prev.y;
-        n.anchorX = prev.anchorX ?? prev.x;
-        n.anchorY = prev.anchorY ?? prev.y;
-        n.homeOffsetX = prev.homeOffsetX ?? 0;
-        n.homeOffsetY = prev.homeOffsetY ?? 0;
-        n.clusterRadius = prev.clusterRadius ?? 32;
-        n.dirRadius = prev.dirRadius ?? 48;
-        n.vx = 0;
-        n.vy = 0;
-        n.renderAlpha = prev.renderAlpha;
-        n.labelAlpha = prev.labelAlpha;
-        n.focusMix = prev.focusMix;
-      } else {
-        needsLayout = true;
-      }
-    }
-    if (needsLayout) {
-      runWarmLayout();
-    } else {
-      rebuildPhysicsClusters();
-    }
-    state.hullsDirty = true;
-    populateSpatialGrid();
-    syncNodeVisualTargets(false);
-    requestDraw(false);
+    preservePositionsOnLiveReload(prevPosById);
   }
 }
 
@@ -3364,6 +3477,86 @@ function renderContextEdgeSection(title, edges, endpointKey) {
   return `<div><div class="insp-section-title">${title} (${edges.length})</div><div class="insp-edge-list">${items}</div></div>`;
 }
 
+function buildWiringInspectorSections(wNode) {
+  const sections = [];
+  const fileHealth = wNode.path ? state.health?.by_file?.[wNode.path] : null;
+  if (fileHealth && fileHealth.count > 0) {
+    const hItems = (fileHealth.issues ?? [])
+      .map(
+        (iss) =>
+          `<div class="insp-edge-item">` +
+            `<div class="insp-edge-top"><span class="insp-edge-name">${escapeHtml(iss.detector)}</span><span class="insp-edge-rel">${escapeHtml(iss.tier)} · ${escapeHtml(iss.severity)}</span></div>` +
+            `<div class="insp-edge-loc">${escapeHtml(iss.span ?? "L1")} · ${escapeHtml(iss.summary)}</div>` +
+          `</div>`
+      )
+      .join("");
+    sections.push(
+      `<div><div class="insp-section-title">Health Findings (${fileHealth.count})</div><div class="insp-edge-list">${hItems}</div></div>`
+    );
+  }
+  const targetIds = new Set([wNode.id]);
+  if (wNode.kind === "file") {
+    for (const s of state.fileSymbols.get(wNode.path) ?? []) targetIds.add(s.id);
+  }
+
+  const inEdges = [];
+  const outEdges = [];
+  for (const tid of targetIds) {
+    for (const e of state.wiringIn.get(tid) ?? []) {
+      if (!targetIds.has(e.source)) inEdges.push(e);
+    }
+    for (const e of state.wiringOut.get(tid) ?? []) {
+      if (!targetIds.has(e.target)) outEdges.push(e);
+    }
+  }
+
+  sections.push(renderEdgeSection("← Incoming (Callers / Dependents)", inEdges, "source"));
+  sections.push(renderEdgeSection("→ Outgoing (Callees / Dependencies)", outEdges, "target"));
+
+  if (wNode.kind === "file") {
+    const syms = state.fileSymbols.get(wNode.path) ?? [];
+    if (syms.length > 0) {
+      const items = syms
+        .map(
+          (s) =>
+            `<div class="insp-edge-item" data-jump-id="${escapeHtml(s.id)}">` +
+              `<div class="insp-edge-top"><span class="insp-edge-name">${escapeHtml(s.name)}</span><span class="insp-edge-rel">${escapeHtml(s.kind)}</span></div>` +
+              `<div class="insp-edge-loc">${escapeHtml(s.span)}${s.signature ? " · " + escapeHtml(s.signature.slice(0, 60)) : ""}</div>` +
+            `</div>`
+        )
+        .join("");
+      sections.push(`<div><div class="insp-section-title">Symbols in File (${syms.length})</div><div class="insp-edge-list">${items}</div></div>`);
+    }
+  }
+  return sections;
+}
+
+function buildContextInspectorSections(cNode, id) {
+  const sections = [];
+  if (cNode.evidence?.length) {
+    sections.push(renderEvidenceSection(cNode.evidence));
+  }
+  if (cNode.owners?.length) {
+    sections.push(renderOwnersSection(cNode.owners));
+  }
+  const inEdges = (state.contextGraph?.edges ?? []).filter((e) => e.target === id);
+  const outEdges = (state.contextGraph?.edges ?? []).filter((e) => e.source === id);
+  if (cNode.sources?.length) {
+    const srcItems = cNode.sources
+      .map((s) => {
+        const text = typeof s === "string" ? s : s.path;
+        const filePart = String(text ?? "").split(" · ")[0];
+        const jumpAttr = state.wiringById.has(filePart) ? ` data-jump-id="${escapeHtml(filePart)}"` : "";
+        return `<div class="insp-edge-item"${jumpAttr}><div class="insp-edge-loc">${escapeHtml(text)}</div></div>`;
+      })
+      .join("");
+    sections.push(`<div><div class="insp-section-title">Sources (${cNode.sources.length})</div><div class="insp-edge-list">${srcItems}</div></div>`);
+  }
+  if (inEdges.length) sections.push(renderContextEdgeSection("← Incoming", inEdges, "source"));
+  if (outEdges.length) sections.push(renderContextEdgeSection("→ Outgoing", outEdges, "target"));
+  return sections;
+}
+
 function openInspector(id, pushHistory = true, scrollOutline = true) {
   const selectionChanged = state.selectedId !== id;
   if (selectionChanged) {
@@ -3427,66 +3620,11 @@ function openInspector(id, pushHistory = true, scrollOutline = true) {
     el.inspSourceBox?.classList.add("hidden");
   }
 
-  const sections = [];
-
-  if (wNode) {
-    const targetIds = new Set([wNode.id]);
-    if (wNode.kind === "file") {
-      for (const s of state.fileSymbols.get(wNode.path) ?? []) targetIds.add(s.id);
-    }
-
-    const inEdges = [];
-    const outEdges = [];
-    for (const tid of targetIds) {
-      for (const e of state.wiringIn.get(tid) ?? []) {
-        if (!targetIds.has(e.source)) inEdges.push(e);
-      }
-      for (const e of state.wiringOut.get(tid) ?? []) {
-        if (!targetIds.has(e.target)) outEdges.push(e);
-      }
-    }
-
-    sections.push(renderEdgeSection("← Incoming (Callers / Dependents)", inEdges, "source"));
-    sections.push(renderEdgeSection("→ Outgoing (Callees / Dependencies)", outEdges, "target"));
-
-    if (wNode.kind === "file") {
-      const syms = state.fileSymbols.get(wNode.path) ?? [];
-      if (syms.length > 0) {
-        const items = syms
-          .map(
-            (s) =>
-              `<div class="insp-edge-item" data-jump-id="${escapeHtml(s.id)}">` +
-                `<div class="insp-edge-top"><span class="insp-edge-name">${escapeHtml(s.name)}</span><span class="insp-edge-rel">${escapeHtml(s.kind)}</span></div>` +
-                `<div class="insp-edge-loc">${escapeHtml(s.span)}${s.signature ? " · " + escapeHtml(s.signature.slice(0, 60)) : ""}</div>` +
-              `</div>`
-          )
-          .join("");
-        sections.push(`<div><div class="insp-section-title">Symbols in File (${syms.length})</div><div class="insp-edge-list">${items}</div></div>`);
-      }
-    }
-  } else if (cNode) {
-    if (cNode.evidence?.length) {
-      sections.push(renderEvidenceSection(cNode.evidence));
-    }
-    if (cNode.owners?.length) {
-      sections.push(renderOwnersSection(cNode.owners));
-    }
-    const inEdges = (state.contextGraph?.edges ?? []).filter((e) => e.target === id);
-    const outEdges = (state.contextGraph?.edges ?? []).filter((e) => e.source === id);
-    if (cNode.sources?.length) {
-      const srcItems = cNode.sources
-        .map((s) => {
-          const text = typeof s === "string" ? s : s.path;
-          const filePart = String(text ?? "").split(" · ")[0];
-          const jumpAttr = state.wiringById.has(filePart) ? ` data-jump-id="${escapeHtml(filePart)}"` : "";
-          return `<div class="insp-edge-item"${jumpAttr}><div class="insp-edge-loc">${escapeHtml(text)}</div></div>`;
-        })
-        .join("");
-      sections.push(`<div><div class="insp-section-title">Sources (${cNode.sources.length})</div><div class="insp-edge-list">${srcItems}</div></div>`);
-    }
-    if (inEdges.length) sections.push(renderContextEdgeSection("← Incoming", inEdges, "source"));
-    if (outEdges.length) sections.push(renderContextEdgeSection("→ Outgoing", outEdges, "target"));
-  }
+  const sections = wNode
+    ? buildWiringInspectorSections(wNode)
+    : cNode
+      ? buildContextInspectorSections(cNode, id)
+      : [];
 
   el.inspSections.innerHTML = sections.join("");
   syncUrlHash(pushHistory);
@@ -3752,7 +3890,7 @@ function toggleSet(set, key) {
   return true;
 }
 
-function wireEvents() {
+function wireOutlineAndSearchEvents() {
   el.tabs.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".tab");
     if (!btn) return;
@@ -3818,7 +3956,9 @@ function wireEvents() {
       el.searchInput.blur();
     }
   });
+}
 
+function wireToolbarAndInspectorEvents() {
   el.scopeSelect.addEventListener("change", () => {
     state.scopeFilter = el.scopeSelect.value;
     rebuildActiveView(true);
@@ -3888,7 +4028,9 @@ function wireEvents() {
       jumpToNodeId(step.dataset.jumpId);
     }
   });
+}
 
+function wireInspectorSourceAndOutlineEvents() {
   el.inspSourceBox?.addEventListener("click", (ev) => {
     const expandBtn = ev.target.closest("[data-source-expand]");
     if (expandBtn) {
@@ -3956,7 +4098,9 @@ function wireEvents() {
     }
     jumpToNodeId(nodeId, false);
   });
+}
 
+function wireOutlinePointerHoverEvents() {
   el.outlineList.addEventListener("pointerover", (ev) => {
     const row = ev.target.closest("[data-node-id]");
     if (row) {
@@ -3995,8 +4139,9 @@ function wireEvents() {
       requestDraw();
     }
   });
+}
 
-  // Canvas pointer interactions
+function wireCanvasPointerDownAndMoveEvents() {
   el.canvas.addEventListener("pointerdown", (ev) => {
     state.pointerDownPos = { x: ev.clientX, y: ev.clientY };
     state.dragMoved = false;
@@ -4080,7 +4225,9 @@ function wireEvents() {
       requestDraw();
     }
   });
+}
 
+function wireCanvasPointerUpAndWheelEvents() {
   el.canvas.addEventListener("pointerleave", () => {
     clearTimeout(state.hoverTimer);
     if (state.hoveredId || state.activeHoverId || state.hoveredClusterKey) {
@@ -4161,7 +4308,9 @@ function wireEvents() {
     },
     { passive: false }
   );
+}
 
+function wireGlobalWindowAndKeyboardEvents() {
   window.addEventListener("resize", () => requestDraw());
   window.addEventListener("popstate", () => applyUrlHash());
 
@@ -4216,6 +4365,16 @@ function wireEvents() {
   });
 }
 
+function wireEvents() {
+  wireOutlineAndSearchEvents();
+  wireToolbarAndInspectorEvents();
+  wireInspectorSourceAndOutlineEvents();
+  wireOutlinePointerHoverEvents();
+  wireCanvasPointerDownAndMoveEvents();
+  wireCanvasPointerUpAndWheelEvents();
+  wireGlobalWindowAndKeyboardEvents();
+}
+
 function centerOnNode(node, animate = true, tauMs = 92) {
   const rect = el.canvas.getBoundingClientRect();
   const bounds = getUnobstructedViewportBounds(rect);
@@ -4255,13 +4414,16 @@ async function loadGraphs(isReload = false) {
   if (window.__PLEXER_DATA__) {
     state.contextGraph = window.__PLEXER_DATA__.contextGraph ?? null;
     state.codeGraph = window.__PLEXER_DATA__.codeGraph ?? null;
+    state.health = window.__PLEXER_DATA__.health ?? null;
   } else {
-    const [ctxRes, codeRes] = await Promise.all([
+    const [ctxRes, codeRes, healthRes] = await Promise.all([
       fetch("/api/context-graph").then((r) => (r.ok ? r.json() : null)).catch(() => null),
       fetch("/api/code-graph").then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch("/api/health").then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ]);
     state.contextGraph = ctxRes;
     state.codeGraph = codeRes;
+    state.health = healthRes;
   }
 
   const meta = state.contextGraph?.meta ?? {};
@@ -4327,6 +4489,6 @@ loadGraphs(false);
 
 if (!window.__PLEXER_DATA__ && typeof EventSource !== "undefined") {
   const es = new EventSource("/events");
-  es.onmessage = () => loadGraphs(true);
+  es.addEventListener("message", () => loadGraphs(true));
 }
 

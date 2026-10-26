@@ -2,7 +2,7 @@
  * CLI wiring for `plexer callers` and its `--direction` / `--depth` flags.
  */
 import { resolve } from "node:path";
-import { fileReader, referenceLines, spanRange, wordRe } from "../blast/evidence.js";
+import { fileReader, needlesForName, referenceLines, spanRange } from "../util/span.js";
 import { isTestPath } from "../ask/ask.js";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached } from "./load.js";
@@ -18,19 +18,6 @@ export function headerOf(n) {
     if (!n.span)
         return `${n.name} · ${n.kind}`;
     return `${n.name} · ${n.kind} · ${n.path}:${n.span}`;
-}
-
-function needlesForName(name) {
-    if (!name)
-        return [];
-    const out = [wordRe(name)];
-    const sep = Math.max(name.lastIndexOf("."), name.lastIndexOf(":"), name.lastIndexOf("#"));
-    if (sep >= 0 && sep + 1 < name.length) {
-        const bare = name.slice(sep + 1);
-        if (bare.length >= 2)
-            out.push(wordRe(bare));
-    }
-    return out;
 }
 
 export function hitLine(direction, hit, showDepth, quote, opts = {}) {
@@ -326,13 +313,20 @@ export function hitJson(hit) {
     return out;
 }
 
-export function resolveDirection(raw) {
+export function resolveCliChoice(raw, flagLabel, allowed, defaultValue) {
     if (raw === undefined)
-        return "in";
-    if (raw === "in" || raw === "out")
+        return defaultValue;
+    if (allowed.includes(raw))
         return raw;
-    console.error(`✗ --direction must be "in" or "out", got "${raw}"`);
+    const listStr = allowed.length === 2
+        ? `"${allowed[0]}" or "${allowed[1]}"`
+        : `${allowed.slice(0, -1).join(", ")} or ${allowed[allowed.length - 1]}`;
+    console.error(`✗ ${flagLabel} must be ${listStr}, got "${raw}"`);
     process.exit(1);
+}
+
+export function resolveDirection(raw) {
+    return resolveCliChoice(raw, "--direction", ["in", "out"], "in");
 }
 
 export function resolveCliDepth(raw, defaultDepth = DEFAULT_DEPTH) {

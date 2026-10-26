@@ -12,7 +12,7 @@ import { formatAsk } from "../ask/ask.js";
 import { formatGrepResult, zeroHitNote } from "../search/grep-cli.js";
 import { federateAsk, federateCallers, federateCheck, federateGrep, federateMap, splitWorkspace, } from "./workspace.js";
 export async function runWorkspaceBuild(root, opts) {
-    const buildChild = async (childDir, childName) => {
+    const buildWorkspaceChild = async (childDir, childName) => {
         const childConfigPatch = {};
         if (opts.includeDirs && opts.includeDirs.length > 0) {
             childConfigPatch.includeDirs = opts.includeDirs;
@@ -31,7 +31,7 @@ export async function runWorkspaceBuild(root, opts) {
         for (const e of g.errors)
             console.error(`✗ ${childName}/: ${e}`);
     };
-    const { children } = await splitWorkspace(root, opts.override, buildChild, ({ children }) => {
+    const { children } = await splitWorkspace(root, opts.override, buildWorkspaceChild, ({ children }) => {
         console.error(`building ${children.length} workspace repos: ${children.join(", ")}`);
     });
     // Each child self-ignored during its own build; the parent's federation

@@ -10,7 +10,7 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { HOSTS, detectHosts } from './registry.js';
-import { mcpTargets } from './mcp-config.js';
+import { CLI_MCP_OPT_IN_HOSTS, mcpTargets } from './mcp-config.js';
 import { hookTargets } from './codex-hooks.js';
 import { antigravitySkillTargets } from './antigravity.js';
 import { claudeTargets } from '../claude/init.js';
@@ -59,8 +59,12 @@ export function selectedWrites(plan, ids, opts = {}) {
         .filter((w) => {
         if (opts.global === false && w.scope === 'global')
             return false;
-        if (opts.mcp === false && w.kind === 'mcp')
-            return false;
+        if (w.kind === 'mcp') {
+            if (opts.mcp === false)
+                return false;
+            if (opts.mcp !== true && CLI_MCP_OPT_IN_HOSTS.has(w.hostId))
+                return false;
+        }
         if (opts.hooks === false && w.kind === 'hook')
             return false;
         if (opts.skills === false && w.kind === 'skill')

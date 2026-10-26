@@ -7,6 +7,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadGraphCached } from "../graph/load.js";
+import { buildVizHealthPayload } from "./serve.js";
 /**
  * JSON safe to drop inside a `<script>` element.
  */
@@ -37,8 +38,10 @@ export function exportViz(opts) {
         ...context,
         meta: { ...context.meta, repoName: opts.repoName, subtitle: opts.subtitle, defaultTab, tabs },
     };
+    const health = buildVizHealthPayload(opts.contextDir);
     const data = [
         "<script>window.__PLEXER_DATA__ = {",
+        `  health: ${inlineJson(health)},`,
         `  contextGraph: ${inlineJson(contextGraph)},`,
         `  codeGraph: ${inlineJson(code)}`,
         "};</script>",

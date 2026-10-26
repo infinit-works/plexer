@@ -15,6 +15,8 @@ import { textReport, markdownReport, mermaidDiagram } from "./blast/render.js";
 import { startVizServer } from "./viz/serve.js";
 import { exportViz } from "./viz/export.js";
 import { startMcpServer } from "./mcp/server.js";
+import { health } from "./health/health.js";
+import { formatHealthText, formatHealthMarkdown } from "./health/render.js";
 
 export class Plexer {
     cfg;
@@ -75,6 +77,9 @@ export class Plexer {
         const { graph } = this.#requireGraph(dir);
         return buildRepoMap(graph, opts);
     }
+    health(dir, opts = {}) {
+        return health(dir, { ...opts, contextDir: this.cfg.contextDir });
+    }
 }
 
 export {
@@ -104,4 +109,7 @@ export {
     startVizServer,
     exportViz,
     startMcpServer,
+    health,
+    formatHealthText,
+    formatHealthMarkdown,
 };

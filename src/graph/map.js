@@ -1,4 +1,4 @@
-import { plural } from "../blast/evidence.js";
+import { plural } from "../util/span.js";
 import { languageLabelOf } from "./extract.js";
 import { computeInDegree } from "./relations.js";
 import { scopeLabel, scopeOf, scopesOfGraph } from "./scopes.js";

@@ -7,11 +7,11 @@
  * resolved against the whole-repo node index later, in build.js.
  */
 import { basename } from "node:path";
-import { spanRange } from "../blast/evidence.js";
-import { contentHash } from "../util/id.js";
+import { contentHash, extractLeadingSummary, fileResidual, mintId, searchBody } from "../util/id.js";
 import { R_ASSIGN_OPS, R_RIGHT_ASSIGN_OPS, collectBindings, goReceiverTypeOf, goReceiverVarOf, phpClosureName, resolveRecvType } from "./bindings.js";
-import { containerLangOf } from "./container.js";
 import { genericLangOf, loadWasmLanguage, parseWasm } from "./generic.js";
+
+export { extractLeadingSummary, fileResidual, mintId, searchBody };
 /**
  * Extension → the tree-sitter grammar that parses it, and the label a human expects
  * to see for it.
@@ -66,145 +66,7 @@ export function languageOf(path) {
  * and the one that matters to a reader checking coverage.
  */
 export function languageLabelOf(path) {
-    return entryFor(path)?.label ?? containerLangOf(path)?.name ?? genericLangOf(path)?.name ?? null;
-}
-/** Max chars of normalized body stored per symbol for search. Large enough that
- * essentially every real definition is stored whole — only a rare giant function
- * is clipped — while bounding how much the committed graph can grow. */
-const MAX_BODY_CHARS = 5000;
-/** Cap for a file node's module-level residual (imports, constants, module
- * docstring — everything not inside a symbol). Higher than the per-symbol cap
- * because a data-heavy module (constant tables, big config dicts) is legitimate
- * residual, and it's the recall play — but still bounded. */
-const MAX_FILE_BODY_CHARS = 16000;
-/** The searchable body of a definition: its source text, whitespace-collapsed
- * so every identifier becomes a token, capped at `max`. Search-only — the agent
- * still reads verbatim source via `ask --source`, which slices the file from
- * disk, so nothing here reaches the agent's context. */
-export function searchBody(text, max = MAX_BODY_CHARS) {
-    const norm = text.replace(/\s+/g, " ").trim();
-    return norm.length > max ? norm.slice(0, max) : norm;
-}
-/** A file's module-level residual: the lines NOT covered by any symbol span.
- * Symbol bodies are already indexed on their own nodes, so this captures only
- * what they miss — top-of-file imports, module constants, module docstrings —
- * making a file findable by a term that lives outside every function/class.
- * `symbols` are the file's emitted nodes (with `Lx-Ly` spans); `source` is the
- * whole file. Far leaner than storing full-file bodies (no symbol duplication). */
-export function fileResidual(source, symbols) {
-    const lines = source.split("\n");
-    const covered = new Uint8Array(lines.length + 2);
-    for (const s of symbols) {
-        const range = spanRange(s.span);
-        if (!range)
-            continue;
-        for (let r = range.start; r <= range.end && r < covered.length; r++)
-            covered[r] = 1;
-    }
-    const kept = [];
-    for (let i = 0; i < lines.length; i++)
-        if (!covered[i + 1])
-            kept.push(lines[i]);
-    return searchBody(kept.join(" "), MAX_FILE_BODY_CHARS);
-}
-/** Extract the first prose sentence/line from a contiguous doc comment (`/**`,
- * `///`, `//`, `---`, `--`, `#'`, `#`) immediately preceding `startRow` (0-indexed),
- * or a Python leading docstring inside `bodyText`. Deterministic and $0. */
-export function extractLeadingSummary(lines, startRow, bodyText = "") {
-    if (Array.isArray(lines) && startRow > 0) {
-        let r = startRow - 1;
-        // Skip up to 4 decorator / attribute lines immediately above the definition
-        let skipped = 0;
-        while (r >= 0 && skipped < 4) {
-            const t = lines[r].trim();
-            if (/^(@[A-Za-z_]|#\[|--\[=\[)/.test(t)) {
-                r--;
-                skipped++;
-            }
-            else {
-                break;
-            }
-        }
-        const commentLines = [];
-        if (r >= 0) {
-            const last = lines[r].trim();
-            if (last.endsWith("*/")) {
-                while (r >= 0) {
-                    const line = lines[r].trim();
-                    commentLines.unshift(line);
-                    const hasOpen = line.includes("/*");
-                    r--;
-                    if (hasOpen || commentLines.length > 30)
-                        break;
-                }
-            }
-            else if (last.endsWith("]]") || last.endsWith("]=]")) {
-                while (r >= 0) {
-                    const line = lines[r].trim();
-                    commentLines.unshift(line);
-                    const hasOpen = /^--\[=*\[/.test(line);
-                    r--;
-                    if (hasOpen || commentLines.length > 30)
-                        break;
-                }
-            }
-            else {
-                while (r >= 0 && commentLines.length < 25) {
-                    const line = lines[r].trim();
-                    if (/^(\/\/|---?|\*\s|#(?!!|\[))/.test(line)) {
-                        commentLines.unshift(line);
-                        r--;
-                    }
-                    else {
-                        break;
-                    }
-                }
-            }
-        }
-        const paraParts = [];
-        for (const raw of commentLines) {
-            const cleaned = raw
-                .replace(/^(\/\*\*+|\/*\*+\/|\*+|\/{2,3}!|--+\[=*\[|\]=*\]|--+|#+'?)\s*/, "")
-                .replace(/\*+\/\s*$/, "")
-                .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-                .replace(/<[^>]+>/g, "")
-                .trim();
-            if (!cleaned) {
-                if (paraParts.length > 0)
-                    break;
-                continue;
-            }
-            if (/^(@\w+|eslint-|prettier-|ts-|nolint|noinspection|luacheck:|selene:|!strict|!nocheck|!native|!optimize|TODO\b|FIXME\b)/i.test(cleaned)) {
-                if (paraParts.length > 0)
-                    break;
-                continue;
-            }
-            if (/^[-=*_~]{3,}$/.test(cleaned)) {
-                if (paraParts.length > 0)
-                    break;
-                continue;
-            }
-            paraParts.push(cleaned);
-            if (paraParts.join(" ").length >= 220)
-                break;
-        }
-        if (paraParts.length > 0) {
-            const joined = paraParts.join(" ");
-            return joined.length > 220 ? `${joined.slice(0, 217)}...` : joined;
-        }
-    }
-    if (bodyText) {
-        const pyMatch = bodyText.match(/^[ \t]*(?:async\s+)?(?:def|class)\s+[^\n]+:\s*\n[ \t]*r?(?:"""([\s\S]*?)"""|'''([\s\S]*?)''')/);
-        const doc = pyMatch?.[1] ?? pyMatch?.[2];
-        if (doc) {
-            for (const raw of doc.split("\n")) {
-                const cleaned = raw.trim();
-                if (cleaned)
-                    return cleaned.length > 140 ? `${cleaned.slice(0, 137)}...` : cleaned;
-            }
-        }
-    }
-    return null;
+    return entryFor(path)?.label ?? (path.toLowerCase().endsWith(".vue") ? "vue" : null) ?? genericLangOf(path)?.name ?? null;
 }
 const TS_KINDS = {
     class_declaration: "class",
@@ -422,20 +284,6 @@ export function extractFile(rel, source, lang = languageOf(rel)) {
     nodes[0].body_text = fileResidual(source, nodes.slice(1));
     return { nodes, rawEdges };
 }
-/** Mint-time uniqueness: a document-order duplicate (same name reopened, or two
- * sibling defs that happen to collide) gets `~2`, `~3`, ... instead of silently
- * shadowing the first. The while-loop (not a single `~2` guess) is what makes
- * this collision-proof: a source name that itself ends in ~N would collide
- * with a single-guess suffix, so this keeps incrementing until it finds a
- * truly free id rather than trusting one candidate suffix is unused. */
-export function mintId(base, minted) {
-    let id = base;
-    let k = 2;
-    while (minted.has(id))
-        id = `${base}~${k++}`;
-    minted.add(id);
-    return id;
-}
 /**
  * tree-sitter-php 0.23.x cannot parse a `const` inside an enum body. An
  * array initializer collapses the whole `enum_declaration` into ERROR; the
@@ -547,97 +395,146 @@ function isNodeExported(node, name, ctx) {
             return tsExported(node);
     }
 }
+function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
+    const idPart = desc.idName ?? desc.name;
+    const base = `${ctx.rel}#${[...ctx.scope, idPart].join(".")}`;
+    const id = mintId(base, minted);
+    const isGoMethod = ctx.lang === "go" && node.type === "method_declaration";
+    const owner = desc.kind === "method"
+        ? (isGoMethod ? (goReceiverTypeOf(node) ?? undefined) : (desc.owner ?? ctx.enclosingClass ?? undefined))
+        : undefined;
+    const nodeText = desc.hashNode.text;
+    out.push({
+        id,
+        name: desc.name,
+        kind: desc.kind,
+        path: ctx.rel,
+        span: `L${desc.hashNode.startPosition.row + 1}-L${desc.hashNode.endPosition.row + 1}`,
+        signature: clean(ctx.source.slice(desc.hashNode.startIndex, desc.headerEnd)),
+        exported: isNodeExported(node, desc.name, ctx),
+        origin: "ast",
+        body_hash: contentHash(nodeText),
+        body_text: searchBody(nodeText),
+        summary_state: "pending",
+        summary: extractLeadingSummary(ctx.lines, desc.hashNode.startPosition.row, ctx.lang === "python" ? nodeText : ""),
+        crux: null,
+        ...(owner !== undefined ? { owner } : {}),
+        ...(desc.arity !== undefined ? { arity: desc.arity } : {}),
+        ...(desc.variadic ? { variadic: true } : {}),
+    });
+    edges.push({ source: ctx.parentId, relation: "contains", targetId: id, file: ctx.rel });
+    const javaTypeDecl = ctx.lang === "java" && JAVA_TYPE_KINDS.has(desc.kind);
+    const kotlinTypeDecl = ctx.lang === "kotlin" && KOTLIN_TYPE_KINDS.has(desc.kind);
+    const swiftTypeDecl = ctx.lang === "swift" && SWIFT_TYPE_KINDS.has(desc.kind);
+    if (desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
+        edges.push(...heritageEdges(node, id, ctx));
+    if (ctx.lang === "php")
+        edges.push(...phpAttributeReferenceEdges(node, id, ctx));
+    if (ctx.lang === "java")
+        edges.push(...javaAnnotationReferenceEdges(node, id, ctx));
+    const enclosingClass = desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl
+        ? desc.name
+        : isGoMethod
+            ? goReceiverTypeOf(node)
+            : (desc.owner ?? ctx.enclosingClass);
+    const childCtx = {
+        ...ctx,
+        scope: [...ctx.scope, idPart],
+        enclosingKind: desc.kind,
+        parentId: id,
+        enclosingClass,
+        goReceiverVar: isGoMethod ? goReceiverVarOf(node) : ctx.goReceiverVar,
+        importedSymbols: desc.kind === "function" || desc.kind === "method"
+            ? withoutShadowedImports(ctx.importedSymbols, node)
+            : ctx.importedSymbols,
+        rR6Access: null,
+        rSuperClass: desc.kind === "class"
+            ? ctx.lang === "r"
+                ? rR6ParentClass(node)
+                : ctx.lang === "swift"
+                    ? swiftSuperClassName(node)
+                    : null
+            : ctx.rSuperClass,
+    };
+    walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
+}
+function emitExtractedCallEdge(node, ctx, edges) {
+    const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
+    const isConsumedRClassCall = consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
+    const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
+    if (!callee)
+        return;
+    const callEdge = {
+        source: ctx.parentId,
+        relation: "calls",
+        name: callee.name,
+        viaMember: callee.viaMember,
+        file: ctx.rel,
+        ...(callee.kinds ? { kinds: callee.kinds } : {}),
+    };
+    const argCount = ctx.lang === "java" ? javaArgCount(node) : ctx.lang === "swift" ? swiftArgCount(node) : undefined;
+    if (argCount !== undefined)
+        callEdge.argCount = argCount;
+    const swiftImplicitSelf = ctx.lang === "swift" &&
+        !callee.viaMember &&
+        !callee.kinds &&
+        ctx.enclosingClass &&
+        !/^[A-Z]/.test(callee.name);
+    if (swiftImplicitSelf) {
+        edges.push({
+            ...callEdge,
+            viaMember: true,
+            recvType: ctx.enclosingClass,
+            implicitSelf: true,
+        });
+    }
+    else {
+        const recvType = resolveRecvType(callee.receiver, ctx);
+        edges.push(recvType ? { ...callEdge, recvType } : callEdge);
+    }
+}
+function emitJavaAnonymousClass(node, body, ctx, out, edges, minted) {
+    const idPart = "{anonymous}";
+    const base = `${ctx.rel}#${[...ctx.scope, idPart].join(".")}`;
+    const id = mintId(base, minted);
+    const nodeText = node.text;
+    out.push({
+        id,
+        name: "{anonymous}",
+        kind: "class",
+        path: ctx.rel,
+        span: `L${node.startPosition.row + 1}-L${node.endPosition.row + 1}`,
+        signature: clean(ctx.source.slice(node.startIndex, body.startIndex)),
+        exported: false,
+        origin: "ast",
+        body_hash: contentHash(nodeText),
+        body_text: searchBody(nodeText),
+        summary_state: "pending",
+        summary: null,
+        crux: null,
+    });
+    edges.push({ source: ctx.parentId, relation: "contains", targetId: id, file: ctx.rel });
+    const superName = javaConstructedTypeName(node.childForFieldName("type"));
+    if (superName) {
+        edges.push({ source: id, relation: "implements", name: superName, file: ctx.rel });
+    }
+    const anonCtx = {
+        ...ctx,
+        scope: [...ctx.scope, idPart],
+        enclosingKind: "class",
+        parentId: id,
+        enclosingClass: "{anonymous}",
+    };
+    for (const child of node.namedChildren) {
+        walk(child, child.type === "class_body" ? anonCtx : ctx, out, edges, minted);
+    }
+}
 function walk(node, ctx, out, edges, minted) {
     const desc = describe(node, ctx);
     if (desc) {
-        // `idName` scopes the id (e.g. a Go method under its receiver: `#DB.Count`) while
-        // `name` stays the bare symbol name so member-call resolution matches it.
-        const idPart = desc.idName ?? desc.name;
-        const base = `${ctx.rel}#${[...ctx.scope, idPart].join(".")}`;
-        const id = mintId(base, minted);
-        const isGoMethod = ctx.lang === "go" && node.type === "method_declaration";
-        const owner = desc.kind === "method"
-            ? (isGoMethod ? (goReceiverTypeOf(node) ?? undefined) : (desc.owner ?? ctx.enclosingClass ?? undefined))
-            : undefined;
-        const nodeText = desc.hashNode.text;
-        out.push({
-            id,
-            name: desc.name,
-            kind: desc.kind,
-            path: ctx.rel,
-            span: `L${desc.hashNode.startPosition.row + 1}-L${desc.hashNode.endPosition.row + 1}`,
-            signature: clean(ctx.source.slice(desc.hashNode.startIndex, desc.headerEnd)),
-            exported: isNodeExported(node, desc.name, ctx),
-            origin: "ast",
-            body_hash: contentHash(nodeText),
-            body_text: searchBody(nodeText),
-            summary_state: "pending",
-            summary: extractLeadingSummary(ctx.lines, desc.hashNode.startPosition.row, ctx.lang === "python" ? nodeText : ""),
-            crux: null,
-            ...(owner !== undefined ? { owner } : {}),
-            ...(desc.arity !== undefined ? { arity: desc.arity } : {}),
-            ...(desc.variadic ? { variadic: true } : {}),
-        });
-        // structural containment
-        edges.push({ source: ctx.parentId, relation: "contains", targetId: id, file: ctx.rel });
-        // class heritage — in Java an interface may also `extends`, and a record/enum
-        // may `implements`, so every type declaration is a heritage site, not just a class.
-        const javaTypeDecl = ctx.lang === "java" && JAVA_TYPE_KINDS.has(desc.kind);
-        const kotlinTypeDecl = ctx.lang === "kotlin" && KOTLIN_TYPE_KINDS.has(desc.kind);
-        const swiftTypeDecl = ctx.lang === "swift" && SWIFT_TYPE_KINDS.has(desc.kind);
-        if (desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
-            edges.push(...heritageEdges(node, id, ctx));
-        if (ctx.lang === "php")
-            edges.push(...phpAttributeReferenceEdges(node, id, ctx));
-        if (ctx.lang === "java")
-            edges.push(...javaAnnotationReferenceEdges(node, id, ctx));
-        const enclosingClass = desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl
-            ? desc.name
-            : isGoMethod
-                ? goReceiverTypeOf(node)
-                : (desc.owner ?? ctx.enclosingClass);
-        const childCtx = {
-            ...ctx,
-            scope: [...ctx.scope, idPart],
-            enclosingKind: desc.kind,
-            parentId: id,
-            enclosingClass,
-            goReceiverVar: isGoMethod ? goReceiverVarOf(node) : ctx.goReceiverVar,
-            importedSymbols: desc.kind === "function" || desc.kind === "method"
-                ? withoutShadowedImports(ctx.importedSymbols, node)
-                : ctx.importedSymbols,
-            // Reset on every new definition — this is a purely local marker for "we're
-            // still inside THIS class-defining call's own public=/private=/active=
-            // argument chain," not something that should leak into a nested definition
-            // (a method's own body, or — vanishingly rare but possible — another class
-            // defined inside one).
-            rR6Access: null,
-            // Unlike rR6Access, only reset when entering a genuinely new class (so it
-            // stays live through a method's whole body, where super$ / super. calls
-            // actually happen) — inherited unchanged for every other definition kind.
-            // Swift reads it off the declaration's own `:` clause, so `super.ping()`
-            // resolves against the PARENT type, not the overriding current one.
-            rSuperClass: desc.kind === "class"
-                ? ctx.lang === "r"
-                    ? rR6ParentClass(node)
-                    : ctx.lang === "swift"
-                        ? swiftSuperClassName(node)
-                        : null
-                : ctx.rSuperClass,
-        };
-        walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
+        emitExtractedDefNode(node, desc, ctx, out, edges, minted);
         return;
     }
-    // R6 (Phase 2): `public =`/`private =`/`active =` inside an R6Class(...) call's
-    // own arguments is a `list(...)` call whose named entries become methods —
-    // this is R's version of a class body, but structurally it's several levels of
-    // ordinary call/argument nodes rather than a dedicated grammar construct, so it
-    // needs its own interception (mirrors how every other stateful/pattern-matched
-    // R construct in this walk needs one). `ctx.enclosingKind === "class"` scopes
-    // this to the class-defining call's own direct structure — once we're inside
-    // an actual method's body, enclosingKind has moved on to "method" and an
-    // unrelated nested `list(public = list(fn = function() {}))` elsewhere won't
-    // be misread as another class body.
     if (ctx.lang === "r" &&
         ctx.enclosingKind === "class" &&
         ctx.rR6Access === null &&
@@ -655,83 +552,17 @@ function walk(node, ctx, out, edges, minted) {
             return;
         }
     }
-    // not a definition — capture calls/imports/references, then descend with the same context
-    // R's `call` node is also its ONLY vehicle for library()/require()/source() —
-    // there's no separate import-statement grammar construct to key off, so isImport
-    // must be checked before the generic calls path or every import call would be
-    // captured as a (harmlessly unresolvable, but wrong) `calls` edge instead.
     const callTypes = CALL_TYPES[ctx.lang];
     if (isImport(node, ctx.lang)) {
         const spec = importSpecifier(node, ctx.lang);
         if (spec)
             edges.push({ source: ctx.rel, relation: "imports", specifier: spec, file: ctx.rel });
-        // Imported identifiers are declarations, not uses. The import-binding pass
-        // above already recorded them, so do not descend and emit false references.
         return;
     }
     else if (callTypes.has(node.type)) {
-        // R6Class(...) / a Phase-5 mixin list(...) is already consumed by its
-        // enclosing binary_operator as the class definition (see describeR) — the
-        // walk still reaches this SAME call node again, recursing generically to
-        // find its public=/private=/active= arguments (there's no other path to
-        // them), and it must not ALSO be treated as an ordinary call to a
-        // function literally named "R6Class"/"list".
-        const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
-        const isConsumedRClassCall = consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
-        const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
-        if (callee) {
-            const callEdge = {
-                source: ctx.parentId,
-                relation: "calls",
-                name: callee.name,
-                viaMember: callee.viaMember,
-                file: ctx.rel,
-                ...(callee.kinds ? { kinds: callee.kinds } : {}),
-            };
-            // Overloading languages: the call site's argument count, to pick the right
-            // overload (see RawEdge.argCount).
-            const argCount = ctx.lang === "java" ? javaArgCount(node) : ctx.lang === "swift" ? swiftArgCount(node) : undefined;
-            if (argCount !== undefined)
-                callEdge.argCount = argCount;
-            // Swift: a bare lowercase call inside a type body may be an implicit-`self`
-            // member call (`walk()` for `self.walk()`), syntactically indistinguishable
-            // from a free-function call — and Swift's own lookup is member-FIRST (inner
-            // scope wins). So the edge is emitted as the member reading, typed to the
-            // enclosing class — resolved through the owner-qualified method index and
-            // the class's in-repo ancestor chain (`clearLogs()` in a test subclass
-            // finds the base class's method) — with `implicitSelf` letting resolve.js
-            // fall back to the free-function reading only when no member exists on the
-            // chain. One edge, both readings, language-order precedence. This is
-            // deliberately NOT a bare-name kind widening: dogfooding on
-            // swift-composable-architecture, a global unique-name match bound
-            // `contains(element)` inside `extension Set` — a stdlib call — to an
-            // unrelated type's only in-repo `contains`. And not for an UpperCamelCase
-            // callee: that is an initializer call (`Text("hi")`), which takes
-            // resolve.js's class/struct/enum fallback instead — extension nodes (kind
-            // "module") can never false-match it.
-            const swiftImplicitSelf = ctx.lang === "swift" &&
-                !callee.viaMember &&
-                !callee.kinds &&
-                ctx.enclosingClass &&
-                !/^[A-Z]/.test(callee.name);
-            if (swiftImplicitSelf) {
-                edges.push({
-                    ...callEdge,
-                    viaMember: true,
-                    recvType: ctx.enclosingClass,
-                    implicitSelf: true,
-                });
-            }
-            else {
-                const recvType = resolveRecvType(callee.receiver, ctx);
-                edges.push(recvType ? { ...callEdge, recvType } : callEdge);
-            }
-        }
+        emitExtractedCallEdge(node, ctx, edges);
     }
     else if (ctx.lang === "php" && node.type === "use_declaration") {
-        // Trait composition inside a class body (`use HasFactory, Notifiable;`).
-        // Modelled as `implements`: like an interface, a trait is a contract of
-        // behaviour the class mixes in (Plexer's Relation set has no `uses`).
         for (const t of node.namedChildren) {
             if (t.type === "name" || t.type === "qualified_name") {
                 edges.push({ source: ctx.parentId, relation: "implements", name: t.text.replace(/^.*\\/, ""), file: ctx.rel });
@@ -753,52 +584,10 @@ function walk(node, ctx, out, edges, minted) {
             });
         }
     }
-    // Java anonymous class (`new Type() { … }`): tree-sitter-java has no
-    // `anonymous_class` node (unlike PHP) — the body is an optional `class_body`
-    // on `object_creation_expression`. Mint `{anonymous}` (mirroring PHP /
-    // `{closure}`) so nested methods take that owner instead of the enclosing
-    // type's, which otherwise pollutes `ownerMethod` and steals real call edges
-    //. The constructor call edge above still fires for `new Type()`.
     if (ctx.lang === "java" && node.type === "object_creation_expression") {
         const body = node.namedChildren.find((c) => c.type === "class_body");
         if (body) {
-            const idPart = "{anonymous}";
-            const base = `${ctx.rel}#${[...ctx.scope, idPart].join(".")}`;
-            const id = mintId(base, minted);
-            const nodeText = node.text;
-            out.push({
-                id,
-                name: "{anonymous}",
-                kind: "class",
-                path: ctx.rel,
-                span: `L${node.startPosition.row + 1}-L${node.endPosition.row + 1}`,
-                signature: clean(ctx.source.slice(node.startIndex, body.startIndex)),
-                exported: false,
-                origin: "ast",
-                body_hash: contentHash(nodeText),
-                body_text: searchBody(nodeText),
-                summary_state: "pending",
-                summary: null,
-                crux: null,
-            });
-            edges.push({ source: ctx.parentId, relation: "contains", targetId: id, file: ctx.rel });
-            // Single supertype from `new Type()`: emit `implements` so an interface
-            // target resolves (adapters are the common case; a class target drops
-            // under resolve's implements kind filter — drop-not-guess).
-            const superName = javaConstructedTypeName(node.childForFieldName("type"));
-            if (superName) {
-                edges.push({ source: id, relation: "implements", name: superName, file: ctx.rel });
-            }
-            const anonCtx = {
-                ...ctx,
-                scope: [...ctx.scope, idPart],
-                enclosingKind: "class",
-                parentId: id,
-                enclosingClass: "{anonymous}",
-            };
-            for (const child of node.namedChildren) {
-                walk(child, child.type === "class_body" ? anonCtx : ctx, out, edges, minted);
-            }
+            emitJavaAnonymousClass(node, body, ctx, out, edges, minted);
             return;
         }
     }
@@ -813,7 +602,7 @@ function walk(node, ctx, out, edges, minted) {
 function collectImportedSymbols(root, lang) {
     if (lang === "typescript" || lang === "tsx") {
         const out = new Map();
-        const visit = (node) => {
+        const visitImportNode = (node) => {
             if (node.type === "import_statement") {
                 const specifier = importSpecifier(node, lang);
                 if (!specifier)
@@ -822,9 +611,9 @@ function collectImportedSymbols(root, lang) {
                 return;
             }
             for (const child of node.namedChildren)
-                visit(child);
+                visitImportNode(child);
         };
-        visit(root);
+        visitImportNode(root);
         return out;
     }
     if (lang === "php")
@@ -834,15 +623,15 @@ function collectImportedSymbols(root, lang) {
 /** PHP `use` bindings: local alias → { exported name, FQN specifier }. */
 function collectPhpImportedSymbols(root) {
     const out = new Map();
-    const visit = (node) => {
+    const visitPhpNode = (node) => {
         if (node.type === "namespace_use_declaration") {
             collectPhpUseDeclaration(node, out);
             return;
         }
         for (const child of node.namedChildren)
-            visit(child);
+            visitPhpNode(child);
     };
-    visit(root);
+    visitPhpNode(root);
     return out;
 }
 function collectPhpUseDeclaration(decl, out) {
@@ -996,7 +785,7 @@ function withoutShadowedImports(imports, definition) {
         return imports;
     const shadowed = new Set();
     const definitionValue = definition.childForFieldName("value");
-    const visit = (node) => {
+    const visitShadowed = (node) => {
         if (!sameSyntaxNode(node, definition) && !sameSyntaxNode(node, definitionValue) && isFunctionBoundary(node)) {
             const name = node.childForFieldName("name");
             if (name?.type === "identifier")
@@ -1017,9 +806,9 @@ function withoutShadowedImports(imports, definition) {
             shadowed.add(node.text);
         }
         for (const child of node.namedChildren)
-            visit(child);
+            visitShadowed(child);
     };
-    visit(definition);
+    visitShadowed(definition);
     if (![...shadowed].some((name) => imports.has(name)))
         return imports;
     return new Map([...imports].filter(([local]) => !shadowed.has(local)));
@@ -1047,67 +836,9 @@ function isDeclarationName(node) {
     const parent = node.parent;
     return sameSyntaxNode(parent?.childForFieldName("name"), node);
 }
-/** Recognize the definition shapes: mapped node types, Go's type/method forms, and
- * TS arrow-consts. */
-function describe(node, ctx) {
-    if (ctx.lang === "go")
-        return describeGo(node, ctx);
-    if (ctx.lang === "r")
-        return describeR(node, ctx);
-    if (ctx.lang === "java")
-        return describeJava(node, ctx);
-    if (ctx.lang === "kotlin")
-        return describeKotlin(node, ctx);
-    if (ctx.lang === "swift")
-        return describeSwift(node, ctx);
-    // PHP closures: `$h = function () {…}` / `fn() => …`, and bare callbacks
-    // (`$routes->get('/x', function () {…})`). Captured as function nodes so a
-    // closure-only file (a routing table, a DI container) keeps its structure
-    // and the calls inside attribute to the closure, not the file.
-    if (ctx.lang === "php" && (node.type === "anonymous_function" || node.type === "arrow_function")) {
-        const body = node.childForFieldName("body");
-        return {
-            name: phpClosureName(node),
-            kind: "function",
-            headerEnd: body ? body.startIndex : node.endIndex,
-            hashNode: node,
-        };
-    }
-    // PHP anonymous classes (`new class implements I {…}`): minted as a class
-    // node named `{anonymous}` (mirroring `{closure}`, deduplicated per file by
-    // mintId). Without this the type vanished — no node, no heritage edge — and
-    // its methods mis-attributed to the enclosing function. The
-    // class kind makes the walk emit heritageEdges (base_clause /
-    // class_interface_clause are direct children) and own the nested methods.
-    if (ctx.lang === "php" && node.type === "anonymous_class") {
-        const body = node.childForFieldName("body");
-        return {
-            name: "{anonymous}",
-            kind: "class",
-            headerEnd: body ? body.startIndex : node.endIndex,
-            hashNode: node,
-        };
-    }
-    const mapped = ctx.kinds[node.type];
-    if (mapped) {
-        const name = node.childForFieldName("name")?.text;
-        if (!name)
-            return null;
-        let kind = mapped;
-        if (ctx.lang === "python" && mapped === "function" && ctx.enclosingKind === "class") {
-            kind = "method";
-        }
-        // tree-sitter-php 0.23.x recovers a collapsed enum method as function_definition
-        // at program scope; walkNamedChildren reparents it under the enum, and this
-        // promotion is what keeps the kind `method` rather than a leaked `function`.
-        if (ctx.lang === "php" && mapped === "function" && ctx.enclosingKind === "enum") {
-            kind = "method";
-        }
-        const body = node.childForFieldName("body");
-        return { name, kind, headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
-    }
+function describeTypeScriptSpecial(node, ctx) {
     // TS: `const foo = (…) => …` / `const foo = function () {}`
-    if ((ctx.lang === "typescript" || ctx.lang === "tsx") && node.type === "variable_declarator") {
+    if (node.type === "variable_declarator") {
         const value = node.childForFieldName("value");
         if (value && FUNCTION_VALUE_TYPES.has(value.type)) {
             const name = node.childForFieldName("name")?.text;
@@ -1123,7 +854,7 @@ function describe(node, ctx) {
         }
     }
     // JS/TS CommonJS / prototype method assignment: `Obj.foo = function () {}` / `exports.foo = () => …`
-    if ((ctx.lang === "typescript" || ctx.lang === "tsx") && node.type === "assignment_expression") {
+    if (node.type === "assignment_expression") {
         const left = node.childForFieldName("left");
         const right = node.childForFieldName("right");
         if (left?.type === "member_expression" && right && FUNCTION_VALUE_TYPES.has(right.type)) {
@@ -1144,7 +875,7 @@ function describe(node, ctx) {
         }
     }
     // JS/TS top-level CLI subcommand builder chain: `program.command("skeleton ...")....action((...) => { ... })`
-    if ((ctx.lang === "typescript" || ctx.lang === "tsx") && node.type === "call_expression" && node.parent?.type === "expression_statement" && ctx.scope.length === 0) {
+    if (node.type === "call_expression" && node.parent?.type === "expression_statement" && ctx.scope.length === 0) {
         const outerFn = node.childForFieldName("function");
         const outerProp = outerFn?.type === "member_expression" ? outerFn.childForFieldName("property")?.text : null;
         if (outerProp === "action" || outerProp === "handler") {
@@ -1158,7 +889,8 @@ function describe(node, ctx) {
                     if (firstArg?.type === "string") {
                         const rawCmd = firstArg.text.replace(/^['"`]|['"`]$/g, "").trim();
                         const mCmd = /^([A-Za-z][\w-]*)/.exec(rawCmd);
-                        if (mCmd) cmdName = mCmd[1];
+                        if (mCmd)
+                            cmdName = mCmd[1];
                     }
                     break;
                 }
@@ -1176,6 +908,57 @@ function describe(node, ctx) {
                 };
             }
         }
+    }
+    return null;
+}
+/** Recognize the definition shapes: mapped node types, Go's type/method forms, and
+ * TS arrow-consts. */
+function describe(node, ctx) {
+    if (ctx.lang === "go")
+        return describeGo(node, ctx);
+    if (ctx.lang === "r")
+        return describeR(node, ctx);
+    if (ctx.lang === "java")
+        return describeJava(node, ctx);
+    if (ctx.lang === "kotlin")
+        return describeKotlin(node, ctx);
+    if (ctx.lang === "swift")
+        return describeSwift(node, ctx);
+    if (ctx.lang === "php" && (node.type === "anonymous_function" || node.type === "arrow_function")) {
+        const body = node.childForFieldName("body");
+        return {
+            name: phpClosureName(node),
+            kind: "function",
+            headerEnd: body ? body.startIndex : node.endIndex,
+            hashNode: node,
+        };
+    }
+    if (ctx.lang === "php" && node.type === "anonymous_class") {
+        const body = node.childForFieldName("body");
+        return {
+            name: "{anonymous}",
+            kind: "class",
+            headerEnd: body ? body.startIndex : node.endIndex,
+            hashNode: node,
+        };
+    }
+    const mapped = ctx.kinds[node.type];
+    if (mapped) {
+        const name = node.childForFieldName("name")?.text;
+        if (!name)
+            return null;
+        let kind = mapped;
+        if (ctx.lang === "python" && mapped === "function" && ctx.enclosingKind === "class") {
+            kind = "method";
+        }
+        if (ctx.lang === "php" && mapped === "function" && ctx.enclosingKind === "enum") {
+            kind = "method";
+        }
+        const body = node.childForFieldName("body");
+        return { name, kind, headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
+    }
+    if (ctx.lang === "typescript" || ctx.lang === "tsx") {
+        return describeTypeScriptSpecial(node, ctx);
     }
     return null;
 }
@@ -1422,7 +1205,7 @@ const R_BASE_GENERICS = new Set([
  * the same limitation Go/C++'s per-file bindings already accept. */
 function collectRGenerics(root) {
     const generics = new Set();
-    const visit = (node) => {
+    const visitRNode = (node) => {
         let fnDef = null;
         let ownName = null;
         if (node.type === "binary_operator") {
@@ -1451,9 +1234,9 @@ function collectRGenerics(root) {
                 generics.add(arg || ownName); // "" means UseMethod() with no args
         }
         for (const child of node.namedChildren)
-            visit(child);
+            visitRNode(child);
     };
-    visit(root);
+    visitRNode(root);
     return generics;
 }
 /** Searches a function body for a `UseMethod(...)` call and returns its
@@ -1907,12 +1690,9 @@ function phpExported(node) {
     const vis = node.namedChildren.find((c) => c.type === "visibility_modifier");
     return vis ? vis.text === "public" : true;
 }
-function heritageEdges(node, classId, ctx) {
+function jvmSwiftHeritageEdges(node, classId, ctx) {
     const edges = [];
     if (ctx.lang === "java") {
-        // `superclass` holds `extends X`; `super_interfaces` holds `implements A, B`
-        // (and, on an interface declaration, `extends A, B` — which tree-sitter-java
-        // still spells `extends_interfaces`).
         const typeParams = javaTypeParameterNames(node);
         for (const child of node.namedChildren) {
             const relation = child.type === "superclass"
@@ -1924,12 +1704,6 @@ function heritageEdges(node, classId, ctx) {
                 continue;
             for (const entry of javaSupertypeEntries(child)) {
                 const name = javaSupertypeName(entry);
-                // Belt-and-braces. A type VARIABLE is never a supertype, and erasing the
-                // arguments already removes every case measured on gson and spring-petclinic
-                // (identical output with this filter removed) — Java cannot extend or implement
-                // a type variable, so a surviving `T` would have to come from a shape neither
-                // repo contains. Kept because a wrong supertype is not a cosmetic edge: it
-                // feeds `classParents` and from there call resolution.
                 if (!name || typeParams.has(name))
                     continue;
                 edges.push({ source: classId, relation, name, file: ctx.rel });
@@ -1938,10 +1712,6 @@ function heritageEdges(node, classId, ctx) {
         return edges;
     }
     if (ctx.lang === "kotlin") {
-        // The `:` clause is a list of `delegation_specifier`s — a superclass construction
-        // (`class A : B()`), an interface, or `by` delegation. The first `type_identifier`
-        // under each names the type; everything else (type args, delegation target) is not
-        // the heritage target, so only the head type counts.
         for (const child of node.namedChildren) {
             if (child.type !== "delegation_specifier")
                 continue;
@@ -1951,29 +1721,25 @@ function heritageEdges(node, classId, ctx) {
         }
         return edges;
     }
-    if (ctx.lang === "swift") {
-        // `class A: B, C` — each `inheritance_specifier` (a direct child of the
-        // declaration; protocols and extensions carry them too) wraps a `user_type`
-        // whose LAST direct `type_identifier` is the bare supertype name: a
-        // module-qualified `Foundation.NSObject` reduces to `NSObject`, and generic
-        // arguments live in nested nodes so they never leak in. Swift cannot say
-        // syntactically whether a specifier is the superclass or a protocol
-        // conformance (that needs the target's kind), so every edge is `extends` —
-        // the same collapse Kotlin's delegation specifiers make.
-        for (const child of node.namedChildren) {
-            if (child.type !== "inheritance_specifier")
-                continue;
-            const ids = child.namedChildren
-                .find((c) => c.type === "user_type")
-                ?.namedChildren.filter((c) => c.type === "type_identifier");
-            const t = ids?.length ? ids[ids.length - 1] : undefined;
-            if (t)
-                edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
-        }
-        return edges;
+    for (const child of node.namedChildren) {
+        if (child.type !== "inheritance_specifier")
+            continue;
+        const ids = child.namedChildren
+            .find((c) => c.type === "user_type")
+            ?.namedChildren.filter((c) => c.type === "type_identifier");
+        const t = ids?.length ? ids[ids.length - 1] : undefined;
+        if (t)
+            edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
     }
+    return edges;
+}
+function heritageEdges(node, classId, ctx) {
+    if (ctx.lang === "java" || ctx.lang === "kotlin" || ctx.lang === "swift") {
+        return jvmSwiftHeritageEdges(node, classId, ctx);
+    }
+    const edges = [];
     if (ctx.lang === "python") {
-        const supers = node.childForFieldName("superclasses"); // argument_list
+        const supers = node.childForFieldName("superclasses");
         for (const c of supers?.namedChildren ?? []) {
             if (c.type === "identifier") {
                 edges.push({ source: classId, relation: "extends", name: c.text, file: ctx.rel });
@@ -1982,24 +1748,17 @@ function heritageEdges(node, classId, ctx) {
         return edges;
     }
     if (ctx.lang === "r") {
-        // `node` is whatever describeR matched: a binary_operator for R6
-        // (`Foo <- R6::R6Class(...)`) or the call itself for S4 (`setClass(...)`
-        // is a bare top-level statement, essentially never assigned).
         const call = node.type === "binary_operator" ? node.childForFieldName("rhs") : node;
         if (call?.type !== "call")
             return edges;
         const callee = rCalleeName(call);
         if (callee === "R6Class") {
-            // `inherit = ParentClass` — a bare identifier (the parent's own
-            // generator variable), not a string; R6 supports single inheritance only.
             const value = rNamedArg(call, "inherit");
             if (value?.type === "identifier") {
                 edges.push({ source: classId, relation: "extends", name: value.text, file: ctx.rel });
             }
         }
         else if (callee === "setClass") {
-            // `contains = "Base"` or `contains = c("Base1", "Base2")` — S4 supports
-            // multiple inheritance.
             for (const name of rStringOrCVector(rNamedArg(call, "contains"))) {
                 edges.push({ source: classId, relation: "extends", name, file: ctx.rel });
             }
@@ -2007,8 +1766,6 @@ function heritageEdges(node, classId, ctx) {
         return edges;
     }
     if (ctx.lang === "php") {
-        // `class C extends B implements I, J` → base_clause (extends) +
-        // class_interface_clause (implements); names may be namespace-qualified.
         for (const clause of node.namedChildren) {
             const relation = clause.type === "base_clause" ? "extends" : clause.type === "class_interface_clause" ? "implements" : null;
             if (!relation)
@@ -2083,23 +1840,18 @@ function javaTypeParameterNames(decl) {
     if (!params)
         return new Set();
     const out = new Set();
-    const visit = (n) => {
+    const visitTypeParam = (n) => {
         if (n.type === "type_identifier")
             out.add(n.text);
         for (const c of n.namedChildren)
-            visit(c);
+            visitTypeParam(c);
     };
-    visit(params);
+    visitTypeParam(params);
     return out;
 }
-function calleeName(node, lang) {
-    // Java first: `method_invocation` has NO `function` field (it splits the callee
-    // into `object` + `name`), so the shared lookup below would return null for every
-    // Java call site and the language would extract nodes with no call edges at all.
+function jvmSwiftCalleeName(node, lang) {
     if (lang === "java") {
         if (node.type === "object_creation_expression") {
-            // `new Foo()` — the constructed type is the call target, named as the graph
-            // names it.
             const name = javaConstructedTypeName(node.childForFieldName("type"));
             return name ? { name, viaMember: false } : null;
         }
@@ -2107,20 +1859,11 @@ function calleeName(node, lang) {
         if (!nameNode)
             return null;
         const obj = node.childForFieldName("object");
-        // No `object` means an implicit-`this` call (`decorate(name)`), which in Java is a
-        // method call, not a free function — Java has none. Reporting it as a plain call
-        // would send it to the function-only resolver and drop it, losing the most common
-        // intra-class edge there is. Spelling it as a `this` member call routes it through
-        // owner-qualified resolution, which also walks the superclass chain and stays
-        // conservative: an unmatched name (e.g. a static import) resolves to nothing.
         if (!obj)
             return { name: nameNode.text, viaMember: true, receiver: "this" };
         return { name: nameNode.text, viaMember: true, receiver: javaReceiver(obj) };
     }
     if (lang === "kotlin") {
-        // `call_expression` = callee expression + `call_suffix`. A bare `foo()` names a
-        // plain call; `obj.foo()` is a `navigation_expression` whose trailing
-        // `navigation_suffix` holds the method name and whose object is the receiver.
         const target = node.namedChildren[0];
         if (target?.type === "simple_identifier")
             return { name: target.text, viaMember: false };
@@ -2137,47 +1880,54 @@ function calleeName(node, lang) {
         }
         return null;
     }
-    if (lang === "swift") {
-        // Same shape as Kotlin's: `call_expression` = callee expression + `call_suffix`.
-        // A bare `foo()` names a plain call (this also covers `Animal()` initializer
-        // calls, which have no distinguishing syntax); `obj.foo()` is a
-        // `navigation_expression` whose trailing `navigation_suffix` holds the member
-        // name and whose head is the receiver.
-        const target = node.namedChildren[0];
-        if (target?.type === "simple_identifier")
-            return { name: target.text, viaMember: false };
-        if (target?.type === "navigation_expression") {
-            const suffix = target.namedChildren.find((c) => c.type === "navigation_suffix");
-            const name = suffix?.namedChildren.find((c) => c.type === "simple_identifier");
-            const receiver = target.namedChildren[0];
-            if (!name)
-                return null;
-            if (receiver?.type === "simple_identifier")
-                return { name: name.text, viaMember: true, receiver: receiver.text };
-            if (receiver?.type === "self_expression" || receiver?.type === "super_expression")
-                return {
-                    name: name.text,
-                    viaMember: true,
-                    receiver: receiver.type === "self_expression" ? "self" : "super",
-                };
-            if (receiver?.type === "navigation_expression") {
-                // `self.repo.save()` — one hop off self is a field access and binds like
-                // TS's `this.x`. Deeper chains and call-result receivers carry no
-                // confident local clue, so those fall through with no receiver.
-                const head = receiver.namedChildren[0];
-                const field = receiver.namedChildren
-                    .find((c) => c.type === "navigation_suffix")
-                    ?.namedChildren.find((c) => c.type === "simple_identifier");
-                if (head?.type === "self_expression" && field)
-                    return { name: name.text, viaMember: true, receiver: `self.${field.text}` };
-            }
-            // Still a member call even with an unknowable receiver (a chained call, a
-            // literal, a subscript): recvType stays unset and resolve drops it rather
-            // than guessing — same contract as Java's and TS's unknown receivers.
-            return { name: name.text, viaMember: true };
+    const target = node.namedChildren[0];
+    if (target?.type === "simple_identifier")
+        return { name: target.text, viaMember: false };
+    if (target?.type === "navigation_expression") {
+        const suffix = target.namedChildren.find((c) => c.type === "navigation_suffix");
+        const name = suffix?.namedChildren.find((c) => c.type === "simple_identifier");
+        const receiver = target.namedChildren[0];
+        if (!name)
+            return null;
+        if (receiver?.type === "simple_identifier")
+            return { name: name.text, viaMember: true, receiver: receiver.text };
+        if (receiver?.type === "self_expression" || receiver?.type === "super_expression")
+            return {
+                name: name.text,
+                viaMember: true,
+                receiver: receiver.type === "self_expression" ? "self" : "super",
+            };
+        if (receiver?.type === "navigation_expression") {
+            const head = receiver.namedChildren[0];
+            const field = receiver.namedChildren
+                .find((c) => c.type === "navigation_suffix")
+                ?.namedChildren.find((c) => c.type === "simple_identifier");
+            if (head?.type === "self_expression" && field)
+                return { name: name.text, viaMember: true, receiver: `self.${field.text}` };
         }
-        return null;
+        return { name: name.text, viaMember: true };
     }
+    return null;
+}
+function rOperatorCalleeName(fn) {
+    const rhs = fn.childForFieldName("rhs");
+    if (rhs?.type !== "identifier")
+        return null;
+    if (fn.type === "extract_operator") {
+        const lhs = fn.childForFieldName("lhs");
+        if (lhs?.type === "identifier" && (lhs.text === "self" || lhs.text === "private")) {
+            return { name: rhs.text, viaMember: true, receiver: "self" };
+        }
+        if (lhs?.type === "identifier" && lhs.text === "super") {
+            return { name: rhs.text, viaMember: true, receiver: "super" };
+        }
+        return { name: rhs.text, viaMember: false, kinds: ["function", "method"] };
+    }
+    return { name: rhs.text, viaMember: false };
+}
+function calleeName(node, lang) {
+    if (lang === "java" || lang === "kotlin" || lang === "swift")
+        return jvmSwiftCalleeName(node, lang);
     if (lang === "php")
         return phpCallee(node);
     const fn = node.childForFieldName("function");
@@ -2187,10 +1937,9 @@ function calleeName(node, lang) {
         return { name: fn.text, viaMember: false };
     if (lang === "python" && fn.type === "attribute") {
         const a = fn.childForFieldName("attribute") ?? fn.namedChildren.at(-1);
-        return a ? { name: a.text, viaMember: true, receiver: pyReceiver(fn) } : null;
+        return a ? { name: a.text, viaMember: true, receiver: memberCallReceiver(fn, "attribute", "attribute", "self", false) } : null;
     }
     if (lang === "go" && fn.type === "selector_expression") {
-        // `pkg.Fn()` / `recv.Method()` — the called name is the trailing field.
         const p = fn.childForFieldName("field") ?? fn.namedChildren.at(-1);
         const operand = fn.childForFieldName("operand");
         const receiver = operand?.type === "identifier" ? operand.text : undefined;
@@ -2198,49 +1947,10 @@ function calleeName(node, lang) {
     }
     if ((lang === "typescript" || lang === "tsx") && fn.type === "member_expression") {
         const p = fn.childForFieldName("property") ?? fn.namedChildren.at(-1);
-        return p ? { name: p.text, viaMember: true, receiver: tsReceiver(fn) } : null;
+        return p ? { name: p.text, viaMember: true, receiver: memberCallReceiver(fn, "member_expression", "property", "this", true) } : null;
     }
     if (lang === "r" && (fn.type === "extract_operator" || fn.type === "namespace_operator")) {
-        const rhs = fn.childForFieldName("rhs");
-        if (rhs?.type !== "identifier")
-            return null;
-        if (fn.type === "extract_operator") {
-            const lhs = fn.childForFieldName("lhs");
-            if (lhs?.type === "identifier" && (lhs.text === "self" || lhs.text === "private")) {
-                // R6 (Phase 2): `self$method()` / `private$method()` — resolves directly to
-                // the enclosing class via ctx.enclosingClass, same mechanism (and same
-                // magic receiver string) as Python/TS's self/cls/this — see
-                // resolveRecvType, which already special-cases "self" generically.
-                return { name: rhs.text, viaMember: true, receiver: "self" };
-            }
-            if (lhs?.type === "identifier" && lhs.text === "super") {
-                // R6 (Phase 3): `super$method()` — R6's inheritance-dispatch keyword,
-                // resolves directly to the PARENT class via ctx.rSuperClass (NOT
-                // ctx.enclosingClass — that would wrongly find the current class's own
-                // same-named override instead of climbing to the parent).
-                return { name: rhs.text, viaMember: true, receiver: "super" };
-            }
-            // Any other `obj$method()` (Phase 4): still a PLAIN name match, not a
-            // typed member call — there's no general field-type-binding table for
-            // R6 composition (`private$other_obj$method()`), and a real codebase's
-            // dominant field-assignment shape (constructor-parameter pass-through,
-            // `do.call(class_var$new, ...)` dynamic dispatch) turned out to defeat
-            // the simple "field <- SomeClass$new()" pattern every other language's
-            // binding table relies on anyway — see plan_r_language_support.md's
-            // Phase 2 "known gaps" and the follow-up investigation against a real
-            // R6-heavy corpus. What DOES help: bare-name resolution must be allowed
-            // to match a "method" node here, not just "function" — R6 methods are
-            // always kind "method", so without `kinds` below, EVERY untyped `$`
-            // call would be unconditionally unresolvable rather than just
-            // occasionally ambiguous (resolve.js already drops a genuinely
-            // ambiguous bare-name match rather than guessing, so this only adds
-            // resolutions for uniquely-named methods, never a wrong-class guess).
-            return { name: rhs.text, viaMember: false, kinds: ["function", "method"] };
-        }
-        // `pkg::fun()` (qualified call) — always a real function/exported symbol,
-        // never an R6 method (those are only ever reached via `$` on an instance),
-        // so no need to widen the match kinds here.
-        return { name: rhs.text, viaMember: false };
+        return rOperatorCalleeName(fn);
     }
     return null;
 }
@@ -2305,17 +2015,21 @@ function javaReceiver(obj) {
     }
     return undefined;
 }
-/** py `attribute` node's receiver text: bare identifier, or `self.x` for a
- * chained `self.x.y()`. Anything else (e.g. a chained call `f().g()`) → none. */
-function pyReceiver(fn) {
+/** Shared member-call receiver extractor for Python (`attribute`) and TS/JS (`member_expression`). */
+function memberCallReceiver(fn, memberNodeType, propField, selfWord, allowBareSelf = false) {
     const obj = fn.childForFieldName("object");
+    if (allowBareSelf && obj?.type === selfWord)
+        return selfWord;
     if (obj?.type === "identifier")
         return obj.text;
-    if (obj?.type === "attribute") {
+    if (obj?.type === memberNodeType) {
         const innerObj = obj.childForFieldName("object");
-        const innerAttr = obj.childForFieldName("attribute");
-        if (innerObj?.type === "identifier" && innerObj.text === "self" && innerAttr)
-            return `self.${innerAttr.text}`;
+        const innerProp = obj.childForFieldName(propField);
+        const isSelf = allowBareSelf
+            ? innerObj?.type === selfWord
+            : innerObj?.type === "identifier" && innerObj.text === selfWord;
+        if (isSelf && innerProp)
+            return `${selfWord}.${innerProp.text}`;
     }
     return undefined;
 }
@@ -2369,21 +2083,6 @@ function phpScopeReceiver(scope) {
         return text;
     if (scope.type === "qualified_name")
         return text.replace(/^.*\\/, "");
-    return undefined;
-}
-/** ts `member_expression` node's receiver text: `this`, `this.x`, or a bare identifier. */
-function tsReceiver(fn) {
-    const obj = fn.childForFieldName("object");
-    if (obj?.type === "this")
-        return "this";
-    if (obj?.type === "identifier")
-        return obj.text;
-    if (obj?.type === "member_expression") {
-        const innerObj = obj.childForFieldName("object");
-        const innerProp = obj.childForFieldName("property");
-        if (innerObj?.type === "this" && innerProp)
-            return `this.${innerProp.text}`;
-    }
     return undefined;
 }
 /** R has no import statement at the grammar level — `library(x)`, `require(x)`,

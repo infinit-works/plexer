@@ -1,9 +1,11 @@
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, unlinkSync, writeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, realpathSync, unlinkSync, writeSync } from 'node:fs';
 import { join, dirname, basename, isAbsolute, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { relevantRetrieval } from '../claude/format.js';
 import {
     MIN_PROMPT_CHARS,
+    LEADING_SLASH_COMMANDS_RE,
+    isSyntheticOrMetaPrompt,
     recordFileEdit,
     readOrientation,
     queryPromptContext,
@@ -11,10 +13,10 @@ import {
 } from '../claude/hooks.js';
 import { ensureFreshGraph } from '../graph/refresh.js';
 import { hasPlexerIndex, isAutoBuildableRepo } from '../graph/root.js';
-import { resolveContextDir, readJson, writeJsonAtomic } from '../util/state.js';
+import { agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo, resolveContextDir, readJson, writeJsonAtomic } from '../util/state.js';
+export { agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo };
 
 const STALE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const LEADING_SLASH_COMMANDS_RE = /^(?:\/(?:plan|grill-me|review|simplify|verify|feature-dev|batch|deep-research|commit|pr|revise-rules|learn|security-scan|claude-security|playground|goal|boost|compact|schedule|browser|plugin|automation)\b\s*)+/i;
 
 export function emptyAgySession() {
     return {
@@ -43,22 +45,6 @@ function normalizePromptKey(text) {
         .trim()
         .replace(LEADING_SLASH_COMMANDS_RE, '')
         .trim();
-}
-
-export function agyLastRepoPath() {
-    return join(tmpdir(), 'plexer-agy-last-repo.json');
-}
-
-export function readAgyLastRepo() {
-    const data = readJson(agyLastRepoPath());
-    return typeof data?.repoDir === 'string' && existsSync(data.repoDir) ? data.repoDir : null;
-}
-
-function writeAgyLastRepo(repoDir) {
-    try {
-        writeJsonAtomic(agyLastRepoPath(), { repoDir, updatedAt: Date.now() }, true);
-    }
-    catch { /* best-effort */ }
 }
 
 function pruneStaleAgySessions() {
@@ -118,16 +104,52 @@ function stripUserRequestTags(text) {
     return (m ? m[1] : text).trim();
 }
 
+let cachedSkillRoots = null;
+function skillTargetRoots() {
+    if (cachedSkillRoots)
+        return cachedSkillRoots;
+    const roots = new Set();
+    const home = homedir();
+    const homeNorm = home.replace(/\\/g, '/');
+    for (const base of [join(home, '.gemini', 'skills'), join(home, '.claude', 'skills'), join(home, '.agents', 'skills')]) {
+        try {
+            const realBase = realpathSync(base).replace(/\\/g, '/');
+            if (realBase && realBase !== '/' && realBase !== homeNorm)
+                roots.add(realBase);
+        }
+        catch { /* ignore */ }
+        try {
+            for (const name of readdirSync(base)) {
+                try {
+                    const realTarget = realpathSync(join(base, name)).replace(/\\/g, '/');
+                    if (realTarget && realTarget !== '/' && realTarget !== homeNorm) {
+                        roots.add(realTarget);
+                        const parent = dirname(realTarget).replace(/\\/g, '/');
+                        if (parent && parent !== '/' && parent !== homeNorm)
+                            roots.add(parent);
+                    }
+                }
+                catch { /* ignore */ }
+            }
+        }
+        catch { /* ignore */ }
+    }
+    cachedSkillRoots = [...roots];
+    return cachedSkillRoots;
+}
+
 function isIgnoredTouchedPath(p, workspaceRoot = null) {
     if (!p || typeof p !== 'string' || !isAbsolute(p))
         return true;
     const norm = p.replace(/\\/g, '/');
     if (/\/(?:\.gemini|\.agents|\.claude|\.codex)(?:\/|$)/.test(norm))
         return true;
-    if (/\/Projects\/skills(?:\/|$)/.test(norm)) {
-        const wsNorm = typeof workspaceRoot === 'string' ? workspaceRoot.replace(/\\/g, '/') : '';
-        if (!wsNorm || !/\/Projects\/skills(?:\/|$)/.test(wsNorm))
-            return true;
+    const wsNorm = typeof workspaceRoot === 'string' ? workspaceRoot.replace(/\\/g, '/') : '';
+    for (const root of skillTargetRoots()) {
+        if (norm === root || norm.startsWith(`${root}/`)) {
+            if (!wsNorm || !(wsNorm === root || wsNorm.startsWith(`${root}/`)))
+                return true;
+        }
     }
     return false;
 }
@@ -172,7 +194,7 @@ function extractPathsFromEntry(obj, sessionState) {
             const p = unquoteArg(args?.[key]);
             if (p && !isIgnoredTouchedPath(p)) {
                 sessionState.lastTouchedPath = p;
-                if ((key === 'Path' || key === 'TargetFile') && /edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file/i.test(name)) {
+                if ((key === 'Path' || key === 'TargetFile') && /^(?:edit_file|write_file)$/i.test(name)) {
                     sessionState.lastEditedFile = p;
                 }
             }
@@ -411,15 +433,18 @@ export async function handleAgyPreInvocation(input) {
             agyState.pendingBlastRadius = null;
             agyState.lastRetrievalText = null;
         }
-        const prompt = normalizePromptKey(agyState.lastUserPrompt);
-        const isNewPrompt = prompt.length >= MIN_PROMPT_CHARS &&
+        const rawPrompt = String(agyState.lastUserPrompt ?? '').trim();
+        const prompt = normalizePromptKey(rawPrompt);
+        const isNewPrompt = !isSyntheticOrMetaPrompt(rawPrompt) &&
+            prompt.length >= MIN_PROMPT_CHARS &&
             prompt !== normalizePromptKey(agyState.lastQuery);
         if (isNewPrompt) {
+            const isFollowUp = (agyState.injectedPointers?.length ?? 0) > 0;
             agyState.lastInjectedStep = agyState.lastUserStep;
             agyState.lastQuery = prompt;
             const ask = queryPromptContext(dir, prompt);
             if (ask) {
-                const txt = relevantRetrieval(ask, agyState);
+                const txt = relevantRetrieval(ask, agyState, 4, { followUp: isFollowUp });
                 if (txt) {
                     messages.push(txt);
                     injectedPromptContext = !txt.startsWith('[plexer] no strong match');
@@ -490,5 +515,14 @@ export function handleAgyStop(input) {
         handleStop(input, dir);
     writeAgySession(sid, agyState);
     process.stdout.write(`${JSON.stringify({ decision: 'allow' })}\n`);
+}
+
+export async function dispatchAgyEvent(event, input) {
+    if (event === 'agy-pre-invocation')
+        await handleAgyPreInvocation(input);
+    else if (event === 'agy-post-edit')
+        handleAgyPostEdit(input);
+    else
+        handleAgyStop(input);
 }
 

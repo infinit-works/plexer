@@ -21,9 +21,19 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
-import { contentHash } from "../util/id.js";
-import { extractLeadingSummary, fileResidual, mintId, searchBody } from "./extract.js";
+import {
+    KIND,
+    contentHash,
+    defScope,
+    enclosingDef,
+    extractLeadingSummary,
+    fileResidual,
+    mintId,
+    searchBody,
+} from "../util/id.js";
 import { extractLuau } from "./luau.js";
+
+export { KIND, defScope, enclosingDef };
 const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 // queries/ ships beside the compiled JS (copied by the build); fall back to src.
@@ -64,13 +74,6 @@ export function genericLangOf(path) {
 export function genericExtensions() {
     return GENERIC_LANGS.flatMap((l) => l.exts);
 }
-// tags.scm @definition.<X>  →  plexer Kind (types.js). Unmapped → "function".
-export const KIND = {
-    function: "function", method: "method", class: "class", interface: "interface",
-    type: "type", struct: "struct", enum: "enum", module: "module",
-    constant: "constant", variable: "variable", field: "variable",
-    object: "class", property: "variable", // Scala object; Swift/Scala property
-};
 const loaded = new Map();
 let tsMod = null;
 let initPromise = null;
@@ -91,13 +94,15 @@ function requireWasm(wasm) {
     }
     // Resolve the grammar wasm from the tree-sitter-wasm bundle (its package.json
     // `exports` maps the bare "<lang>/…" subpath to the actual "out/<lang>/…" file).
+    let resolvedWasm = null;
     try {
         const p = require.resolve(`tree-sitter-wasm/${wasm}/tree-sitter-${wasm}.wasm`);
-        return readFileSync(p);
+        resolvedWasm = readFileSync(p);
     }
     catch {
-        return null;
+        /* grammar not bundled in tree-sitter-wasm */
     }
+    return resolvedWasm;
 }
 function loadQuery(name) {
     for (const dir of QUERY_DIRS) {
@@ -152,12 +157,14 @@ export async function loadWasmLanguage(wasm) {
     const bytes = requireWasm(wasm);
     if (!bytes)
         return null;
+    let lang = null;
     try {
-        return await tsMod.Language.load(bytes);
+        lang = await tsMod.Language.load(bytes);
     }
     catch {
-        return null;
+        /* invalid or unsupported WASM binary */
     }
+    return lang;
 }
 const PARSE_CHUNK = 16384; // <32KB slices — same tree-sitter limit workaround as extract.ts
 const PARSERS = new WeakMap();
@@ -176,18 +183,19 @@ function getParser(language) {
 export function parseWasm(language, source) {
     if (!tsMod)
         return null;
+    let parsedRoot = null;
     try {
         const parser = getParser(language);
         const tree = parser.parse((i) => source.slice(i, i + PARSE_CHUNK));
-        if (!tree)
-            return null;
-        const root = tree.rootNode;
-        root._tree = tree;
-        return root;
+        if (tree) {
+            parsedRoot = tree.rootNode;
+            parsedRoot._tree = tree;
+        }
     }
     catch {
-        return null;
+        /* parser failure degrades to null root */
     }
+    return parsedRoot;
 }
 function fileNode(rel, source) {
     return {
@@ -265,7 +273,7 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
  * `super::`, `self::`, external crates, and globs are skipped — resolve.js settles the
  * path against the file's crate root, and drops it when it can't. */
 function extractUses(root, rel, rawEdges) {
-    const visit = (n) => {
+    const visitUseNode = (n) => {
         if (n.type === "use_declaration") {
             const spec = rustUseModule(n.text);
             if (spec !== null)
@@ -274,10 +282,10 @@ function extractUses(root, rel, rawEdges) {
         for (let i = 0; i < (n.namedChildCount ?? 0); i++) {
             const c = n.namedChild?.(i);
             if (c)
-                visit(c);
+                visitUseNode(c);
         }
     };
-    visit(root);
+    visitUseNode(root);
 }
 /** The crate-relative path a Rust `use crate::…` names (`::`→`/`), or null when it is not
  * an in-crate import. The FULL path is returned — including any trailing item segment —
@@ -304,7 +312,7 @@ function rustUseModule(text) {
  * in-repo header (relative to the including file, else a unique path-suffix match), and
  * keeps it as an external string when it cannot — never a guessed edge. */
 function extractIncludes(root, rel, rawEdges) {
-    const visit = (n) => {
+    const visitIncludeNode = (n) => {
         if (n.type === "preproc_include") {
             const raw = n.childForFieldName?.("path")?.text ?? "";
             if (raw.startsWith('"')) {
@@ -316,25 +324,10 @@ function extractIncludes(root, rel, rawEdges) {
         for (let i = 0; i < (n.namedChildCount ?? 0); i++) {
             const c = n.namedChild?.(i);
             if (c)
-                visit(c);
+                visitIncludeNode(c);
         }
     };
-    visit(root);
-}
-/** Innermost enclosing definition of a token at byte offset `at`. */
-export function enclosingDef(defs, at) {
-    let best;
-    let bestSpan = Infinity;
-    for (const d of defs) {
-        if (d.startIndex <= at && at < d.endIndex) {
-            const span = d.endIndex - d.startIndex;
-            if (span < bestSpan) {
-                bestSpan = span;
-                best = d;
-            }
-        }
-    }
-    return best;
+    visitIncludeNode(root);
 }
 /** tags.scm path: @definition.<kind> → nodes, @reference.call/@reference.send →
  * bare-name call edges attributed to the innermost enclosing definition. */
@@ -459,49 +452,4 @@ function walkExtract(root, mkDef) {
         }
     };
     visit(root);
-}
-// Some grammars' tags.scm put @definition.<X> on a narrow node (C tags the
-// `function_declarator`, not the whole `function_definition` with its body), so
-// the capture's span stops before the body and calls inside it can't be
-// attributed to the function. Expand up to the outermost enclosing
-// declaration/definition node so a def's span covers its body.
-const DEF_CONTAINER = /(definition|declaration|specifier|_item)$/;
-function nextNamedSibling(n) {
-    const tagged = n;
-    if ("nextNamedSibling" in tagged)
-        return tagged.nextNamedSibling ?? null;
-    const p = n.parent;
-    if (!p?.namedChild)
-        return null;
-    const count = p.namedChildCount ?? 0;
-    for (let i = 0; i < count - 1; i++) {
-        const c = p.namedChild(i);
-        if (c && c.startIndex === n.startIndex && c.endIndex === n.endIndex)
-            return p.namedChild(i + 1);
-    }
-    return null;
-}
-export function defScope(node, langName) {
-    let n = node;
-    while (n.parent && DEF_CONTAINER.test(n.parent.type))
-        n = n.parent;
-    // Dart's grammar leaves `function_signature` / `method_signature` as a sibling
-    // of `function_body` (no wrapping function_definition). Expand so a def's span
-    // covers its body and calls inside it attribute to the function, not the file
-    // or enclosing class. Gated on Dart so other breadth-tier languages are untouched.
-    if (langName === "dart") {
-        const body = nextNamedSibling(n);
-        if (body?.type === "function_body") {
-            return {
-                type: n.type,
-                text: n.text,
-                startIndex: n.startIndex,
-                endIndex: body.endIndex,
-                startPosition: n.startPosition,
-                endPosition: body.endPosition,
-                parent: n.parent,
-            };
-        }
-    }
-    return n;
 }

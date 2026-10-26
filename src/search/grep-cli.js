@@ -8,9 +8,9 @@
  * report, rather than re-implementing it.
  */
 import { resolve } from "node:path";
-import { plural } from "../blast/evidence.js";
+import { plural } from "../util/span.js";
 import { contextDirFor } from "../context/node-file.js";
-import { loadGraphCached } from "../graph/load.js";
+import { loadGraphCached } from "../ask/index-file.js";
 import { grepGraph } from "./grep.js";
 function groupHeader(g) {
     if (g.symbol)

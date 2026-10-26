@@ -32,14 +32,14 @@
  */
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { plural } from "../blast/evidence.js";
+import { plural } from "../util/span.js";
 import { CACHE_DIR, contextDirFor, envTruthy } from "../context/node-file.js";
 import { acquireLockIn, releaseLockIn } from "../util/state.js";
 import { buildGraph } from "./build.js";
 import { driftCount, isClean, probeDrift, readFingerprint } from "./fingerprint.js";
 import { invalidateGraphCaches } from "./load.js";
 import { isAutoBuildableRepo } from "./root.js";
-import { seedGraph } from "./seed.js";
+import { canSeedGraph, seedGraph } from "./seed.js";
 import { wiringPath } from "./write.js";
 /** How long to wait for another process's in-flight rebuild before giving up and
  * answering from the current graph. Long enough to ride out a small repo's build,
@@ -104,6 +104,8 @@ async function waitForLock(cache) {
  * rather than trusting this return value.
  */
 async function seedUnderLock(dir, outDir, contextDir) {
+    if (!canSeedGraph(dir, { contextDir }))
+        return { seeded: false };
     const lockCache = join(outDir, CACHE_DIR);
     // `busy` matters: with no graph on disk there is nothing to fall back to, so a
     // caller that stayed silent here would emit the bare "no matching nodes" this whole

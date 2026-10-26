@@ -117,7 +117,7 @@ writeFileSync(
                             {
                                 type: "command",
                                 command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook prompt`,
-                                timeout: 15000,
+                                timeout: 15,
                             },
                         ],
                     },
@@ -129,7 +129,7 @@ writeFileSync(
                             {
                                 type: "command",
                                 command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook post-edit`,
-                                timeout: 10000,
+                                timeout: 10,
                             },
                         ],
                     },

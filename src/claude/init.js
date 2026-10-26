@@ -1,15 +1,84 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { installClaudeGlobal } from '../hosts/claude-global.js';
-import { readJsonObject, writeOwned } from '../hosts/config-write.js';
-import { mergePlexerSettings } from './settings-merge.js';
-import { statuslineShim, hooksShim } from './shim-template.js';
-import { skillTemplate } from './skill-template.js';
+import { hasPlexerIndex } from '../graph/root.js';
+import { toPosixPath } from '../util/paths.js';
+import { BIN_LAUNCH, mergeJsonKey, readJsonObject, updateJsonConfig, writeOwned } from '../util/state.js';
+import { mergePlexerHooks, mergePlexerSettings } from './settings-merge.js';
+import { statuslineShim, hooksShim, skillTemplate } from './shim-template.js';
 import { claudeDistDir } from './paths.js';
-import { mergeJsonKey, BIN_LAUNCH } from '../hosts/mcp-config.js';
-import { buildGraphIfMissing } from '../hosts/init.js';
-export { buildGraphIfMissing };
+
+/** The directory the user-level shim lives in — the base every hook command names. */
+export function globalHelpersDir(home) {
+    return join(home, '.claude', 'helpers');
+}
+/**
+ * The files a user-level install would touch — pure, no writes, so `--dry-run` and
+ * the picker can report them up front. All three are scoped 'global': they apply to
+ * every project opened with Claude Code, not just this one.
+ */
+export function claudeGlobalTargets(home) {
+    const g = (id, path, kind, what) => ({ hostId: 'claude', id, path, scope: 'global', kind, what });
+    return [
+        g('claude-global-shim', join(globalHelpersDir(home), 'plexer-hooks.cjs'), 'hook', 'hooks shim (user level)'),
+        g('claude-global-hooks', join(home, '.claude', 'settings.json'), 'hook', 'SessionStart / UserPromptSubmit / PostToolUse / Stop'),
+        g('claude-global-mcp', join(home, '.claude.json'), 'mcp', 'mcpServers.plexer'),
+    ];
+}
+/**
+ * Install the user-level copy: the shim, the hook entries that call it, and the
+ * user-scope MCP registration.
+ */
+export function installClaudeGlobal(home, opts = {}) {
+    const [shim, settings, mcp] = claudeGlobalTargets(home);
+    const out = [];
+    if (opts.hooks !== false) {
+        let shimAction = 'skipped-unparseable';
+        try {
+            const res = writeOwned(shim.id, shim.path, hooksShim(claudeDistDir()), 0o755);
+            shimAction = res.action;
+            out.push(res);
+        }
+        catch {
+            out.push({ id: shim.id, path: shim.path, action: 'skipped-unparseable' });
+        }
+        if (shimAction !== 'skipped-unparseable') {
+            try {
+                const helpers = toPosixPath(globalHelpersDir(home));
+                out.push(updateJsonConfig(settings.id, settings.path, (existing) => mergePlexerHooks(existing, helpers).merged));
+            }
+            catch {
+                out.push({ id: settings.id, path: settings.path, action: 'skipped-unparseable' });
+            }
+        }
+    }
+    if (opts.mcp === true) {
+        try {
+            out.push(mergeJsonKey(mcp.id, mcp.path, 'mcpServers', BIN_LAUNCH));
+        }
+        catch {
+            out.push({ id: mcp.id, path: mcp.path, action: 'skipped-unparseable' });
+        }
+    }
+    return out;
+}
+/**
+ * Build the graph if it isn't there yet. Not Claude-specific: the wiring for any
+ * host points at `plexer/`, so `plexer init` builds whichever hosts were selected.
+ * Best-effort; the user can always run `plexer build`.
+ */
+export function buildGraphIfMissing(dir, opts) {
+    if (opts.build === false || !opts.cliPath || hasPlexerIndex(dir))
+        return false;
+    try {
+        execFileSync(process.execPath, [...process.execArgv, opts.cliPath, 'build', '.'], { cwd: dir, stdio: 'inherit', timeout: 300000 });
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
 /**
  * The files `runInit` writes — pure, no writes, so `--dry-run` and the picker
  * can report them up front. All repo-local: the Claude Code layer never writes
@@ -51,9 +120,9 @@ export function runInit(dir, opts = {}) {
         shims.push(hooks);
     }
     writeOwned('claude-skill', skill, skillTemplate());
-    const mcp = opts.mcp === false
-        ? { id: 'claude', path: mcpTarget, action: 'unchanged' }
-        : mergeJsonKey('claude', mcpTarget, 'mcpServers', BIN_LAUNCH);
+    const mcp = opts.mcp === true
+        ? mergeJsonKey('claude', mcpTarget, 'mcpServers', BIN_LAUNCH)
+        : { id: 'claude', path: mcpTarget, action: 'unchanged' };
     const global = opts.global === false
         ? []
         : installClaudeGlobal(opts.home ?? homedir(), { hooks: opts.hooks, mcp: opts.mcp });

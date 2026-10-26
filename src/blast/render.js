@@ -125,6 +125,21 @@ export function markdownReport(r, opts = {}) {
         for (const line of caveats)
             out.push(line);
     }
+    if (Array.isArray(r.healthHotspots) && r.healthHotspots.length > 0) {
+        const totalIssues = r.healthHotspots.reduce((acc, h) => acc + h.count, 0);
+        out.push("");
+        out.push("<details>");
+        out.push(`<summary><strong>Health hotspots on touched/impacted files</strong> — ${plural(totalIssues, "open finding")} across ${plural(r.healthHotspots.length, "file")}</summary>`);
+        out.push("");
+        for (const h of r.healthHotspots) {
+            out.push(`- **\`${h.file}\`** (${h.role}, ${plural(h.count, "finding")}, max ${h.max_tier})`);
+            for (const iss of h.issues) {
+                out.push(`  - \`[${iss.tier} · ${iss.detector}]\` \`${iss.span || "L1"}\` — ${iss.summary}`);
+            }
+        }
+        out.push("");
+        out.push("</details>");
+    }
     out.push("");
     out.push(`<sub>\`plexer blast\` · ${r.basis} · ${depthLabel(r.depth)} · ${plural(r.changed.length, "changed file")}</sub>`);
     return out.join("\n") + "\n";
@@ -415,5 +430,13 @@ export function textReport(r) {
     }
     for (const line of caveatLines(r))
         lines.push(line.replace(/⚠️ /, "⚠ "), "");
+    if (Array.isArray(r.healthHotspots) && r.healthHotspots.length > 0) {
+        const totalIssues = r.healthHotspots.reduce((acc, h) => acc + h.count, 0);
+        lines.push(`health hotspots (${plural(totalIssues, "open finding")} in ${plural(r.healthHotspots.length, "file")})`);
+        for (const h of r.healthHotspots.slice(0, 8)) {
+            lines.push(`  ${h.file} [${h.role}] — ${plural(h.count, "finding")} (max ${h.max_tier})`);
+        }
+        lines.push("");
+    }
     return lines.join("\n").replace(/\n+$/, "\n");
 }

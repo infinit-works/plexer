@@ -5,30 +5,14 @@
  */
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { buildGraphIfMissing } from '../claude/init.js';
 import { HOSTS, detectHosts } from './registry.js';
 import { upsertSection } from './sections.js';
-import { registerMcpConfigs } from './mcp-config.js';
+import { CLI_MCP_OPT_IN_HOSTS, registerMcpConfigs } from './mcp-config.js';
 import { installCodexHooks } from './codex-hooks.js';
 import { installAntigravitySkill } from './antigravity.js';
 import { writeOwned } from './config-write.js';
-import { hasPlexerIndex } from '../graph/root.js';
-/**
- * Build the graph if it isn't there yet. Not Claude-specific: the wiring for any
- * host points at `plexer/`, so `plexer init` builds whichever hosts were selected.
- * Best-effort; the user can always run `plexer build`.
- */
-export function buildGraphIfMissing(dir, opts) {
-    if (opts.build === false || !opts.cliPath || hasPlexerIndex(dir))
-        return false;
-    try {
-        execFileSync(process.execPath, [...process.execArgv, opts.cliPath, 'build', '.'], { cwd: dir, stdio: 'inherit', timeout: 300000 });
-        return true;
-    }
-    catch {
-        return false;
-    }
-}
+export { buildGraphIfMissing };
 export function runHostsInit(repo, opts = {}) {
     const home = opts.home ?? homedir();
     let selected;
@@ -58,9 +42,14 @@ export function runHostsInit(repo, opts = {}) {
         written.push({ id: host.id, path, action });
     }
     const skipped = HOSTS.filter((h) => !selected.includes(h)).map((h) => h.id);
-    const mcp = opts.mcp === false
+    const mcpHostIds = opts.mcp === false
         ? []
-        : registerMcpConfigs(repo, selected.map((h) => h.id), { home, global: opts.global });
+        : selected
+            .map((h) => h.id)
+            .filter((id) => opts.mcp === true || !CLI_MCP_OPT_IN_HOSTS.has(id));
+    const mcp = mcpHostIds.length === 0
+        ? []
+        : registerMcpConfigs(repo, mcpHostIds, { home, global: opts.global });
     // The Codex hook targets are user-level (~/.codex), so --no-global suppresses them.
     const hooks = opts.hooks === false || opts.global === false || !selected.some((h) => h.id === 'agents')
         ? []

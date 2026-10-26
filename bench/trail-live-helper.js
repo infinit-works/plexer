@@ -19,6 +19,24 @@ export const TRAIL_CLAUDE_DIST = join(TRAIL_DIST_DIR, "claude");
 
 const HELPER_PATH = resolve(import.meta.dirname, "trail-live-helper.js");
 
+let shimExitHookRegistered = false;
+
+export function removeTrailBinShims() {
+    const localBin = join(homedir(), ".local", "bin");
+    for (const target of [join(localBin, "trail"), join(localBin, "graft")]) {
+        try {
+            if (existsSync(target)) {
+                const content = readFileSync(target, "utf8");
+                if (content.includes("/tmp/trail-eval/")) {
+                    rmSync(target, { force: true });
+                }
+            }
+        } catch {
+            // ignore
+        }
+    }
+}
+
 export function ensureTrailBinShims() {
     const shimCode = [
         "#!/usr/bin/env node",
@@ -50,6 +68,16 @@ export function ensureTrailBinShims() {
             chmodSync(target, 0o755);
         } catch {
             // ignore
+        }
+    }
+    if (!shimExitHookRegistered) {
+        shimExitHookRegistered = true;
+        process.on("exit", removeTrailBinShims);
+        for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+            process.on(sig, () => {
+                removeTrailBinShims();
+                process.exit(1);
+            });
         }
     }
 }
@@ -201,7 +229,7 @@ function extractAgyPromptFromTranscript(input) {
     }
     if ((!tp || !existsSync(tp)) && input?.conversationId) {
         const realHome = process.env.SUDO_USER ? `/home/${process.env.SUDO_USER}` : homedir();
-        for (const base of [realHome, "/home/kohl"]) {
+        for (const base of [realHome]) {
             const cands = [
                 join(base, ".gemini", "antigravity-cli", "brain", input.conversationId, ".system_generated", "logs", "transcript_full.jsonl"),
                 join(base, ".gemini", "antigravity-cli", "brain", input.conversationId, ".system_generated", "logs", "transcript.jsonl"),
@@ -329,7 +357,7 @@ async function handleAgyPostEdit() {
     let file = ti.Path || ti.TargetFile || ti.file_path || ti.path;
     if ((!file || typeof file !== "string") && input?.conversationId) {
         const realHome = process.env.SUDO_USER ? `/home/${process.env.SUDO_USER}` : homedir();
-        for (const base of [realHome, "/home/kohl"]) {
+        for (const base of [realHome]) {
             for (const sub of ["antigravity-cli", "antigravity"]) {
                 const tp = join(base, ".gemini", sub, "brain", input.conversationId, ".system_generated", "logs", "transcript.jsonl");
                 if (existsSync(tp)) {

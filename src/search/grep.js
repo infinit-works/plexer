@@ -11,10 +11,9 @@
  */
 import { join } from "node:path";
 import { isTestPath } from "../ask/ask.js";
-import { escapeRegExp, spanRange } from "../blast/evidence.js";
-import { computeInDegree } from "../graph/relations.js";
-import { assertPrefixIndexed, pathUnderPrefix } from "../graph/scopes.js";
-import { normalizePathPrefix, pushMap } from "../util/paths.js";
+import { escapeRegExp, spanRange } from "../util/span.js";
+import { computeInDegree } from "../util/id.js";
+import { assertPrefixIndexed, normalizePathPrefix, pathUnderPrefix, pushMap } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
 const DEFAULT_MAX_HITS = 120;
 const DEFAULT_MAX_HITS_PER_SYMBOL = 8;
@@ -37,63 +36,45 @@ function toSymbolRef(n) {
     const hash = n.id.indexOf("#");
     return { id: n.id, name: hash >= 0 ? n.id.slice(hash + 1) : n.name, kind: n.kind, path: n.path, span: n.span };
 }
-export function grepGraph(graph, repoRoot, pattern, opts = {}) {
-    const maxHits = opts.maxHits ?? DEFAULT_MAX_HITS;
-    const maxHitsPerSymbol = opts.maxHitsPerSymbol ?? DEFAULT_MAX_HITS_PER_SYMBOL;
-    const explicitContext = opts.context !== undefined && opts.context !== null;
-    const baseContextLines = Math.max(0, Number(opts.context ?? (opts.source ? 2 : 0)) || 0);
-    const source = opts.fixed
-        ? pattern.includes("\\|") || /^[A-Za-z0-9_.:#\s-]+(?:\|[A-Za-z0-9_.:#\s-]+)+$/.test(pattern)
-            ? pattern.split(/\\?\||\|/).map(escapeRegExp).join("|")
-            : escapeRegExp(pattern)
-        : pattern.replace(/\\\|/g, "|");
-    const regex = new RegExp(source, opts.ignoreCase ? "i" : "");
-    const inDegree = computeInDegree(graph);
-    const inPrefix = opts.in ? normalizePathPrefix(opts.in) : undefined;
-    if (inPrefix)
-        assertPrefixIndexed(graph, inPrefix);
-    let fileNodes;
-    let symbolsByPath;
+function getOrBuildGrepSymbolIndex(graph, inPrefix) {
     if (inPrefix === undefined && graph._grepSymbolIndex && graph._grepNodeLen === graph.nodes.length) {
-        fileNodes = graph._grepSymbolIndex.fileNodes;
-        symbolsByPath = graph._grepSymbolIndex.symbolsByPath;
+        return graph._grepSymbolIndex;
     }
-    else {
-        fileNodes = [];
-        symbolsByPath = new Map();
-        for (const n of graph.nodes) {
-            if (inPrefix !== undefined && !pathUnderPrefix(n.path, inPrefix))
-                continue;
-            if (n.kind === "file") {
-                fileNodes.push(n);
-                continue;
-            }
-            const b = spanRange(n.span);
-            if (!b)
-                continue;
-            pushMap(symbolsByPath, n.path, { node: n, start: b.start, end: b.end });
+    const fileNodes = [];
+    const symbolsByPath = new Map();
+    for (const n of graph.nodes) {
+        if (inPrefix !== undefined && !pathUnderPrefix(n.path, inPrefix))
+            continue;
+        if (n.kind === "file") {
+            fileNodes.push(n);
+            continue;
         }
-        for (const syms of symbolsByPath.values()) {
-            syms.sort((a, b) => a.start - b.start);
-        }
-        if (inPrefix === undefined) {
-            Object.defineProperty(graph, "_grepSymbolIndex", { value: { fileNodes, symbolsByPath }, enumerable: false, configurable: true, writable: true });
-            Object.defineProperty(graph, "_grepNodeLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
-        }
+        const b = spanRange(n.span);
+        if (!b)
+            continue;
+        pushMap(symbolsByPath, n.path, { node: n, start: b.start, end: b.end });
     }
-    let textCache;
+    for (const syms of symbolsByPath.values()) {
+        syms.sort((a, b) => a.start - b.start);
+    }
+    if (inPrefix === undefined) {
+        Object.defineProperty(graph, "_grepSymbolIndex", { value: { fileNodes, symbolsByPath }, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(graph, "_grepNodeLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
+    }
+    return { fileNodes, symbolsByPath };
+}
+function getOrInitGrepTextCache(graph, repoRoot) {
     if (graph._grepFileTextCache && graph._grepFileTextRoot === repoRoot && graph._grepFileTextLen === graph.nodes.length) {
-        textCache = graph._grepFileTextCache;
+        return graph._grepFileTextCache;
     }
-    else {
-        textCache = new Map();
-        Object.defineProperty(graph, "_grepFileTextCache", { value: textCache, enumerable: false, configurable: true, writable: true });
-        Object.defineProperty(graph, "_grepFileTextRoot", { value: repoRoot, enumerable: false, configurable: true, writable: true });
-        Object.defineProperty(graph, "_grepFileTextLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
-    }
-    const isSimpleFixed = Boolean(opts.fixed && !opts.ignoreCase && !pattern.includes("|") && !pattern.includes("\\|"));
+    const textCache = new Map();
+    Object.defineProperty(graph, "_grepFileTextCache", { value: textCache, enumerable: false, configurable: true, writable: true });
+    Object.defineProperty(graph, "_grepFileTextRoot", { value: repoRoot, enumerable: false, configurable: true, writable: true });
+    Object.defineProperty(graph, "_grepFileTextLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
+    return textCache;
+}
+function collectGrepFileMatches(fileNodes, repoRoot, textCache, isSimpleFixed, pattern, regex, symbolsByPath, inDegree, maxHitsPerSymbol, linesByPath) {
     const groups = new Map();
-    const linesByPath = (baseContextLines > 0 || opts.source) ? new Map() : null;
     let totalMatchedLines = 0;
     let truncatedFiles = 0;
     for (const file of fileNodes) {
@@ -149,33 +130,85 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
         if (fileHasHit && linesByPath)
             linesByPath.set(file.path, lines);
     }
+    return { groups, totalMatchedLines, truncatedFiles };
+}
+function rankGrepSymbolNameMatch(group, candTerms) {
+    if (!group.symbol?.name || candTerms.length === 0)
+        return 2;
+    const nameLower = group.symbol.name.toLowerCase();
+    const sep = Math.max(nameLower.lastIndexOf("."), nameLower.lastIndexOf(":"), nameLower.lastIndexOf("#"));
+    const bare = sep >= 0 ? nameLower.slice(sep + 1) : nameLower;
+    let best = 2;
+    for (const normPat of candTerms) {
+        if (nameLower === normPat || bare === normPat)
+            return 0;
+        if (bare.includes(normPat))
+            best = 1;
+    }
+    return best;
+}
+function buildGrepContextBlocks(group, fileLines, contextLines, candTerms) {
+    const symSpan = group.symbol ? spanRange(group.symbol.span) : null;
+    const minLine = symSpan ? Math.max(1, symSpan.start) : 1;
+    const maxLine = symSpan ? Math.min(fileLines.length, symSpan.end) : fileLines.length;
+    const symSpanLen = symSpan ? maxLine - minLine + 1 : Infinity;
+    const fullShortSym = symSpanLen <= (rankGrepSymbolNameMatch(group, candTerms) === 0 ? 22 : Math.max(12, contextLines * 3));
+    const matchSet = new Set(group.hits.map((h) => h.line));
+    const windows = [];
+    for (const h of group.hits) {
+        const hitRaw = (fileLines[h.line - 1] ?? "").trim();
+        const extraAfter = hitRaw.endsWith("{") ? Math.max(contextLines, 6) : contextLines;
+        const wStart = fullShortSym ? minLine : Math.max(minLine, h.line - contextLines);
+        const wEnd = fullShortSym ? maxLine : Math.min(maxLine, h.line + extraAfter);
+        const last = windows[windows.length - 1];
+        if (last && wStart <= last.end + 1)
+            last.end = Math.max(last.end, wEnd);
+        else
+            windows.push({ start: wStart, end: wEnd });
+    }
+    return windows.map((w) => {
+        const blockLines = [];
+        for (let ln = w.start; ln <= w.end; ln++) {
+            const raw = fileLines[ln - 1] ?? "";
+            blockLines.push({
+                line: ln,
+                text: raw.length > MAX_HIT_TEXT ? raw.slice(0, MAX_HIT_TEXT) : raw,
+                isMatch: matchSet.has(ln),
+            });
+        }
+        return { start: w.start, end: w.end, lines: blockLines };
+    });
+}
+export function grepGraph(graph, repoRoot, pattern, opts = {}) {
+    const maxHits = opts.maxHits ?? DEFAULT_MAX_HITS;
+    const maxHitsPerSymbol = opts.maxHitsPerSymbol ?? DEFAULT_MAX_HITS_PER_SYMBOL;
+    const explicitContext = opts.context !== undefined && opts.context !== null;
+    const baseContextLines = Math.max(0, Number(opts.context ?? (opts.source ? 2 : 0)) || 0);
+    const source = opts.fixed
+        ? pattern.includes("\\|") || /^[A-Za-z0-9_.:#\s-]+(?:\|[A-Za-z0-9_.:#\s-]+)+$/.test(pattern)
+            ? pattern.split(/\\?\||\|/).map(escapeRegExp).join("|")
+            : escapeRegExp(pattern)
+        : pattern.replace(/\\\|/g, "|");
+    const regex = new RegExp(source, opts.ignoreCase ? "i" : "");
+    const inDegree = computeInDegree(graph);
+    const inPrefix = opts.in ? normalizePathPrefix(opts.in) : undefined;
+    if (inPrefix)
+        assertPrefixIndexed(graph, inPrefix);
+    const { fileNodes, symbolsByPath } = getOrBuildGrepSymbolIndex(graph, inPrefix);
+    const textCache = getOrInitGrepTextCache(graph, repoRoot);
+    const isSimpleFixed = Boolean(opts.fixed && !opts.ignoreCase && !pattern.includes("|") && !pattern.includes("\\|"));
+    const linesByPath = (baseContextLines > 0 || opts.source) ? new Map() : null;
+    const { groups, totalMatchedLines, truncatedFiles } = collectGrepFileMatches(
+        fileNodes, repoRoot, textCache, isSimpleFixed, pattern, regex, symbolsByPath, inDegree, maxHitsPerSymbol, linesByPath,
+    );
     const candTerms = pattern
         .split(/\\?\||\|/)
-        .map((t) =>
-            t
-                .replace(/^(?:\\b|\\\.|[.:#^$\s])+|(?:\\b|\\\.|[.:#$()\s])+$/g, "")
-                .toLowerCase(),
-        )
+        .map((t) => t.replace(/^(?:\\b|\\\.|[.:#^$\s])+|(?:\\b|\\\.|[.:#$()\s])+$/g, "").toLowerCase())
         .filter((t) => t.length >= 2);
-    const symNameMatchRank = (g) => {
-        if (!g.symbol?.name || candTerms.length === 0)
-            return 2;
-        const nameLower = g.symbol.name.toLowerCase();
-        const sep = Math.max(nameLower.lastIndexOf("."), nameLower.lastIndexOf(":"), nameLower.lastIndexOf("#"));
-        const bare = sep >= 0 ? nameLower.slice(sep + 1) : nameLower;
-        let best = 2;
-        for (const normPat of candTerms) {
-            if (nameLower === normPat || bare === normPat)
-                return 0;
-            if (bare.includes(normPat))
-                best = 1;
-        }
-        return best;
-    };
     const allSortedGroups = [...groups.values()].sort(
         (a, b) =>
             Number(isTestPath(a.path)) - Number(isTestPath(b.path)) ||
-            symNameMatchRank(a) - symNameMatchRank(b) ||
+            rankGrepSymbolNameMatch(a, candTerms) - rankGrepSymbolNameMatch(b, candTerms) ||
             b.inDegree - a.inDegree ||
             a.path.localeCompare(b.path),
     );
@@ -207,38 +240,8 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
         collected += g.hits.length;
         if (linesByPath && g.hits.length > 0) {
             const fileLines = linesByPath.get(g.path);
-            if (fileLines) {
-                const symSpan = g.symbol ? spanRange(g.symbol.span) : null;
-                const minLine = symSpan ? Math.max(1, symSpan.start) : 1;
-                const maxLine = symSpan ? Math.min(fileLines.length, symSpan.end) : fileLines.length;
-                const symSpanLen = symSpan ? maxLine - minLine + 1 : Infinity;
-                const fullShortSym = symSpanLen <= (symNameMatchRank(g) === 0 ? 22 : Math.max(12, contextLines * 3));
-                const matchSet = new Set(g.hits.map((h) => h.line));
-                const windows = [];
-                for (const h of g.hits) {
-                    const hitRaw = (fileLines[h.line - 1] ?? "").trim();
-                    const extraAfter = hitRaw.endsWith("{") ? Math.max(contextLines, 6) : contextLines;
-                    const wStart = fullShortSym ? minLine : Math.max(minLine, h.line - contextLines);
-                    const wEnd = fullShortSym ? maxLine : Math.min(maxLine, h.line + extraAfter);
-                    const last = windows[windows.length - 1];
-                    if (last && wStart <= last.end + 1)
-                        last.end = Math.max(last.end, wEnd);
-                    else
-                        windows.push({ start: wStart, end: wEnd });
-                }
-                g.contextBlocks = windows.map((w) => {
-                    const blockLines = [];
-                    for (let ln = w.start; ln <= w.end; ln++) {
-                        const raw = fileLines[ln - 1] ?? "";
-                        blockLines.push({
-                            line: ln,
-                            text: raw.length > MAX_HIT_TEXT ? raw.slice(0, MAX_HIT_TEXT) : raw,
-                            isMatch: matchSet.has(ln),
-                        });
-                    }
-                    return { start: w.start, end: w.end, lines: blockLines };
-                });
-            }
+            if (fileLines)
+                g.contextBlocks = buildGrepContextBlocks(g, fileLines, contextLines, candTerms);
         }
         keptGroups.push(g);
     }

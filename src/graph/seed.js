@@ -43,10 +43,6 @@ import { FINGERPRINT_PREFIX } from "./fingerprint.js";
 import { GRAPH_DIR, wiringPath } from "./write.js";
 /** The one line a linked worktree's `.git` file carries. */
 const GITDIR_KEY = "gitdir:";
-/** Env kill switch, mirroring `PLEXER_NO_REFRESH` in ./refresh.js. */
-function seedDisabled() {
-    return envTruthy("PLEXER_NO_SEED");
-}
 /**
  * The main checkout of the repo `root` is a linked worktree of, or null when `root`
  * isn't one (which is the common case, and not an error).
@@ -95,10 +91,12 @@ export function mainWorktreeRoot(root) {
             return null;
         return main;
     }
-    catch {
+    catch (err) {
         // No `.git` at all, an unreadable one, a `commondir` that doesn't exist: all of
         // them mean "can't seed from here", which is the same answer as "not a worktree".
-        return null;
+        const notWorktree = null;
+        void err;
+        return notWorktree;
     }
 }
 const NOT_SEEDED = { seeded: false };
@@ -152,7 +150,7 @@ function seedable(rel) {
  * symlink, and nothing in the allowlist is one.
  */
 function copyTree(srcDir, outDir) {
-    const walk = (rel) => {
+    const copyRelDir = (rel) => {
         const from = rel ? join(srcDir, rel) : srcDir;
         mkdirSync(rel ? join(outDir, rel) : outDir, { recursive: true });
         for (const entry of readdirSync(from, { withFileTypes: true })) {
@@ -160,12 +158,12 @@ function copyTree(srcDir, outDir) {
             if (!seedable(childRel))
                 continue;
             if (entry.isDirectory())
-                walk(childRel);
+                copyRelDir(childRel);
             else if (entry.isFile())
                 copyFileSync(join(from, entry.name), join(outDir, childRel));
         }
     };
-    walk("");
+    copyRelDir("");
 }
 /**
  * Put `wiring.json` in place last, via a temp file and a rename.
@@ -190,6 +188,24 @@ function installGraph(srcGraph, destGraph) {
         throw err;
     }
 }
+/** True when `root` is a linked git worktree with no local graph whose main checkout has one. */
+export function canSeedGraph(root, opts = {}) {
+    if (opts.contextDir || envTruthy("PLEXER_NO_SEED"))
+        return false;
+    try {
+        const dir = resolve(root);
+        const outDir = contextDirFor(dir);
+        if (existsSync(wiringPath(outDir)))
+            return false;
+        const main = mainWorktreeRoot(dir);
+        if (!main)
+            return false;
+        return existsSync(wiringPath(contextDirFor(main)));
+    }
+    catch {
+        return false;
+    }
+}
 /**
  * Copy the parent checkout's graph into `root`'s own `plexer/`, if all of this holds:
  * `root` is a linked worktree, it has no graph yet, the parent has one, and no `--dir`
@@ -200,13 +216,11 @@ function installGraph(srcGraph, destGraph) {
  * this function did, so every failure returns `{ seeded: false }` rather than raising.
  */
 export function seedGraph(root, opts = {}) {
-    if (opts.contextDir || seedDisabled())
+    if (!canSeedGraph(root, opts))
         return NOT_SEEDED;
     try {
         const dir = resolve(root);
         const outDir = contextDirFor(dir);
-        if (existsSync(wiringPath(outDir)))
-            return NOT_SEEDED; // already has its own
         const main = mainWorktreeRoot(dir);
         if (!main)
             return NOT_SEEDED;

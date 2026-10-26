@@ -21,6 +21,17 @@ import { warmGenericGrammars, extractGeneric } from "../src/graph/generic.js";
 import { normalizeLuauForParse } from "../src/graph/luau.js";
 import { loadGraphCached } from "../src/graph/load.js";
 import { callTool } from "../src/mcp/tools.js";
+import { claudeDistDir, claudeScriptPath, packageRootDir } from "../src/claude/paths.js";
+import { contextDirFor, envTruthy } from "../src/context/node-file.js";
+import { WALK_RELATIONS, computeInDegree } from "../src/graph/relations.js";
+import { hasPlexerIndex, isAutoBuildableRepo, nearestPlexerRoot } from "../src/graph/root.js";
+import { pathUnderPrefix, scopeLabel, scopeOf, scopesHereClause } from "../src/graph/scopes.js";
+import { readGraph, wiringPath, writeGraph } from "../src/graph/write.js";
+import { isPlexerEntry, readJsonObject, writeOwned } from "../src/hosts/config-write.js";
+import { BIN_LAUNCH, mergeJsonKey } from "../src/hosts/mcp-config.js";
+import { contentHash } from "../src/util/id.js";
+import { normalizePathPrefix, pushMap, relPosix, stripTrailingSlashes, toPosixPath } from "../src/util/paths.js";
+import { needlesForName, parseSpan, plural, spanRange, spanStart } from "../src/util/span.js";
 
 describe("WASM Tree-Sitter Extraction (Depth + Breadth + Luau)", () => {
     it("extracts TypeScript, Python, Go, Rust, C, and Luau symbols via WASM without native addons", async () => {
@@ -115,6 +126,7 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
                     "local App = {",
                     "\tscript = script,",
                     "\tShared = Shared,",
+                    "\tmodules = Shared,",
                     "\tUtil = require(Shared:WaitForChild('Util')),",
                     "\tValidate = require(Shared:WaitForChild('Validate')),",
                     "}",
@@ -191,11 +203,17 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
                     "local Validate = require('@shared/Validate')",
                     "local Util = require(script.Parent.Parent.Shared.Util)",
                     "local Widgets = require(script.Parent.Parent.Widgets)",
+                    "local targetSpec = {",
+                    "\tnormalize = function(raw)",
+                    "\t\treturn tostring(raw)",
+                    "\tend,",
+                    "}",
                     "return function(app)",
-                    "\tlocal Shared = app.Shared",
-                    "\tlocal ExtraValidate = require(Shared.Validate)",
+                    "\tlocal mods = app.modules",
+                    "\tlocal ExtraValidate = require(mods.Validate)",
                     "\tfunction app.kickPlayer(ctx, target)",
-                    "\t\tlocal res = Validate.check(target)",
+                    "\t\tlocal cleaned = targetSpec.normalize(target)",
+                    "\t\tlocal res = Validate.check(cleaned)",
                     "\t\tExtraValidate.check(target)",
                     "\t\tapp.Util.Table.freezeDeep(res)",
                     "\t\tctx.Validate.check(target)",
@@ -247,6 +265,11 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
             assert.ok(modalTargets.length > 0);
             const modalWalk = edgeWalk(graph, modalTargets[0], "in", 2);
             assert.ok(modalWalk.some((s) => s.node.id.includes("Kick.luau#kickPlayer")));
+
+            const specTargets = resolveSymbol(graph, "targetSpec.normalize");
+            assert.ok(specTargets.length > 0, "non-primary camelCase table field function must be qualified as targetSpec.normalize");
+            const specWalk = edgeWalk(graph, specTargets[0], "in", 2);
+            assert.ok(specWalk.some((s) => s.node.id.includes("Kick.luau#kickPlayer")));
 
             // Repo map
             const map = buildRepoMap(graph);
@@ -306,17 +329,87 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
                 await srv.close();
             }
 
-            // MCP tool calls
+            // MCP tool calls (9-tool parity + annotations + multi-item batching)
+            const { TOOLS } = await import("../src/mcp/tools.js");
+            const { PLEXER_MCP_TOOL_CANONICAL } = await import("../src/mcp/tool-names.js");
+            const { mcpInstructions, toolSearchQuery } = await import("../src/mcp/instructions.js");
+            assert.equal(TOOLS.length, 9);
+            assert.deepEqual(
+                TOOLS.map((t) => t.name).sort(),
+                [...PLEXER_MCP_TOOL_CANONICAL].sort(),
+            );
+            for (const t of TOOLS) {
+                assert.equal(t.annotations?.readOnlyHint, true, `${t.name} must advertise readOnlyHint: true`);
+                assert.equal(t.annotations?.destructiveHint, false, `${t.name} must advertise destructiveHint: false`);
+            }
+            const instr = mcpInstructions();
+            assert.ok(instr.length <= 1050, `mcpInstructions (${instr.length} chars) must stay concise`);
+            for (const name of PLEXER_MCP_TOOL_CANONICAL) {
+                assert.ok(instr.includes(name), `mcpInstructions must document ${name}`);
+                assert.ok(toolSearchQuery().includes(`mcp__plexer__${name}`));
+            }
+
             const mcpMap = await callTool(tmp, "plexer_repo_map", {});
             assert.ok(!mcpMap.isError);
             assert.ok(mcpMap.text.includes("Validate.luau") || mcpMap.text.includes("src/"));
 
             const mcpCalls = await callTool(tmp, "plexer_trace_calls", {
-                symbol: "Validate.check",
+                symbol: ["Validate.check"],
                 direction: "in",
+                full: true,
             });
             assert.ok(!mcpCalls.isError);
             assert.ok(mcpCalls.text.includes("Kick.luau"));
+
+            const mcpRead = await callTool(tmp, "plexer_read", {
+                spans: ["Validate.luau:Validate.check", "Kick.luau:L1-L10"],
+            });
+            assert.equal(mcpRead.isError, false);
+            assert.ok(mcpRead.text.includes("Validate.check"));
+            assert.ok(mcpRead.text.includes("Kick.luau:L1-"));
+
+            // Absolute path root inference when MCP server CWD is tmpdir()
+            const mcpAbsRead = await callTool(tmpdir(), "plexer_read", {
+                spans: `${join(tmp, "src", "Shared", "Validate.luau")}:L1-L6`,
+            });
+            assert.equal(mcpAbsRead.isError, false);
+            assert.ok(mcpAbsRead.text.includes("Validate.luau:L1-"));
+
+            const mcpMultiAsk = await callTool(tmp, "plexer_find_code", {
+                query: ["validate permission check", "kick player"],
+            });
+            assert.equal(mcpMultiAsk.isError, false);
+            assert.ok(mcpMultiAsk.text.includes("Validate.luau"));
+            assert.ok(mcpMultiAsk.text.includes("Kick.luau"));
+
+            const mcpMultiGrep = await callTool(tmp, "plexer_find_all", {
+                pattern: ["Validate.check", "Kick"],
+                fixed: true,
+                full: true,
+            });
+            assert.equal(mcpMultiGrep.isError, false);
+            assert.ok(mcpMultiGrep.text.includes("Validate.check"));
+
+            execFileSync("git", ["add", "."], { cwd: tmp });
+            execFileSync(
+                "git",
+                ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+                { cwd: tmp },
+            );
+            const validatePath = join(tmp, "src", "Shared", "Validate.luau");
+            const origValidate = readFileSync(validatePath, "utf8");
+            writeFileSync(validatePath, origValidate.replace("expected string", "expected valid string"));
+            const mcpBlast = await callTool(tmp, "plexer_blast", {
+                format: "markdown",
+            });
+            assert.equal(mcpBlast.isError, false);
+            assert.ok(mcpBlast.text.includes("Validate.check") || mcpBlast.text.includes("Kick"));
+            const mcpBlastMermaid = await callTool(tmp, "plexer_blast", {
+                format: "mermaid",
+            });
+            assert.equal(mcpBlastMermaid.isError, false);
+            assert.ok(mcpBlastMermaid.text.includes("flowchart") || mcpBlastMermaid.text.includes("graph"));
+            writeFileSync(validatePath, origValidate);
 
             // Ensure runRetract never deletes SKILL.md through a symlinked skill directory
             const { symlinkSync } = await import("node:fs");
@@ -746,13 +839,18 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             await buildGraph(pkgB);
             writeWorkspace(tmp, { version: 1, children: ["pkg-a", "pkg-b"] });
 
-            // Federated skeleton + MCP plexer_file_api
+            // Federated skeleton + MCP plexer_file_api + MCP plexer_read
             const skel = federateSkeleton(tmp, undefined, "pkg-a/src/onlyA/a.ts");
             assert.equal(skel.file, "pkg-a/src/onlyA/a.ts");
             assert.equal(skel.entries.length, 1);
-            const mcpSkel = await callTool(tmp, "plexer_file_api", { file: "pkg-a/src/onlyA/a.ts" });
+            const mcpSkel = await callTool(tmp, "plexer_file_api", { file: ["pkg-a/src/onlyA/a.ts", "pkg-b/src/b.ts"] });
             assert.equal(mcpSkel.isError, false);
             assert.ok(mcpSkel.text.includes("alpha"));
+            assert.ok(mcpSkel.text.includes("beta"));
+            const mcpWsRead = await callTool(tmp, "plexer_read", { spans: ["pkg-a/src/onlyA/a.ts:alpha", "b.ts:beta"] });
+            assert.equal(mcpWsRead.isError, false);
+            assert.ok(mcpWsRead.text.includes("pkg-a/src/onlyA/a.ts:L1-L1"));
+            assert.ok(mcpWsRead.text.includes("pkg-b/src/b.ts:L1-L1"));
 
             // Federated grep with --in existing only in pkg-a must not throw on pkg-b
             const fg = federateGrep(tmp, undefined, "alpha", { in: "src/onlyA" });
@@ -793,6 +891,23 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
                 exclude: ["12345+alicedev@users.noreply.github.com"],
             });
             assert.equal(ownersExcludedByEmail.length, 0, "noreply email in exclude list must match handle-keyed owner");
+
+            // ensureFreshGraph on a non-worktree / non-existent path must not mkdirSync .cache
+            const { ensureFreshGraph } = await import("../src/graph/refresh.js");
+            await ensureFreshGraph(join(pkgA, "origin", "main"));
+            assert.equal(existsSync(join(pkgA, "origin")), false, "ensureFreshGraph must not create origin/ folder for non-worktree paths");
+
+            // CLI `plexer blast <base>` treats non-repo positional arg as --base and never creates an origin/ folder
+            const cliPath = new URL("../bin/plexer.js", import.meta.url).pathname;
+            assert.throws(
+                () => execFileSync(process.execPath, [cliPath, "blast", "origin/main"], { cwd: pkgA, encoding: "utf8", stdio: "pipe" }),
+                /base ref "origin\/main" is not in this checkout/,
+            );
+            assert.equal(existsSync(join(pkgA, "origin")), false, "plexer blast origin/main must not create origin/ directory");
+            const blastHeadOut = execFileSync(process.execPath, [cliPath, "blast", "HEAD", "--no-refresh"], { cwd: pkgA, encoding: "utf8" });
+            assert.ok(blastHeadOut.includes("HEAD...HEAD"), "plexer blast HEAD should treat HEAD as positional base ref");
+            const blastHeadWithDirOut = execFileSync(process.execPath, [cliPath, "blast", "HEAD", pkgA, "--no-refresh"], { encoding: "utf8" });
+            assert.ok(blastHeadWithDirOut.includes("HEAD...HEAD"), "plexer blast <base> <dir> should accept both positional base and dir");
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }
@@ -802,7 +917,7 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
         const { depthExtensions, languageLabelOf } = await import("../src/graph/extract.js");
         const { genericExtensions } = await import("../src/graph/generic.js");
         const { containerExtensions } = await import("../src/graph/container.js");
-        const { readCurrentVersion } = await import("../src/cli-meta.js");
+        const { readCurrentVersion } = await import("../src/util/cli-meta.js");
         const { isPlexerAllowEntry } = await import("../src/claude/settings-merge.js");
 
         const depthSet = new Set(depthExtensions());
@@ -1117,6 +1232,76 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             );
             assert.ok(multiGrepOut.includes("if (count > MAX_RERUNS)"), "plexer grep should include -C 2 context by default");
             assert.ok(multiGrepOut.includes('"flushQueue" —'), "variadic plexer grep should run second pattern");
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("exercises core utility, graph, context, claude, and host config hub contracts", () => {
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-hubs-"));
+        try {
+            assert.equal(contentHash("abc").length, 64);
+            assert.equal(toPosixPath("src/a/b.js"), "src/a/b.js");
+            assert.equal(stripTrailingSlashes("src/foo///"), "src/foo");
+            assert.equal(normalizePathPrefix("./src/foo/"), "src/foo");
+            assert.equal(relPosix("/repo", "/repo/src/index.js"), "src/index.js");
+            const bucketMap = new Map();
+            pushMap(bucketMap, "k", 1);
+            pushMap(bucketMap, "k", 2);
+            assert.deepEqual(bucketMap.get("k"), [1, 2]);
+
+            assert.deepEqual(spanRange("L10-L20"), { start: 10, end: 20 });
+            assert.equal(spanStart("L15-L20"), 15);
+            assert.deepEqual(parseSpan("src/a.js:L3-L9"), { path: "src/a.js", start: 3, end: 9 });
+            assert.equal(plural(1, "item"), "1 item");
+            assert.equal(plural(2, "item"), "2 items");
+            assert.equal(needlesForName("Foo.bar").length, 2);
+
+            assert.ok(claudeDistDir().endsWith("claude"));
+            assert.ok(claudeScriptPath("sync-run.js").endsWith("sync-run.js"));
+            assert.ok(existsSync(join(packageRootDir(), "package.json")));
+
+            assert.equal(contextDirFor("/repo", "custom"), "/repo/custom");
+            assert.equal(envTruthy("PLEXER_NONEXISTENT_FLAG_XYZ"), false);
+
+            assert.ok(WALK_RELATIONS.has("calls"));
+            const deg = computeInDegree({
+                nodes: [],
+                edges: [
+                    { source: "a", target: "b", relation: "calls" },
+                    { source: "c", target: "b", relation: "imports" },
+                ],
+            });
+            assert.equal(deg.get("b"), 2);
+
+            const scopes = [
+                { prefix: "packages/web", label: "packages/web", markers: ["package.json"] },
+                { prefix: "", label: "", markers: ["package.json"] },
+            ];
+            assert.equal(scopeOf("packages/web/a.ts", scopes).prefix, "packages/web");
+            assert.equal(scopeLabel(""), "(root)");
+            assert.ok(scopesHereClause(scopes).includes("packages/web/"));
+            assert.equal(pathUnderPrefix("packages/web/a.ts", "packages/web"), true);
+            assert.equal(pathUnderPrefix("packages/web-extra/a.ts", "packages/web"), false);
+
+            const gPath = writeGraph(
+                { meta: { version: 1 }, nodes: [{ id: "n1", name: "n1", body_text: "drop" }], edges: [] },
+                join(tmp, "plexer"),
+            );
+            assert.equal(gPath, wiringPath(join(tmp, "plexer")));
+            const loadedG = readGraph(gPath);
+            assert.equal(loadedG.nodes[0].body_text, undefined);
+            assert.equal(hasPlexerIndex(tmp), true);
+            assert.equal(nearestPlexerRoot(tmp).root, tmp);
+            assert.equal(isAutoBuildableRepo("/"), false);
+
+            const ownedFile = join(tmp, "owned.txt");
+            assert.equal(writeOwned("t", ownedFile, "hello").action, "created");
+            assert.equal(writeOwned("t", ownedFile, "hello").action, "unchanged");
+            assert.equal(isPlexerEntry({ command: "plexer-hooks.cjs" }), true);
+            const mcpFile = join(tmp, "mcp.json");
+            assert.equal(mergeJsonKey("mcp", mcpFile, "mcpServers", BIN_LAUNCH).action, "created");
+            assert.equal(readJsonObject(mcpFile).existed, true);
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }

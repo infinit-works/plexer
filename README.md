@@ -1,14 +1,12 @@
 # `plexer`
 
-**Offline structural code graph for AI coding agents.**
+**Offline structural code graph and call-chain indexer for AI coding agents.** Indexes symbols, call edges, import graphs, and exact line spans into a local `plexer/` directory using pure WASM Tree-sitter so agents resolve definitions, callers, blast radius, and inlined `L<n>:` source spans in a single turn.
 
-Coding agents burn most of their context window running blind `grep` searches and reading whole files just to find a few lines. `plexer` indexes your repository locally in seconds using pure WASM Tree-sitter—offline, `$0`, with no API keys, embeddings, or native C++ compilation—and incrementally refreshes modified files in milliseconds before every query.
-
-- **59–73% fewer tool output tokens (`48W/0L`)** and **45–67% fewer tool calls** across 80+ paired A/B and 3-arm evaluations on Gemini 3.8 Flash, Gemini 4 Argon, Claude Sonnet 5.5, and Claude Opus 5.5 ([see benchmarks](#benchmarks))
-- **100.0% Recall@1 · 1.000 MRR** in **7–19ms** on natural-language intent queries across 17,551 symbols and 32,566 edges (`73–96%` smaller than raw files)
-- **25 languages out of the box** — TypeScript/JS, Python, Go, Rust, Java, C/C++, C#, Kotlin, Swift, Ruby, PHP, and more, plus **first-class Luau / Roblox** (`default.project.json`, `.luaurc`, `require()`, `_K` registries)
-- **12 AI coding hosts** — one command wires Claude Code, Google Antigravity, OpenAI Codex, Cursor, Gemini CLI, Windsurf, GitHub Copilot, Aider, Kiro, OpenCode, Grok CLI, and Amp
-- **60fps HTML5 Canvas visualizer** — interactive force-directed architecture and diff blast-radius explorer (`plexer viz`)
+- **59–73% fewer tool output tokens (`48W/0L`)** and **45–67% fewer tool calls** across 80+ paired A/B and 3-arm evaluations on Gemini 3.8 Flash, Gemini 4 Argon, Claude Sonnet 5.5, and Claude Opus 5.5 ([see benchmarks](#benchmarks)).
+- **100.0% Recall@1 · 1.000 MRR** in **7–19ms** on natural-language intent queries across 17,551 symbols and 32,566 edges (`73–96%` smaller than raw files).
+- **25 languages out of the box:** TypeScript/JS, Python, Go, Rust, Java, C/C++, C#, Kotlin, Swift, Ruby, PHP, and more, plus **first-class Luau / Roblox** (`default.project.json`, `.luaurc`, `require()`, barrel re-exports, `:GetChildren()` loaders).
+- **12 AI coding hosts:** One command wires Claude Code, Google Antigravity, OpenAI Codex, Cursor, Gemini CLI, Windsurf, GitHub Copilot, Aider, Kiro, OpenCode, Grok CLI, and Amp.
+- **60fps HTML5 Canvas visualizer:** Interactive force-directed architecture, health hotspot, and diff blast-radius explorer (`plexer viz`).
 
 ---
 
@@ -26,13 +24,13 @@ plexer init            # Index current repo (<repo>/plexer/) and wire detected A
 Run `plexer retract` at any time to cleanly remove every host edit.
 
 <p align="center">
-  <img src="assets/how-it-works.svg" alt="How plexer works: Your Codebase (25 languages) is indexed by plexer init into a Live Code Graph in plexer/, powering Turn-1 Code Search, Callers &amp; Blast Radius, and an Interactive Web Graph." width="100%" />
+  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli/assets/how-it-works.svg" alt="How plexer works: Your Codebase (25 languages) is indexed by plexer init into a Live Code Graph in plexer/, powering Turn-1 Code Search, Callers &amp; Blast Radius, and an Interactive Web Graph." width="100%" />
 </p>
 
 Once initialized, your coding agent uses `plexer` automatically:
 - **Turn-1 orientation**: Lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreInvocation`) inject a compact repo map and prompt-matched symbol spans before the first tool call.
 - **Live blast-radius warnings & ~3ms freshness**: `PostToolUse` hooks warn on downstream caller impact after edits, and every CLI/MCP query incrementally re-parses drifted files before answering.
-- **Native MCP server (`plexer mcp`)**: Exposes `plexer_find_code`, `plexer_find_all`, `plexer_trace_calls`, `plexer_file_api`, `plexer_repo_map`, and `plexer_check_freshness` over stdio.
+- **Native MCP server (`plexer mcp`)**: Exposes `plexer_find_code`, `plexer_read`, `plexer_trace_calls`, `plexer_find_all`, `plexer_file_api`, `plexer_repo_map`, `plexer_blast`, `plexer_health`, and `plexer_check_freshness` over stdio with `readOnlyHint` annotations.
 
 ---
 
@@ -61,8 +59,50 @@ All query commands auto-refresh modified files and accept `--json` and `--no-ref
 | `plexer skeleton <files...>` | File signatures, exact line spans, and doc summaries (`--all-matches`). |
 | `plexer map [dir]` | Architectural overview: directory clusters, hub symbols, and hotspots (`--max-dirs <n>`). |
 | `plexer blast [dir]` | Git diff blast radius (`--base <ref>`, `--markdown`, `--mermaid`, `--export-viz <dir>`). |
+| `plexer health [sub]` | Codebase health scanner, living execution queue (`scan`, `next`, `resolve`, `suppress`, `plan`, `review`, `autofix`, `move`, `tree`, `viz`, `detect`, `status`, `prompt`), and 20-dimension anti-gaming scorecard (`--diff`, `--in <path>`). |
 | `plexer viz [dir]` | Interactive 60fps HTML5 Canvas graph server (`-p <port>`, `--export <dir>`). |
 | `plexer check` / `retract` | Verify index hash freshness (`check`) or cleanly remove host wiring (`retract` / `uninstall`). |
+
+---
+
+## Codebase Health Loop (`plexer health`)
+
+`plexer health` combines fast graph/AST mechanical detection (dead code, duplication, file/directory cycles, cohesion, complexity, test coverage gaps, and first-class **Luau / Roblox** checks) with blind subjective LLM review and a persistent execution queue (`plexer/.health/`).
+
+Paste this prompt into your agent (or print it anytime with `plexer health prompt`):
+
+```text
+I want you to systematically improve the quality of this codebase using `plexer health`.
+Run ALL of the following:
+
+Before scanning, check for directories that should be excluded (vendor, build output,
+generated code, packages, worktrees, etc.) and exclude obvious ones with `plexer health exclude <path>`.
+Share any questionable candidates with me before excluding.
+
+plexer health scan .
+plexer health next
+
+Your goal is to get the **strict score** as high as possible (target >= 98). The scoring
+resists gaming — the only way to improve it is to genuinely make the code better.
+
+THE LOOP: run `plexer health next`. It is the execution queue from the living plan, not the
+whole backlog. It tells you what to fix now, which file and lines, and the exact
+`plexer health resolve` command to run when done.
+Fix it, resolve it, run `plexer health next` again. Over and over. This is your main job.
+
+Use `plexer health backlog` only when you need to inspect broader open work that is not
+currently driving execution.
+
+Don't be lazy. Large refactors and small detailed fixes — do both with equal energy. No task
+is too big or too small. Fix things properly, not minimally. Use `plexer callers`, `plexer blast`,
+and `plexer health move` to verify blast radius and update all callers cleanly.
+
+Use `plexer health plan` / `plexer health plan queue` to reorder priorities or cluster related
+issues (`plexer health plan cluster create <name>`). When subjective review is surfaced by `next`,
+run `plexer health review --prepare`, evaluate dimensions blindly against
+`plexer/.health/review_packet_blind.json`, and import with `plexer health review --import`.
+Rescan periodically with `plexer health scan`. Follow the scan output's agent instructions.
+```
 
 ---
 
@@ -85,7 +125,7 @@ Evaluated across **Gemini 3.8 Flash**, **Gemini 4 Argon** (`low` & `medium`), **
 - **12 AI Coding Hosts (`plexer init`, `plexer init --list-agents`)**: Claude Code (`claude`), Google Antigravity (`antigravity`), OpenAI Codex / `AGENTS.md` (`agents`), Cursor (`cursor`), Gemini CLI (`gemini`), Windsurf (`windsurf`), GitHub Copilot (`copilot`), Aider (`aider`), Kiro (`kiro`), OpenCode (`opencode`), Grok CLI (`grok`), and Amp (`amp`).
 - **25 Languages (WASM Tree-sitter)**:
   - **Depth AST + receiver/import resolution (9)**: TypeScript, JavaScript, Python, Go, Java, Kotlin, Swift, PHP, R
-  - **Luau / Roblox (1)**: 2024–2026 Luau syntax normalizer, Rojo `default.project.json` DataModel paths, `.luaurc` aliases, `require()`, `Module.fn` / `Class:Method()`, and `_K` registries
+  - **Luau / Roblox (1)**: 2024–2026 Luau syntax normalizer, Rojo `default.project.json` DataModel paths, `.luaurc` aliases, `require()`, `Module.fn` / `Class:Method()`, barrel re-exports, and `:GetChildren()` dynamic loaders
   - **Breadth `tags.scm` + cross-file calls/imports (15)**: Rust, C, C++, C#, Ruby, Scala, Elixir, Solidity, OCaml, Zig, Dart, Clojure, Nix, Lua, and Vue (`<script>`)
 
 ---

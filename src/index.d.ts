@@ -402,6 +402,7 @@ export class Plexer {
     grep(dir: string, pattern: string, opts?: GrepOptions): GrepResult;
     callers(dir: string, symbol: string, opts?: CallersOptions): CallersMatch[];
     map(dir: string, opts?: RepoMapOptions): RepoMapResult;
+    health(dir: string, opts?: Record<string, unknown>): Record<string, unknown>;
 }
 
 export function buildGraph(dir: string, opts?: BuildGraphOptions): Promise<BuildGraphResult>;

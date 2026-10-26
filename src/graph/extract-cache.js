@@ -27,7 +27,7 @@ import { readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, extname, join } from "node:path";
-import { readPackageVersion } from "../cli-meta.js";
+import { readPackageVersion } from "../util/cli-meta.js";
 import { CACHE_DIR } from "../context/node-file.js";
 import { contentHash } from "../util/id.js";
 import { readSourceFile } from "../util/source.js";
@@ -130,8 +130,10 @@ function computeStamp() {
         // every upgrade, which is the case that ships broken parses to users.
         return v ? `v${v}` : null;
     }
-    catch {
-        return null;
+    catch (err) {
+        const fallback = null;
+        void err;
+        return fallback;
     }
 }
 /**

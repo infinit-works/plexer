@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { buildGraph } from '../graph/build.js';
 import { readWiring, computeStats, patchStats, releaseLock, resolveContextDir } from '../util/state.js';
@@ -15,8 +16,13 @@ async function realBuild(dir) {
     await buildGraph(dir, { contextDir: resolveContextDir(dir) });
 }
 export async function runSync(dir, build = realBuild) {
+    const ctxDir = resolveContextDir(dir);
+    if (!existsSync(dir) || !existsSync(ctxDir))
+        return;
     try {
         await build(dir);
+        if (!existsSync(dir) || !existsSync(ctxDir))
+            return;
         const w = readWiring(dir);
         if (!w) {
             patchStats(dir, { syncing: false });
@@ -28,10 +34,12 @@ export async function runSync(dir, build = realBuild) {
         });
     }
     catch {
-        patchStats(dir, { syncing: false }); // leave dirty=true; retry next turn
+        if (existsSync(dir) && existsSync(ctxDir))
+            patchStats(dir, { syncing: false }); // leave dirty=true; retry next turn
     }
     finally {
-        releaseLock(dir);
+        if (existsSync(dir) && existsSync(ctxDir))
+            releaseLock(dir);
     }
 }
 export async function main() {

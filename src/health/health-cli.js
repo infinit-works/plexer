@@ -1,0 +1,323 @@
+/**
+ * CLI dispatcher for `plexer health` subcommands (`scan`, `next`, `backlog`, `status`,
+ * `show`, `resolve`, `suppress`, `plan`, `review`, `autofix`, `move`, `tree`, `viz`,
+ * `detect`, `zone`, `exclude`, `directives`, `config`, `prompt`).
+ */
+import { existsSync, statSync } from "node:fs";
+import { resolve } from "node:path";
+import { health } from "./health.js";
+import { formatHealthMarkdown, formatHealthText } from "./render.js";
+
+const KNOWN_ACTIONS = new Set([
+    "scan",
+    "next",
+    "backlog",
+    "status",
+    "show",
+    "resolve",
+    "suppress",
+    "plan",
+    "review",
+    "autofix",
+    "move",
+    "tree",
+    "viz",
+    "detect",
+    "zone",
+    "exclude",
+    "directives",
+    "config",
+    "prompt",
+]);
+
+function isDirArg(candidate) {
+    if (!candidate) return false;
+    try {
+        return existsSync(candidate) && statSync(candidate).isDirectory();
+    } catch {
+        return false;
+    }
+}
+
+function parsePlanCliSubargs(args, callOpts) {
+    const sub = (args[0] || "show").toLowerCase();
+    callOpts.subAction = sub;
+    const rest = args.slice(1);
+    if (sub === "resolve" || sub === "skip" || sub === "reopen") {
+        callOpts.patterns = rest;
+    } else if (sub === "reorder") {
+        const posCandidate = rest[rest.length - 1]?.toLowerCase();
+        if (["top", "bottom", "before", "after"].includes(posCandidate)) {
+            callOpts.position = posCandidate;
+            callOpts.patterns = rest.slice(0, -1);
+        } else {
+            callOpts.position = "top";
+            callOpts.patterns = rest;
+        }
+    } else if (sub === "cluster") {
+        const cAct = (rest[0] || "list").toLowerCase();
+        callOpts.clusterAction = cAct;
+        if (cAct === "list") {
+            callOpts.clusterName = null;
+        } else if (cAct === "move") {
+            callOpts.patterns = rest.slice(1);
+        } else {
+            callOpts.clusterName = rest[1];
+            callOpts.patterns = rest.slice(2);
+        }
+    } else if (sub === "focus") {
+        callOpts.clusterName = rest[0] || null;
+    } else if (sub === "commit-log") {
+        callOpts.commitAction = rest[0] || "status";
+    }
+}
+
+function parseHealthCliArgs(defaultDir, positionalArgs, opts) {
+    const args = [...positionalArgs];
+    let action = "scan";
+    let dir = defaultDir;
+
+    if (args.length > 0 && KNOWN_ACTIONS.has(args[0].toLowerCase())) {
+        action = args.shift().toLowerCase();
+    } else if (args.length > 0 && isDirArg(args[0])) {
+        dir = resolve(args.shift());
+    }
+
+    if (opts.path && isDirArg(opts.path)) {
+        dir = resolve(opts.path);
+    }
+
+    const callOpts = { ...opts, action, scanPath: opts.path || "." };
+
+    if (["scan", "next", "backlog", "status", "tree", "viz"].includes(action)) {
+        if (args.length > 0 && isDirArg(args[0])) dir = resolve(args.shift());
+    } else if (action === "show" || action === "resolve") {
+        callOpts.patterns = args;
+    } else if (action === "suppress") {
+        callOpts.pattern = args[0];
+        callOpts.patterns = args;
+    } else if (action === "detect") {
+        callOpts.detector = args[0] || "all";
+        if (args[1] && isDirArg(args[1])) dir = resolve(args[1]);
+    } else if (action === "exclude") {
+        callOpts.target = args[0];
+    } else if (action === "autofix") {
+        callOpts.fixer = args[0] || "all";
+    } else if (action === "move") {
+        callOpts.src = args[0];
+        callOpts.dst = args[1];
+    } else if (action === "zone") {
+        callOpts.subAction = args[0] === "set" || args[0] === "clear" ? args[0] : "show";
+        callOpts.target = args[1];
+        if (args[0] === "set") callOpts.zone = args[2];
+    } else if (action === "config") {
+        callOpts.subAction = args[0] === "set" || args[0] === "unset" ? args[0] : "show";
+        callOpts.key = args[1];
+        if (args[0] === "set") callOpts.value = args.slice(2).join(" ");
+    } else if (action === "directives") {
+        callOpts.subAction = args[0] === "set" || args[0] === "unset" ? args[0] : "show";
+        callOpts.phase = args[1];
+        if (args[0] === "set") callOpts.message = args.slice(2).join(" ");
+    } else if (action === "plan") {
+        parsePlanCliSubargs(args, callOpts);
+    } else if (action === "review") {
+        if (opts.import) callOpts.importFile = opts.import;
+        if (opts.merge && typeof opts.merge === "string") callOpts.mergeDir = opts.merge;
+    }
+
+    return { action, dir, callOpts };
+}
+
+function printHealthShowResult(result) {
+    if (result.view === "concerns") {
+        console.log(`plexer health show concerns — ${result.count} design concern signal(s):`);
+        for (const c of result.concerns) {
+            console.log(`  [${c.type} · ${c.fingerprint}] ${c.file} — ${c.summary}`);
+            console.log(`    Question: ${c.question}`);
+        }
+        return result;
+    }
+    if (result.view === "dimension") {
+        const d = result.dimension || {};
+        const staleTag = d.stale ? ` [STALE: ${d.stale_reason}]` : "";
+        const scoreStr = d.score !== null && d.score !== undefined ? `${d.score}%` : "unassessed";
+        console.log(
+            `plexer health show ${d.id || d.name} (${d.pool} pool, weight ${d.weight}%, score ${scoreStr}${staleTag}) — ${result.count} matching finding(s):`,
+        );
+        if (d.judgment?.score_rationale || d.judgment?.dimension_character) {
+            console.log(`  Rationale: ${d.judgment.score_rationale || d.judgment.dimension_character}`);
+        }
+        for (const it of result.items) {
+            console.log(`  [${it.status} · ${it.tier} · ${it.severity}] ${it.id} (${it.file}:${it.span}) — ${it.summary}`);
+            if (it.code_excerpt) {
+                for (const line of it.code_excerpt.split("\n")) console.log(`    ${line}`);
+            }
+        }
+        return result;
+    }
+    console.log(`plexer health show — ${result.count} matching finding(s):`);
+    for (const it of result.items) {
+        console.log(`  [${it.status} · ${it.tier} · ${it.severity}] ${it.id} (${it.file}:${it.span}) — ${it.summary}`);
+        if (it.code_excerpt) {
+            for (const line of it.code_excerpt.split("\n")) console.log(`    ${line}`);
+        }
+    }
+    return result;
+}
+
+function printCommitLogResult(result) {
+    if (result.sub_action === "pr") {
+        console.log(result.pr_markdown);
+        return true;
+    }
+    if (result.sub_action === "history") {
+        console.log(`plexer health plan commit-log history (${result.total_commits} commit(s)):`);
+        for (const r of result.records || []) {
+            const br = r.branch ? ` (${r.branch})` : "";
+            console.log(
+                `  ${r.commit || r.sha}${br} — ${(r.issue_ids || []).length} issue(s) [${(r.recorded_at || "").slice(0, 16)}]${r.note ? ` · ${r.note}` : ""}`,
+            );
+        }
+        return true;
+    }
+    if (result.sub_action === "record") {
+        const rec = result.recorded || {};
+        console.log(
+            `✓ Recorded commit ${rec.commit} with ${(rec.issue_ids || []).length} issue(s).` +
+                (rec.pr_updated ? ` Updated PR #${rec.commit_pr}.` : ""),
+        );
+        return true;
+    }
+    console.log(
+        `plexer health plan commit-log — ${result.uncommitted_count} uncommitted, ${result.committed_count} committed across ${(result.commit_log || []).length} commit(s)` +
+            (result.git?.branch ? ` [branch: ${result.git.branch}]` : ""),
+    );
+    return true;
+}
+
+function printHealthMutationResult(action, result) {
+    if (action === "resolve" || result.action === "plan_resolve") {
+        if (result.status === "scan_gate_blocked" || result.status === "not_found") {
+            console.error(`✗ ${result.message}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Resolved ${result.resolved_ids.length} finding(s): ${result.resolved_ids.join(", ")}`);
+        if (result.suggested_commit) console.log(`  Suggested commit: ${result.suggested_commit}`);
+        return true;
+    }
+    if (result.action === "plan_skip") {
+        if (result.status === "attestation_invalid" || result.status === "not_found") {
+            console.error(`✗ ${result.message}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Marked ${result.skipped_ids.length} finding(s) as ${result.status}: ${result.skipped_ids.join(", ")}`);
+        return true;
+    }
+    if (action === "autofix") {
+        if (result.git_dirty_warning) console.log(`  ⚠ ${result.git_dirty_warning}`);
+        console.log(
+            `plexer health autofix (${result.fixer}${result.dry_run ? ", dry-run" : ""}) — ${result.total_edits} edit(s) across ${result.files_changed} file(s)` +
+                (result.reconciled_issue_ids?.length > 0 ? ` (${result.reconciled_issue_ids.length} state issue(s) marked fixed)` : ""),
+        );
+        for (const c of result.changes) {
+            for (const e of c.edits) console.log(`  ${c.file}:L${e.line} [${e.fixer}] ${e.before} → ${e.after}`);
+        }
+        return true;
+    }
+    if (result.action === "plan_commit_log") return printCommitLogResult(result);
+    if (result.action === "review_run_batches") {
+        if (result.status === "failed" || result.status === "error") {
+            console.error(`✗ review --run-batches failed (${result.batches_completed}/${result.batches_attempted} completed)`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Completed ${result.batches_completed}/${result.batches_attempted} review batch(es) via ${result.runner}. Strict score: ${result.scores?.strict}%`);
+        return true;
+    }
+    if (action === "move") {
+        console.log(`plexer health move${result.dry_run ? " (dry-run)" : ""}: ${result.from} → ${result.to} (${result.updated_importers.length} file(s) updated)`);
+        for (const f of result.updated_importers) console.log(`  updated imports in ${f}`);
+        return true;
+    }
+    if (result.action === "review_prepare") {
+        console.log(`✓ Prepared blind review packet: ${result.blind_packet_path}`);
+        console.log(`  Session ID: ${result.session_id} (${result.concerns_count || 0} concern signals included)`);
+        console.log(`  Batches (${result.batches.length}):`);
+        for (const b of result.batches) {
+            console.log(`    Batch ${b.batch} (${b.theme}) → ${b.output_file}: ${b.dimensions.map((d) => d.id).join(", ")}`);
+        }
+        console.log(`  Import when done: plexer health review --import <merged.json> --attested-external --attest "${result.attest_example}"`);
+        return true;
+    }
+    if (result.action === "review_import") {
+        if (result.status === "error" || result.status === "target_anchored_reset") {
+            console.error(`✗ ${result.message}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Imported ${result.imported_dimensions} dimension score(s) and ${result.imported_findings} review finding(s). Strict score: ${result.scores.strict}%`);
+        return true;
+    }
+    return false;
+}
+
+export async function runHealthCommand(defaultDir, positionalArgs = [], opts = {}) {
+    const { action, dir, callOpts } = parseHealthCliArgs(defaultDir, positionalArgs, opts);
+    const result = await health(dir, callOpts);
+    const format = opts.format || (opts.json ? "json" : opts.markdown ? "markdown" : "text");
+
+    if (format === "json") {
+        console.log(JSON.stringify(result, null, 2));
+        return result;
+    }
+    if (action === "prompt") {
+        console.log(result.prompt);
+        return result;
+    }
+    if (action === "tree") {
+        console.log(result.tree_text);
+        return result;
+    }
+    if (action === "viz") {
+        console.log(
+            `✓ Health treemap written to ${result.output_path} (${result.total_files} files, ${result.total_loc} LOC, ${result.open_issues} open issues)`,
+        );
+        return result;
+    }
+    if (action === "detect") {
+        console.log(`plexer health detect (${result.detector}) — ${result.count} finding(s):`);
+        for (const it of result.items) {
+            console.log(`  [${it.tier} · ${it.severity} · ${it.detector}] ${it.file}:${it.span} — ${it.summary}`);
+        }
+        return result;
+    }
+    if (action === "suppress") {
+        if (result.status !== "suppressed") {
+            console.error(`✗ ${result.message}`);
+            process.exitCode = 1;
+            return result;
+        }
+        console.log(
+            `✓ Suppressed pattern "${result.pattern}" (${result.suppressed_ids.length} issue(s) marked wontfix/suppressed). Strict score: ${result.scores.strict}%`,
+        );
+        return result;
+    }
+    if (format === "markdown" && (action === "scan" || action === "status" || action === "next")) {
+        console.log(formatHealthMarkdown(result));
+        return result;
+    }
+    if (action === "scan" || action === "next" || action === "backlog" || action === "status") {
+        console.log(formatHealthText(result));
+        return result;
+    }
+    if (action === "show") {
+        return printHealthShowResult(result);
+    }
+    if (printHealthMutationResult(action, result)) {
+        return result;
+    }
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+}

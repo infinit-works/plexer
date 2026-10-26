@@ -104,7 +104,7 @@ export function runGlobalSetup(opts = {}) {
     }
 
     const wantHooks = opts.hooks !== false;
-    const wantMcp = opts.mcp !== false;
+    const wantMcp = opts.mcp === true;
 
     if (wantAgent('claude') && dirExists(join(home, '.claude'))) {
         if (wantHooks || wantMcp) {

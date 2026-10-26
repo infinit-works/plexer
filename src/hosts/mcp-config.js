@@ -10,36 +10,17 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { dirExists, updateJsonConfig } from './config-write.js';
+import { BIN_LAUNCH, dirExists, mergeJsonKey, updateJsonConfig } from '../util/state.js';
+export { BIN_LAUNCH, mergeJsonKey };
 /**
- * How to launch the MCP server, decided once at init time.
- *
- * `npx -y` resolves the package before it can serve: measured at a 211 ms
- * spawn→`initialize` handshake against 80 ms for the installed binary, five runs
- * each. The harness registers a server's tools only once that handshake lands, and
- * a slow one can miss the first request entirely — in a traced session plexer's
- * tools arrived 13.9 s in, four model turns too late to shape the approach. (That
- * 13.9 s is NOT explained by 130 ms; the gap's cause is still unknown. This is the
- * cheap half of the fix, not the whole of it.)
- *
- * Deliberately a bare command name, never an absolute path: these files get
- * committed and shared, and this repo already carries the scar of the alternative —
- * a checked-in hook shim with another machine's home directory baked into it. A
- * bare `plexer` works on any machine that has it installed; `npx` remains the
- * fallback for machines that don't.
+ * CLI/skill hosts (`claude`, `agents`/Codex, `antigravity`, `gemini`) already
+ * run the `plexer` CLI via `SKILL.md` / `AGENTS.md` / hooks, so MCP server
+ * registration is opt-in (`--mcp` / `opts.mcp === true`) on those hosts.
  */
-export const BIN_LAUNCH = { command: 'plexer', args: ['mcp'] };
+export const CLI_MCP_OPT_IN_HOSTS = new Set(['claude', 'agents', 'antigravity', 'gemini']);
 function opencodeEntry() {
     const { command, args } = BIN_LAUNCH;
     return { type: 'local', command: [command, ...args], enabled: true };
-}
-export function mergeJsonKey(id, path, topKey, entry) {
-    return updateJsonConfig(id, path, (root) => {
-        const bucket = (root[topKey] ??= {});
-        if (typeof bucket !== 'object' || bucket === null || Array.isArray(bucket))
-            return 'unparseable';
-        bucket.plexer = entry;
-    });
 }
 /** The `[mcp_servers.plexer]` table header, as written and as matched. */
 const TOML_HEADER = '[mcp_servers.plexer]';

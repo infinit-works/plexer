@@ -1,6 +1,6 @@
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
-import { skillTemplate } from '../claude/skill-template.js';
+import { skillTemplate } from './skill-template.js';
 import { hooksShim } from '../claude/shim-template.js';
 import { claudeDistDir } from '../claude/paths.js';
 import { updateJsonConfig, writeOwned } from './config-write.js';
@@ -45,7 +45,7 @@ function desiredPlexerHooksBlock(shim) {
         ],
         PostToolUse: [
             {
-                matcher: 'edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file',
+                matcher: 'edit_file|write_file',
                 hooks: [
                     { type: 'command', command: `node "${shim}" agy-post-edit`, timeout: 10 },
                 ],

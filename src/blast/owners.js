@@ -149,11 +149,11 @@ export function ownersFor(root, files, opts = {}) {
         if (h)
             excluded.add(h.toLowerCase());
     }
-    const isExcluded = (o, key) => excluded.has(key.toLowerCase()) ||
+    const isExcludedOwner = (o, key) => excluded.has(key.toLowerCase()) ||
         excluded.has(o.name.toLowerCase()) ||
         (o.handle !== undefined && excluded.has(o.handle.toLowerCase())) ||
         [...o.emails].some((e) => excluded.has(e));
-    const kept = [...people].filter(([key, o]) => !isExcluded(o, key)).map(([, o]) => o);
+    const kept = [...people].filter(([key, o]) => !isExcludedOwner(o, key)).map(([, o]) => o);
     // The floor is a SHARE of what is left after the author is dropped, not of the
     // whole area. On a repo where one person wrote everything, their own PR would
     // otherwise leave every remaining contributor under the floor and report nobody.
@@ -218,7 +218,7 @@ export function localIdentity(root) {
  */
 export function attachOwners(root, report, opts = {}) {
     const ranked = new Map();
-    const visit = (label, files, weight) => {
+    const accumulateAreaOwners = (label, files, weight) => {
         const owners = ownersFor(root, files, opts);
         for (const o of owners) {
             const key = (o.handle ?? o.name).toLowerCase();
@@ -240,9 +240,9 @@ export function attachOwners(root, report, opts = {}) {
         return owners;
     };
     for (const area of report.areas)
-        area.owners = visit(area.label, area.files, 1);
+        area.owners = accumulateAreaOwners(area.label, area.files, 1);
     for (const mod of report.modules)
-        mod.owners = visit(mod.label, mod.files, AFFECTED_WEIGHT);
+        mod.owners = accumulateAreaOwners(mod.label, mod.files, AFFECTED_WEIGHT);
     report.reviewers = [...ranked.values()]
         .sort((a, b) => b.weighted - a.weighted || b.commits - a.commits || a.name.localeCompare(b.name))
         .slice(0, MAX_REVIEWERS)

@@ -9,7 +9,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { instructionBody, cursorRule, kiroSteering, windsurfRule } from './instructions.js';
-import { skillTemplate } from '../claude/skill-template.js';
+import { skillTemplate } from './skill-template.js';
 import { dirExists } from './config-write.js';
 export const HOSTS = [
     {

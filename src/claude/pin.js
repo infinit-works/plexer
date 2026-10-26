@@ -37,7 +37,7 @@ export function namedIdentifiers(prompt) {
         .replace(/^Working directory:.*$/gm, '')
         .replace(/Important:[\s\S]*$/gm, '');
     const found = new Map();
-    const add = (name, strength, owner = null) => {
+    const recordIdentifier = (name, strength, owner = null) => {
         if (!name || (name.length < 4 && !owner) || STOP.has(name.toLowerCase()) || /^\d/.test(name)) return;
         const key = owner ? `${owner}#${name}` : name;
         const e = found.get(key) ?? { name, owner, strength: 0, order: found.size };
@@ -45,7 +45,7 @@ export function namedIdentifiers(prompt) {
         found.set(key, e);
     };
     for (const m of text.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`\s+in\s+`([A-Za-z_][A-Za-z0-9_]*)`/g)) {
-        add(m[1], 3, m[2]);
+        recordIdentifier(m[1], 3, m[2]);
     }
     // Backticked code spans: skip paths/URLs/flags, and skip lowercase namespace prefixes (`user.email.fn` -> `fn`).
     for (const m of text.matchAll(/`([^`\n]{1,160})`/g)) {
@@ -56,7 +56,7 @@ export function namedIdentifiers(prompt) {
             const idx = id.index ?? 0;
             const after = span.slice(idx + id[0].length);
             if (/^[.:][A-Za-z_]/.test(after) && !/^[A-Z]/.test(id[0])) continue; // lowercase receiver prefix
-            add(id[0], /^\s*\(/.test(after) ? 2 : 1);
+            recordIdentifier(id[0], /^\s*\(/.test(after) ? 2 : 1);
         }
     }
     // Call syntax in prose without whitespace before `(` (`helper()`, `GetEvaluationRollouts(ctx)`), never English `word (`.
@@ -64,7 +64,7 @@ export function namedIdentifiers(prompt) {
         const idx = m.index ?? 0;
         const after = text.slice(idx + m[0].length - 1);
         if (idx > 0 && /[/:]/.test(text[idx - 1])) continue;
-        add(m[1], /^\([^)\n]{0,80}\)/.test(after) ? 1 : 0);
+        recordIdentifier(m[1], /^\([^)\n]{0,80}\)/.test(after) ? 1 : 0);
     }
     return [...found.values()].filter((x) => x.strength > 0);
 }
@@ -163,6 +163,52 @@ export function resolveNamedDefinitions(graph, prompt, { maxPins = 3, hintFiles 
     return [...ordered, ...deferred].slice(0, maxPins);
 }
 
+function collectPinRelationsAndDelegators(root, pinNode, graph, byId, fileCache, code, used, budgetBytes) {
+    const related = [];
+    const seenRel = new Set();
+    for (const e of graph?.edges ?? []) {
+        if (related.length >= 6) break;
+        if (e.source === pinNode.id && e.relation === 'calls') {
+            const tn = byId.get(e.target);
+            if (tn?.path && tn?.span && tn.kind !== 'file') {
+                const lbl = `→ ${tn.name} (${tn.path}:${tn.span})`;
+                if (!seenRel.has(lbl)) { seenRel.add(lbl); related.push(lbl); }
+            }
+        } else if (e.target === pinNode.id && (e.relation === 'calls' || e.relation === 'imports')) {
+            const sn = byId.get(e.source);
+            if (sn?.path && sn?.span && sn.kind !== 'file') {
+                const lbl = `← ${sn.name} (${sn.path}:${sn.span})`;
+                if (!seenRel.has(lbl)) { seenRel.add(lbl); related.push(lbl); }
+                const dsp = sn.name === pinNode.name && sn.path !== pinNode.path ? parseSpan(sn.span) : null;
+                if (dsp && dsp[1] - dsp[0] <= 10 && !code.includes(`// delegator in ${sn.path}:`)) {
+                    try {
+                        let dLines = fileCache.get(sn.path);
+                        if (!dLines) {
+                            dLines = readFileSync(join(root, sn.path), 'utf8').split('\n');
+                            fileCache.set(sn.path, dLines);
+                        }
+                        const dStart = Math.max(1, dsp[0] - 3);
+                        const dEnd = Math.min(dLines.length, dsp[1] + 3);
+                        const dBody = dLines.slice(dStart - 1, dEnd).map((l, i) => `L${dStart + i}: ${l}`).join('\n');
+                        const dBlock = `\n\n// delegator in ${sn.path}:L${dStart}-L${dEnd}\n${dBody}`;
+                        const dBytes = Buffer.byteLength(dBlock, 'utf8');
+                        if (used + dBytes <= budgetBytes) {
+                            code += dBlock;
+                            used += dBytes;
+                        }
+                    } catch {
+                        // ignore
+                    }
+                }
+            } else if (sn?.path && sn.kind === 'file') {
+                const lbl = `← ${sn.path}`;
+                if (!seenRel.has(lbl)) { seenRel.add(lbl); related.push(lbl); }
+            }
+        }
+    }
+    return { related, code, used };
+}
+
 /**
  * Turn pinned definitions into hook hits with inlined `L<n>:` bodies, within `budgetBytes`.
  * Long bodies are cut at `MAX_PIN_LINES` with an explicit continuation pointer.
@@ -192,7 +238,7 @@ export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 
         }
         let end = Math.min(p.b, start + maxLinesPerPin - 1, lines.length);
         if (p.b - end <= 8) end = Math.min(p.b, lines.length);
-        let body = lines.slice(start - 1, end).map((l, i) => `L${start + i}: ${l}`);
+        const body = lines.slice(start - 1, end).map((l, i) => `L${start + i}: ${l}`);
         if (end < p.b) body.push(`… (+${p.b - end} more lines; open ${p.node.path}:L${end + 1}-L${p.b})`);
         let code = body.join('\n');
         let bytes = Buffer.byteLength(code, 'utf8');
@@ -214,48 +260,9 @@ export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 
             bytes = Buffer.byteLength(code, 'utf8');
         }
         used += bytes;
-        const related = [];
-        const seenRel = new Set();
-        for (const e of graph?.edges ?? []) {
-            if (related.length >= 6) break;
-            if (e.source === p.node.id && e.relation === 'calls') {
-                const tn = byId.get(e.target);
-                if (tn?.path && tn?.span && tn.kind !== 'file') {
-                    const lbl = `→ ${tn.name} (${tn.path}:${tn.span})`;
-                    if (!seenRel.has(lbl)) { seenRel.add(lbl); related.push(lbl); }
-                }
-            } else if (e.target === p.node.id && (e.relation === 'calls' || e.relation === 'imports')) {
-                const sn = byId.get(e.source);
-                if (sn?.path && sn?.span && sn.kind !== 'file') {
-                    const lbl = `← ${sn.name} (${sn.path}:${sn.span})`;
-                    if (!seenRel.has(lbl)) { seenRel.add(lbl); related.push(lbl); }
-                    const dsp = sn.name === p.node.name && sn.path !== p.node.path ? parseSpan(sn.span) : null;
-                    if (dsp && dsp[1] - dsp[0] <= 10 && !code.includes(`// delegator in ${sn.path}:`)) {
-                        try {
-                            let dLines = fileCache.get(sn.path);
-                            if (!dLines) {
-                                dLines = readFileSync(join(root, sn.path), 'utf8').split('\n');
-                                fileCache.set(sn.path, dLines);
-                            }
-                            const dStart = Math.max(1, dsp[0] - 3);
-                            const dEnd = Math.min(dLines.length, dsp[1] + 3);
-                            const dBody = dLines.slice(dStart - 1, dEnd).map((l, i) => `L${dStart + i}: ${l}`).join('\n');
-                            const dBlock = `\n\n// delegator in ${sn.path}:L${dStart}-L${dEnd}\n${dBody}`;
-                            const dBytes = Buffer.byteLength(dBlock, 'utf8');
-                            if (used + dBytes <= budgetBytes) {
-                                code += dBlock;
-                                used += dBytes;
-                            }
-                        } catch {
-                            // ignore
-                        }
-                    }
-                } else if (sn?.path && sn.kind === 'file') {
-                    const lbl = `← ${sn.path}`;
-                    if (!seenRel.has(lbl)) { seenRel.add(lbl); related.push(lbl); }
-                }
-            }
-        }
+        const relRes = collectPinRelationsAndDelegators(root, p.node, graph, byId, fileCache, code, used, budgetBytes);
+        code = relRes.code;
+        used = relRes.used;
         hits.push({
             kind: 'symbol',
             title: `${p.node.name} · ${p.node.kind} (named in prompt)`,
@@ -264,7 +271,7 @@ export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 
             score: 1,
             code,
             pinned: true,
-            related: related.length > 0 ? related : undefined,
+            related: relRes.related.length > 0 ? relRes.related : undefined,
             a: p.a,
             b: p.b,
         });

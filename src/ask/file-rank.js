@@ -63,7 +63,7 @@ function lexicalAnchorOrder(a, b, queryWeights) {
  * The anchor is the only pooled candidate. Graph-only symbols, residual nodes,
  * and all other lexical symbols remain exact baseline competitors.
  */
-export function rankFilesBounded(candidates, queryWeights) {
+function groupRankableCandidatesByFile(candidates) {
     const groups = new Map();
     for (const candidate of candidates) {
         if (!candidate.file || !finitePositive(candidate.baselineScore))
@@ -74,102 +74,115 @@ export function rankFilesBounded(candidates, queryWeights) {
         else
             groups.set(candidate.file, [candidate]);
     }
+    return groups;
+}
+function computeFileGroupCoverage(donors, allLexicalMembers, lexicalAnchor, queryWeights) {
+    let unionCoverage = 0;
+    let unionStrongCoverage = 0;
+    let anchorCoverage = 0;
+    let boundedResidual = 0;
+    let pooledLexical = lexicalAnchor ? clamp01(lexicalAnchor.lexical) : 0;
+    if (lexicalAnchor) {
+        const unionTerms = new Set();
+        for (const donor of allLexicalMembers)
+            for (const term of donor.matchedTerms)
+                unionTerms.add(term);
+        for (const term of unionTerms) {
+            const weight = queryWeights.get(term);
+            if (finitePositive(weight ?? 0))
+                unionCoverage += weight;
+        }
+        unionCoverage = clamp01(unionCoverage);
+        const unionStrongTerms = new Set();
+        for (const donor of donors)
+            for (const term of donor.matchedStrongTerms ?? [])
+                unionStrongTerms.add(term);
+        for (const term of unionStrongTerms) {
+            const weight = queryWeights.get(term);
+            if (finitePositive(weight ?? 0))
+                unionStrongCoverage += weight;
+        }
+        unionStrongCoverage = clamp01(unionStrongCoverage);
+        anchorCoverage = coverage(lexicalAnchor, queryWeights);
+        boundedResidual = unionCoverage > 0
+            ? clamp01(anchorCoverage * Math.max(0, unionCoverage - anchorCoverage) /
+                unionCoverage)
+            : 0;
+        pooledLexical = clamp01(lexicalAnchor.lexical +
+            (1 - clamp01(lexicalAnchor.lexical)) * boundedResidual);
+    }
+    const lexicalDelta = lexicalAnchor
+        ? Math.max(0, pooledLexical - clamp01(lexicalAnchor.lexical))
+        : 0;
+    return {
+        unionCoverage,
+        unionStrongCoverage,
+        anchorCoverage,
+        boundedResidual,
+        pooledLexical,
+        lexicalDelta,
+    };
+}
+function scoreBoundedFileGroup(file, members, queryWeights) {
+    const donors = members.filter((candidate) => candidate.kind === "symbol" &&
+        candidate.eligible &&
+        finitePositive(candidate.rawLexical) &&
+        finitePositive(candidate.lexical));
+    const allLexicalMembers = members.filter((candidate) =>
+        finitePositive(candidate.rawLexical) &&
+        finitePositive(candidate.lexical));
+    donors.sort((a, b) => lexicalAnchorOrder(a, b, queryWeights));
+    allLexicalMembers.sort((a, b) => lexicalAnchorOrder(a, b, queryWeights));
+    const lexicalAnchor = donors[0] ?? allLexicalMembers[0];
+    const cov = computeFileGroupCoverage(donors, allLexicalMembers, lexicalAnchor, queryWeights);
+    const ordered = [...members].sort(baselineOrder);
+    const baselineRepresentative = ordered[0];
+    const coverageBonus = cov.unionCoverage > 0.5
+        ? 0.22 * (cov.unionCoverage - 0.5) * (0.6 + 0.4 * cov.unionStrongCoverage)
+        : 0;
+    const graphScale = 0.5 * (0.35 + 0.65 * Math.max(cov.unionCoverage, cov.unionStrongCoverage));
+    const pooledAnchorScore = lexicalAnchor
+        ? clamp01(lexicalAnchor.rankFactor) *
+            (cov.pooledLexical + graphScale * clamp01(lexicalAnchor.graph) + coverageBonus)
+        : 0;
+    const repCoverage = baselineRepresentative ? coverage(baselineRepresentative, queryWeights) : 0;
+    const repResidual = cov.unionCoverage > 0 && repCoverage > 0
+        ? clamp01(repCoverage * Math.max(0, cov.unionCoverage - repCoverage) / cov.unionCoverage)
+        : 0;
+    const pooledRepLexical = baselineRepresentative
+        ? clamp01(baselineRepresentative.lexical + (1 - clamp01(baselineRepresentative.lexical)) * repResidual)
+        : 0;
+    const pooledRepScore = baselineRepresentative
+        ? clamp01(baselineRepresentative.rankFactor) *
+            (pooledRepLexical + graphScale * clamp01(baselineRepresentative.graph) + coverageBonus)
+        : 0;
+    const pooledWins = Boolean(lexicalAnchor && pooledAnchorScore > pooledRepScore);
+    const representative = pooledWins ? lexicalAnchor : baselineRepresentative;
+    const score = pooledWins ? pooledAnchorScore : pooledRepScore;
+    const representativeReason = pooledWins
+        ? "pooled-anchor"
+        : representative.kind === "file"
+            ? "baseline-residual"
+            : "baseline-symbol";
+    const queue = [
+        representative,
+        ...ordered.filter((candidate) => candidate.id !== representative.id),
+    ];
+    return {
+        file,
+        representative,
+        representativeReason,
+        lexicalAnchor,
+        queue,
+        ...cov,
+        score,
+    };
+}
+export function rankFilesBounded(candidates, queryWeights) {
+    const groups = groupRankableCandidatesByFile(candidates);
     const ranked = [];
     for (const [file, members] of groups) {
-        const donors = members.filter((candidate) => candidate.kind === "symbol" &&
-            candidate.eligible &&
-            finitePositive(candidate.rawLexical) &&
-            finitePositive(candidate.lexical));
-        const allLexicalMembers = members.filter((candidate) =>
-            finitePositive(candidate.rawLexical) &&
-            finitePositive(candidate.lexical));
-        donors.sort((a, b) => lexicalAnchorOrder(a, b, queryWeights));
-        allLexicalMembers.sort((a, b) => lexicalAnchorOrder(a, b, queryWeights));
-        const lexicalAnchor = donors[0] ?? allLexicalMembers[0];
-        let unionCoverage = 0;
-        let unionStrongCoverage = 0;
-        let anchorCoverage = 0;
-        let boundedResidual = 0;
-        let pooledLexical = lexicalAnchor ? clamp01(lexicalAnchor.lexical) : 0;
-        if (lexicalAnchor) {
-            const unionTerms = new Set();
-            for (const donor of allLexicalMembers)
-                for (const term of donor.matchedTerms)
-                    unionTerms.add(term);
-            for (const term of unionTerms) {
-                const weight = queryWeights.get(term);
-                if (finitePositive(weight ?? 0))
-                    unionCoverage += weight;
-            }
-            unionCoverage = clamp01(unionCoverage);
-            const unionStrongTerms = new Set();
-            for (const donor of donors)
-                for (const term of donor.matchedStrongTerms ?? [])
-                    unionStrongTerms.add(term);
-            for (const term of unionStrongTerms) {
-                const weight = queryWeights.get(term);
-                if (finitePositive(weight ?? 0))
-                    unionStrongCoverage += weight;
-            }
-            unionStrongCoverage = clamp01(unionStrongCoverage);
-            anchorCoverage = coverage(lexicalAnchor, queryWeights);
-            boundedResidual = unionCoverage > 0
-                ? clamp01(anchorCoverage * Math.max(0, unionCoverage - anchorCoverage) /
-                    unionCoverage)
-                : 0;
-            pooledLexical = clamp01(lexicalAnchor.lexical +
-                (1 - clamp01(lexicalAnchor.lexical)) * boundedResidual);
-        }
-        const lexicalDelta = lexicalAnchor
-            ? Math.max(0, pooledLexical - clamp01(lexicalAnchor.lexical))
-            : 0;
-        const ordered = [...members].sort(baselineOrder);
-        const baselineRepresentative = ordered[0];
-        const coverageBonus = unionCoverage > 0.5
-            ? 0.22 * (unionCoverage - 0.5) * (0.6 + 0.4 * unionStrongCoverage)
-            : 0;
-        const graphScale = 0.5 * (0.35 + 0.65 * Math.max(unionCoverage, unionStrongCoverage));
-        const pooledAnchorScore = lexicalAnchor
-            ? clamp01(lexicalAnchor.rankFactor) *
-                (pooledLexical + graphScale * clamp01(lexicalAnchor.graph) + coverageBonus)
-            : 0;
-        const repCoverage = baselineRepresentative ? coverage(baselineRepresentative, queryWeights) : 0;
-        const repResidual = unionCoverage > 0 && repCoverage > 0
-            ? clamp01(repCoverage * Math.max(0, unionCoverage - repCoverage) / unionCoverage)
-            : 0;
-        const pooledRepLexical = baselineRepresentative
-            ? clamp01(baselineRepresentative.lexical + (1 - clamp01(baselineRepresentative.lexical)) * repResidual)
-            : 0;
-        const pooledRepScore = baselineRepresentative
-            ? clamp01(baselineRepresentative.rankFactor) *
-                (pooledRepLexical + graphScale * clamp01(baselineRepresentative.graph) + coverageBonus)
-            : 0;
-        const pooledWins = Boolean(lexicalAnchor && pooledAnchorScore > pooledRepScore);
-        const representative = pooledWins ? lexicalAnchor : baselineRepresentative;
-        const score = pooledWins ? pooledAnchorScore : pooledRepScore;
-        const representativeReason = pooledWins
-            ? "pooled-anchor"
-            : representative.kind === "file"
-                ? "baseline-residual"
-                : "baseline-symbol";
-        const queue = [
-            representative,
-            ...ordered.filter((candidate) => candidate.id !== representative.id),
-        ];
-        ranked.push({
-            file,
-            representative,
-            representativeReason,
-            lexicalAnchor,
-            queue,
-            unionCoverage,
-            unionStrongCoverage,
-            anchorCoverage,
-            boundedResidual,
-            pooledLexical,
-            lexicalDelta,
-            score,
-        });
+        ranked.push(scoreBoundedFileGroup(file, members, queryWeights));
     }
     ranked.sort((a, b) => b.score - a.score ||
         baselineOrder(a.representative, b.representative) ||
