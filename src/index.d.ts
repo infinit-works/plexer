@@ -69,7 +69,7 @@ export interface BuildGraphOptions {
     extensions?: string[];
     reuse?: boolean;
     onlyDirs?: string[];
-    graphOnly?: boolean;
+    cards?: boolean;
     onProgress?: (event: BuildProgressEvent) => void;
 }
 
@@ -165,6 +165,23 @@ export interface SkeletonResult {
     entries: SkeletonEntry[];
     note?: string;
     error?: string;
+}
+
+export interface ReadOptions {
+    contextDir?: string;
+}
+
+export interface ReadSpanBlock {
+    spec: string;
+    file?: string;
+    span?: string;
+    totalLines?: number;
+    code?: string;
+    error?: string;
+}
+
+export interface ReadSpansResult {
+    blocks: ReadSpanBlock[];
 }
 
 export interface GrepOptions {
@@ -380,6 +397,7 @@ export class Plexer {
     graph(dir: string, opts?: BuildGraphOptions): Promise<BuildGraphResult>;
     ask(dir: string, query: string, opts?: AskOptions): AskResult;
     skeleton(dir: string, file: string, opts?: SkeletonOptions): SkeletonResult;
+    read(dir: string, spans: string | string[], opts?: ReadOptions): ReadSpansResult;
     blast(dir: string, opts?: BlastOptions): BlastResult;
     grep(dir: string, pattern: string, opts?: GrepOptions): GrepResult;
     callers(dir: string, symbol: string, opts?: CallersOptions): CallersMatch[];
@@ -400,6 +418,8 @@ export function ask(dir: string, query: string, opts?: AskOptions): AskResult;
 export function formatAsk(result: AskResult): string;
 export function skeleton(dir: string, file: string, opts?: SkeletonOptions): SkeletonResult;
 export function formatSkeleton(result: SkeletonResult): string;
+export function readSpans(dir: string, spanSpecs: string | string[], opts?: ReadOptions): ReadSpansResult;
+export function formatReadSpans(result: ReadSpansResult): string;
 export function grepGraph(graph: WiringGraph, root: string, pattern: string, opts?: GrepOptions): GrepResult;
 export function formatGrepResult(result: GrepResult): string;
 export function runGrepCommand(pattern: string, dir: string, opts?: GrepOptions & { globalDir?: string; json?: boolean }): void;

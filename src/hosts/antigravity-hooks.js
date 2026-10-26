@@ -1,4 +1,4 @@
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, unlinkSync, writeSync } from 'node:fs';
 import { join, dirname, basename, isAbsolute, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { relevantRetrieval } from '../claude/format.js';
@@ -9,8 +9,12 @@ import {
     queryPromptContext,
     handleStop,
 } from '../claude/hooks.js';
-import { hasPlexerIndex } from '../graph/root.js';
+import { ensureFreshGraph } from '../graph/refresh.js';
+import { hasPlexerIndex, isAutoBuildableRepo } from '../graph/root.js';
 import { resolveContextDir, readJson, writeJsonAtomic } from '../util/state.js';
+
+const STALE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const LEADING_SLASH_COMMANDS_RE = /^(?:\/(?:plan|grill-me|review|simplify|verify|feature-dev|batch|deep-research|commit|pr|revise-rules|learn|security-scan|claude-security|playground|goal|boost|compact|schedule|browser|plugin|automation)\b\s*)+/i;
 
 export function emptyAgySession() {
     return {
@@ -26,6 +30,7 @@ export function emptyAgySession() {
         lastQuery: null,
         perAgentQuery: {},
         injectedPointers: [],
+        emittedBlastFiles: [],
         nudges: 0,
         lastRetrievalText: null,
     };
@@ -33,9 +38,46 @@ export function emptyAgySession() {
 
 function normalizePromptKey(text) {
     return String(text ?? '')
-        .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
-        .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, '')
+        .replace(/<ADDITIONAL_METADATA>[\s\S]*?(?:<\/ADDITIONAL_METADATA>|$)/gi, '')
+        .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?(?:<\/USER_SETTINGS_CHANGE>|$)/gi, '')
+        .trim()
+        .replace(LEADING_SLASH_COMMANDS_RE, '')
         .trim();
+}
+
+export function agyLastRepoPath() {
+    return join(tmpdir(), 'plexer-agy-last-repo.json');
+}
+
+export function readAgyLastRepo() {
+    const data = readJson(agyLastRepoPath());
+    return typeof data?.repoDir === 'string' && existsSync(data.repoDir) ? data.repoDir : null;
+}
+
+function writeAgyLastRepo(repoDir) {
+    try {
+        writeJsonAtomic(agyLastRepoPath(), { repoDir, updatedAt: Date.now() }, true);
+    }
+    catch { /* best-effort */ }
+}
+
+function pruneStaleAgySessions() {
+    try {
+        const dir = tmpdir();
+        const now = Date.now();
+        for (const name of readdirSync(dir)) {
+            if (!name.startsWith('plexer-agy-') || !name.endsWith('.json') || name === 'plexer-agy-last-repo.json')
+                continue;
+            const full = join(dir, name);
+            try {
+                const st = statSync(full);
+                if (now - st.mtimeMs > STALE_SESSION_TTL_MS)
+                    unlinkSync(full);
+            }
+            catch { /* ignore */ }
+        }
+    }
+    catch { /* ignore */ }
 }
 
 export function agySessionPath(sessionId) {
@@ -72,15 +114,22 @@ function unquoteArg(val) {
 }
 
 function stripUserRequestTags(text) {
-    const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i.exec(text);
+    const m = /<USER_REQUEST>([\s\S]*?)(?:<\/USER_REQUEST>|<ADDITIONAL_METADATA>|<USER_SETTINGS_CHANGE>|$)/i.exec(text);
     return (m ? m[1] : text).trim();
 }
 
-function isIgnoredTouchedPath(p) {
+function isIgnoredTouchedPath(p, workspaceRoot = null) {
     if (!p || typeof p !== 'string' || !isAbsolute(p))
         return true;
     const norm = p.replace(/\\/g, '/');
-    return /\/\.gemini\/antigravity(?:-cli|-ide)?\/brain\//.test(norm);
+    if (/\/(?:\.gemini|\.agents|\.claude|\.codex)(?:\/|$)/.test(norm))
+        return true;
+    if (/\/Projects\/skills(?:\/|$)/.test(norm)) {
+        const wsNorm = typeof workspaceRoot === 'string' ? workspaceRoot.replace(/\\/g, '/') : '';
+        if (!wsNorm || !/\/Projects\/skills(?:\/|$)/.test(wsNorm))
+            return true;
+    }
+    return false;
 }
 
 function extractPathsFromText(raw, sessionState) {
@@ -234,10 +283,13 @@ function findNearestRepoAncestor(startPath) {
 }
 
 export function resolveAgyRepoDir(input, sessionState) {
+    const wsRoot = input?.workspacePaths?.[0] || null;
+    const rawTouched = sessionState?.lastTouchedPath;
+    const touched = rawTouched && !isIgnoredTouchedPath(rawTouched, wsRoot) ? rawTouched : null;
     const candidates = [
-        sessionState?.lastTouchedPath,
+        touched,
         input?.cwd,
-        input?.workspacePaths?.[0],
+        wsRoot,
         process.cwd(),
     ].filter(Boolean);
     for (const c of candidates) {
@@ -262,7 +314,15 @@ function agySessionId(input) {
 function loadAgyContext(input) {
     const sid = agySessionId(input);
     const agyState = readAgySession(sid);
+    const isFreshSession = agyState.lastUserStep === -1 && agyState.transcriptOffset === 0;
+    if (isFreshSession)
+        pruneStaleAgySessions();
     let transcriptPath = input?.transcriptPath || input?.transcript_path;
+    if (typeof transcriptPath === 'string' && transcriptPath.endsWith('/transcript.jsonl')) {
+        const fullSibling = join(dirname(transcriptPath), 'transcript_full.jsonl');
+        if (existsSync(fullSibling))
+            transcriptPath = fullSibling;
+    }
     if ((!transcriptPath || !existsSync(transcriptPath)) && input?.conversationId) {
         const home = homedir();
         const candidates = [
@@ -289,10 +349,40 @@ function isIsolatedBenchDir(dir) {
     return norm.includes('/plexer-ab-') || norm.includes('/plexer-bench-') || norm.includes('/plexer-swebench-');
 }
 
-export function handleAgyPreInvocation(input) {
+function fitAgyEphemeral(text, maxChars = 11500) {
+    if (text.length <= maxChars)
+        return text;
+    let out = text.replace(/\nL\d+:\s*\/\*\*[\s\S]*?\nL\d+:\s*\*\/(?=\n```)/g, '');
+    if (out.length > maxChars) {
+        out = out.replace(/(\n [2-9]\. [^\n]+(?:\n    [^\n]+)*\n```\n)([\s\S]*?)(\n\n\/\/ (?:same-file helper|cross-file callee):)/g, (_m, head, body, helperHdr) => {
+            const lines = body.split('\n');
+            if (lines.length <= 10)
+                return _m;
+            return `${head}${[...lines.slice(0, 3), '  …', ...lines.slice(-5)].join('\n')}${helperHdr}`;
+        });
+    }
+    if (out.length > maxChars) {
+        out = out.replace(/(\nL\d+:\s*\/\/[^\n]*)+/g, '');
+    }
+    if (out.length <= maxChars)
+        return out;
+    let sliced = out.slice(0, maxChars);
+    const lastNl = sliced.lastIndexOf('\n');
+    if (lastNl > maxChars * 0.8)
+        sliced = sliced.slice(0, lastNl);
+    const fenceCount = (sliced.match(/^```/gm) || []).length;
+    if (fenceCount % 2 === 1)
+        sliced += '\n```';
+    return sliced;
+}
+
+export async function handleAgyPreInvocation(input) {
     const { sid, agyState } = loadAgyContext(input);
-    if (typeof input?.prompt === 'string' && input.prompt.trim()) {
-        const cleaned = normalizePromptKey(stripUserRequestTags(input.prompt));
+    const directPrompt = typeof input?.prompt === 'string' && input.prompt.trim()
+        ? input.prompt
+        : (typeof input?.lastUserInput === 'string' && input.lastUserInput.trim() ? input.lastUserInput : null);
+    if (directPrompt) {
+        const cleaned = normalizePromptKey(stripUserRequestTags(directPrompt));
         if (cleaned && cleaned !== normalizePromptKey(agyState.lastUserPrompt)) {
             agyState.lastUserPrompt = cleaned;
             agyState.lastUserStep = (agyState.lastUserStep ?? -1) + 1;
@@ -307,13 +397,20 @@ export function handleAgyPreInvocation(input) {
     }
     const messages = [];
     const ctxDir = resolveContextDir(dir);
+    if (!existsSync(ctxDir) && isAutoBuildableRepo(dir)) {
+        try {
+            await ensureFreshGraph(dir);
+        }
+        catch { /* best-effort auto-build */ }
+    }
+    let injectedPromptContext = false;
     if (existsSync(ctxDir)) {
+        writeAgyLastRepo(dir);
         if (agyState.pendingBlastRadius) {
             messages.push(agyState.pendingBlastRadius);
             agyState.pendingBlastRadius = null;
             agyState.lastRetrievalText = null;
         }
-        let injectedPromptContext = false;
         const prompt = normalizePromptKey(agyState.lastUserPrompt);
         const isNewPrompt = prompt.length >= MIN_PROMPT_CHARS &&
             prompt !== normalizePromptKey(agyState.lastQuery);
@@ -326,15 +423,8 @@ export function handleAgyPreInvocation(input) {
                 if (txt) {
                     messages.push(txt);
                     injectedPromptContext = !txt.startsWith('[plexer] no strong match');
-                    if (injectedPromptContext)
-                        agyState.lastRetrievalText = txt;
                 }
             }
-        }
-        else if (!agyState.pendingBlastRadius && agyState.lastRetrievalText) {
-            messages.push(agyState.lastRetrievalText);
-            agyState.lastRetrievalText = null;
-            injectedPromptContext = true;
         }
         if (!Array.isArray(agyState.orientedDirs))
             agyState.orientedDirs = [];
@@ -347,12 +437,14 @@ export function handleAgyPreInvocation(input) {
         }
     }
     writeAgySession(sid, agyState);
-    if (messages.length > 0) {
-        process.stdout.write(`${JSON.stringify({ injectSteps: [{ ephemeralMessage: messages.join('\n\n') }] })}\n`);
-    }
-    else {
-        process.stdout.write('{}\n');
-    }
+    const ephMsg = fitAgyEphemeral(messages.join('\n\n'), 11500);
+    const stepObj = injectedPromptContext
+        ? { systemMessage: { systemMessage: ephMsg } }
+        : { ephemeralMessage: ephMsg };
+    const payload = messages.length > 0
+        ? `${JSON.stringify({ injectSteps: [stepObj] })}\n`
+        : '{}\n';
+    writeSync(1, payload);
 }
 
 export function handleAgyPostEdit(input) {
@@ -372,7 +464,11 @@ export function handleAgyPostEdit(input) {
             const editedFile = isAbsolute(rawTarget) ? rawTarget : join(repoRoot, rawTarget);
             if (existsSync(resolveContextDir(repoRoot))) {
                 const br = recordFileEdit(repoRoot, editedFile);
-                if (br) {
+                const base = basename(editedFile);
+                if (!Array.isArray(agyState.emittedBlastFiles))
+                    agyState.emittedBlastFiles = [];
+                if (br && !agyState.emittedBlastFiles.includes(base)) {
+                    agyState.emittedBlastFiles.push(base);
                     if (agyState.pendingBlastRadius && !agyState.pendingBlastRadius.includes(br)) {
                         agyState.pendingBlastRadius = `${agyState.pendingBlastRadius}\n${br}`;
                     }

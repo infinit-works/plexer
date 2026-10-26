@@ -1,0 +1,53 @@
+{
+  "T1": {},
+  "T2": {},
+  "T3": {},
+  "T4": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T4-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-plexer/z"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T4-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-cold/z"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T4-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-trail/z"
+    }
+  },
+  "T5": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T5-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-cold/plexer"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T5-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-plexer/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T5-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-trail/plexer"
+    }
+  },
+  "T6": {},
+  "T7": {},
+  "T8": {},
+  "T9": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T9-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-plexer/plexer"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T9-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-cold/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/flash-medium/T9-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-flash-medium-trail/plexer"
+    }
+  },
+  "T10": {},
+  "T11": {},
+  "T12": {}
+}

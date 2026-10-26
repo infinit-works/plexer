@@ -119,6 +119,10 @@ export function buildRepoMap(graph, opts = {}) {
     const maxDirs = opts.maxDirs ?? DEFAULT_MAX_DIRS;
     const hubsPerDir = opts.hubsPerDir ?? DEFAULT_HUBS_PER_DIR;
     const hotspotsN = opts.hotspots ?? DEFAULT_HOTSPOTS;
+    const isDefault = maxDirs === DEFAULT_MAX_DIRS && hubsPerDir === DEFAULT_HUBS_PER_DIR && hotspotsN === DEFAULT_HOTSPOTS;
+    if (isDefault && graph._defaultRepoMap && graph._mapNodeLen === graph.nodes.length && graph._mapEdgeLen === graph.edges.length) {
+        return graph._defaultRepoMap;
+    }
     const fileNodes = graph.nodes.filter((n) => n.kind === "file");
     const totalFiles = fileNodes.length;
     const inDegree = computeInDegree(graph);
@@ -151,7 +155,7 @@ export function buildRepoMap(graph, opts = {}) {
     }
     const allSymbols = graph.nodes.filter((n) => n.kind !== "file");
     const hotspots = topHubs(allSymbols, inDegree, hotspotsN);
-    return {
+    const result = {
         totals: {
             files: totalFiles,
             symbols: allSymbols.length,
@@ -163,6 +167,12 @@ export function buildRepoMap(graph, opts = {}) {
         hotspots,
         dropped,
     };
+    if (isDefault) {
+        Object.defineProperty(graph, "_defaultRepoMap", { value: result, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(graph, "_mapNodeLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(graph, "_mapEdgeLen", { value: graph.edges.length, enumerable: false, configurable: true, writable: true });
+    }
+    return result;
 }
 const DIR_COL_WIDTH = 20;
 function basenameOf(path) {

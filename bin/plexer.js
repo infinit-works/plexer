@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * `plexer` CLI — structural codebase context graph ($0, offline, WASM tree-sitter + Luau/Roblox).
- * Commands: build, ask, check, viz, mcp, callers, skeleton, grep, map, blast, init, uninstall, version.
+ * Commands: build, ask, read, callers, callees, impact, skeleton, grep, map, blast, viz, mcp, check, init, setup, retract, version.
  */
 import { Command } from "commander";
 import { homedir } from "node:os";
@@ -39,6 +39,15 @@ if (process.argv[2] === "_hook") {
     const { main } = await import("../src/claude/hooks.js");
     await main(process.argv[3]);
     process.exit(0);
+}
+
+if (
+    process.env.PLEXER_ENABLE_BENCH_HOOKS === "0" ||
+    process.env.PLEXER_DISABLE_HOOKS === "1" ||
+    /\/tmp\/plexer-(?:ab|swebench)-[^/]*-(?:cold|trail)(?:\/|$)/.test(process.cwd())
+) {
+    process.stderr.write("plexer: command not available in this environment\n");
+    process.exit(127);
 }
 
 const program = new Command();
@@ -354,8 +363,8 @@ program
 
 program
     .command("read")
-    .description("Read one or more exact file:Lx-Ly line spans (or unique basenames) with L<n>: line numbers ($0, offline)")
-    .argument("<spans...>", "one or more file:Lx-Ly, file:Lx, or file spans")
+    .description("Read one or more exact file:Lx-Ly line spans or file:symbol spans (or unique basenames) with L<n>: line numbers ($0, offline)")
+    .argument("<spans...>", "one or more file:Lx-Ly, file:Lx, file:symbol, or file spans")
     .option("--json", "output the result as JSON")
     .option(...NO_REFRESH_FLAG)
     .action(async (spansArg, opts) => {

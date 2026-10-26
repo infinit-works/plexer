@@ -1045,15 +1045,69 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             assert.ok(multiAskOut.includes("runTick"), "multi-ask second query should surface runTick");
             assert.ok(multiAskOut.includes("call sites ("), "ask should fuse quoted call sites onto top hits");
 
-            // CLI read <file:Lx-Ly> [...]
+            // CLI read <file:Lx-Ly> and <file:symbol> [...]
             const readOut = execFileSync(
                 process.execPath,
-                [cliPath, "read", "scheduler.ts:L7-L13", "src/consumer.ts:L5-L8", tmp, "--no-refresh"],
+                [cliPath, "read", "scheduler.ts:L7-L13", "src/consumer.ts:runTick", tmp, "--no-refresh"],
                 { encoding: "utf8" },
             );
             assert.ok(readOut.includes("src/scheduler.ts:L7-L13"), "plexer read should resolve unique basename and span");
             assert.ok(readOut.includes("L8:   if (count > MAX_RERUNS)"), "plexer read should output L<n>: prefixed lines");
-            assert.ok(readOut.includes("src/consumer.ts:L5-L8"), "plexer read should support multiple spans in one call");
+            assert.ok(readOut.includes("src/consumer.ts:L5-L8"), "plexer read should resolve file:symbol to exact symbol span");
+
+            // MAX_CLOSURE_NODES cap on impactOfMany with maxDepth=Infinity
+            const { impactOfMany, MAX_CLOSURE_NODES } = await import("../src/graph/traverse.js");
+            assert.equal(MAX_CLOSURE_NODES, 100, "MAX_CLOSURE_NODES should be 100");
+            const bigNodes = Array.from({ length: 151 }, (_, i) => ({ id: `n${i}`, name: `n${i}`, kind: "function", path: "a.ts", span: "L1-L2" }));
+            const bigEdges = [];
+            for (let i = 0; i < 150; i++) {
+                bigEdges.push({ source: `n${i + 1}`, target: `n${i}`, relation: "calls" });
+            }
+            const closureHits = impactOfMany({ nodes: bigNodes, edges: bigEdges }, [bigNodes[0]], Infinity, "in");
+            assert.equal(closureHits.length, MAX_CLOSURE_NODES, "impactOfMany with Infinity depth should cap at MAX_CLOSURE_NODES");
+
+            // formatOrientation never dumps INDEX.md prose
+            const { formatOrientation } = await import("../src/claude/format.js");
+            const orient = formatOrientation("# Big Index\n" + "x".repeat(2000), 1200);
+            assert.ok(!orient.includes("# Big Index"), "formatOrientation should omit INDEX.md prose");
+            assert.ok(orient.length < 300, "formatOrientation should remain compact");
+
+            // distillPromptQueries strips Steps to reproduce before splitting numbered lists
+            const { distillPromptQueries } = await import("../src/claude/hooks.js");
+            const { readSession } = await import("../src/util/state.js");
+            const prPrompt = [
+                "## Description",
+                "Queue flushing needs a guard threshold.",
+                "## Steps to Reproduce",
+                "1. Open the app",
+                "2. Click the button",
+                "3. Wait 5 seconds",
+                "## Requirements",
+                "- Update `checkGuard` in `src/scheduler.ts`",
+                "- Update `runTick` in `src/consumer.ts`",
+            ].join("\n");
+            const prQueries = distillPromptQueries(tmp, undefined, prPrompt);
+            assert.ok(prQueries.some((q) => q.includes("checkGuard") || q.includes("scheduler.ts")), "distillPromptQueries should preserve Requirements after Steps to Reproduce");
+
+            // post-edit hook deduplicates per-file blast radius within a session
+            const hookPayload = JSON.stringify({
+                session_id: "dedup-test-session",
+                cwd: tmp,
+                tool_input: { file_path: join(tmp, "src", "scheduler.ts") },
+            });
+            const firstPost = execFileSync(process.execPath, [cliPath, "_hook", "post-edit"], {
+                input: hookPayload,
+                encoding: "utf8",
+            });
+            const firstText = JSON.parse(firstPost).hookSpecificOutput.additionalContext;
+            assert.ok(firstText.includes("scheduler.ts"), "first edit should emit blast radius");
+            const secondPost = execFileSync(process.execPath, [cliPath, "_hook", "post-edit"], {
+                input: hookPayload,
+                encoding: "utf8",
+            });
+            assert.equal(secondPost.trim(), "", "second edit to same file in same session should suppress duplicate blast-radius dump");
+            const sessState = readSession(tmp, "dedup-test-session");
+            assert.ok(sessState.emittedBlastFiles.includes("scheduler.ts"));
 
             // Variadic CLI grep with default -C 2 context
             const multiGrepOut = execFileSync(

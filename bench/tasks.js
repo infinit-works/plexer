@@ -62,7 +62,7 @@ export const TASKS = [
                 id: "auth_file_cited",
                 description: "Cites src/Shared/Auth.luau with line numbers around targetUserArgument and getGroupEntryRank/isPublicRole",
                 weight: 2,
-                test: (txt) => /src\/Shared\/Auth\.luau:L?\d+/i.test(txt),
+                test: (txt) => /src\/Shared\/Auth\.luau[:#]L?\d+/i.test(txt),
             },
             {
                 id: "roles_loaded_attribute",
@@ -114,7 +114,7 @@ export const TASKS = [
                 description: "Cites src/Graph.luau with line numbers",
                 weight: 2,
                 test: (txt) =>
-                    /src\/Graph\.luau:L?\d+/i.test(txt) ||
+                    /src\/Graph\.luau[:#]L?\d+/i.test(txt) ||
                     hasAll(txt, [/src\/Graph\.luau/i, /\bL\d+-L\d+\b/]),
             },
             {
@@ -165,7 +165,7 @@ export const TASKS = [
                 id: "model_and_prop_cited",
                 description: "Cites src/model.luau (and optionally src/prop.luau) with line spans",
                 weight: 2,
-                test: (txt) => /src\/model\.luau:L?\d+/i.test(txt),
+                test: (txt) => /src\/model\.luau[:#]L?\d+/i.test(txt),
             },
             {
                 id: "precondition_state_shift",
@@ -215,7 +215,7 @@ export const TASKS = [
                 id: "resolve_rs_cited",
                 description: "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
                 weight: 2,
-                test: (txt) => /compiler\/src\/resolve\.rs:L?\d+/i.test(txt),
+                test: (txt) => /compiler\/src\/resolve\.rs[:#]L?\d+/i.test(txt),
             },
             {
                 id: "zero_size_detection",
@@ -272,7 +272,7 @@ export const TASKS = [
                 weight: 2,
                 test: (txt) =>
                     hasAll(txt, [
-                        /src\/graph\/fingerprint\.js:L?\d+/i,
+                        /src\/graph\/fingerprint\.js[:#]L?\d+/i,
                         /probeDrift|isClean/,
                     ]),
             },
@@ -282,7 +282,7 @@ export const TASKS = [
                 weight: 2,
                 test: (txt) =>
                     hasAll(txt, [
-                        /src\/graph\/refresh\.js:L?\d+/i,
+                        /src\/graph\/refresh\.js[:#]L?\d+/i,
                         /ensureFreshGraph/,
                     ]),
             },
@@ -292,7 +292,7 @@ export const TASKS = [
                 weight: 2,
                 test: (txt) =>
                     hasAll(txt, [
-                        /bin\/plexer\.js:L?\d+/i,
+                        /bin\/plexer\.js[:#]L?\d+/i,
                         /refreshBefore/,
                         /\bask\b/,
                         /\bskeleton\b/,
@@ -306,7 +306,7 @@ export const TASKS = [
                 weight: 2,
                 test: (txt) =>
                     hasAll(txt, [
-                        /src\/mcp\/tools\.js:L?\d+/i,
+                        /src\/mcp\/tools\.js[:#]L?\d+/i,
                         /callTool|ensureFreshGraph/,
                     ]),
             },
@@ -330,7 +330,7 @@ export const TASKS = [
                 weight: 2,
                 test: (txt) =>
                     hasAll(txt, [
-                        /src\/Shared\/Auth\.luau:L?\d+/i,
+                        /src\/Shared\/Auth\.luau[:#]L?\d+/i,
                         /hasPermission/,
                     ]),
             },
@@ -391,8 +391,8 @@ export const TASKS = [
                 weight: 2,
                 test: (txt) =>
                     hasAll(txt, [
-                        /src\/init\.luau:L?\d+/i,
-                        /src\/Clock\.luau:L?\d+/i,
+                        /src\/init\.luau[:#]L?\d+/i,
+                        /src\/Clock\.luau[:#]L?\d+/i,
                     ]),
             },
             {
@@ -504,11 +504,11 @@ export const TASKS = [
         title: "Implement multi-file `--all-matches` mode for `plexer skeleton`",
         prompt: (repoDir) =>
             `Working directory: ${repoDir}\n\n` +
-            `Currently, the file-API \`skeleton(repoDir, fileQuery, opts)\` function returns an \`{ error: 'ambiguous path "..." — matches: ...' }\` object whenever \`fileQuery\` matches multiple indexed files and none is an exact path match.\n\n` +
+            `Currently, the \`skeleton(dir, file, opts)\` function returns \`{ file, entries: [], note: "ambiguous — matches: ..." }\` whenever \`file\` matches multiple indexed files by suffix and none is an exact path match.\n\n` +
             `Implement an opt-in multi-match mode across the skeleton API, formatter, and CLI in this repository:\n` +
-            `1. When \`skeleton(repoDir, fileQuery, opts)\` is called with \`opts.allMatches\` truthy and \`fileQuery\` matches multiple indexed files (with no single exact match), instead of returning \`{ error }\`, return \`{ files, entries }\` where \`files\` is the sorted array of matched file paths and \`entries\` is the combined array of skeleton entries across all matched files in that sorted file order (preserving each entry's \`file\` property and sorting each file's entries by start line). Preserve the existing single-file return shape \`{ file, entries }\` when only 1 file matches, and preserve the \`{ error }\` return when \`opts.allMatches\` is falsy.\n` +
-            `2. In \`formatSkeleton(skel)\`, when \`Array.isArray(skel.files)\` is present, format each file's section (\`<file> — skeleton (<N> symbols)\` followed by its entries) separated by a blank line.\n` +
-            `3. In the CLI entrypoint, support \`--all-matches\` on \`plexer skeleton <file> [--all-matches]\` and pass \`allMatches\` to \`skeleton(...)\`.\n\n` +
+            `1. When \`skeleton(dir, file, opts)\` is called with \`opts.allMatches\` truthy and \`file\` matches multiple indexed files (with no single exact match), instead of returning the ambiguous \`note\`, return \`{ files, entries }\` where \`files\` is the sorted array of matched file paths and \`entries\` is the combined array of skeleton entries across all matched files in that sorted file order (attaching \`file: matchedPath\` to each entry and sorting each file's entries by start line). Preserve the existing single-file return shape \`{ file, entries }\` when only 1 file matches, and preserve the ambiguous \`note\` return when \`opts.allMatches\` is falsy.\n` +
+            `2. In \`formatSkeleton(r)\`, when \`Array.isArray(r.files)\` is present, format each file's section (\`<file> — skeleton (<N> symbols)\` followed by its entries) separated by a blank line.\n` +
+            `3. In the CLI entrypoint and \`Plexer\` class wrapper, support \`--all-matches\` on \`plexer skeleton <file> [--all-matches]\` and pass \`{ allMatches }\` through to \`skeleton(...)\`.\n\n` +
             `Run \`npm test\` to verify all tests pass.`,
         rubric: [
             {

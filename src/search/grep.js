@@ -52,51 +52,79 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
     const inPrefix = opts.in ? normalizePathPrefix(opts.in) : undefined;
     if (inPrefix)
         assertPrefixIndexed(graph, inPrefix);
-    const fileNodes = [];
-    const symbolsByPath = new Map();
-    for (const n of graph.nodes) {
-        if (inPrefix !== undefined && !pathUnderPrefix(n.path, inPrefix))
-            continue;
-        if (n.kind === "file") {
-            fileNodes.push(n);
-            continue;
-        }
-        const b = spanRange(n.span);
-        if (!b)
-            continue;
-        pushMap(symbolsByPath, n.path, { node: n, start: b.start, end: b.end });
+    let fileNodes;
+    let symbolsByPath;
+    if (inPrefix === undefined && graph._grepSymbolIndex && graph._grepNodeLen === graph.nodes.length) {
+        fileNodes = graph._grepSymbolIndex.fileNodes;
+        symbolsByPath = graph._grepSymbolIndex.symbolsByPath;
     }
+    else {
+        fileNodes = [];
+        symbolsByPath = new Map();
+        for (const n of graph.nodes) {
+            if (inPrefix !== undefined && !pathUnderPrefix(n.path, inPrefix))
+                continue;
+            if (n.kind === "file") {
+                fileNodes.push(n);
+                continue;
+            }
+            const b = spanRange(n.span);
+            if (!b)
+                continue;
+            pushMap(symbolsByPath, n.path, { node: n, start: b.start, end: b.end });
+        }
+        for (const syms of symbolsByPath.values()) {
+            syms.sort((a, b) => a.start - b.start);
+        }
+        if (inPrefix === undefined) {
+            Object.defineProperty(graph, "_grepSymbolIndex", { value: { fileNodes, symbolsByPath }, enumerable: false, configurable: true, writable: true });
+            Object.defineProperty(graph, "_grepNodeLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
+        }
+    }
+    let textCache;
+    if (graph._grepFileTextCache && graph._grepFileTextRoot === repoRoot && graph._grepFileTextLen === graph.nodes.length) {
+        textCache = graph._grepFileTextCache;
+    }
+    else {
+        textCache = new Map();
+        Object.defineProperty(graph, "_grepFileTextCache", { value: textCache, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(graph, "_grepFileTextRoot", { value: repoRoot, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(graph, "_grepFileTextLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
+    }
+    const isSimpleFixed = Boolean(opts.fixed && !opts.ignoreCase && !pattern.includes("|") && !pattern.includes("\\|"));
     const groups = new Map();
     const linesByPath = (baseContextLines > 0 || opts.source) ? new Map() : null;
     let totalMatchedLines = 0;
     let truncatedFiles = 0;
     for (const file of fileNodes) {
-        let text;
-        try {
-            const decoded = readSourceFile(join(repoRoot, file.path));
-            if (decoded === null) {
-                truncatedFiles++;
-                continue;
+        let text = textCache.get(file.path);
+        if (text === undefined) {
+            try {
+                text = readSourceFile(join(repoRoot, file.path));
             }
-            text = decoded;
+            catch {
+                text = null;
+            }
+            textCache.set(file.path, text);
         }
-        catch {
+        if (text === null) {
             truncatedFiles++;
             continue;
         }
+        if (isSimpleFixed ? !text.includes(pattern) : !regex.test(text))
+            continue;
         let symbols;
         const lines = text.split("\n");
         let fileHasHit = false;
         for (let i = 0; i < lines.length; i++) {
             const raw = lines[i];
-            if (!regex.test(raw))
+            if (isSimpleFixed ? !raw.includes(pattern) : !regex.test(raw))
                 continue;
             fileHasHit = true;
             totalMatchedLines++;
             const lineNo = i + 1;
             if (!symbols) {
                 symbols = symbolsByPath.get(file.path) ?? [];
-                symbols.sort((a, b) => a.start - b.start);
             }
             const sym = enclosingSymbol(symbols, lineNo);
             const key = sym ? sym.id : `file:${file.path}`;

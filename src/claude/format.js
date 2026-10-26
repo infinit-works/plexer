@@ -63,7 +63,19 @@ export function incomingEdges(w, filePath, dir) {
     const ids = nodeIdsInFile(w, filePath, dir);
     if (!ids.size)
         return [];
-    return (w.edges ?? []).filter((e) => ids.has(e.target) && !ids.has(e.source));
+    const byId = w._byId ?? new Map((w.nodes ?? []).map((n) => [n.id, n]));
+    const isTestTarget = /(?:^|\/)(?:tests?|specs?|__tests__|fixtures?)\b|(?:\.|_)(?:test|spec)\.[a-z0-9]+$/i.test(filePath);
+    return (w.edges ?? []).filter((e) => {
+        if (!ids.has(e.target) || ids.has(e.source))
+            return false;
+        if (!isTestTarget) {
+            const sn = byId.get(e.source);
+            const sp = sn?.path ?? '';
+            if (/(?:^|\/)(?:tests?|specs?|__tests__|fixtures?)\b|(?:\.|_)(?:test|spec)\.[a-z0-9]+$/i.test(sp))
+                return false;
+        }
+        return true;
+    });
 }
 export function formatBlastRadius(w, filePath, cap = 8, dir) {
     const edges = incomingEdges(w, filePath, dir);
@@ -79,35 +91,47 @@ export function formatBlastRadius(w, filePath, cap = 8, dir) {
     const more = allItems.length > cap ? `\n • +${allItems.length - cap} more` : '';
     return `[plexer] blast radius for ${basename(filePath)}, who depends on it:\n${items.join('\n')}${more}`;
 }
-function retrievalBody(hits) {
-    const blocks = hits.map((h, i) => {
+function retrievalBody(hits, isEditPrompt = false) {
+    let ranked = 0;
+    const blocks = hits.map((h, n) => {
+        // Pinned hits are numbered but don't consume the ranked hits' "top result" slots
+        // (which earn the related / call-site lines below).
+        const i = h.pinned ? Infinity : ranked++;
+        const num = n + 1;
         const ptr = (h.pointer ?? '').split(',')[0].trim();
         const snip = (h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
         const redundant = isRedundantSnippet(snip, h.code);
-        let b = ` ${i + 1}. ${h.title}: ${ptr}`;
-        if (snip && !redundant)
+        let b = ` ${num}. ${h.title}: ${ptr}`;
+        if (snip && !redundant && (!isEditPrompt || !h.code))
             b += `\n    ${snip}`;
-        if (h.related?.length && (h.code || i < 2))
+        if (h.related?.length && (isEditPrompt ? Boolean(h.code) || i < 2 : (h.code || i < 2)))
             b += `\n    related: ${h.related.slice(0, 6).join(', ')}`;
-        if (h.callSites?.length && i === 0) {
+        if (h.callSites?.length && (i === 0 || h.wantsCallSites)) {
+            const maxCs = h.wantsCallSites ? 26 : (isEditPrompt ? 3 : 5);
             b += `\n    call sites (${h.callSites.length}):`;
-            for (const cs of h.callSites.slice(0, 5))
+            for (const cs of h.callSites.slice(0, maxCs))
                 b += `\n      ← ${cs}`;
         }
+        if (h.otherSymbols && !h.code && i < 3)
+            b += `\n    symbols: ${h.otherSymbols.split(', ').slice(0, 6).join(', ')}`;
         if (h.code)
             b += `\n\`\`\`\n${h.code}\n\`\`\``;
         return b;
     });
     const header = hits.some((h) => h.code)
-        ? '[plexer] retrieved context, read these spans; do not re-open the files:'
+        ? (isEditPrompt
+            ? '[plexer] edit targets localized (skip repo-wide grep/find; batch remaining reads in 1 turn, then apply all edits in 1 turn):'
+            : '[plexer] retrieved context, read these spans; do not re-open the files:')
         : '[plexer] starting points for this task: pull the code inline with `plexer ask "<what you need>" --source`, trace impact with `plexer callers <symbol>`, or search with `plexer grep "<literal>"`:';
     return `${header}\n${blocks.join('\n')}`;
 }
 export function formatRetrieval(ask, cap = 5) {
-    const hits = (ask.hits ?? []).slice(0, cap);
+    // Pinned (named-in-prompt) definitions ride on top of the ranked cap.
+    const pinned = (ask.hits ?? []).filter((h) => h.pinned).length;
+    const hits = (ask.hits ?? []).slice(0, cap + pinned);
     if (!hits.length)
         return null;
-    return retrievalBody(hits);
+    return retrievalBody(hits, Boolean(ask.isEditPrompt || ask.editEnvelope));
 }
 /** How many recently-injected pointers the novelty gate remembers per session. */
 const INJECTED_POINTERS_CAP = 40;
@@ -130,7 +154,7 @@ export function relevantRetrieval(ask, s, cap = 4) {
     if (!(ask.hits ?? []).length)
         return null;
     const lexical = typeof ask.coverage === 'number' || typeof ask.coverageStrong === 'number';
-    if (lexical) {
+    if (lexical && !ask.hits.some((h) => h.pinned)) {
         const strong = ask.coverageStrong ?? 0;
         const broad = ask.coverage ?? 0;
         const hasSubstantialMatch = strong >= STRONG_FLOOR || broad >= HIGH_FLOOR || (strong >= 0.04 && broad >= 0.14) || broad >= 0.28;
@@ -144,22 +168,16 @@ export function relevantRetrieval(ask, s, cap = 4) {
     const txt = formatRetrieval({ ...ask, hits: fresh }, cap);
     if (!txt)
         return null;
-    s.injectedPointers = [...(s.injectedPointers ?? []), ...fresh.slice(0, cap).map((h) => h.pointer)]
+    s.injectedPointers = [...(s.injectedPointers ?? []), ...fresh.slice(0, cap + fresh.filter((h) => h.pinned).length).map((h) => h.pointer)]
         .slice(-INJECTED_POINTERS_CAP);
     return txt;
 }
-export function formatOrientation(indexMd, budgetBytes = 1200, staleNote) {
+export function formatOrientation(indexMd, budgetBytes = 0, staleNote) {
     const banner = staleNote ? `${staleNote}\n\n` : "";
     if (budgetBytes <= 0) {
         return `${banner}[plexer] This repo is indexed by plexer.`;
     }
-    const directive = `[plexer] This repo is indexed by plexer. Use plexer to get exact file:Lx-Ly spans and L<n>: source in one call, then answer or edit directly without redundant file reads:\n` +
-        `  • plexer ask "<task>": locate + understand (inlines L<n>: source for top hits + same-file helpers + constants; --full for full span; --in <scope>/ for monorepos).\n` +
-        `  • plexer callers <syms...> [--depth 2] [--direction out]: exact callers/callees/blast radius with via-hop provenance and inlined call-site source.\n` +
-        `  • plexer grep "<pattern>" [--fixed]: symbol-grouped literal/regex search with context (-i case-insensitive).\n` +
-        `  • plexer skeleton <file>: signatures-only file API in ~200 tokens (--all-matches when ambiguous).\n` +
-        `  • plexer map: directory clusters, hubs, hotspots.\n`;
-    return `${banner}${directive}\nrepo map (plexer/INDEX.md):\n${indexMd.slice(0, budgetBytes)}`;
+    return `${banner}[plexer] This repo is indexed by plexer. Use \`plexer ask "<task>"\`, \`plexer callers <sym> [--depth 2|all]\`, \`plexer read <file:Lx-Ly|file:sym>\`, \`plexer skeleton <file>\`, or \`plexer grep "<pat>"\` to get exact spans and L<n>: source without redundant file reads.`;
 }
 export function renderSubagent(agentName, session) {
     const q = session?.perAgentQuery?.[agentName];

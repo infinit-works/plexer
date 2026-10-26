@@ -124,9 +124,9 @@ export function quoteFor(hit, needles, read, opts = {}) {
     const isCommandTableItem = /^[a-z0-9_]+\.run$/i.test(hit.node.name ?? "");
     const matches = referenceLines(hit.node.path, hit.node.span, effectiveNeedles, read, {
         excludeRanges,
-        maxMatches: isTest ? 1 : isFileNode ? 10 : callerSpanLen > 120 ? 8 : withinBudget ? 5 : 2,
+        maxMatches: isTest ? 1 : !withinBudget ? 1 : isFileNode ? 10 : callerSpanLen > 120 ? 8 : 5,
         contextLines: allowFullWindow ? (isFileNode ? 1 : 2) : 0,
-        includeHeaderContext: isFileNode || callerSpanLen > 120 || isCommandTableItem,
+        includeHeaderContext: withinBudget && (isFileNode || callerSpanLen > 120 || isCommandTableItem),
         allowAboveSpan: isCommandTableItem,
     });
     if (allowFullWindow && matches.length > 0) {
@@ -418,16 +418,31 @@ export function runCallersCommand(queryInput, dir, opts) {
     const blocks = [];
     const read = fileReader(root);
     const seenSourceIds = new Set();
-    const maxBytesPerSymbol = queries.length > 1 ? 4600 : 5400;
-    for (const { symbol, candidateCount, hits } of allResults) {
-        const sourceBudget = { bytes: 0, maxBytes: maxBytesPerSymbol };
+    const seenHomonymCallerKeys = new Set();
+    const maxBytesPerSymbol = allResults.length > 1 ? Math.max(1200, Math.floor(5800 / allResults.length)) : 5400;
+    let totalBytes = 0;
+    for (let idx = 0; idx < allResults.length; idx++) {
+        const { symbol, candidateCount, hits } = allResults[idx];
+        const remaining = allResults.length > 1 ? Math.max(0, 5800 - totalBytes) : maxBytesPerSymbol;
+        const dedupedHits = candidateCount > 1 && idx > 0
+            ? hits.filter((h) => !seenHomonymCallerKeys.has(`${symbol.name}:${h.id}:${h.relation}:${h.depth}`))
+            : hits;
+        for (const h of dedupedHits) {
+            seenHomonymCallerKeys.add(`${symbol.name}:${h.id}:${h.relation}:${h.depth}`);
+        }
+        if (candidateCount > 1 && idx > 0 && dedupedHits.length === 0 && hits.length > 0 && remaining <= 0) {
+            blocks.push(`${headerOf(symbol)}\n  (shared callers shown above)`);
+            continue;
+        }
+        const sourceBudget = { bytes: 0, maxBytes: Math.min(maxBytesPerSymbol, remaining) };
         blocks.push(
-            renderMatchBlock(symbol, hits, direction, showDepth, candidateCount, read, {
-                source: opts.source,
+            renderMatchBlock(symbol, dedupedHits, direction, showDepth, candidateCount, read, {
+                source: opts.source && remaining > 0,
                 seenSourceIds,
                 sourceBudget,
             }),
         );
+        totalBytes += sourceBudget.bytes;
     }
     process.stdout.write(`${blocks.join("\n\n")}\n`);
 }

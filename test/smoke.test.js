@@ -88,7 +88,8 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
                 }),
             );
             assert.ok(Array.isArray(preOut1.injectSteps));
-            assert.ok(preOut1.injectSteps[0].ephemeralMessage.includes("[plexer] This repo is indexed by plexer."));
+            const preMsg1 = preOut1.injectSteps[0].systemMessage?.systemMessage ?? preOut1.injectSteps[0].ephemeralMessage;
+            assert.ok(preMsg1.includes("[plexer] This repo is indexed by plexer."));
 
             // 2. Modify util.ts and trigger agy-post-edit (via both replace_file_content and edit_file)
             writeFileSync(utilFile, "export function helper(x: number): number { return x + 2; }\n");
@@ -204,9 +205,85 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
                     { lastTouchedPath: join(unindexedRepo, "src", "foo.ts") },
                 );
                 assert.equal(resolved, unindexedRepo, "must resolve unindexed active repo instead of leaking indexed workspace");
+
+                // Reading a skill/config file under ~/.gemini or ~/.agents must not hijack workspacePaths[0]
+                const resolvedWithSkillRead = resolveAgyRepoDir(
+                    { workspacePaths: [unindexedRepo] },
+                    { lastTouchedPath: "/home/kohl/.gemini/config/skills/review/SKILL.md" },
+                );
+                assert.equal(resolvedWithSkillRead, unindexedRepo, "skill path under .gemini must not hijack workspace root");
             } finally {
                 rmSync(indexedWs, { recursive: true, force: true });
                 rmSync(unindexedRepo, { recursive: true, force: true });
+            }
+
+            // Cold/unindexed git repo auto-builds plexer/ on Turn 1 in handleAgyPreInvocation & callTool,
+            // prefers transcript_full.jsonl over truncated transcript.jsonl, and strips slash commands
+            const { agySessionPath } = await import("../src/hosts/antigravity-hooks.js");
+            const { callTool } = await import("../src/mcp/tools.js");
+            const coldRepo = mkdtempSync(join(tmpdir(), "plexer-agy-lifecycle-cold-"));
+            const logsDir = join(coldRepo, ".logs");
+            const sid = `test-cold-${Date.now()}`;
+            try {
+                execFileSync("git", ["init", "-q"], { cwd: coldRepo });
+                mkdirSync(join(coldRepo, "src"), { recursive: true });
+                mkdirSync(logsDir, { recursive: true });
+                writeFileSync(
+                    join(coldRepo, "src", "tracker.py"),
+                    "def compute_revenue_summary(sales):\n    return sum(s.get('amount', 0) for s in sales)\n",
+                );
+                // Compact transcript is truncated, while transcript_full.jsonl has the full USER_REQUEST
+                writeFileSync(
+                    join(logsDir, "transcript.jsonl"),
+                    JSON.stringify({
+                        type: "USER_INPUT",
+                        step_index: 0,
+                        content: "<USER_REQUEST>\n/plan /grill-me ",
+                        truncated_fields: ["content"],
+                    }) + "\n",
+                );
+                writeFileSync(
+                    join(logsDir, "transcript_full.jsonl"),
+                    JSON.stringify({
+                        type: "USER_INPUT",
+                        step_index: 0,
+                        content:
+                            "<USER_REQUEST>\n/plan /grill-me how does compute_revenue_summary calculate sales in tracker.py?\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlong metadata\n</ADDITIONAL_METADATA>",
+                    }) + "\n",
+                );
+
+                const hookOut = JSON.parse(
+                    runHookEvent("agy-pre-invocation", {
+                        conversationId: sid,
+                        workspacePaths: [coldRepo],
+                        transcriptPath: join(logsDir, "transcript.jsonl"),
+                    }),
+                );
+
+                assert.equal(existsSync(join(coldRepo, "plexer", ".graph", "wiring.json")), true, "cold repo must auto-build wiring.json on Turn 1");
+                assert.equal(existsSync(join(coldRepo, "plexer", "INDEX.md")), true, "cold repo must auto-build INDEX.md on Turn 1");
+                assert.ok(Array.isArray(hookOut.injectSteps) && hookOut.injectSteps.length === 1, "PreInvocation must inject Turn-1 context on cold repo");
+                const hookMsg = hookOut.injectSteps[0].systemMessage?.systemMessage ?? hookOut.injectSteps[0].ephemeralMessage;
+                assert.ok(hookMsg.includes("compute_revenue_summary"), "PreInvocation must retrieve symbol from transcript_full.jsonl after stripping slash commands");
+
+                // Also verify callTool auto-builds a second cold repo when called via MCP
+                const coldMcpRepo = mkdtempSync(join(tmpdir(), "plexer-mcp-cold-"));
+                try {
+                    execFileSync("git", ["init", "-q"], { cwd: coldMcpRepo });
+                    mkdirSync(join(coldMcpRepo, "src"), { recursive: true });
+                    writeFileSync(join(coldMcpRepo, "src", "app.py"), "def start_server(port):\n    return port\n");
+                    const mcpRes = await callTool(tmpdir(), "plexer_find_code", {
+                        query: "start_server",
+                        dir: coldMcpRepo,
+                    });
+                    assert.equal(mcpRes.isError, false, "MCP callTool on cold repo must succeed");
+                    assert.ok(mcpRes.text.includes("start_server"), "MCP callTool must return indexed symbol from auto-built graph");
+                } finally {
+                    rmSync(coldMcpRepo, { recursive: true, force: true });
+                }
+            } finally {
+                rmSync(coldRepo, { recursive: true, force: true });
+                rmSync(agySessionPath(sid), { force: true });
             }
         } finally {
             rmSync(home, { recursive: true, force: true });

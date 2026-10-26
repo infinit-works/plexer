@@ -1,0 +1,433 @@
+{
+  "generatedAt": "2026-10-26T03:42:15.088Z",
+  "symmetryCheck": {
+    "passed": true,
+    "violations": []
+  },
+  "totals": {
+    "cold": {
+      "calls": 26,
+      "turns": 21,
+      "toolOutputTokens": 14137,
+      "uncachedInputTokens": 85079,
+      "cachedInputTokens": 385498,
+      "cumulativeInputTokens": 470577,
+      "finalContextTokens": 70374,
+      "totalModelOutputTokens": 10808,
+      "searchMs": 60000,
+      "totalMs": 80437,
+      "score": 24,
+      "maxScore": 24
+    },
+    "plexer": {
+      "calls": 11,
+      "turns": 8,
+      "toolOutputTokens": 5850,
+      "uncachedInputTokens": 70061,
+      "cachedInputTokens": 113769,
+      "cumulativeInputTokens": 183830,
+      "finalContextTokens": 53083,
+      "totalModelOutputTokens": 6603,
+      "searchMs": 33000,
+      "totalMs": 52752,
+      "score": 24,
+      "maxScore": 24
+    },
+    "tokenWins": 3,
+    "tokenTies": 0,
+    "tokenLosses": 0,
+    "callWins": 3,
+    "callTies": 0,
+    "callLosses": 0,
+    "speedWins": 3,
+    "speedTies": 0,
+    "speedLosses": 0,
+    "trailComparison": {
+      "taskIds": [
+        "T4",
+        "T5",
+        "T9"
+      ],
+      "cold": {
+        "calls": 26,
+        "turns": 21,
+        "toolOutputTokens": 14137,
+        "uncachedInputTokens": 85079,
+        "cachedInputTokens": 385498,
+        "cumulativeInputTokens": 470577,
+        "finalContextTokens": 70374,
+        "totalModelOutputTokens": 10808,
+        "searchMs": 60000,
+        "totalMs": 80437,
+        "score": 24,
+        "maxScore": 24
+      },
+      "trail": {
+        "calls": 20,
+        "turns": 13,
+        "toolOutputTokens": 11841,
+        "uncachedInputTokens": 75892,
+        "cachedInputTokens": 245193,
+        "cumulativeInputTokens": 321085,
+        "finalContextTokens": 72945,
+        "totalModelOutputTokens": 7487,
+        "searchMs": 44000,
+        "totalMs": 63289,
+        "score": 24,
+        "maxScore": 24
+      },
+      "plexer": {
+        "calls": 11,
+        "turns": 8,
+        "toolOutputTokens": 5850,
+        "uncachedInputTokens": 70061,
+        "cachedInputTokens": 113769,
+        "cumulativeInputTokens": 183830,
+        "finalContextTokens": 53083,
+        "totalModelOutputTokens": 6603,
+        "searchMs": 33000,
+        "totalMs": 52752,
+        "score": 24,
+        "maxScore": 24
+      }
+    }
+  },
+  "tasks": [
+    {
+      "id": "T4",
+      "category": "diagnosis",
+      "repo": "z",
+      "holdout": true,
+      "title": "Diagnose zero-byte element validation in count-prefixed arrays (Holdout)",
+      "cold": {
+        "conversationId": "52ff34fc-9f83-42e8-a399-7a9c84aee83e",
+        "calls": 4,
+        "turns": 3,
+        "toolOutputTokens": 2244,
+        "uncachedInputTokens": 17667,
+        "cachedInputTokens": 33647,
+        "cumulativeInputTokens": 51314,
+        "finalContextTokens": 16160,
+        "totalModelOutputTokens": 1404,
+        "searchMs": 6000,
+        "totalMs": 12503,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "resolve_rs_cited",
+            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "zero_size_detection",
+            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "consumes_instance_exception",
+            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "composite_type_rules",
+            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "4e716551-95dc-4e56-89bb-7d0a70f0f0b2",
+        "calls": 0,
+        "turns": 0,
+        "toolOutputTokens": 0,
+        "uncachedInputTokens": 13810,
+        "cachedInputTokens": 0,
+        "cumulativeInputTokens": 13810,
+        "finalContextTokens": 13810,
+        "totalModelOutputTokens": 1003,
+        "searchMs": 0,
+        "totalMs": 8195,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "resolve_rs_cited",
+            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "zero_size_detection",
+            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "consumes_instance_exception",
+            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "composite_type_rules",
+            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "be30e966-b331-40ad-8e90-8dfda1e10339",
+        "calls": 3,
+        "turns": 3,
+        "toolOutputTokens": 3498,
+        "uncachedInputTokens": 25115,
+        "cachedInputTokens": 53118,
+        "cumulativeInputTokens": 78233,
+        "finalContextTokens": 22127,
+        "totalModelOutputTokens": 1182,
+        "searchMs": 6000,
+        "totalMs": 11986,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "resolve_rs_cited",
+            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "zero_size_detection",
+            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "consumes_instance_exception",
+            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "composite_type_rules",
+            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T5",
+      "category": "blast-radius",
+      "repo": "plexer",
+      "holdout": false,
+      "title": "Blast radius of changing working-tree freshness checking",
+      "cold": {
+        "conversationId": "56a97972-39a6-47e6-9206-c38c360ab2c8",
+        "calls": 6,
+        "turns": 6,
+        "toolOutputTokens": 5286,
+        "uncachedInputTokens": 33847,
+        "cachedInputTokens": 97322,
+        "cumulativeInputTokens": 131169,
+        "finalContextTokens": 23177,
+        "totalModelOutputTokens": 2776,
+        "searchMs": 13000,
+        "totalMs": 22130,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "fingerprint_def",
+            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "direct_callers",
+            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "cli_commands_using_ensure",
+            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mcp_freshness",
+            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "df0abd26-4e21-4f4c-aa05-f5901176c5df",
+        "calls": 3,
+        "turns": 3,
+        "toolOutputTokens": 1758,
+        "uncachedInputTokens": 24909,
+        "cachedInputTokens": 37301,
+        "cumulativeInputTokens": 62210,
+        "finalContextTokens": 16066,
+        "totalModelOutputTokens": 1813,
+        "searchMs": 10000,
+        "totalMs": 16505,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "fingerprint_def",
+            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "direct_callers",
+            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "cli_commands_using_ensure",
+            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mcp_freshness",
+            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "b45cda49-a79b-4998-bd32-8c4a6dea75e0",
+        "calls": 5,
+        "turns": 3,
+        "toolOutputTokens": 3821,
+        "uncachedInputTokens": 21620,
+        "cachedInputTokens": 56516,
+        "cumulativeInputTokens": 78136,
+        "finalContextTokens": 22860,
+        "totalModelOutputTokens": 1941,
+        "searchMs": 10000,
+        "totalMs": 17940,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "fingerprint_def",
+            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "direct_callers",
+            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "cli_commands_using_ensure",
+            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mcp_freshness",
+            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T9",
+      "category": "code-edit",
+      "repo": "plexer",
+      "holdout": false,
+      "title": "Implement multi-file `--all-matches` mode for `plexer skeleton`",
+      "cold": {
+        "conversationId": "1a1d2028-6ea2-49b5-ab13-66379a914453",
+        "calls": 16,
+        "turns": 12,
+        "toolOutputTokens": 6607,
+        "uncachedInputTokens": 33565,
+        "cachedInputTokens": 254529,
+        "cumulativeInputTokens": 288094,
+        "finalContextTokens": 31037,
+        "totalModelOutputTokens": 6628,
+        "searchMs": 41000,
+        "totalMs": 45804,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "unit_and_behavioral_tests",
+            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "828b8e38-5a20-457c-acce-ddfda3962766",
+        "calls": 8,
+        "turns": 5,
+        "toolOutputTokens": 4092,
+        "uncachedInputTokens": 31342,
+        "cachedInputTokens": 76468,
+        "cumulativeInputTokens": 107810,
+        "finalContextTokens": 23207,
+        "totalModelOutputTokens": 3787,
+        "searchMs": 23000,
+        "totalMs": 28052,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "unit_and_behavioral_tests",
+            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "4c305486-f5b9-4cac-8ef4-0efd595d55d2",
+        "calls": 12,
+        "turns": 7,
+        "toolOutputTokens": 4522,
+        "uncachedInputTokens": 29157,
+        "cachedInputTokens": 135559,
+        "cumulativeInputTokens": 164716,
+        "finalContextTokens": 27958,
+        "totalModelOutputTokens": 4364,
+        "searchMs": 28000,
+        "totalMs": 33363,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "unit_and_behavioral_tests",
+            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      }
+    }
+  ]
+}

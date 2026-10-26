@@ -17,13 +17,8 @@ function reply(id, result) {
 function replyError(id, code, message) {
     send({ jsonrpc: '2.0', id, error: { code, message } });
 }
-function advertised(root, dirOverride) {
-    if (dirOverride !== undefined)
-        return TOOLS;
-    if (hasPlexerIndex(root))
-        return TOOLS;
-    const main = mainWorktreeRoot(root);
-    return main && hasPlexerIndex(main) ? TOOLS : [];
+function advertised(_root, _dirOverride) {
+    return TOOLS;
 }
 export function startMcpServer(root = process.cwd(), dirOverride, version = readCurrentVersion(import.meta.url)) {
     const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });

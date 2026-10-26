@@ -200,13 +200,26 @@ function parseClaudeTranscript(filePath, arm) {
     };
 }
 
-export function parseTranscript(conversationId, arm) {
-    if (conversationId.endsWith(".jsonl") && existsSync(conversationId)) {
-        const firstLine = readFileSync(conversationId, "utf8").split("\n").find((l) => l.trim().length > 0);
+export function parseTranscript(conversationId, arm, streamDurationMs = null) {
+    if ((conversationId.endsWith(".jsonl") || conversationId.endsWith(".jsonl.tmp")) && existsSync(conversationId)) {
+        const rawLines = readFileSync(conversationId, "utf8").split("\n").filter((l) => l.trim().length > 0);
+        const firstLine = rawLines[0];
         if (firstLine) {
             try {
                 const firstObj = JSON.parse(firstLine);
                 if (firstObj.event === "init" && firstObj.conversation_id) {
+                    let durMs = null;
+                    for (let i = rawLines.length - 1; i >= 0; i--) {
+                        try {
+                            const obj = JSON.parse(rawLines[i]);
+                            if (obj.event === "result" && typeof obj.result?.duration_seconds === "number") {
+                                durMs = Math.round(obj.result.duration_seconds * 1000);
+                                break;
+                            }
+                        } catch {
+                            // ignore
+                        }
+                    }
                     const cliBrainTranscript = join(
                         CLI_BRAIN_DIR,
                         firstObj.conversation_id,
@@ -222,7 +235,7 @@ export function parseTranscript(conversationId, arm) {
                         "transcript.jsonl"
                     );
                     if (existsSync(cliBrainTranscript) || existsSync(cliBrainCompact)) {
-                        return parseTranscript(firstObj.conversation_id, arm);
+                        return parseTranscript(firstObj.conversation_id, arm, durMs);
                     }
                 }
             } catch {
@@ -269,9 +282,9 @@ export function parseTranscript(conversationId, arm) {
         if ((step.type === "USER_INPUT" || step.type === "SYSTEM_MESSAGE") && firstUserMs === null && ts !== null) {
             firstUserMs = ts;
         }
-        if (step.type === "EPHEMERAL_MESSAGE" && typeof step.content === "string") {
+        if ((step.type === "EPHEMERAL_MESSAGE" || step.type === "SYSTEM_MESSAGE") && typeof step.content === "string") {
             if (arm === "cold" && (step.content.includes("plexer/INDEX.md") || step.content.includes("[plexer]"))) {
-                symmetryViolations.push("EPHEMERAL_MESSAGE leaked plexer/INDEX.md hook");
+                symmetryViolations.push(`${step.type} leaked plexer/INDEX.md hook`);
             }
         }
         if (step.type === "PLANNER_RESPONSE") {
@@ -372,10 +385,11 @@ export function parseTranscript(conversationId, arm) {
         firstToolTurnMs !== null && lastToolDoneMs !== null && lastToolDoneMs >= firstToolTurnMs
             ? lastToolDoneMs - firstToolTurnMs
             : 0;
-    const totalMs =
+    const transcriptTotalMs =
         firstUserMs !== null && lastPlannerMs !== null && lastPlannerMs >= firstUserMs
             ? lastPlannerMs - firstUserMs
             : searchMs;
+    const totalMs = streamDurationMs !== null ? Math.max(transcriptTotalMs, streamDurationMs) : transcriptTotalMs;
 
     return {
         conversationId,
@@ -455,39 +469,74 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
     const allViolations = [];
 
     for (const task of TASKS) {
-        const entry = manifest[task.id];
-        if (!entry || !entry.cold?.conversationId || !entry.plexer?.conversationId) {
+        const entry = manifest[task.id] || {};
+        const prevTask = prevByTask.get(task.id);
+        const hasCold = Boolean(entry.cold?.conversationId || prevTask?.cold);
+        const hasPlexer = Boolean(entry.plexer?.conversationId || prevTask?.plexer);
+        if (!hasCold || !hasPlexer) {
             continue;
         }
 
-        const coldMetrics = parseTranscript(entry.cold.conversationId, "cold");
-        const plexerMetrics = parseTranscript(entry.plexer.conversationId, "plexer");
+        const coldMetrics =
+            (!activeTaskIds || activeTaskIds.has(`${task.id}:cold`)) &&
+            entry.cold?.conversationId &&
+            existsSync(entry.cold.conversationId)
+                ? parseTranscript(entry.cold.conversationId, "cold")
+                : prevTask?.cold;
+        const plexerMetrics =
+            (!activeTaskIds || activeTaskIds.has(`${task.id}:plexer`)) &&
+            entry.plexer?.conversationId &&
+            existsSync(entry.plexer.conversationId)
+                ? parseTranscript(entry.plexer.conversationId, "plexer")
+                : prevTask?.plexer;
+        if (!coldMetrics || !plexerMetrics) {
+            continue;
+        }
 
-        const prevTask = prevByTask.get(task.id);
         const canReuseCold =
-            task.category === "code-edit" &&
-            activeTaskIds &&
-            !activeTaskIds.has(`${task.id}:cold`) &&
-            prevTask?.cold?.conversationId === coldMetrics.conversationId &&
-            prevTask.cold.score > 0;
+            (!activeTaskIds || !activeTaskIds.has(`${task.id}:cold`)) &&
+            prevTask?.cold?.score !== undefined;
         const canReusePlexer =
-            task.category === "code-edit" &&
-            activeTaskIds &&
-            !activeTaskIds.has(`${task.id}:plexer`) &&
-            prevTask?.plexer?.conversationId === plexerMetrics.conversationId &&
-            prevTask.plexer.score > 0;
+            (!activeTaskIds || !activeTaskIds.has(`${task.id}:plexer`)) &&
+            prevTask?.plexer?.score !== undefined;
+        const canReuseTrail =
+            (!activeTaskIds || !activeTaskIds.has(`${task.id}:trail`)) &&
+            prevTask?.trail?.score !== undefined;
 
         const coldGrade = canReuseCold
             ? { score: prevTask.cold.score, maxScore: prevTask.cold.maxScore, checks: prevTask.cold.checks }
-            : gradeTaskArm(task, coldMetrics, entry.cold.cloneDir);
+            : gradeTaskArm(task, coldMetrics, entry.cold?.cloneDir || prevTask?.cold?.cloneDir);
         const plexerGrade = canReusePlexer
             ? { score: prevTask.plexer.score, maxScore: prevTask.plexer.maxScore, checks: prevTask.plexer.checks }
-            : gradeTaskArm(task, plexerMetrics, entry.plexer.cloneDir);
+            : gradeTaskArm(task, plexerMetrics, entry.plexer?.cloneDir || prevTask?.plexer?.cloneDir);
 
-        for (const v of coldMetrics.symmetryViolations) {
+        let trailCombined = null;
+        if (entry.trail?.conversationId || prevTask?.trail) {
+            const trailMetrics =
+                (!activeTaskIds || activeTaskIds.has(`${task.id}:trail`)) &&
+                entry.trail?.conversationId &&
+                existsSync(entry.trail.conversationId)
+                    ? parseTranscript(entry.trail.conversationId, "trail")
+                    : prevTask?.trail;
+            if (trailMetrics) {
+                const trailGrade = canReuseTrail
+                    ? { score: prevTask.trail.score, maxScore: prevTask.trail.maxScore, checks: prevTask.trail.checks }
+                    : gradeTaskArm(task, trailMetrics, entry.trail?.cloneDir || prevTask?.trail?.cloneDir);
+                for (const v of trailMetrics.symmetryViolations ?? []) {
+                    allViolations.push(`${task.id} (trail): ${v}`);
+                }
+                trailCombined = {
+                    ...trailMetrics,
+                    ...trailGrade,
+                    cloneDir: entry.trail?.cloneDir || prevTask?.trail?.cloneDir,
+                };
+            }
+        }
+
+        for (const v of coldMetrics.symmetryViolations ?? []) {
             allViolations.push(`${task.id} (cold): ${v}`);
         }
-        for (const v of plexerMetrics.symmetryViolations) {
+        for (const v of plexerMetrics.symmetryViolations ?? []) {
             allViolations.push(`${task.id} (plexer): ${v}`);
         }
 
@@ -497,8 +546,9 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
             repo: task.repo,
             holdout: task.holdout,
             title: task.title,
-            cold: { ...coldMetrics, ...coldGrade, cloneDir: entry.cold.cloneDir },
-            plexer: { ...plexerMetrics, ...plexerGrade, cloneDir: entry.plexer.cloneDir },
+            cold: { ...coldMetrics, ...coldGrade, cloneDir: entry.cold?.cloneDir || prevTask?.cold?.cloneDir },
+            plexer: { ...plexerMetrics, ...plexerGrade, cloneDir: entry.plexer?.cloneDir || prevTask?.plexer?.cloneDir },
+            ...(trailCombined ? { trail: trailCombined } : {}),
         });
     }
 
@@ -594,13 +644,55 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
         }
     );
 
+    const trailRows = rows.filter((r) => r.trail);
+    let trailComparison = undefined;
+    if (trailRows.length > 0) {
+        const emptyArm = () => ({
+            calls: 0,
+            turns: 0,
+            toolOutputTokens: 0,
+            uncachedInputTokens: 0,
+            cachedInputTokens: 0,
+            cumulativeInputTokens: 0,
+            finalContextTokens: 0,
+            totalModelOutputTokens: 0,
+            searchMs: 0,
+            totalMs: 0,
+            score: 0,
+            maxScore: 0,
+        });
+        trailComparison = trailRows.reduce(
+            (acc, r) => {
+                for (const arm of ["cold", "trail", "plexer"]) {
+                    acc[arm].calls += r[arm].calls;
+                    acc[arm].turns += r[arm].turns;
+                    acc[arm].toolOutputTokens += r[arm].toolOutputTokens;
+                    acc[arm].uncachedInputTokens += r[arm].uncachedInputTokens;
+                    acc[arm].cachedInputTokens += r[arm].cachedInputTokens;
+                    acc[arm].cumulativeInputTokens += r[arm].cumulativeInputTokens;
+                    acc[arm].finalContextTokens += r[arm].finalContextTokens;
+                    acc[arm].totalModelOutputTokens += r[arm].totalModelOutputTokens;
+                    acc[arm].searchMs += r[arm].searchMs;
+                    acc[arm].totalMs += r[arm].totalMs;
+                    acc[arm].score += r[arm].score;
+                    acc[arm].maxScore += r[arm].maxScore;
+                }
+                return acc;
+            },
+            { taskIds: trailRows.map((r) => r.id), cold: emptyArm(), trail: emptyArm(), plexer: emptyArm() }
+        );
+    }
+
     const summary = {
         generatedAt: new Date().toISOString(),
         symmetryCheck: {
             passed: allViolations.length === 0,
             violations: allViolations,
         },
-        totals,
+        totals: {
+            ...totals,
+            ...(trailComparison ? { trailComparison } : {}),
+        },
         tasks: rows.map((r) => ({
             id: r.id,
             category: r.category,
@@ -639,6 +731,26 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 maxScore: r.plexer.maxScore,
                 checks: r.plexer.checks,
             },
+            ...(r.trail
+                ? {
+                      trail: {
+                          conversationId: r.trail.conversationId,
+                          calls: r.trail.calls,
+                          turns: r.trail.turns,
+                          toolOutputTokens: r.trail.toolOutputTokens,
+                          uncachedInputTokens: r.trail.uncachedInputTokens,
+                          cachedInputTokens: r.trail.cachedInputTokens,
+                          cumulativeInputTokens: r.trail.cumulativeInputTokens,
+                          finalContextTokens: r.trail.finalContextTokens,
+                          totalModelOutputTokens: r.trail.totalModelOutputTokens,
+                          searchMs: r.trail.searchMs,
+                          totalMs: r.trail.totalMs,
+                          score: r.trail.score,
+                          maxScore: r.trail.maxScore,
+                          checks: r.trail.checks,
+                      },
+                  }
+                : {}),
         })),
     };
 

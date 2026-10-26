@@ -14,15 +14,48 @@
  * dir that isn't the repo.
  */
 import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
 import { wiringPath } from "./write.js";
 import { workspacePath } from "./workspace.js";
+
+const REPO_ROOT_MARKERS = [
+    ".git",
+    "sert.toml",
+    "default.project.json",
+    "rokit.toml",
+    "wally.toml",
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+    "requirements.txt",
+];
+
 /** True when `dir` is a plexer root of either shape — a built repo or a workspace parent. */
 export function hasPlexerIndex(dir) {
     return existsSync(wiringPath(contextDirFor(dir))) || existsSync(workspacePath(dir));
 }
-/** The nearest ancestor of `start` (inclusive) that holds a plexer index, else `start`. */
+
+/** True when `dir` is a project/repository root suitable for automatic initial indexing. */
+export function isAutoBuildableRepo(dir) {
+    if (!dir || typeof dir !== "string")
+        return false;
+    const resolved = resolve(dir);
+    const norm = resolved.replace(/\\/g, "/");
+    if (
+        resolved === "/" ||
+        resolved === resolve(homedir()) ||
+        resolved === resolve(tmpdir()) ||
+        /\/(?:\.gemini|\.agents|\.claude|\.codex)(?:\/|$)/.test(norm)
+    ) {
+        return false;
+    }
+    return REPO_ROOT_MARKERS.some((m) => existsSync(join(resolved, m)));
+}
+
+/** The nearest ancestor of `start` (inclusive) that holds a plexer index (or project root), else `start`. */
 export function nearestPlexerRoot(start, override) {
     const from = resolve(start);
     if (override)
@@ -30,6 +63,15 @@ export function nearestPlexerRoot(start, override) {
     let dir = from;
     for (let levels = 0;; levels++) {
         if (hasPlexerIndex(dir))
+            return { root: dir, levels };
+        const up = dirname(dir);
+        if (up === dir)
+            break;
+        dir = up;
+    }
+    dir = from;
+    for (let levels = 0;; levels++) {
+        if (isAutoBuildableRepo(dir))
             return { root: dir, levels };
         const up = dirname(dir);
         if (up === dir)

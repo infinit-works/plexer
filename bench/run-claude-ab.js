@@ -16,8 +16,15 @@ import { execFileSync, spawn } from "node:child_process";
 import { cpSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TASKS } from "./tasks.js";
-import { gradeManifest } from "./grade.js";
+import { gradeManifest, parseTranscript } from "./grade.js";
 import { ensureFreshGraph } from "../src/graph/refresh.js";
+import { ensureAbBaseRepos } from "./ensure-base.js";
+import {
+    buildTrailClaudeSettingsJson,
+    getTrailEnv,
+    getTrailSkillBody,
+    prepareTrailWorktreeDir,
+} from "./trail-live-helper.js";
 
 const rawModelArg = process.argv[2] || "sonnet";
 const CLAUDE_MODEL_MAP = {
@@ -31,11 +38,16 @@ const CLAUDE_MODEL_MAP = {
 const modelArg = rawModelArg.replace(/^claude-/, "").replace(/-5-5$/, "");
 const resolvedModelId = CLAUDE_MODEL_MAP[rawModelArg] || rawModelArg;
 const concurrency = Number(process.argv[3] || 4);
-const armFilter = process.argv[4] || "both"; // "both" | "cold" | "plexer"
+const armFilter = process.argv[4] || "both"; // "both" | "all" | "cold" | "plexer" | "trail" | comma-separated
 const taskFilterArg = process.argv[5] || "all";
 const effortArg = process.argv[6] || "medium";
 const taskFilterSet = taskFilterArg === "all" ? null : new Set(taskFilterArg.split(",").map((s) => s.trim()));
-const armsToRun = armFilter === "cold" ? ["cold"] : armFilter === "plexer" ? ["plexer"] : ["cold", "plexer"];
+const armsToRun =
+    armFilter === "both"
+        ? ["cold", "plexer"]
+        : armFilter === "all"
+          ? ["cold", "plexer", "trail"]
+          : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
 
 const logDir = `/tmp/plexer-claude-logs/${modelArg}`;
 mkdirSync(logDir, { recursive: true });
@@ -48,14 +60,20 @@ const basePrompt = [
 
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+const trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
 
 const coldSysFile = join(logDir, "cold-system.txt");
 const plexerSysFile = join(logDir, "plexer-system.txt");
+const trailSysFile = join(logDir, "trail-system.txt");
 writeFileSync(coldSysFile, `${basePrompt}\n`, "utf8");
 writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
+if (trailSkillBody) {
+    writeFileSync(trailSysFile, `${basePrompt}\n\n${trailSkillBody}\n`, "utf8");
+}
 
 const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
+const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
 writeFileSync(
     plexerHooksSettingsFile,
     JSON.stringify(
@@ -91,6 +109,7 @@ writeFileSync(
     ),
     "utf8"
 );
+writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
 
 function resetRepoWorktree(repo, arm) {
     const cloneDir = `/tmp/plexer-ab-${modelArg}-${arm}/${repo}`;
@@ -110,7 +129,14 @@ function resetRepoWorktree(repo, arm) {
         }
     }
     execFileSync("git", ["checkout", "--", "."], { cwd: cloneDir, stdio: "ignore" });
-    execFileSync("git", ["clean", "-fd", "-e", "plexer"], { cwd: cloneDir, stdio: "ignore" });
+    execFileSync("git", ["clean", "-fd", "-e", "plexer", "-e", "graft", "-e", ".trail"], { cwd: cloneDir, stdio: "ignore" });
+    if (arm === "plexer" && existsSync(`/tmp/plexer-ab-base/indexed/${repo}/plexer`)) {
+        rmSync(join(cloneDir, "plexer"), { recursive: true, force: true });
+        cpSync(`/tmp/plexer-ab-base/indexed/${repo}/plexer`, join(cloneDir, "plexer"), { recursive: true });
+    } else if (arm === "trail") {
+        rmSync(join(cloneDir, "plexer"), { recursive: true, force: true });
+        prepareTrailWorktreeDir(cloneDir, repo, baseCleanDir);
+    }
     const cacheDir = join(cloneDir, "plexer", ".cache");
     if (existsSync(cacheDir)) {
         for (const f of readdirSync(cacheDir)) {
@@ -126,19 +152,17 @@ async function runOne(task, arm) {
     const cloneDir = `/tmp/plexer-ab-${modelArg}-${arm}/${task.repo}`;
     if (task.category === "code-edit") {
         resetRepoWorktree(task.repo, arm);
-        if (arm === "plexer") {
-            await ensureFreshGraph(cloneDir);
-        }
     }
     return new Promise((resolveRun, rejectRun) => {
         const outJsonl = join(logDir, `${task.id}-${arm}.jsonl`);
-        const sysFile = arm === "plexer" ? plexerSysFile : coldSysFile;
+        const sysFile = arm === "plexer" ? plexerSysFile : arm === "trail" ? trailSysFile : coldSysFile;
+        const settingsFile = arm === "plexer" ? plexerHooksSettingsFile : arm === "trail" ? trailHooksSettingsFile : null;
         const promptText = task.prompt(cloneDir);
 
         const args = [
             "--setting-sources",
             "",
-            ...(arm === "plexer" ? ["--settings", plexerHooksSettingsFile] : []),
+            ...(settingsFile ? ["--settings", settingsFile] : []),
             "--disable-slash-commands",
             "--strict-mcp-config",
             "--dangerously-skip-permissions",
@@ -158,13 +182,17 @@ async function runOne(task, arm) {
         ];
 
         const outStream = createWriteStream(outJsonl, { flags: "w" });
+        const env =
+            arm === "trail"
+                ? getTrailEnv()
+                : {
+                      ...process.env,
+                      PLEXER_DISABLE_HOOKS: arm === "plexer" ? "0" : "1",
+                      ...(arm === "plexer" ? { PLEXER_ENABLE_BENCH_HOOKS: "1" } : {}),
+                  };
         const child = spawn("claude", args, {
             cwd: cloneDir,
-            env: {
-                ...process.env,
-                PLEXER_DISABLE_HOOKS: arm === "plexer" ? "0" : "1",
-                ...(arm === "plexer" ? { PLEXER_ENABLE_BENCH_HOOKS: "1" } : {}),
-            },
+            env,
             stdio: ["ignore", "pipe", "pipe"],
         });
 
@@ -209,14 +237,13 @@ const editTasks = selectedTasks.filter((t) => t.category === "code-edit");
 
 console.log(`Starting Claude (${modelArg}) A/B benchmark: ${selectedTasks.length} tasks × [${armsToRun.join(",")}] (concurrency=${concurrency})...`);
 
+await ensureAbBaseRepos(new Set(selectedTasks.map((t) => t.repo)));
+
 if (readOnlyTasks.length > 0) {
     const readOnlyRepos = new Set(readOnlyTasks.map((t) => t.repo));
     for (const repo of readOnlyRepos) {
         for (const arm of armsToRun) {
-            const cloneDir = resetRepoWorktree(repo, arm);
-            if (arm === "plexer") {
-                await ensureFreshGraph(cloneDir);
-            }
+            resetRepoWorktree(repo, arm);
         }
     }
 }
@@ -245,7 +272,19 @@ const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath
 for (const t of TASKS) {
     manifest[t.id] = manifest[t.id] || {};
 }
-for (const r of allRuns) {
+const validRuns = allRuns.filter((r) => {
+    const p = parseTranscript(r.transcriptPath);
+    if (r.code !== 0 || p.cumulativeInputTokens === 0) {
+        console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${p.cumulativeInputTokens}`);
+        return false;
+    }
+    return true;
+});
+if (validRuns.length === 0) {
+    console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing ${manifestPath} and ${resultsPath}.`);
+    process.exit(1);
+}
+for (const r of validRuns) {
     manifest[r.taskId][r.arm] = {
         conversationId: r.transcriptPath,
         cloneDir: r.cloneDir,
@@ -256,5 +295,5 @@ writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 gradeManifest(
     manifestPath,
     resultsPath,
-    new Set(allRuns.map((r) => `${r.taskId}:${r.arm}`)),
+    new Set(validRuns.map((r) => `${r.taskId}:${r.arm}`)),
 );

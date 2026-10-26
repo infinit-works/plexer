@@ -1,6 +1,6 @@
 {
 	"name": "@plexer/cli",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"description": "Offline structural code graph for AI coding agents.",
 	"type": "module",
 	"bin": {

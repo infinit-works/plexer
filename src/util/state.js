@@ -100,7 +100,7 @@ export function computeStats(w) {
 }
 
 function emptySession() {
-    return { lastQuery: null, perAgentQuery: {}, injectedPointers: [], nudges: 0 };
+    return { lastQuery: null, perAgentQuery: {}, injectedPointers: [], emittedBlastFiles: [], nudges: 0 };
 }
 
 /** The per-repo session directory holding one `<id>.json` per agent session. */

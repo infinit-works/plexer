@@ -1143,6 +1143,40 @@ function describe(node, ctx) {
             }
         }
     }
+    // JS/TS top-level CLI subcommand builder chain: `program.command("skeleton ...")....action((...) => { ... })`
+    if ((ctx.lang === "typescript" || ctx.lang === "tsx") && node.type === "call_expression" && node.parent?.type === "expression_statement" && ctx.scope.length === 0) {
+        const outerFn = node.childForFieldName("function");
+        const outerProp = outerFn?.type === "member_expression" ? outerFn.childForFieldName("property")?.text : null;
+        if (outerProp === "action" || outerProp === "handler") {
+            const actionCb = node.childForFieldName("arguments")?.namedChildren.find((c) => FUNCTION_VALUE_TYPES.has(c.type));
+            let cur = outerFn.childForFieldName("object");
+            let cmdName = null;
+            while (cur?.type === "call_expression") {
+                const m = cur.childForFieldName("function");
+                if (m?.type === "member_expression" && m.childForFieldName("property")?.text === "command") {
+                    const firstArg = cur.childForFieldName("arguments")?.namedChildren[0];
+                    if (firstArg?.type === "string") {
+                        const rawCmd = firstArg.text.replace(/^['"`]|['"`]$/g, "").trim();
+                        const mCmd = /^([A-Za-z][\w-]*)/.exec(rawCmd);
+                        if (mCmd) cmdName = mCmd[1];
+                    }
+                    break;
+                }
+                cur = m?.type === "member_expression" ? m.childForFieldName("object") : null;
+            }
+            if (cmdName && actionCb) {
+                const vbody = actionCb.childForFieldName("body");
+                return {
+                    name: cmdName,
+                    idName: `Command.${cmdName}`,
+                    owner: "Command",
+                    kind: "method",
+                    headerEnd: vbody ? vbody.startIndex : node.endIndex,
+                    hashNode: node,
+                };
+            }
+        }
+    }
     return null;
 }
 /** Go definition shapes: top-level funcs, receiver methods, and named types

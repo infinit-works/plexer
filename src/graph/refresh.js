@@ -38,6 +38,7 @@ import { acquireLockIn, releaseLockIn } from "../util/state.js";
 import { buildGraph } from "./build.js";
 import { driftCount, isClean, probeDrift, readFingerprint } from "./fingerprint.js";
 import { invalidateGraphCaches } from "./load.js";
+import { isAutoBuildableRepo } from "./root.js";
 import { seedGraph } from "./seed.js";
 import { wiringPath } from "./write.js";
 /** How long to wait for another process's in-flight rebuild before giving up and
@@ -140,11 +141,27 @@ export async function ensureFreshGraph(root, opts = {}) {
             const seed = await seedUnderLock(dir, outDir, opts.contextDir);
             seededFrom = seed.from;
             // Still nothing (not a worktree, parent never built, or a concurrent seed we
-            // lost the race for and which we now re-check for): the caller's own "no graph
-            // — run plexer build" message is the right answer. Auto-building a whole repo
-            // under a query is a surprise, and it's the one case where the user hasn't
-            // opted into plexer at all yet.
+            // lost the race for and which we now re-check for): if `dir` is a recognized
+            // project/git root, bootstrap a full Tier-1 graph (including INDEX.md and
+            // .gitignore) under the sync lock so cold repos work on the first query/hook.
             if (!existsSync(wiringPath(outDir))) {
+                if (opts.autoBuild !== false && isAutoBuildableRepo(dir)) {
+                    const lockCache = join(outDir, CACHE_DIR);
+                    if (await waitForLock(lockCache)) {
+                        const unhook = releaseOnSignal(lockCache);
+                        try {
+                            if (!existsSync(wiringPath(outDir))) {
+                                await buildGraph(dir, { contextDir: opts.contextDir });
+                            }
+                            invalidateGraphCaches(outDir);
+                            return { refreshed: true, note: `indexed repo into ${outDir}` };
+                        }
+                        finally {
+                            unhook();
+                            releaseLockIn(lockCache);
+                        }
+                    }
+                }
                 return seed.busy
                     ? { refreshed: false, note: "another process is still copying the graph into this worktree — retry the query in a moment" }
                     : CLEAN;

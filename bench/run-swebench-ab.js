@@ -19,17 +19,24 @@
  *   node bench/run-swebench-ab.js <model> [concurrency=4] [arm=both] [taskFilter=all]
  */
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseTranscript } from "./grade.js";
 import { buildGraph } from "../src/graph/build.js";
 import { ensureFreshGraph } from "../src/graph/refresh.js";
+import {
+    buildTrailAgyHooksJson,
+    buildTrailClaudeSettingsJson,
+    getTrailEnv,
+    getTrailSkillBody,
+    prepareTrailWorktreeDir,
+} from "./trail-live-helper.js";
 
 const SWEBENCH_TASKS = JSON.parse(
     readFileSync(resolve(import.meta.dirname, "swebench/tasks.json"), "utf8")
 );
 
-const rawModelArg = process.argv[2] || "sonnet"; // "argon-low" | "argon-medium" | "sonnet" | "opus"
+const rawModelArg = process.argv[2] || "sonnet"; // "argon-low" | "argon-medium" | "flash-medium" | "sonnet" | "opus"
 const CLAUDE_MODELS = {
     sonnet: "claude-sonnet-5-5",
     "sonnet-5-5": "claude-sonnet-5-5",
@@ -38,21 +45,38 @@ const CLAUDE_MODELS = {
     "opus-5-5": "claude-opus-5-5",
     "claude-opus-5-5": "claude-opus-5-5",
 };
-const modelArg = rawModelArg.startsWith("argon")
-    ? rawModelArg
-    : rawModelArg.replace(/^claude-/, "").replace(/-5-5$/, "");
+const modelArg =
+    rawModelArg.startsWith("argon") || rawModelArg.startsWith("flash") || rawModelArg.endsWith("-agy")
+        ? rawModelArg
+        : rawModelArg.replace(/^claude-/, "").replace(/-5-5$/, "");
 const resolvedClaudeModel = CLAUDE_MODELS[rawModelArg] || rawModelArg;
 const concurrency = Number(process.argv[3] || 4);
 const armFilter = process.argv[4] || "both";
 const taskFilterArg = process.argv[5] || "all";
 const taskFilterSet = taskFilterArg === "all" ? null : new Set(taskFilterArg.split(",").map((s) => s.trim()));
-const armsToRun = armFilter === "cold" ? ["cold"] : armFilter === "plexer" ? ["plexer"] : ["cold", "plexer"];
+const armsToRun =
+    armFilter === "both"
+        ? ["cold", "plexer"]
+        : armFilter === "all"
+          ? ["cold", "plexer", "trail"]
+          : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
 
-const isAgy = modelArg.startsWith("argon");
+const isAgy =
+    process.env.FORCE_CLAUDE_CLI !== "1" ||
+    modelArg.startsWith("argon") ||
+    modelArg.startsWith("flash") ||
+    modelArg.endsWith("-agy");
 const AGY_MODELS = {
     "argon-low": { model: "gemini-4-argon-low", effort: "low" },
     "argon-medium": { model: "gemini-4-argon-medium", effort: "medium" },
     "argon-high": { model: "gemini-4-argon-high", effort: "high" },
+    "flash-low": { model: "gemini-3.8-flash-low", effort: "low" },
+    "flash-medium": { model: "gemini-3.8-flash-medium", effort: "medium" },
+    "flash-high": { model: "gemini-3.8-flash-high", effort: "high" },
+    sonnet: { model: "claude-sonnet-5-5-medium", effort: "medium" },
+    "sonnet-agy": { model: "claude-sonnet-5-5-medium", effort: "medium" },
+    opus: { model: "claude-opus-5-5-medium", effort: "medium" },
+    "opus-agy": { model: "claude-opus-5-5-medium", effort: "medium" },
 };
 
 const BASE_CACHE_DIR = "/tmp/plexer-swebench-base";
@@ -68,14 +92,20 @@ const basePrompt = [
 
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+const trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
 
 const coldSysFile = join(logDir, "cold-system.txt");
 const plexerSysFile = join(logDir, "plexer-system.txt");
+const trailSysFile = join(logDir, "trail-system.txt");
 writeFileSync(coldSysFile, `${basePrompt}\n`, "utf8");
 writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
+if (trailSkillBody) {
+    writeFileSync(trailSysFile, `${basePrompt}\n\n${trailSkillBody}\n`, "utf8");
+}
 
 const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
+const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
 writeFileSync(
     plexerHooksSettingsFile,
     JSON.stringify(
@@ -111,6 +141,7 @@ writeFileSync(
     ),
     "utf8"
 );
+writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
 const agyHooksJson = JSON.stringify(
     {
         "plexer-hooks": {
@@ -138,6 +169,7 @@ const agyHooksJson = JSON.stringify(
     null,
     2
 );
+const trailAgyHooksJson = buildTrailAgyHooksJson();
 
 function makeAgyAgentMd(name, desc, body, hooksPath = null) {
     return [
@@ -168,7 +200,7 @@ function makeAgyAgentMd(name, desc, body, hooksPath = null) {
 const coldAgyMd = makeAgyAgentMd(
     "bench-cold",
     "Cold baseline software engineering agent for SWE-bench Pro A/B benchmarking.",
-    basePrompt
+    `${basePrompt}\n\nIMPORTANT: Do NOT read or use any external skill files under ~/.gemini/ or ~/.agents/ or run \`plexer\` or \`trail\` commands; use standard repository tools only.`
 );
 
 /**
@@ -213,19 +245,24 @@ async function prepareWorktree(task, arm) {
     } else {
         execFileSync("git", ["reset", "--hard", task.base_commit], { cwd: workDir, stdio: "ignore" });
         execFileSync("git", ["checkout", "--", "."], { cwd: workDir, stdio: "ignore" });
-        execFileSync("git", ["clean", "-fd", "-e", "plexer", "-e", ".agents"], { cwd: workDir, stdio: "ignore" });
+        execFileSync("git", ["clean", "-fd", "-e", "plexer", "-e", ".agents", "-e", "graft", "-e", ".trail"], { cwd: workDir, stdio: "ignore" });
         if (arm === "plexer") {
-            await ensureFreshGraph(workDir);
+            rmSync(join(workDir, "plexer"), { recursive: true, force: true });
+            cpSync(join(indexedDir, "plexer"), join(workDir, "plexer"), { recursive: true });
         } else if (existsSync(join(workDir, "plexer"))) {
             rmSync(join(workDir, "plexer"), { recursive: true, force: true });
         }
+    }
+    if (arm === "trail") {
+        rmSync(join(workDir, "plexer"), { recursive: true, force: true });
+        prepareTrailWorktreeDir(workDir, task.id, cleanDir);
     }
 
     const excludePath = join(workDir, ".git", "info", "exclude");
     if (existsSync(excludePath)) {
         const cur = readFileSync(excludePath, "utf8");
-        if (!cur.includes(".agents")) {
-            writeFileSync(excludePath, `${cur.trimEnd()}\n.agents/\npLexer/\nplexer/\n`, "utf8");
+        if (!cur.includes("graft/")) {
+            writeFileSync(excludePath, `${cur.trimEnd()}\n.agents/\npLexer/\nplexer/\ngraft/\n.trail/\n`, "utf8");
         }
     }
 
@@ -244,8 +281,22 @@ async function prepareWorktree(task, arm) {
             ),
             "utf8"
         );
+        if (trailSkillBody) {
+            writeFileSync(
+                join(agentsDir, "bench-trail.md"),
+                makeAgyAgentMd(
+                    "bench-trail",
+                    "Trail-equipped software engineering agent for SWE-bench Pro A/B benchmarking.",
+                    `${basePrompt}\n\nIMPORTANT: Do NOT read or use any external skill files under ~/.gemini/ or ~/.agents/ or run \`plexer\` commands.\n\n${trailSkillBody}`,
+                    hooksPath
+                ),
+                "utf8"
+            );
+        }
         if (arm === "plexer") {
             writeFileSync(hooksPath, `${agyHooksJson}\n`, "utf8");
+        } else if (arm === "trail") {
+            writeFileSync(hooksPath, `${trailAgyHooksJson}\n`, "utf8");
         } else if (existsSync(hooksPath)) {
             rmSync(hooksPath, { force: true });
         }
@@ -271,20 +322,21 @@ function buildTaskPrompt(task, workDir) {
 }
 
 function extractPatchSymbols(patchText) {
-    const syms = new Set();
+    const headerSyms = new Set();
+    const addedSyms = new Set();
     const lines = patchText.split("\n");
     for (const line of lines) {
         const hh = line.match(/^@@[^@]+@@\s*(.+)$/);
         if (hh) {
             const m = hh[1].match(/(?:function|def|func|class)\s+([A-Za-z_][A-Za-z0-9_]*)/);
-            if (m) syms.add(m[1]);
+            if (m) headerSyms.add(m[1]);
         }
-        if (/^[+-]/.test(line) && !/^[+-]{3}/.test(line)) {
+        if (/^\+/.test(line) && !/^\+{3}/.test(line)) {
             const m = line.match(/(?:function\s+|def\s+|func\s+(?:\([^)]+\)\s*)?|export\s+(?:async\s+)?function\s+|\.\s*)([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
-            if (m && m[1].length > 2) syms.add(m[1]);
+            if (m && m[1].length > 2) addedSyms.add(m[1]);
         }
     }
-    return [...syms];
+    return { all: [...new Set([...headerSyms, ...addedSyms])], headerSyms };
 }
 
 /**
@@ -304,7 +356,16 @@ function gradeSweTask(task, workDir, parsed, useDocker = false) {
     );
     const modifiedFiles = [...agentPatch.matchAll(/^diff --git (\S+) (\S+)/gm)]
         .map((m) => m[2].replace(/^[abciw]\//, ""))
-        .filter((f) => f !== ".gitignore");
+        .filter(
+            (f) =>
+                f !== ".gitignore" &&
+                !f.startsWith("graft/") &&
+                !f.startsWith(".trail/") &&
+                !f.startsWith(".agents/") &&
+                f !== "app-android/app/src/main/assets/tutanota" &&
+                f !== "app-ios/tutanota/tutanota-web" &&
+                f !== "fdroid-metadata-workaround"
+        );
     const goldOverride = {
         S1: ["qutebrowser/browser/webkit/network/networkreply.py"],
         S4: ["internal/storage/cache/cache.go", "internal/storage/storage.go"],
@@ -315,10 +376,11 @@ function gradeSweTask(task, workDir, parsed, useDocker = false) {
     );
     const goldSet = new Set(goldSourceFiles);
     const matchedFiles = goldSourceFiles.filter((f) => modifiedFiles.includes(f));
+    const modifiedSourceFiles = modifiedFiles.filter((f) => !f.startsWith("test/") && !f.startsWith("tests/"));
     const fileRecall = goldSourceFiles.length > 0 ? matchedFiles.length / goldSourceFiles.length : 1;
-    const filePrecision = modifiedFiles.length > 0 ? matchedFiles.length / modifiedFiles.length : 0;
+    const filePrecision = modifiedSourceFiles.length > 0 ? matchedFiles.length / modifiedSourceFiles.length : 0;
 
-    // Filter task.patch to hunks belonging to goldSourceFiles so multi-commit PRs with unrelated files don't skew symbol/token recall
+    // Filter task.patch and agentPatch to hunks belonging to goldSourceFiles so unrelated files don't skew symbol/token recall
     const patchSections = task.patch.split(/(?=^diff --git )/m);
     const relevantPatch =
         patchSections
@@ -329,14 +391,36 @@ function gradeSweTask(task, workDir, parsed, useDocker = false) {
                 return goldSet.has(f);
             })
             .join("\n") || task.patch;
+    const relevantAgentPatch =
+        agentPatch
+            .split(/(?=^diff --git )/m)
+            .filter((sec) => {
+                const m = sec.match(/^diff --git \S+ (\S+)/);
+                if (!m) return false;
+                const f = m[1].replace(/^[abciw]\//, "");
+                return goldSet.has(f);
+            })
+            .join("\n");
+    const modifiedContents = matchedFiles
+        .filter((f) => existsSync(join(workDir, f)))
+        .map((f) => readFileSync(join(workDir, f), "utf8"))
+        .join("\n");
 
-    const goldSyms = extractPatchSymbols(relevantPatch);
-    const matchedSyms = goldSyms.filter((s) => agentPatch.includes(s));
+    const { all: goldSyms, headerSyms } = extractPatchSymbols(relevantPatch);
+    const matchedSyms = goldSyms.filter(
+        (s) => relevantAgentPatch.includes(s) || (headerSyms.has(s) && modifiedContents.includes(s))
+    );
     const symRecall = goldSyms.length > 0 ? matchedSyms.length / goldSyms.length : 1;
 
     // Deterministic requirement checks on the generated patch (0..8 rubric scale matching T1..T12)
+    const removedTokens = new Set();
     const goldAddedTokens = new Set();
     for (const line of relevantPatch.split("\n")) {
+        if (line.startsWith("-") && !line.startsWith("---")) {
+            for (const tok of line.slice(1).match(/[A-Za-z_][A-Za-z0-9_]{3,}/g) || []) {
+                removedTokens.add(tok);
+            }
+        }
         if (line.startsWith("+") && !line.startsWith("+++")) {
             for (const tok of line.slice(1).match(/[A-Za-z_][A-Za-z0-9_]{3,}/g) || []) {
                 goldAddedTokens.add(tok);
@@ -345,7 +429,9 @@ function gradeSweTask(task, workDir, parsed, useDocker = false) {
     }
     let matchedAddedTokens = 0;
     for (const tok of goldAddedTokens) {
-        if (agentPatch.includes(tok)) matchedAddedTokens += 1;
+        if (relevantAgentPatch.includes(tok) || (removedTokens.has(tok) && modifiedContents.includes(tok))) {
+            matchedAddedTokens += 1;
+        }
     }
     const tokenRecall = goldAddedTokens.size > 0 ? matchedAddedTokens / goldAddedTokens.size : 1;
 
@@ -437,7 +523,7 @@ async function runOne(task, arm) {
                 "-p",
                 promptText,
                 "--agent",
-                arm === "plexer" ? "bench-plexer" : "bench-cold",
+                arm === "plexer" ? "bench-plexer" : arm === "trail" ? "bench-trail" : "bench-cold",
                 "--model",
                 cfg.model,
                 "--effort",
@@ -449,17 +535,21 @@ async function runOne(task, arm) {
             ];
         } else {
             cmd = "claude";
+            const settingsFile =
+                arm === "plexer" ? plexerHooksSettingsFile : arm === "trail" ? trailHooksSettingsFile : null;
+            const sysFile =
+                arm === "plexer" ? plexerSysFile : arm === "trail" ? trailSysFile : coldSysFile;
             args = [
                 "--setting-sources",
                 "",
-                ...(arm === "plexer" ? ["--settings", plexerHooksSettingsFile] : []),
+                ...(settingsFile ? ["--settings", settingsFile] : []),
                 "--disable-slash-commands",
                 "--strict-mcp-config",
                 "--dangerously-skip-permissions",
                 "--tools",
                 "Bash,Read,Edit,Write,Grep,Glob",
                 "--append-system-prompt-file",
-                arm === "plexer" ? plexerSysFile : coldSysFile,
+                sysFile,
                 "-p",
                 promptText,
                 "--model",
@@ -472,14 +562,25 @@ async function runOne(task, arm) {
             ];
         }
 
-        const outStream = createWriteStream(outJsonl, { flags: "w" });
+        const tmpJsonl = `${outJsonl}.tmp`;
+        const outStream = createWriteStream(tmpJsonl, { flags: "w" });
+        const env =
+            arm === "trail"
+                ? getTrailEnv()
+                : {
+                      ...process.env,
+                      PLEXER_ENABLE_BENCH_HOOKS: arm === "plexer" ? "1" : "0",
+                      GIT_CONFIG_COUNT: "2",
+                      GIT_CONFIG_KEY_0: "commit.gpgsign",
+                      GIT_CONFIG_VALUE_0: "false",
+                      GIT_CONFIG_KEY_1: "tag.gpgsign",
+                      GIT_CONFIG_VALUE_1: "false",
+                  };
+        delete env.PLEXER_DISABLE_HOOKS;
+        delete env.PLEXER_DIR;
         const child = spawn(cmd, args, {
             cwd: workDir,
-            env: {
-                ...process.env,
-                PLEXER_DISABLE_HOOKS: arm === "plexer" ? "0" : "1",
-                ...(arm === "plexer" ? { PLEXER_ENABLE_BENCH_HOOKS: "1" } : {}),
-            },
+            env,
             stdio: ["ignore", "pipe", "pipe"],
         });
 
@@ -495,7 +596,11 @@ async function runOne(task, arm) {
         });
         child.on("close", (code) => {
             outStream.end(() => {
-                const parsed = parseTranscript(outJsonl, arm);
+                if (code === 0) {
+                    renameSync(tmpJsonl, outJsonl);
+                }
+                const targetJsonl = code === 0 ? outJsonl : tmpJsonl;
+                const parsed = parseTranscript(targetJsonl, arm);
                 const grade = gradeSweTask(task, workDir, parsed, process.env.SWEBENCH_DOCKER === "1");
                 console.log(
                     `[${modelArg}] ${task.id} (${arm}) calls=${parsed.calls} (${parsed.turns}t) toolTok=${parsed.toolOutputTokens} search=${(parsed.searchMs / 1000).toFixed(1)}s score=${grade.score}/8 fileRecall=${grade.fileRecall}`
@@ -504,7 +609,7 @@ async function runOne(task, arm) {
                     taskId: task.id,
                     arm,
                     workDir,
-                    transcriptPath: outJsonl,
+                    transcriptPath: targetJsonl,
                     parsed,
                     grade,
                     code,
@@ -560,7 +665,17 @@ if (regradeOnly) {
         }
     }
 
-    runs = await runWave(jobs, concurrency);
+    runs = (await runWave(jobs, concurrency)).filter((r) => {
+        if (r.code !== 0 || r.parsed.cumulativeInputTokens === 0) {
+            console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${r.parsed.cumulativeInputTokens}`);
+            return false;
+        }
+        return true;
+    });
+    if (runs.length === 0) {
+        console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing results.`);
+        process.exit(1);
+    }
 }
 
 const resultsPath = resolve(import.meta.dirname, `results-swebench-${modelArg}.json`);
@@ -602,9 +717,24 @@ for (const t of SWEBENCH_TASKS) {
 }
 
 const taskRows = [...byId.values()].filter((r) => r.cold && r.plexer);
+const emptyArmTotals = () => ({
+    calls: 0,
+    turns: 0,
+    toolOutputTokens: 0,
+    uncachedInputTokens: 0,
+    cachedInputTokens: 0,
+    cumulativeInputTokens: 0,
+    finalContextTokens: 0,
+    totalModelOutputTokens: 0,
+    searchMs: 0,
+    totalMs: 0,
+    score: 0,
+    maxScore: 0,
+});
+const hasAnyTrail = taskRows.some((r) => r.trail);
 const totals = taskRows.reduce(
     (acc, r) => {
-        for (const arm of ["cold", "plexer"]) {
+        for (const arm of ["cold", "plexer", ...(r.trail ? ["trail"] : [])]) {
             acc[arm].calls += r[arm].calls;
             acc[arm].turns += r[arm].turns;
             acc[arm].toolOutputTokens += r[arm].toolOutputTokens;
@@ -621,34 +751,9 @@ const totals = taskRows.reduce(
         return acc;
     },
     {
-        cold: {
-            calls: 0,
-            turns: 0,
-            toolOutputTokens: 0,
-            uncachedInputTokens: 0,
-            cachedInputTokens: 0,
-            cumulativeInputTokens: 0,
-            finalContextTokens: 0,
-            totalModelOutputTokens: 0,
-            searchMs: 0,
-            totalMs: 0,
-            score: 0,
-            maxScore: 0,
-        },
-        plexer: {
-            calls: 0,
-            turns: 0,
-            toolOutputTokens: 0,
-            uncachedInputTokens: 0,
-            cachedInputTokens: 0,
-            cumulativeInputTokens: 0,
-            finalContextTokens: 0,
-            totalModelOutputTokens: 0,
-            searchMs: 0,
-            totalMs: 0,
-            score: 0,
-            maxScore: 0,
-        },
+        cold: emptyArmTotals(),
+        plexer: emptyArmTotals(),
+        ...(hasAnyTrail ? { trail: emptyArmTotals() } : {}),
     }
 );
 

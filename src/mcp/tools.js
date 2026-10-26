@@ -13,8 +13,11 @@ import { fileReader, wordRe } from '../blast/evidence.js';
 import { grepGraph } from '../search/grep.js';
 import { formatGrepResult, zeroHitNote } from '../search/grep-cli.js';
 import { buildRepoMap, formatRepoMap } from '../graph/map.js';
+import { hasPlexerIndex, isAutoBuildableRepo, nearestPlexerRoot } from '../graph/root.js';
 import { federateAsk, federateCallers, federateCheck, federateGrep, federateMap, federateSkeleton, readWorkspace, } from '../graph/workspace.js';
+import { readAgyLastRepo } from '../hosts/antigravity-hooks.js';
 const NO_GRAPH = 'no graph found — run `plexer build` first';
+const DIR_PROP = { type: 'string', description: 'optional repository root directory (defaults to current workspace)' };
 function unknownSymbolText(query) {
     return `no symbol "${query}" in the graph — check spelling or run \`plexer build\``;
 }
@@ -35,6 +38,7 @@ export const TOOLS = [
                     type: 'string',
                     description: 'narrow to nodes under this repo-relative path prefix',
                 },
+                dir: DIR_PROP,
             },
             required: ['query'],
         },
@@ -46,6 +50,7 @@ export const TOOLS = [
             type: 'object',
             properties: {
                 file: { type: 'string', description: 'repo-relative path (or unique basename) of the file' },
+                dir: DIR_PROP,
             },
             required: ['file'],
         },
@@ -53,7 +58,7 @@ export const TOOLS = [
     {
         name: 'plexer_check_freshness',
         description: 'Report whether the graph is in sync with the working tree.',
-        inputSchema: { type: 'object', properties: {} },
+        inputSchema: { type: 'object', properties: { dir: DIR_PROP } },
     },
     {
         name: 'plexer_trace_calls',
@@ -70,6 +75,7 @@ export const TOOLS = [
                 depth: { description: 'transitive walk depth (default 1 = direct edges; 2 = blast radius; "all" = full connected closure)' },
                 source: { type: 'boolean', description: 'inline target definition and call-site source excerpts' },
                 in: { type: 'string', description: 'narrow matches to nodes under this repo-relative path prefix' },
+                dir: DIR_PROP,
             },
             required: ['symbol'],
         },
@@ -86,6 +92,7 @@ export const TOOLS = [
                 fixed: { type: 'boolean', description: 'treat pattern as a literal string, not a regex' },
                 context: { type: 'number', description: 'lines of surrounding context to show around each hit' },
                 source: { type: 'boolean', description: 'show surrounding source context around each hit (default 3 lines)' },
+                dir: DIR_PROP,
             },
             required: ['pattern'],
         },
@@ -97,6 +104,7 @@ export const TOOLS = [
             type: 'object',
             properties: {
                 max_dirs: { type: 'number', description: 'max directory entries shown (default 16)' },
+                dir: DIR_PROP,
             },
         },
     },
@@ -186,18 +194,34 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
 /** Tools whose whole job is to REPORT drift. Rebuilding first would make
  * `plexer_check_freshness` answer about a graph it just fixed, i.e. always "OK". */
 const NO_REFRESH_TOOLS = new Set(['plexer_check_freshness']);
+function resolveMcpRoot(root, args, dirOverride) {
+    if (typeof args?.dir === 'string' && args.dir.trim()) {
+        return nearestPlexerRoot(args.dir.trim(), dirOverride).root;
+    }
+    const candidate = nearestPlexerRoot(root, dirOverride).root;
+    if (dirOverride !== undefined || hasPlexerIndex(candidate) || isAutoBuildableRepo(candidate)) {
+        return candidate;
+    }
+    const lastAgy = readAgyLastRepo();
+    if (lastAgy) {
+        return nearestPlexerRoot(lastAgy, dirOverride).root;
+    }
+    return candidate;
+}
+
 export async function callTool(root, name, args, dirOverride) {
     try {
-        const ws = readWorkspace(root, dirOverride);
+        const targetRoot = resolveMcpRoot(root, args, dirOverride);
+        const ws = readWorkspace(targetRoot, dirOverride);
         let note = null;
         if (!NO_REFRESH_TOOLS.has(name)) {
             const r = ws
-                ? await ensureFreshChildren(root, ws.children, { contextDir: dirOverride })
-                : await ensureFreshGraph(root, { contextDir: dirOverride });
+                ? await ensureFreshChildren(targetRoot, ws.children, { contextDir: dirOverride })
+                : await ensureFreshGraph(targetRoot, { contextDir: dirOverride });
             note = refreshNote(r);
         }
-        const fed = ws ? await callWorkspaceTool(root, dirOverride, name, args) : null;
-        const res = fed ?? (await callSingleTool(root, name, args, dirOverride));
+        const fed = ws ? await callWorkspaceTool(targetRoot, dirOverride, name, args) : null;
+        const res = fed ?? (await callSingleTool(targetRoot, name, args, dirOverride));
         return note ? { ...res, text: `${note}\n${res.text}` } : res;
     }
     catch (err) {

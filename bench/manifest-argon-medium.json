@@ -37,6 +37,10 @@
     "plexer": {
       "conversationId": "/tmp/plexer-agy-logs/argon-medium/T4-plexer.jsonl",
       "cloneDir": "/tmp/plexer-ab-argon-medium-plexer/z"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-medium/T4-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-medium-trail/z"
     }
   },
   "T5": {
@@ -47,6 +51,10 @@
     "plexer": {
       "conversationId": "/tmp/plexer-agy-logs/argon-medium/T5-plexer.jsonl",
       "cloneDir": "/tmp/plexer-ab-argon-medium-plexer/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-medium/T5-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-medium-trail/plexer"
     }
   },
   "T6": {
@@ -87,6 +95,10 @@
     "plexer": {
       "conversationId": "/tmp/plexer-agy-logs/argon-medium/T9-plexer.jsonl",
       "cloneDir": "/tmp/plexer-ab-argon-medium-plexer/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/argon-medium/T9-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-argon-medium-trail/plexer"
     }
   },
   "T10": {

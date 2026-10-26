@@ -42,7 +42,7 @@ export function resolveSymbol(graph, query, opts = {}) {
         }
     }
     const hasLuau = !graph.meta?.languages || graph.meta.languages.includes("luau");
-    if (hasLuau) {
+    if (hasLuau && (matches.length === 0 || lowerQuery.includes(".") || lowerQuery.includes(":"))) {
         const luauMatches = matchLuauSymbol(graph.nodes, lowerQuery, graph.edges);
         if (luauMatches.length > 0 && (matches.length === 0 || luauMatches.some((m) => m.exported)))
             matches = luauMatches;
@@ -78,9 +78,13 @@ export function stripOrdinals(idTail) {
 
 /** Lowercase `n.id` with mint-time disambiguation ordinals stripped from the symbol tail. */
 export function stripNodeOrdinals(n) {
+    if (n._strippedId !== undefined)
+        return n._strippedId;
     const lowerId = n.id.toLowerCase();
     const hashIdx = lowerId.indexOf("#");
-    return hashIdx === -1 ? lowerId : lowerId.slice(0, hashIdx + 1) + stripOrdinals(lowerId.slice(hashIdx + 1));
+    const stripped = hashIdx === -1 ? lowerId : lowerId.slice(0, hashIdx + 1) + stripOrdinals(lowerId.slice(hashIdx + 1));
+    Object.defineProperty(n, "_strippedId", { value: stripped, enumerable: false, configurable: true, writable: true });
+    return stripped;
 }
 
 function symbolMatches(nodes, lowerQuery) {
@@ -89,7 +93,8 @@ function symbolMatches(nodes, lowerQuery) {
     return nodes.filter((n) => {
         if (n.kind === "file")
             return false;
-        if (n.name.toLowerCase() === lowerQuery)
+        const lowerName = n._lowerName ?? (Object.defineProperty(n, "_lowerName", { value: n.name.toLowerCase(), enumerable: false, configurable: true, writable: true }), n._lowerName);
+        if (lowerName === lowerQuery)
             return true;
         const candidateId = stripNodeOrdinals(n);
         return candidateId.endsWith(suffixHash) || candidateId.endsWith(suffixDot);
@@ -123,6 +128,8 @@ function directWalk(graph, symbol, direction) {
     return hits;
 }
 
+export const MAX_CLOSURE_NODES = 100;
+
 export function impactOfMany(graph, seeds, maxDepth = 2, direction = "in") {
     if (seeds.length === 0)
         return [];
@@ -130,10 +137,13 @@ export function impactOfMany(graph, seeds, maxDepth = 2, direction = "in") {
     const adj = walkAdjacency(graph, direction);
     const visited = new Set(seeds.map((s) => s.id));
     const hits = [];
+    const cap = maxDepth === Number.POSITIVE_INFINITY ? MAX_CLOSURE_NODES : Number.POSITIVE_INFINITY;
     let frontier = [...visited];
-    for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
+    for (let depth = 1; depth <= maxDepth && frontier.length > 0 && hits.length < cap; depth++) {
         const next = [];
         for (const current of frontier) {
+            if (hits.length >= cap)
+                break;
             const viaNode = byId.get(current) ?? null;
             for (const { other, relation } of adj.get(current) ?? []) {
                 if (visited.has(other))
@@ -147,6 +157,8 @@ export function impactOfMany(graph, seeds, maxDepth = 2, direction = "in") {
                     depth,
                 });
                 next.push(other);
+                if (hits.length >= cap)
+                    break;
             }
         }
         frontier = next;

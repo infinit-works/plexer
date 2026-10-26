@@ -13,7 +13,7 @@
  * v1 is deterministic and $0 (term-overlap scoring, no LLM, no embeddings). The
  * output is markdown so it drops straight into an agent's context.
  */
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached, loadAskIndexCached } from "../graph/load.js";
 import { assertPrefixIndexed, pathUnderPrefix, scopeLabel, scopeOf, scopesHereClause, scopesOfGraph, } from "../graph/scopes.js";
@@ -51,9 +51,13 @@ function loadCorpus(outDir) {
  * the results (they still matter for "where are the tests") but below the real
  * definition. Covers Go (`_test.go`), JS/TS (`.test.` / `.spec.`), and test dirs. */
 export function isTestPath(path) {
-    return /(?:^|\/)(?:__tests__|tests?|specs?|bench|benchmarks?|fixtures?|__mocks__)\/|\.(?:test|spec|bench)\.[a-z0-9]+$|_test\.(?:go|py|rb)$|(^|\/)(?:test_[^/]+|conftest)\.py$/i.test(path || "");
+    return /(?:^|\/)(?:__tests__|tests?|specs?|bench|benchmarks?|fixtures?|__mocks__|mocks?)\/|\.(?:test|spec|bench|mock)\.[a-z0-9]+$|_(?:test|mock)\.(?:go|py|rb|ts|js|tsx|jsx)$|(^|\/)(?:test_[^/]+|mock_[^/]+|conftest)\.(?:py|go|ts|js)$/i.test(path || "");
+}
+export function isGeneratedPath(path) {
+    return /\.pb\.(?:go|ts|js|cc|h)$|_pb2(?:_grpc)?\.py$|\.(?:generated|gen)\.[a-z0-9]+$|(?:\b|^)(?:generated|__generated__)\//i.test(path || "");
 }
 const TEST_RANK_PENALTY = 0.35;
+const GENERATED_RANK_PENALTY = 0.25;
 function fastTermCount(doc, docStems, t, alt, stem) {
     const exact = doc.get(t);
     if (exact)
@@ -323,12 +327,34 @@ function normalizedQueryWeights(q, idf, dfltIdf) {
         return new Map();
     return new Map([...q.keys()].map((term) => [term, (idf.get(term) ?? dfltIdf) / total]));
 }
+const _testPathCache = new Map();
+const _genPathCache = new Map();
+function cachedTestPath(path) {
+    let v = _testPathCache.get(path);
+    if (v === undefined) {
+        v = isTestPath(path);
+        _testPathCache.set(path, v);
+    }
+    return v;
+}
+function cachedGenPath(path) {
+    let v = _genPathCache.get(path);
+    if (v === undefined) {
+        v = isGeneratedPath(path);
+        _genPathCache.set(path, v);
+    }
+    return v;
+}
 function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fileComplement = false, fileTopLock = false, includeRankingMetadata = false) {
     // Binary query terms: a word repeated in a pasted issue body counts once, so a
     // ranty description can't linearly amplify an incidental word.
     const q = new Map([...counts(tokenize(query)).keys()].map((t) => [t, 1]));
     const qStemOf = new Map([...q.keys()].map((t) => [t, stemToken(t)]));
-    const rawIdentifiers = new Set((query.toLowerCase().match(/[a-z0-9_]+/g) ?? []).filter((w) => w.length >= 4));
+    const rawIdentifiers = new Set([
+        ...(query.toLowerCase().match(/[a-z0-9_]+/g) ?? []).filter((w) => w.length >= 4),
+        ...(query.toLowerCase().match(/[a-z0-9_]+(?:\.[a-z0-9_]+)+/g) ?? []),
+    ]);
+    const rawFileNames = new Set(query.toLowerCase().match(/\b[a-z0-9_-]+\.(?:py|go|js|ts|tsx|jsx|luau|rs)\b/g) ?? []);
     const graph = corpus.graph;
     // Test-file de-ranking is query-aware: a query that ASKS about tests wants test
     // files on top, so it gets no penalty; every other query wants the real
@@ -336,7 +362,7 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
     // (e.g. `TestDownloadStall` matching "download stall") from outranking the
     // source it exercises — the "tests ranked above the actual code" trap.
     const wantsTests = /\b(tests?|specs?|coverage|assert(?:ion)?s?|fixtures?|mocks?)\b/i.test(query);
-    const testFactor = (path) => (!wantsTests && isTestPath(path) ? TEST_RANK_PENALTY : 1);
+    const testFactor = (path) => (!wantsTests && cachedTestPath(path) ? TEST_RANK_PENALTY : cachedGenPath(path) ? GENERATED_RANK_PENALTY : 1);
     // ── Pass 1: tokenize every scored field once, and collect per-document token
     // bags so IDF can down-weight words that occur across the whole corpus. ──
     let hydratedById = null;
@@ -369,25 +395,58 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
     }
     const askIndex = hydratedById || rawDocById ? corpus.askIndex : null;
     const graphNodes = inPrefix ? (graph?.nodes ?? []).filter((n) => pathUnderPrefix(n.path, inPrefix)) : (graph?.nodes ?? []);
-    const symbolDocs = graphNodes.map((n) => {
-        const hd = hydratedById?.get(n.id);
-        if (hd) {
-            return {
-                n,
-                name: hd.name,
-                path: hd.path,
-                body: hd.body,
-                nameStems: hd.nameStems,
-                pathStems: hd.pathStems,
-                bodyStems: hd.bodyStems,
-                bodyLen: hd.bodyLen,
-            };
-        }
-        const d = rawDocById?.get(n.id);
-        if (d) {
-            const name = new Map(d.name);
-            const path = new Map(d.path);
-            const body = new Map(d.body);
+    let symbolDocs;
+    if (!inPrefix && graph && hydratedById && graph._symbolDocsAskIndex === corpus.askIndex && graph._symbolDocsNodeLen === graphNodes.length) {
+        symbolDocs = graph._symbolDocs;
+    }
+    else {
+        symbolDocs = graphNodes.map((n) => {
+            const slashIdx = n.path ? n.path.lastIndexOf("/") : -1;
+            const baseNameLower = (slashIdx >= 0 ? n.path.slice(slashIdx + 1) : (n.path ?? "")).toLowerCase();
+            const extDotIdx = baseNameLower.lastIndexOf(".");
+            const fileStemLower = extDotIdx >= 0 ? baseNameLower.slice(0, extDotIdx) : baseNameLower;
+            const ownerLower = n.owner ? n.owner.toLowerCase() : "";
+            const singleWordMethod = Boolean(ownerLower && !n.name.includes("_") && !/[A-Z]/.test(n.name.slice(1)));
+            const hd = hydratedById?.get(n.id);
+            if (hd) {
+                return {
+                    n,
+                    name: hd.name,
+                    path: hd.path,
+                    body: hd.body,
+                    nameStems: hd.nameStems,
+                    pathStems: hd.pathStems,
+                    bodyStems: hd.bodyStems,
+                    bodyLen: hd.bodyLen,
+                    baseNameLower,
+                    fileStemLower,
+                    ownerLower,
+                    singleWordMethod,
+                };
+            }
+            const d = rawDocById?.get(n.id);
+            if (d) {
+                const name = new Map(d.name);
+                const path = new Map(d.path);
+                const body = new Map(d.body);
+                return {
+                    n,
+                    name,
+                    path,
+                    body,
+                    nameStems: stemCounts(name),
+                    pathStems: stemCounts(path),
+                    bodyStems: stemCounts(body),
+                    bodyLen: bagLen(body),
+                    baseNameLower,
+                    fileStemLower,
+                    ownerLower,
+                    singleWordMethod,
+                };
+            }
+            const name = counts(tokenize(n.name));
+            const path = counts(tokenize(n.path));
+            const body = counts(tokenize(`${n.signature ?? ""} ${n.summary ?? ""} ${n.body_text ?? ""}`));
             return {
                 n,
                 name,
@@ -397,22 +456,18 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
                 pathStems: stemCounts(path),
                 bodyStems: stemCounts(body),
                 bodyLen: bagLen(body),
+                baseNameLower,
+                fileStemLower,
+                ownerLower,
+                singleWordMethod,
             };
+        });
+        if (!inPrefix && graph && hydratedById) {
+            Object.defineProperty(graph, "_symbolDocs", { value: symbolDocs, enumerable: false, configurable: true, writable: true });
+            Object.defineProperty(graph, "_symbolDocsAskIndex", { value: corpus.askIndex, enumerable: false, configurable: true, writable: true });
+            Object.defineProperty(graph, "_symbolDocsNodeLen", { value: graphNodes.length, enumerable: false, configurable: true, writable: true });
         }
-        const name = counts(tokenize(n.name));
-        const path = counts(tokenize(n.path));
-        const body = counts(tokenize(`${n.signature ?? ""} ${n.summary ?? ""} ${n.body_text ?? ""}`));
-        return {
-            n,
-            name,
-            path,
-            body,
-            nameStems: stemCounts(name),
-            pathStems: stemCounts(path),
-            bodyStems: stemCounts(body),
-            bodyLen: bagLen(body),
-        };
-    });
+    }
     const qTerms = [...q.keys()];
     const qLen = qTerms.length;
     const idf = askIndex && !inPrefix
@@ -496,11 +551,9 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
     const invAvgDl = 1 / (avgBodyLen || 1);
     const scoreSymbolDocs = (docs) => {
         const out = new Map();
-        for (const { n, name, path, body, nameStems, pathStems, bodyStems, bodyLen: dBodyLen } of docs) {
-            const effBodyLen = n.kind === "file" ? dBodyLen * 0.35 : Math.max(dBodyLen, avgBodyLen * 0.65);
+        for (const { n, name, path, body, nameStems, pathStems, bodyStems, bodyLen: dBodyLen, baseNameLower, fileStemLower, ownerLower, singleWordMethod } of docs) {
+            const effBodyLen = n.kind === "file" ? Math.min(dBodyLen * 0.35, 420) : Math.max(dBodyLen, avgBodyLen * 0.65);
             const norm = k1 * (1 - b + b * effBodyLen * invAvgDl);
-            const slashIdx = n.path ? n.path.lastIndexOf("/") : -1;
-            const baseNameLower = (slashIdx >= 0 ? n.path.slice(slashIdx + 1) : (n.path ?? "")).toLowerCase();
             let nameScore = 0;
             let pathScore = 0;
             let bodyScore = 0;
@@ -515,12 +568,14 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
                 const alt = qAlts[i];
                 const stem = qStems[i];
                 const wIdf = qIdfs[i];
-                const nTf = fastTermCount(name, nameStems, t, alt, stem);
+                const rawNTf = fastTermCount(name, nameStems, t, alt, stem);
+                const oTf = rawNTf === 0 && singleWordMethod && (ownerLower === t || ownerLower === alt || (stem && ownerLower === stem) || (t.length >= 4 && ownerLower.endsWith(t))) ? 0.85 : 0;
+                const nTf = rawNTf || oTf;
                 const pTf = fastTermCount(path, pathStems, t, alt, stem);
                 const bTf = fastTermCount(body, bodyStems, t, alt, stem);
                 if (nTf === 0 && pTf === 0 && bTf === 0)
                     continue;
-                const dirOnlyMatch = pTf > 0 && nTf === 0 && bTf === 0 && !baseNameLower.includes(t) && (!stem || !baseNameLower.includes(stem));
+                const dirOnlyMatch = pTf > 0 && nTf === 0 && bTf === 0 && !fileStemLower.includes(t) && (!stem || !fileStemLower.includes(stem));
                 matchedCount += dirOnlyMatch ? 0.45 : 1;
                 matchedIdf += wIdf * (dirOnlyMatch ? 0.45 : 1);
                 if (nTf > 0) {
@@ -552,21 +607,36 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
                 if (rawIdentifiers.size > 0) {
                     const sepIdx = Math.max(n.name.lastIndexOf("#"), n.name.lastIndexOf("."));
                     const bare = (sepIdx >= 0 ? n.name.slice(sepIdx + 1) : n.name).toLowerCase();
-                    if (bare.length >= 4 && rawIdentifiers.has(bare)) {
-                        nameScore *= matchedInName >= 2 ? 1.65 : 1.25;
-                        if (matchedInName >= 2)
+                    const qual = ownerLower ? `${ownerLower}.${bare}` : "";
+                    if ((bare.length >= 4 && rawIdentifiers.has(bare)) || (qual && rawIdentifiers.has(qual))) {
+                        const isQualMatch = Boolean(qual && rawIdentifiers.has(qual));
+                        const isExactFullName = isQualMatch || matchedInName >= 2 || (tokenize(bare).length === 1 && (qLen <= 3 || matchedCount * 2 >= qLen));
+                        nameScore *= isQualMatch ? 1.85 : isExactFullName ? 1.65 : 1.25;
+                        if (isExactFullName)
                             exactCompoundName = true;
+                        if (matchedInName >= 3 && bare.endsWith("error"))
+                            nameScore *= 0.62;
                     }
                 }
             }
             if (pathScore > 0) {
                 if (matchedInPath >= 2)
                     pathScore *= 1 + 0.25 * Math.min(2, matchedInPath - 1);
-                if (rawIdentifiers.size > 0 && baseNameLower) {
-                    const dotIdx = baseNameLower.indexOf(".");
-                    const fileStem = dotIdx >= 0 ? baseNameLower.slice(0, dotIdx) : baseNameLower;
-                    if (fileStem.length >= 4 && rawIdentifiers.has(fileStem))
-                        pathScore *= 1.25;
+                if (baseNameLower) {
+                    if (rawFileNames.has(baseNameLower)) {
+                        pathScore *= 4.0;
+                        exactCompoundName = true;
+                    }
+                    else if (rawIdentifiers.size > 0) {
+                        const dotIdx = baseNameLower.indexOf(".");
+                        const fileStem = dotIdx >= 0 ? baseNameLower.slice(0, dotIdx) : baseNameLower;
+                        if (fileStem.length >= 4 && rawIdentifiers.has(fileStem)) {
+                            const isPrimaryModule = (n.kind !== "file" && n.name.toLowerCase() === fileStem) || (n.kind === "file" && matchedInPath === 1 && matchedCount >= 3 && !/[a-z][A-Z]|[._]/.test(query));
+                            pathScore *= isPrimaryModule ? 2.1 : 1.25;
+                            if (fileStem.length >= 5 && isPrimaryModule && matchedCount >= 3)
+                                exactCompoundName = true;
+                        }
+                    }
                 }
             }
             let raw = nameScore + pathScore + bodyScore;
@@ -652,14 +722,32 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
         symbolHits.push(hits[0]);
     };
     if (scopes && scopes.length > 1) {
-        const byScope = new Map();
-        const scopeById = new Map();
-        for (const d of symbolDocs) {
-            const s = scopeOf(d.n.path, scopes).prefix;
-            scopeById.set(d.n.id, s);
-            pushMap(byScope, s, d);
-        }
+        let byScope;
+        let scopeById;
         let pageRankByScope;
+        if (!inPrefix && graph && hydratedById && graph._multiScopeCache?.askIndex === corpus.askIndex && graph._multiScopeCache?.edgeLen === graph.edges.length) {
+            byScope = graph._multiScopeCache.byScope;
+            scopeById = graph._multiScopeCache.scopeById;
+            pageRankByScope = graph._multiScopeCache.pageRankByScope;
+        }
+        else {
+            byScope = new Map();
+            scopeById = new Map();
+            for (const d of symbolDocs) {
+                const s = scopeOf(d.n.path, scopes).prefix;
+                scopeById.set(d.n.id, s);
+                pushMap(byScope, s, d);
+            }
+            if (!inPrefix && graph && hydratedById) {
+                pageRankByScope = preparePageRankPartitions(graph, (id) => scopeById.get(id));
+                Object.defineProperty(graph, "_multiScopeCache", {
+                    value: { askIndex: corpus.askIndex, edgeLen: graph.edges.length, byScope, scopeById, pageRankByScope },
+                    enumerable: false,
+                    configurable: true,
+                    writable: true,
+                });
+            }
+        }
         let collapsedComponents = [];
         let collapsedComponentById;
         let collapsedFileByRepresentative;
@@ -870,6 +958,8 @@ function lexical(query, corpus, limit, graphRank, inPrefix, fileFirst = true, fi
                     coverage: matchedOf.get(baselineTop) ?? 0,
                     coverageStrong: matchedStrongOf.get(baselineTop) ?? 0,
                 };
+            matchedOf.set(lockedLeader, locked.coverage);
+            matchedStrongOf.set(lockedLeader, locked.coverageStrong);
             projectedGroups = [
                 locked,
                 ...unlockedGroups.filter((group) => group.key !== key),
@@ -1173,29 +1263,62 @@ function synthesizeCrux(lines, path, from, to, qTerms, qStems, maxContiguous = M
  * `…` gap markers on long symbols) for the top `SOURCE_TOP_HITS` hits while keeping
  * lower hits compact. */
 function inlineSource(root, hits, graph, full, query = "", opts = {}) {
-    const cruxByPointer = new Map();
-    const fileSpanByPath = new Map();
-    const nodeByPointer = new Map();
-    const byId = graph?._byId ?? new Map();
-    const outCallsById = new Map();
-    const inCallsById = new Map();
-    if (graph) {
-        for (const n of graph.nodes) {
-            if (!byId.has(n.id))
-                byId.set(n.id, n);
-            const ptr = n.kind === "file" ? n.path : `${n.path}:${n.span}`;
-            if (!nodeByPointer.has(ptr) || n.kind !== "file")
-                nodeByPointer.set(ptr, n);
-            if (!full && n.crux?.code)
-                cruxByPointer.set(`${n.path}:${n.span}`, n.crux.code);
-            if (n.kind === "file" && n.span)
-                fileSpanByPath.set(n.path, n.span);
-        }
-        for (const e of graph.edges) {
-            if (e.relation !== "calls")
-                continue;
-            pushMap(outCallsById, e.source, e.target);
-            pushMap(inCallsById, e.target, e.source);
+    let cruxByPointer;
+    let fileSpanByPath;
+    let nodeByPointer;
+    let byId;
+    let outCallsById;
+    let inCallsById;
+    let nodesByPath;
+    if (graph && !full && graph._inlineSourceIndex && graph._inlineSourceIndex.nodeLen === graph.nodes.length && graph._inlineSourceIndex.edgeLen === graph.edges.length) {
+        ({ cruxByPointer, fileSpanByPath, nodeByPointer, byId, outCallsById, inCallsById, nodesByPath } = graph._inlineSourceIndex);
+    }
+    else {
+        cruxByPointer = new Map();
+        fileSpanByPath = new Map();
+        nodeByPointer = new Map();
+        byId = graph?._byId ?? new Map();
+        outCallsById = new Map();
+        inCallsById = new Map();
+        nodesByPath = new Map();
+        if (graph) {
+            for (const n of graph.nodes) {
+                if (!byId.has(n.id))
+                    byId.set(n.id, n);
+                const ptr = n.kind === "file" ? n.path : `${n.path}:${n.span}`;
+                if (!nodeByPointer.has(ptr) || n.kind !== "file")
+                    nodeByPointer.set(ptr, n);
+                if (!full && n.crux?.code)
+                    cruxByPointer.set(`${n.path}:${n.span}`, n.crux.code);
+                if (n.kind === "file" && n.span)
+                    fileSpanByPath.set(n.path, n.span);
+                if (n.kind !== "file" && n.path)
+                    pushMap(nodesByPath, n.path, n);
+            }
+            for (const e of graph.edges) {
+                if (e.relation !== "calls" && e.relation !== "imports")
+                    continue;
+                pushMap(outCallsById, e.source, e.target);
+                pushMap(inCallsById, e.target, e.source);
+            }
+            if (!full) {
+                Object.defineProperty(graph, "_inlineSourceIndex", {
+                    value: {
+                        nodeLen: graph.nodes.length,
+                        edgeLen: graph.edges.length,
+                        cruxByPointer,
+                        fileSpanByPath,
+                        nodeByPointer,
+                        byId,
+                        outCallsById,
+                        inCallsById,
+                        nodesByPath,
+                    },
+                    enumerable: false,
+                    configurable: true,
+                    writable: true,
+                });
+            }
         }
     }
     const qTerms = new Set(tokenize(query));
@@ -1207,13 +1330,6 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
     let inlinedHitCount = 0;
     const shownPointers = opts.seenPointers ?? new Set();
     const constsByPath = new Map();
-    const nodesByPath = new Map();
-    if (graph) {
-        for (const n of graph.nodes) {
-            if (n.kind !== "file" && n.path)
-                pushMap(nodesByPath, n.path, n);
-        }
-    }
     const getFileConsts = (path, lines) => {
         if (constsByPath.has(path))
             return constsByPath.get(path);
@@ -1244,7 +1360,8 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
         return out;
     };
     const isMultiQuery = Boolean(opts.maxHitsToInline && opts.maxHitsToInline <= 2);
-    const wantsCallSites = /\b(callers?|called|calls|invokes?|invoked|who\s+uses|used\s+by|blast\s+radius|refactor|references?|where\s+is\b.*\bused)\b/i.test(query);
+    const wantsCallSites = Boolean(opts.wantsCallSites) || /\b(callers?|called|calls|invokes?|invoked|who\s+uses|used\s+by|blast\s+radius|refactor|references?|where\s+is\b.*\bused)\b/i.test(query);
+    const editEnvelope = Boolean(opts.editEnvelope);
     for (let i = 0; i < hits.length; i++) {
         const h = hits[i];
         const node = nodeByPointer.get(h.pointer);
@@ -1273,7 +1390,7 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                 if (!isTestPath(sn.path)) {
                     directCallerNodes.push({ caller: sn, via: null });
                 }
-                if (sn.kind !== "file" && rel.length < maxTotalRel) {
+                if (sn.kind !== "file" && !isTestPath(sn.path) && rel.length < maxTotalRel) {
                     rel.push(`← ${sn.name} (${sn.path}:${sn.span})`);
                 }
             }
@@ -1282,18 +1399,62 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
             const namedCallersOnly = directCallerNodes.filter((c) => c.caller.kind !== "file");
             const activeCallers = wantsCallSites ? directCallerNodes : namedCallersOnly;
             if (i === 0 && activeCallers.length > 0 && activeCallers.length <= 20) {
-                if (wantsCallSites && activeCallers.length <= 3) {
+                if (wantsCallSites && activeCallers.length <= 6) {
+                    const outCallees = (outCallsById.get(node.id) ?? []).map((tid) => byId.get(tid)).filter((tn) => tn && tn.kind !== "file" && tn.name === node.name);
+                    for (const callee of outCallees) {
+                        for (const sid of inCallsById.get(callee.id) ?? []) {
+                            if (seenRel.has(sid) || activeCallers.length >= 14)
+                                continue;
+                            const sn = byId.get(sid);
+                            if (!sn || sn.kind === "file" || isTestPath(sn.path))
+                                continue;
+                            seenRel.add(sid);
+                            activeCallers.push({ caller: sn, via: null });
+                        }
+                    }
                     for (const { caller } of [...activeCallers]) {
                         if (caller.kind === "file")
                             continue;
                         for (const sid2 of inCallsById.get(caller.id) ?? []) {
-                            if (seenRel.has(sid2) || activeCallers.length >= 12)
+                            if (seenRel.has(sid2) || activeCallers.length >= 16)
                                 continue;
                             const sn2 = byId.get(sid2);
                             if (!sn2 || isTestPath(sn2.path))
                                 continue;
                             seenRel.add(sid2);
                             activeCallers.push({ caller: sn2, via: caller });
+                        }
+                    }
+                    for (const { caller, via } of [...activeCallers]) {
+                        if (!via || caller.kind === "file")
+                            continue;
+                        const cr = spanRange(caller.span);
+                        if (!cr || cr.end - cr.start > 20)
+                            continue;
+                        for (const sid3 of inCallsById.get(caller.id) ?? []) {
+                            if (seenRel.has(sid3) || activeCallers.length >= 22)
+                                continue;
+                            const sn3 = byId.get(sid3);
+                            if (!sn3 || isTestPath(sn3.path))
+                                continue;
+                            seenRel.add(sid3);
+                            activeCallers.push({ caller: sn3, via: caller });
+                        }
+                    }
+                    for (const { caller, via } of [...activeCallers]) {
+                        if (!via || caller.kind === "file" || caller.exported)
+                            continue;
+                        const cr = spanRange(caller.span);
+                        if (!cr || cr.end - cr.start > 30)
+                            continue;
+                        for (const sid4 of inCallsById.get(caller.id) ?? []) {
+                            if (seenRel.has(sid4) || activeCallers.length >= 22)
+                                continue;
+                            const sn4 = byId.get(sid4);
+                            if (!sn4 || sn4.path !== caller.path || isTestPath(sn4.path))
+                                continue;
+                            seenRel.add(sid4);
+                            activeCallers.push({ caller: sn4, via: caller });
                         }
                     }
                 }
@@ -1352,6 +1513,8 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                 }
                 if (callSites.length > 0) {
                     h.callSites = callSites;
+                    if (wantsCallSites)
+                        h.wantsCallSites = true;
                 }
             }
         }
@@ -1377,19 +1540,52 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
             inlinedHitCount++;
             continue;
         }
-        const lines = readLines(s.path);
-        const spanLen = s.end - s.start + 1;
+        let lines = readLines(s.path);
+        let spanLen = s.end - s.start + 1;
+        if (editEnvelope && lines && spanLen <= 14 && node?.kind === "function") {
+            const enclosing = (nodesByPath.get(s.path) ?? []).find((pn) => {
+                if (pn.id === node.id || (pn.kind !== "function" && pn.kind !== "method"))
+                    return false;
+                const ps = parseSpan(`${pn.path}:${pn.span}`);
+                if (!ps)
+                    return false;
+                const pLen = ps.end - ps.start + 1;
+                return ps.start <= s.start && ps.end >= s.end && pLen > spanLen && pLen <= 60;
+            });
+            if (enclosing) {
+                const ps = parseSpan(`${enclosing.path}:${enclosing.span}`);
+                if (ps) {
+                    s = ps;
+                    spanLen = ps.end - ps.start + 1;
+                    h.pointer = `${enclosing.path}:${enclosing.span}`;
+                    h.title = `${enclosing.name} · ${enclosing.kind}`;
+                }
+            }
+        }
         const isUnrequestedLargeType = node?.kind === "type" && spanLen > 24 && !qTerms.has("type") && !qTerms.has((node.name ?? "").toLowerCase());
         if (isUnrequestedLargeType || (inlinedHitCount > 0 && ((spanLen > 500 && node?.kind !== "file") || (node?.kind === "type" && spanLen > 20))))
             continue;
-        const effStart = lines && spanLen <= 6 ? Math.max(1, s.start - 3) : s.start;
-        const effEnd = lines && spanLen <= 6 ? Math.min(lines.length, s.end + 3) : s.end;
+        const effStart = lines && spanLen <= 6 ? Math.max(1, s.start - 3) : (editEnvelope && s.start <= 10 ? 1 : s.start);
+        let effEnd = lines && spanLen <= 6 ? Math.min(lines.length, s.end + 3) : s.end;
+        if (editEnvelope && lines && spanLen <= 45) {
+            const nextTiny = (nodesByPath.get(s.path) ?? []).find((nn) => {
+                if (nn.id === node?.id || nn.kind === "file")
+                    return false;
+                const ns = parseSpan(`${nn.path}:${nn.span}`);
+                return ns && ns.start >= s.end + 1 && ns.start <= s.end + 3 && ns.end - ns.start + 1 <= 10;
+            });
+            if (nextTiny) {
+                const ns = parseSpan(`${nextTiny.path}:${nextTiny.span}`);
+                if (ns)
+                    effEnd = ns.end;
+            }
+        }
         const maxSpan = inlinedHitCount < 2 ? MAX_SPAN_LINES : 40;
         const isDominantTop = inlinedHitCount === 0 && (hits.length === 1 || (hits[0]?.score ?? 0) >= 1.15 * (hits[1]?.score ?? 0) || opts.maxHitsToInline === 1);
         const maxContiguous = inlinedHitCount === 0
-            ? (isDominantTop ? 80 : isMultiQuery ? 60 : MAX_CONTIGUOUS_TOP_LINES)
-            : MAX_CONTIGUOUS_SECONDARY_LINES;
-        const maxCrux = node?.kind === "file" ? (spanLen > 200 ? 22 : 16) : inlinedHitCount === 0 ? (isMultiQuery ? 28 : MAX_CRUX_LINES) : 18;
+            ? (editEnvelope ? (!isMultiQuery && spanLen <= 42 ? 42 : 22) : isDominantTop ? 80 : isMultiQuery ? 60 : MAX_CONTIGUOUS_TOP_LINES)
+            : (editEnvelope ? 14 : MAX_CONTIGUOUS_SECONDARY_LINES);
+        const maxCrux = node?.kind === "file" ? (spanLen > 200 ? 22 : 16) : inlinedHitCount === 0 ? (editEnvelope ? 15 : isMultiQuery ? 28 : MAX_CRUX_LINES) : (editEnvelope ? 10 : 18);
         const hitQTerms = new Set(qTerms);
         for (const oh of hits.slice(0, 6)) {
             if (oh.pointer.startsWith(`${s.path}:`)) {
@@ -1477,9 +1673,44 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                     sameFileCands.set(nid, { node: nn, ptr, hop, isSameFile, isCallee, viaTinyCallee: viaTinyCallee && isCallee, fromGraph: true });
                 }
             };
+            const scanTextCalls = (startLine, endLine, hop, viaTinyCallee) => {
+                const text = lines
+                    .slice(Math.max(0, startLine - 1), Math.min(lines.length, endLine))
+                    .map((l) => l.replace(/(?:--|\s\/\/|\/\/).*$/, ""))
+                    .join("\n");
+                for (const nn of nodesByPath.get(s.path) ?? []) {
+                    if (nn.id === node.id || nn.kind === "file")
+                        continue;
+                    const existing = sameFileCands.get(nn.id);
+                    if (existing?.fromGraph)
+                        continue;
+                    const ptr = `${nn.path}:${nn.span}`;
+                    if (shownPointers.has(ptr))
+                        continue;
+                    const escaped = (nn.name ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    if (!escaped)
+                        continue;
+                    const bareSuffix = (nn.name ?? "").split(/[.:]/).pop()?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    const isDirectCall = new RegExp(`\\b${escaped}\\s*\\(`).test(text) ||
+                        Boolean(bareSuffix && bareSuffix.length >= 4 && bareSuffix !== escaped && new RegExp(`[:.]${bareSuffix}\\s*\\(`).test(text));
+                    const isDottedIdent = nn.name.includes(".") && new RegExp(`\\b${escaped}\\b`).test(text);
+                    if (isDirectCall || isDottedIdent) {
+                        sameFileCands.set(nn.id, {
+                            node: nn,
+                            ptr,
+                            hop: existing?.fromGraph ? Math.min(existing.hop, hop) : hop,
+                            isSameFile: true,
+                            isCallee: true,
+                            viaTinyCallee: Boolean(existing?.viaTinyCallee || viaTinyCallee),
+                            fromGraph: true,
+                        });
+                    }
+                }
+            };
             addNeighbours(node.id, 1, spanLen <= 55, false);
-            if (sameFileCands.size === 0 || node.kind === "type" || node.kind === "interface" || i === 0) {
-                const isTypeNode = node.kind === "type" || node.kind === "interface";
+            scanTextCalls(s.start, s.end, 1, false);
+            if (sameFileCands.size === 0 || node.kind === "type" || node.kind === "interface" || node.kind === "struct" || i === 0) {
+                const isTypeNode = node.kind === "type" || node.kind === "interface" || node.kind === "struct";
                 const hadGraphCands = sameFileCands.size > 0;
                 const typeBodyToks = isTypeNode ? new Set(tokenize(lines.slice(Math.max(0, s.start - 1), Math.min(lines.length, s.end)).join(" "))) : null;
                 for (const nn of nodesByPath.get(s.path) ?? []) {
@@ -1504,7 +1735,12 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                                 m++;
                         }
                     }
-                    const isTypeMemberOrCtor = Boolean(typeBodyToks && nn.kind === "function" && (typeBodyToks.has(nn.name.toLowerCase()) || /^(?:new|create)$/.test(nn.name)));
+                    const isTypeMemberOrCtor = Boolean(
+                        isTypeNode &&
+                        (nn.kind === "function" || nn.kind === "method") &&
+                        ((typeBodyToks && (typeBodyToks.has(nn.name.toLowerCase()) || /^(?:new|create)$/.test(nn.name))) ||
+                            (node.name && nn.signature && nn.signature.includes(node.name)))
+                    );
                     if (m >= 1 || isTypeMemberOrCtor) {
                         sameFileCands.set(nn.id, { node: nn, ptr, hop: 1, isSameFile: true, isCallee: !hadGraphCands || isTypeMemberOrCtor, viaTinyCallee: isTypeMemberOrCtor, fromGraph: isTypeMemberOrCtor });
                     }
@@ -1516,8 +1752,13 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                         const cs = parseSpan(`${cand.node.path}:${cand.node.span}`);
                         const cLen = cs ? cs.end - cs.start + 1 : 999;
                         const isNested = Boolean(cs && cs.start >= s.start && cs.end <= s.end);
-                        if (cand.isSameFile && cand.hop === 1 && (isNested || cand.isCallee)) {
-                            addNeighbours(nid, isNested || cLen <= 16 ? 1 : 2, isNested || cLen <= 16, isNested || cLen <= 8 || (cand.isCallee && cLen <= 90));
+                        if (cand.isSameFile && cand.hop === 1 && (isNested || (cand.isCallee && cand.fromGraph))) {
+                            const nextHop = isNested || (cLen <= 16 && spanLen <= 20) ? 1 : 2;
+                            const isViaTiny = isNested || cLen <= 16;
+                            addNeighbours(nid, nextHop, isNested || cLen <= 16, isViaTiny);
+                            if (cs && cLen <= 90) {
+                                scanTextCalls(cs.start, cs.end, nextHop, isViaTiny);
+                            }
                         }
                     }
                 }
@@ -1545,19 +1786,38 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                     if (cand.isSameFile) {
                         hScore += 2.0;
                         if (cand.fromGraph)
-                            hScore += 3.5;
+                            hScore += cand.hop === 1 ? 8.5 : 4.5;
                         if (cand.isCallee && cand.hop === 1 && cand.fromGraph)
                             hScore += 4.5;
+                        if (cand.fromGraph && !cand.isCallee && cand.hop === 1 && hSpanLen >= 18 && hSpanLen <= 90)
+                            hScore += 4.5;
+                        if (cand.fromGraph && !cand.isCallee && cand.hop === 1 && cand.node.exported && !node.exported)
+                            hScore += 8.0;
+                        if (cand.viaTinyCallee && cand.fromGraph && cand.isCallee && hSpanLen <= 22 && spanLen <= 20)
+                            hScore += 14.0;
+                        if (!cand.fromGraph && Boolean(cand.node.exported) && node.exported && hSpanLen >= 10 && hSpanLen <= 55) {
+                            const nodeToks = new Set(tokenize(node.name).filter((t) => t !== "format" && t !== "get" && t !== "set" && t !== "run" && t !== "read" && t !== "write"));
+                            const sharesNameTok = nodeToks.size > 0 && tokenize(cand.node.name).some((t) => nodeToks.has(t));
+                            hScore += sharesNameTok ? 18.0 : -6.0;
+                        }
+                        else if (!cand.fromGraph && hSpanLen > 18)
+                            hScore -= 12.0;
                     }
                     else if (cand.isCallee && cand.hop === 1 && hSpanLen <= 12) {
                         hScore += 6.5;
                     }
                     if (cand.isSameFile || cand.node.name.length >= 4 || (cand.isCallee && hSpanLen <= 12)) {
-                        for (const nTok of new Set(tokenize(cand.node.name))) {
-                            if (qTerms.has(nTok))
-                                hScore += 8;
-                            else if (stemToken(nTok).length >= 4 && qStems.has(stemToken(nTok)))
-                                hScore += 6;
+                        const canBoostName = cand.fromGraph && cand.isCallee && cand.hop === 1;
+                        if (canBoostName) {
+                            const fileStem = basename(s.path).replace(/\.[a-z0-9]+$/i, "").toLowerCase();
+                            for (const nTok of new Set(tokenize(cand.node.name))) {
+                                if (cand.isSameFile && nTok === fileStem)
+                                    continue;
+                                if (qTerms.has(nTok))
+                                    hScore += 8;
+                                else if (stemToken(nTok).length >= 4 && qStems.has(stemToken(nTok)))
+                                    hScore += 6;
+                            }
                         }
                     }
                     if (!cand.isSameFile && cand.isCallee && hSpanLen <= 12 && cand.node.summary) {
@@ -1570,7 +1830,7 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                     if (/\b(?:[A-Z0-9_]*(?:LIMIT|MAX|MIN|PASS|PASSES|GUARD|BOUND|SIZE|TIMEOUT|RETRY|COUNT|CAP|THRESHOLD)[A-Z0-9_]*)\b/.test(bodySlice)) {
                         hScore += 2.5;
                     }
-                    const helperText = `${cand.node.name} ${cand.node.summary ?? ""} ${bodySlice}`;
+                    const helperText = `${cand.node.owner ?? ""} ${cand.node.name} ${cand.node.summary ?? ""} ${bodySlice}`;
                     for (const tok of new Set(tokenize(helperText))) {
                         if (qTerms.has(tok)) {
                             hScore += 3;
@@ -1595,39 +1855,51 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                     for (const t of tokenize(hCand.node.name))
                         hitQTerms.add(t);
                 }
-                const maxHelpers = opts.maxHitsToInline ? (i === 0 ? 2 : 1) : i === 0 ? 2 : 1;
-                const maxHelperBytesForHit = opts.maxHitsToInline ? (i === 0 ? 1300 : 800) : i === 0 ? 1500 : 800;
+                const isTinyTypeHit = (node.kind === "struct" || node.kind === "type" || node.kind === "interface") && spanLen <= 12;
+                const maxHelpers = editEnvelope
+                    ? (i === 0 ? (isTinyTypeHit ? 4 : (spanLen <= 28 && (scoredHelpers[0]?.hScore ?? 0) >= 16 && (scoredHelpers[0]?.hSpanLen ?? 99) <= 28 ? 1 : 0)) : 0)
+                    : (i === 0 ? 3 : 1);
+                const maxHelperBytesForHit = editEnvelope ? (i === 0 ? (isTinyTypeHit ? 1100 : 600) : 0) : (i === 0 ? 2250 : 1150);
+                const singleHelperBonus = (scoredHelpers[0]?.hSpanLen >= 40 || (scoredHelpers[0]?.node?.exported && !scoredHelpers[0]?.isCallee)) ? 250 : 0;
                 let hitHelperBytes = 0;
                 const helperBlocks = [];
                 const nestedRanges = [];
-                for (let hIdx = 0; hIdx < Math.min(scoredHelpers.length, maxHelpers); hIdx++) {
-                    const hCand = scoredHelpers[hIdx];
-                    if (hCand.hScore < 3.5)
+                let hIdx = 0;
+                for (let sIdx = 0; sIdx < scoredHelpers.length && hIdx < maxHelpers; sIdx++) {
+                    const hCand = scoredHelpers[sIdx];
+                    if (hCand.hScore < 3.5 || shownPointers.has(hCand.ptr))
                         continue;
-                    const hStart = hCand.hSpanLen <= 18
+                    if (wantsCallSites && (h.callSites?.length ?? 0) >= 8 && hCand.hop > 1 && hIdx >= 2)
+                        continue;
+                    const hStart = hCand.hSpanLen <= 18 && hCand.isSameFile
                         ? Math.max(1, hCand.cs.start - (hCand.node.summary ? Math.min(5, hCand.node.summary.split("\n").length + 1) : 2))
                         : hCand.cs.start;
-                    const hContig = hIdx === 0 && hCand.hSpanLen <= 38 ? 38 : 26;
+                    const hEnd = hCand.isSameFile && s.start > hCand.cs.end && s.start - hCand.cs.end <= 15
+                        ? s.start - 1
+                        : hCand.cs.end;
+                    const hContig = hIdx === 0 && hCand.hSpanLen <= 48 ? 48 : 26;
                     let hCode = full
-                        ? sliceSpan(hCand.candLines, hCand.node.path, hStart, hCand.cs.end, 45)
-                        : synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hCand.cs.end, hitQTerms, qStems, hContig);
+                        ? sliceSpan(hCand.candLines, hCand.node.path, hStart, hEnd, 48)
+                        : synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hEnd, hitQTerms, qStems, hContig, null, 22);
                     if (hCode) {
                         const label = hCand.isSameFile ? "same-file helper" : "cross-file callee";
                         let block = `// ${label}: ${hCand.node.name} (${hCand.ptr})\n${hCode}`;
                         let bLen = Buffer.byteLength(block, "utf8");
-                        if (!full && (totalInlinedBytes + bLen > maxTotalBytes || hitHelperBytes + bLen > maxHelperBytesForHit)) {
-                            const compactH = synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hCand.cs.end, hitQTerms, qStems, 14, null, 11);
+                        const effMaxTotal = hIdx === 0 ? maxTotalBytes + singleHelperBonus : maxTotalBytes;
+                        const effMaxHit = hIdx === 0 ? maxHelperBytesForHit + singleHelperBonus : maxHelperBytesForHit;
+                        if (!full && (totalInlinedBytes + bLen > effMaxTotal || hitHelperBytes + bLen > effMaxHit)) {
+                            const compactH = synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hCand.cs.end, hitQTerms, qStems, 16, null, 16);
                             if (compactH) {
                                 block = `// ${label}: ${hCand.node.name} (${hCand.ptr})\n${compactH}`;
                                 bLen = Buffer.byteLength(block, "utf8");
                             }
                         }
-                        if (totalInlinedBytes + bLen > maxTotalBytes || hitHelperBytes + bLen > maxHelperBytesForHit)
+                        if (totalInlinedBytes + bLen > effMaxTotal || hitHelperBytes + bLen > effMaxHit)
                             continue;
-                        shownPointers.add(hCand.ptr);
                         helperBlocks.push(block);
                         totalInlinedBytes += bLen;
                         hitHelperBytes += bLen;
+                        hIdx++;
                         if (hCand.isSameFile && hCand.cs.start > effStart && hCand.cs.end <= effEnd) {
                             nestedRanges.push({ start: hCand.cs.start, end: hCand.cs.end });
                         }
@@ -1678,6 +1950,161 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                     h.code = combined;
                 }
             }
+            if (editEnvelope && lines && h.code) {
+                const fileNodes = nodesByPath.get(s.path) ?? [];
+                let bestType = null;
+                let bestTypeScore = 0;
+                const baseFileLower = s.path.split("/").pop()?.replace(/\.[a-z0-9]+$/i, "").toLowerCase() ?? "";
+                if (i <= 1 && node.kind !== "struct" && node.kind !== "type" && node.kind !== "interface") {
+                    for (const tn of fileNodes) {
+                        if ((tn.kind !== "type" && tn.kind !== "interface") || tn.id === node.id)
+                            continue;
+                        const tPtr = `${tn.path}:${tn.span}`;
+                        if (shownPointers.has(tPtr))
+                            continue;
+                        const ts = parseSpan(tPtr);
+                        if (!ts || ts.end - ts.start + 1 > 32)
+                            continue;
+                        const typeNameLower = (tn.name ?? "").toLowerCase();
+                        let tScore = 0;
+                        if (qTerms.has(typeNameLower))
+                            tScore += 10;
+                        for (const tk of tokenize(tn.name ?? "")) {
+                            if (qTerms.has(tk))
+                                tScore += 4;
+                            else if (stemToken(tk).length >= 4 && qStems.has(stemToken(tk)))
+                                tScore += 3;
+                        }
+                        if (typeNameLower === "store" && qTerms.has("store"))
+                            tScore += 6;
+                        if (tScore === 0 && typeNameLower === baseFileLower && ts.end - ts.start + 1 <= 20)
+                            tScore = 2;
+                        if (tScore > bestTypeScore) {
+                            bestTypeScore = tScore;
+                            bestType = { tn, tPtr, ts };
+                        }
+                    }
+                }
+                if (bestType && bestTypeScore >= 2) {
+                    const { tn, tPtr, ts } = bestType;
+                    const tSlice = sliceSpan(lines, s.path, ts.start, ts.end, 30);
+                    if (tSlice && !h.code.includes(`L${ts.start}:`)) {
+                        const tBlock = `// exported type: ${tn.name} (${tPtr})\n${tSlice}`;
+                        const tbLen = Buffer.byteLength(tBlock, "utf8");
+                        if (totalInlinedBytes + tbLen <= maxTotalBytes + 350) {
+                            shownPointers.add(tPtr);
+                            h.code = `${tBlock}\n\n${h.code}`;
+                            totalInlinedBytes += tbLen;
+                        }
+                    }
+                }
+                const tailStart = Math.max(1, lines.length - 20);
+                if (i <= 1 && !h.code.includes(`L${lines.length}:`)) {
+                    let retLineIdx = -1;
+                    for (let idx = lines.length - 1; idx >= tailStart - 1; idx--) {
+                        const rawLine = lines[idx] ?? "";
+                        const t = rawLine.trim();
+                        if (t === "return {" || (!/^\s/.test(rawLine) && /^(?:return\b|module\.exports\b|export\s+(?:default\b|\{))/.test(t))) {
+                            retLineIdx = idx + 1;
+                            if (t === "return {" || t.endsWith("{")) {
+                                break;
+                            }
+                        }
+                    }
+                    if (retLineIdx > 0) {
+                        let envStart = retLineIdx;
+                        const lastFn = [...fileNodes]
+                            .map((fn) => (fn.kind !== "file" ? parseSpan(`${fn.path}:${fn.span}`) : null))
+                            .filter(Boolean)
+                            .sort((a, b) => b.end - a.end)[0];
+                        if (lastFn && lastFn.end >= lines.length - 3 && lastFn.end - lastFn.start + 1 <= 28 && lastFn.start < envStart) {
+                            envStart = lastFn.start;
+                        }
+                        else if (/^return\s+[A-Za-z_]\w*$/.test((lines[retLineIdx - 1] ?? "").trim())) {
+                            for (let p = retLineIdx - 2; p >= Math.max(0, retLineIdx - 26); p--) {
+                                const pt = (lines[p] ?? "").trim();
+                                if (/^(?:self|M|[A-Za-z_]\w*)\.[A-Za-z_]\w*\s*=/.test(pt) || pt === "return self") {
+                                    envStart = p + 1;
+                                }
+                            }
+                        }
+                        const tailSlice = sliceSpan(lines, s.path, envStart, lines.length, 28);
+                        if (tailSlice && !h.code.includes(`L${envStart}:`)) {
+                            const tailBlock = `// module return (${s.path}:L${envStart}-L${lines.length}):\n${tailSlice}`;
+                            const tbLen = Buffer.byteLength(tailBlock, "utf8");
+                            if (totalInlinedBytes + tbLen <= maxTotalBytes + (envStart < retLineIdx ? 680 : 350)) {
+                                h.code = `${h.code}\n\n${tailBlock}`;
+                                totalInlinedBytes += tbLen;
+                            }
+                        }
+                    }
+                }
+                const otherSyms = [];
+                const seenOtherNames = new Map();
+                for (const fn of fileNodes
+                    .filter((fn) => fn.id !== node.id && fn.span && !shownPointers.has(`${fn.path}:${fn.span}`))
+                    .sort((a, b) => {
+                        const aFn = a.kind === "function" || a.kind === "method" ? 1 : 0;
+                        const bFn = b.kind === "function" || b.kind === "method" ? 1 : 0;
+                        if (aFn !== bFn)
+                            return bFn - aFn;
+                        const aMatch = tokenize(a.name ?? "").some((t) => qTerms.has(t) || qStems.has(stemToken(t))) ? 1 : 0;
+                        const bMatch = tokenize(b.name ?? "").some((t) => qTerms.has(t) || qStems.has(stemToken(t))) ? 1 : 0;
+                        if (aMatch !== bMatch)
+                            return bMatch - aMatch;
+                        return Number(Boolean(b.exported)) - Number(Boolean(a.exported));
+                    })) {
+                    const dispName = fn.owner && fileNodes.filter((x) => x.name === fn.name).length > 1 ? `${fn.owner}.${fn.name}` : fn.name;
+                    const cnt = seenOtherNames.get(dispName) ?? 0;
+                    if (cnt >= 1)
+                        continue;
+                    seenOtherNames.set(dispName, cnt + 1);
+                    otherSyms.push(`${dispName}(${fn.span})`);
+                    if (otherSyms.length >= 10)
+                        break;
+                }
+                if (otherSyms.length > 0 && !h.code.includes(`// other symbols in ${s.path}:`)) {
+                    const footer = `\n// other symbols in ${s.path}: ${otherSyms.join(", ")}`;
+                    h.code += footer;
+                    totalInlinedBytes += Buffer.byteLength(footer, "utf8");
+                }
+            }
+        }
+    }
+    if (editEnvelope) {
+        for (const h of hits.slice(0, 4)) {
+            if (h.code || h.otherSymbols)
+                continue;
+            const s = parseSpan(h.pointer);
+            const filePath = s?.path ?? (h.pointer || "").split(":")[0];
+            if (!filePath)
+                continue;
+            const fileNodes = nodesByPath.get(filePath) ?? [];
+            const otherSyms = [];
+            const seenOtherNames = new Map();
+            for (const fn of fileNodes
+                .filter((fn) => fn.span && `${fn.path}:${fn.span}` !== h.pointer && !shownPointers.has(`${fn.path}:${fn.span}`))
+                .sort((a, b) => {
+                    const aFn = a.kind === "function" || a.kind === "method" ? 1 : 0;
+                    const bFn = b.kind === "function" || b.kind === "method" ? 1 : 0;
+                    if (aFn !== bFn)
+                        return bFn - aFn;
+                    const aMatch = tokenize(a.name ?? "").some((t) => qTerms.has(t) || qStems.has(stemToken(t))) ? 1 : 0;
+                    const bMatch = tokenize(b.name ?? "").some((t) => qTerms.has(t) || qStems.has(stemToken(t))) ? 1 : 0;
+                    if (aMatch !== bMatch)
+                        return bMatch - aMatch;
+                    return Number(Boolean(b.exported)) - Number(Boolean(a.exported));
+                })) {
+                const cnt = seenOtherNames.get(fn.name) ?? 0;
+                if (cnt >= 1)
+                    continue;
+                seenOtherNames.set(fn.name, cnt + 1);
+                otherSyms.push(`${fn.name}(${fn.span})`);
+                if (otherSyms.length >= 8)
+                    break;
+            }
+            if (otherSyms.length > 0)
+                h.otherSymbols = otherSyms.join(", ");
         }
     }
     for (const { h, code } of deferredFourthHits) {
@@ -1728,7 +2155,7 @@ export function ask(dir, query, opts = {}) {
             : result.hits;
         result.usedSourceBytes = inlineSource(root, [...new Set(allHits)], corpus.graph, opts.full ?? false, query, opts);
     }
-    if (opts.seenPointers) {
+    if (opts.seenPointers && !opts.source) {
         for (const h of result.hits)
             opts.seenPointers.add(h.pointer);
     }
@@ -1753,7 +2180,35 @@ export function skeleton(dir, file, opts = {}) {
     const graph = loadGraphCached(outDir);
     if (!graph)
         return { file, entries: [], note: "no wiring graph — run `plexer build` first" };
+    if (!graph._skeletonByPath || graph._skeletonNodeLen !== graph.nodes.length) {
+        const byPath = new Map();
+        for (const n of graph.nodes) {
+            if (!n.path)
+                continue;
+            let list = byPath.get(n.path);
+            if (!list) {
+                list = [];
+                byPath.set(n.path, list);
+            }
+            if (n.kind !== "file")
+                list.push(n);
+        }
+        for (const list of byPath.values()) {
+            list.sort((a, b) => spanStart(a.span, 0) - spanStart(b.span, 0));
+        }
+        Object.defineProperty(graph, "_skeletonByPath", { value: byPath, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(graph, "_skeletonNodeLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
+    }
     const normFile = String(file ?? "").replace(/\\/g, "/").replace(/^\/+/, "");
+    const exactMatch = graph._skeletonByPath.get(file) ?? graph._skeletonByPath.get(normFile);
+    if (exactMatch) {
+        if (!exactMatch.length)
+            return { file: normFile, entries: [], note: "no definitions indexed for this file" };
+        return {
+            file: exactMatch[0].path,
+            entries: exactMatch.map(toSkeletonEntry),
+        };
+    }
     const suffix = `/${normFile}`;
     const exact = [];
     const bySuffix = new Map();
@@ -1927,15 +2382,24 @@ export function formatAsk(r) {
 }
 function parseReadSpanSpec(spec) {
     const trimmed = String(spec ?? "").trim();
-    const m = /^(.*?)(?::L?(\d+)(?:-L?(\d+))?)?$/.exec(trimmed);
-    if (!m || !m[1])
+    const mRange = /^(.*?):L?(\d+)(?:-L?(\d+))?$/.exec(trimmed);
+    if (mRange && mRange[1]) {
+        const rawPath = mRange[1].replace(/\\/g, "/").replace(/^\/+/, "");
+        const start = Math.max(1, Number(mRange[2]));
+        const end = mRange[3] !== undefined ? Math.max(start, Number(mRange[3])) : start + 30;
+        return { raw: trimmed, file: rawPath, start, end, hasExplicitRange: true, symbol: null };
+    }
+    const mSym = /^(.*?):([A-Za-z_][A-Za-z0-9_.:#]*)$/.exec(trimmed);
+    if (mSym && mSym[1] && mSym[2]) {
+        const rawPath = mSym[1].replace(/\\/g, "/").replace(/^\/+/, "");
+        return { raw: trimmed, file: rawPath, start: 1, end: 120, hasExplicitRange: false, symbol: mSym[2] };
+    }
+    if (!trimmed)
         return null;
-    const rawPath = m[1].replace(/\\/g, "/").replace(/^\/+/, "");
-    const start = m[2] !== undefined ? Math.max(1, Number(m[2])) : 1;
-    const end = m[3] !== undefined ? Math.max(start, Number(m[3])) : m[2] !== undefined ? start + 30 : 120;
-    return { raw: trimmed, file: rawPath, start, end, hasExplicitRange: m[2] !== undefined };
+    const rawPath = trimmed.replace(/\\/g, "/").replace(/^\/+/, "");
+    return { raw: trimmed, file: rawPath, start: 1, end: 120, hasExplicitRange: false, symbol: null };
 }
-/** Read one or more `<file>[:L<start>[-L<end>]]` spans (matching exact repo-relative paths
+/** Read one or more `<file>[:L<start>[-L<end>] | :<symbol>]` spans (matching exact repo-relative paths
  * or unique basenames from the graph) with `L<n>:` line prefixes. */
 export function readSpans(dir, spanSpecs, opts = {}) {
     const root = resolve(dir);
@@ -1976,11 +2440,38 @@ export function readSpans(dir, spanSpecs, opts = {}) {
             blocks.push({ spec: rawSpec, file: resolvedFile, error: `cannot read "${resolvedFile}"` });
             continue;
         }
-        const start = Math.max(1, Math.min(parsed.start, lines.length));
-        const end = Math.max(start, Math.min(parsed.hasExplicitRange ? parsed.end : Math.min(lines.length, 120), lines.length));
+        let spanStartLine = parsed.start;
+        let spanEndLine = parsed.end;
+        let hasExplicit = parsed.hasExplicitRange;
+        if (parsed.symbol && graph) {
+            const symLower = parsed.symbol.toLowerCase();
+            const symBare = symLower.split(/[.:#]/).pop() || symLower;
+            const fileNodes = graph.nodes.filter((n) => n.kind !== "file" && n.path === resolvedFile && n.span);
+            const matchNode =
+                fileNodes.find((n) => n.name.toLowerCase() === symLower) ??
+                fileNodes.find((n) => n.name.toLowerCase() === symBare || n.name.toLowerCase().endsWith(`.${symBare}`) || n.name.toLowerCase().endsWith(`:${symBare}`)) ??
+                fileNodes.find((n) => n.id.toLowerCase().endsWith(`#${symLower}`) || n.id.toLowerCase().endsWith(`.${symBare}`));
+            if (!matchNode) {
+                blocks.push({ spec: rawSpec, file: resolvedFile, error: `no symbol "${parsed.symbol}" in "${resolvedFile}"` });
+                continue;
+            }
+            const sr = spanRange(matchNode.span);
+            if (sr) {
+                spanStartLine = sr.start;
+                spanEndLine = sr.end;
+                hasExplicit = true;
+            }
+        }
+        const start = Math.max(1, Math.min(spanStartLine, lines.length));
+        const requestedEnd = Math.max(start, Math.min(hasExplicit ? spanEndLine : Math.min(lines.length, 120), lines.length));
+        const maxLinesForSpec = specs.length >= 2 ? Math.max(45, Math.floor(160 / specs.length)) : 170;
+        const end = Math.min(requestedEnd, start + maxLinesForSpec - 1);
         const slice = [];
         for (let ln = start; ln <= end; ln++) {
             slice.push(`L${ln}: ${lines[ln - 1]}`);
+        }
+        if (end < requestedEnd) {
+            slice.push(`… (+${requestedEnd - end} more lines in ${resolvedFile}:L${end + 1}-L${requestedEnd})`);
         }
         blocks.push({
             spec: rawSpec,

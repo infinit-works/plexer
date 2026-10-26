@@ -128,9 +128,10 @@ export function rankFilesBounded(candidates, queryWeights) {
         const coverageBonus = unionCoverage > 0.5
             ? 0.22 * (unionCoverage - 0.5) * (0.6 + 0.4 * unionStrongCoverage)
             : 0;
+        const graphScale = 0.5 * (0.35 + 0.65 * Math.max(unionCoverage, unionStrongCoverage));
         const pooledAnchorScore = lexicalAnchor
             ? clamp01(lexicalAnchor.rankFactor) *
-                (pooledLexical + 0.5 * clamp01(lexicalAnchor.graph) + coverageBonus)
+                (pooledLexical + graphScale * clamp01(lexicalAnchor.graph) + coverageBonus)
             : 0;
         const repCoverage = baselineRepresentative ? coverage(baselineRepresentative, queryWeights) : 0;
         const repResidual = unionCoverage > 0 && repCoverage > 0
@@ -140,11 +141,8 @@ export function rankFilesBounded(candidates, queryWeights) {
             ? clamp01(baselineRepresentative.lexical + (1 - clamp01(baselineRepresentative.lexical)) * repResidual)
             : 0;
         const pooledRepScore = baselineRepresentative
-            ? Math.max(
-                baselineRepresentative.baselineScore,
-                clamp01(baselineRepresentative.rankFactor) *
-                    (pooledRepLexical + 0.5 * clamp01(baselineRepresentative.graph) + coverageBonus),
-            )
+            ? clamp01(baselineRepresentative.rankFactor) *
+                (pooledRepLexical + graphScale * clamp01(baselineRepresentative.graph) + coverageBonus)
             : 0;
         const pooledWins = Boolean(lexicalAnchor && pooledAnchorScore > pooledRepScore);
         const representative = pooledWins ? lexicalAnchor : baselineRepresentative;

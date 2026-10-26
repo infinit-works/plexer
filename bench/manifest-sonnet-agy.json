@@ -1,0 +1,53 @@
+{
+  "T1": {},
+  "T2": {},
+  "T3": {},
+  "T4": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T4-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-plexer/z"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T4-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-cold/z"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T4-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-trail/z"
+    }
+  },
+  "T5": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T5-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-plexer/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T5-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-trail/plexer"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T5-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-cold/plexer"
+    }
+  },
+  "T6": {},
+  "T7": {},
+  "T8": {},
+  "T9": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T9-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-plexer/plexer"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T9-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-cold/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/sonnet-agy/T9-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-agy-trail/plexer"
+    }
+  },
+  "T10": {},
+  "T11": {},
+  "T12": {}
+}
