@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure npm >= 11.5.1 for OIDC Trusted Publishing
+        run: npm install -g npm@latest
+
+      - name: Verify tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(node -p "require('./package.json').version")"
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $declared" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        run: npm test
+
+      - name: Packed tarball smoke test
+        run: |
+          set -euo pipefail
+          tarball="$(npm pack --ignore-scripts | tail -n1)"
+          smoke="$(mktemp -d)"
+          tar -xzf "$tarball" -C "$smoke"
+          pkg="$smoke/package"
+          npm install --omit=dev --ignore-scripts --no-audit --no-fund --prefix "$pkg"
+          node "$pkg/bin/plexer.js" --version
+          rm -f "$tarball"
+
+      - name: Publish to npm via OIDC Trusted Publisher
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if npm view "@plexer/cli@$version" version >/dev/null 2>&1; then
+            echo "@plexer/cli@$version is already on the registry; skipping publish"
+          else
+            npm publish --provenance --access public
+          fi
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          fi
