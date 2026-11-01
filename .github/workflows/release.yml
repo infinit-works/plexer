@@ -58,7 +58,7 @@ jobs:
           if npm view "@plexer/cli@$version" version >/dev/null 2>&1; then
             echo "@plexer/cli@$version is already on the registry; skipping publish"
           else
-            npm stage publish --provenance --access public
+            npm stage publish --provenance=false --access public
           fi
 
       - name: Create GitHub Release
