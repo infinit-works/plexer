@@ -1,62 +1,68 @@
 # `plexer` Benchmarks & Methodology
 
-This directory contains the reproducible multi-model benchmark suite for `plexer`:
-- **Tasks (`T1`–`T12`):** [`bench/tasks.js`](tasks.js) defines 12 natural-language A/B engineering task specifications (`T1`–`T12`), rubrics, and automated code-edit verification commands across 6 repositories (including 2 unseen holdout repositories).
-- **SWE-bench Pro V2 (`S1`–`S8`):** [`bench/swebench/tasks.json`](swebench/tasks.json) bundles 8 real-world software engineering tasks (`S1`–`S8`) from **`ScaleAI/SWE-bench_Pro` V2** across 4 languages (**Python**, **Go**, **JavaScript**, **TypeScript**) and 4 repositories (`qutebrowser/qutebrowser`, `flipt-io/flipt`, `NodeBB/NodeBB`, `tutao/tutanota`), with their official container verifier scripts (`test.sh`, `run_script.sh`, `parser.py`, `config.json`).
-- **Transcript Grader:** [`bench/grade.js`](grade.js) implements the automated transcript parser (supporting both Antigravity JSONL and Claude Code `stream-json` JSONL), cohort-symmetry validator, separated token accounting (`toolOutputTokens`, `finalContextTokens`, `uncachedInputTokens`, `cachedInputTokens`, `cumulativeInputTokens`, `totalModelOutputTokens`), rubric/test grader, and Markdown table generator.
-- **Antigravity A/B Runner:** [`bench/run-agy-ab.js`](run-agy-ab.js) runs headless Google Antigravity (`agy -p`) evaluations across explicit model and effort configurations (`argon-low`: `gemini-4-argon-low --effort low`; `argon-medium`: `gemini-4-argon-medium --effort medium`).
-- **Claude Code A/B Runner:** [`bench/run-claude-ab.js`](run-claude-ab.js) runs headless Claude Code (`claude -p`) evaluations with explicit `--effort medium` (`claude-sonnet-5-5` and `claude-opus-5-5`) across all 12 tasks (`T1`–`T12`).
-- **SWE-bench A/B Runner:** [`bench/run-swebench-ab.js`](run-swebench-ab.js) runs `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`) across all 4 models (`argon-low`, `argon-medium`, `claude-sonnet-5-5`, `claude-opus-5-5`), supporting both deterministic patch/symbol/file grading and official Docker container verification (`SWEBENCH_DOCKER=1`).
-- **Offline Fast Evaluator:** [`bench/eval-fast.js`](eval-fast.js) runs a deterministic (`~4.8s`, `$0` API cost) offline evaluation across all 20 benchmark tasks (`T1`–`T12` + `S1`–`S8`), measuring `SKILL.md` + `SessionStart` + `UserPromptSubmit` Turn-0 BPE token budgets, ground-truth file/symbol/token recall, empirical needed-line coverage (`NeedCov` / `LocCov`), and live-calibrated wall-time / cumulative-input predictions (`EstWall`, `EstCum`).
-- **Transcript Span Miner:** [`bench/replay.js`](replay.js) & [`bench/needed-spans.json`](needed-spans.json) extract ranged file reads, whole-file reads, grep hits, and gold patch hunks across all 20 tasks into a committed ground-truth fixture.
+This directory contains the multi-model benchmark suite for `plexer`:
+- **Tasks (`T1`–`T12`):** [`bench/tasks.js`](tasks.js) defines 12 engineering tasks (`T1`–`T12`), rubrics, and automated code-edit verification commands across 6 repositories, including 2 holdout repositories.
+- **SWE-bench Pro V2 (`S1`–`S8`):** [`bench/swebench/tasks.json`](swebench/tasks.json) bundles 8 tasks (`S1`–`S8`) from **`ScaleAI/SWE-bench_Pro` V2** across Python, Go, JavaScript, and TypeScript (`qutebrowser/qutebrowser`, `flipt-io/flipt`, `NodeBB/NodeBB`, `tutao/tutanota`), along with their container verifier scripts (`test.sh`, `run_script.sh`, `parser.py`, `config.json`).
+- **Transcript Grader:** [`bench/grade.js`](grade.js) parses Antigravity and Claude Code JSONL transcripts, checks cohort symmetry, scores rubrics and tests, and computes separated token metrics (`toolOutputTokens`, `finalContextTokens`, `uncachedInputTokens`, `cachedInputTokens`, `cumulativeInputTokens`, `totalModelOutputTokens`).
+- **Antigravity A/B Runner:** [`bench/run-agy-ab.js`](run-agy-ab.js) runs headless Google Antigravity (`agy -p`) evaluations on `argon-low` (`gemini-4-argon-low --effort low`) and `argon-medium` (`gemini-4-argon-medium --effort medium`).
+- **Claude Code A/B Runner:** [`bench/run-claude-ab.js`](run-claude-ab.js) runs headless Claude Code (`claude -p --effort medium`) evaluations on `claude-sonnet-5-5` and `claude-opus-5-5` across `T1`–`T12`.
+- **SWE-bench A/B Runner:** [`bench/run-swebench-ab.js`](run-swebench-ab.js) runs `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`) across all 4 models, supporting both patch/symbol grading and Docker verification (`SWEBENCH_DOCKER=1`).
+- **Offline Fast Evaluator:** [`bench/eval-fast.js`](eval-fast.js) evaluates all 20 tasks (`T1`–`T12` + `S1`–`S8`) offline in ~4.8s at `$0` API cost. It measures Turn-0 BPE token budgets, file and symbol recall, needed-line coverage (`NeedCov` / `LocCov`), and predicted wall time and cumulative input (`EstWall`, `EstCum`).
+- **Transcript Span Miner:** [`bench/replay.js`](replay.js) and [`bench/needed-spans.json`](needed-spans.json) extract ranged file reads, whole-file reads, grep hits, and gold patch hunks across all 20 tasks into a ground-truth fixture.
 - **Coverage Metrics:** [`bench/needcov.js`](needcov.js) computes `needCov` (weighted share of needed lines inlined at Turn 0), `locCov` (share of needed symbols pointed to or inlined), and `fileCov`.
-- **Empirical Cost Model:** [`bench/cost-model.js`](cost-model.js) & [`bench/turn-model.json`](turn-model.json) fit per-family empirical cost equations (`wall_ms ~ 1 + turns + outTok`, `outTok ~ 1 + turns`, `cumIn - (turns + 1)·t0 ~ 1 + (turns + 1)`) with leave-one-out cross-validation (`R² = 0.83–0.94`).
-- **Offline Trail-Code Comparison:** [`bench/graft-arm.js`](graft-arm.js) runs an offline head-to-head benchmark comparing `plexer` against Trail-Code's `@trailhq/trail-code@0.25.0` (`graft-hook` and `graft-push`) across `T4`, `T5`, `T9`, and `S1`–`S8`.
-- **Live 3-Arm Trail-Code Harness:** [`bench/trail-live-helper.js`](trail-live-helper.js) wires `@trailhq/trail-code@0.25.0` (`trail init`, `trail _hook`, `PreInvocation` `systemMessage` prompt-cache persistence, and deduplicated `PostToolUse` blast-radius hooks) in isolated worktrees alongside `cold` and `plexer`.
-- **Trail-Comparable Metrics:** [`bench/trail-table.js`](trail-table.js) computes Trail-Code-comparable per-task means (tool calls, uncached input tokens `input + cache_creation`, cache-aware cost, and latency) alongside cumulative input tokens and search wall time.
-- **Worktree Fixture Builder:** [`bench/ensure-base.js`](ensure-base.js) idempotently populates `/tmp/plexer-ab-base/{clean,indexed}` and `/tmp/plexer-swebench-base/{clean,indexed}`.
-- **Interactive Evaluation Viewer:** [`bench/skill-review.html`](skill-review.html) renders a self-contained `/skill-creator` evaluation viewer across all paired A/B evaluations.
-- **Engine & Retrieval Benchmark:** [`bench/run.js`](run.js) runs the deterministic engine and retrieval benchmark across 6 repositories and 24 de-leaked natural-language intent queries (`npm run bench`).
+- **Empirical Cost Model:** [`bench/cost-model.js`](cost-model.js) and [`bench/turn-model.json`](turn-model.json) fit per-family cost equations (`wall_ms ~ 1 + turns + outTok`, `outTok ~ 1 + turns`, `cumIn - (turns + 1)·t0 ~ 1 + (turns + 1)`) with leave-one-out cross-validation (`R² = 0.83–0.94`).
+- **Offline Trail-Code Comparison:** [`bench/graft-arm.js`](graft-arm.js) compares `plexer` offline against `@trailhq/trail-code@0.25.0` (`graft-hook` and `graft-push`) across `T4`, `T5`, `T9`, and `S1`–`S8`.
+- **Live 3-Arm Trail-Code Runner:** [`bench/trail-live-helper.js`](trail-live-helper.js) wires `@trailhq/trail-code@0.25.0` (`trail init`, `trail _hook`, `PreInvocation` `systemMessage` caching, and deduplicated `PostToolUse` hooks) in isolated worktrees alongside `cold` and `plexer`.
+- **Trail-Comparable Metrics:** [`bench/trail-table.js`](trail-table.js) computes per-task means (tool calls, uncached input tokens `input + cache_creation`, cache-aware cost, and latency) alongside cumulative input tokens and search wall time.
+- **Worktree Fixture Builder:** [`bench/ensure-base.js`](ensure-base.js) populates `/tmp/plexer-ab-base/{clean,indexed}` and `/tmp/plexer-swebench-base/{clean,indexed}`.
+- **Interactive Evaluation Viewer:** [`bench/skill-review.html`](skill-review.html) renders a self-contained `/skill-creator` evaluation viewer for all paired A/B runs.
+- **Engine & Retrieval Benchmark:** [`bench/run.js`](run.js) runs the deterministic engine and retrieval benchmark across 6 repositories and 24 natural-language intent queries (`npm run bench`).
 
 ---
 
-## 1. De-Benchmaxxed 4-Model Live A/B Agent Evaluation (`T1`–`T12`: `plexer` vs. Cold Agent)
+## 1. 4-Model Live A/B Agent Evaluation (`T1`–`T12`: `plexer` vs. Cold Agent)
 
-### Methodology & Anti-Benchmaxxing Controls
+### Methodology & Controls
 
-To evaluate whether `plexer` genuinely improves coding agent token efficiency, speed, and correctness on realistic software engineering work across multiple model families and effort levels, we ran a **48-pair (96-session) A/B evaluation** (`12 tasks × 2 arms × 4 explicit model configurations`: **Antigravity `argon-low` (`gemini-4-argon-low --effort low`)**, **Antigravity `argon-medium` (`gemini-4-argon-medium --effort medium`)**, **Claude Sonnet 5.5 (`claude -p --model claude-sonnet-5-5 --effort medium`)**, and **Claude Opus 5.5 (`claude -p --model claude-opus-5-5 --effort medium`)**) across **6 repositories** (`plexer`, `kohls-admin`, `flux`, `sert`, plus **2 unseen holdouts** `building-tools` and `z`, spanning JavaScript, Luau, Rust, and Python from 1,028 to 5,878 symbols and up to 9,594 edges) and **3 realistic task categories**:
+We ran a **48-pair (96-session) A/B evaluation** across 12 tasks, 2 arms (`cold` vs. `plexer`), and 4 model configurations:
+- **Antigravity `argon-low`** (`gemini-4-argon-low --effort low`)
+- **Antigravity `argon-medium`** (`gemini-4-argon-medium --effort medium`)
+- **Claude Sonnet 5.5** (`claude -p --model claude-sonnet-5-5 --effort medium`)
+- **Claude Opus 5.5** (`claude -p --model claude-opus-5-5 --effort medium`)
 
-1. **Symptom-Based Bug / Behavior Diagnosis (`T1`–`T4`)**: Given a user-facing symptom or edge-case question described in domain language (without internal symbol names or file paths leaked in the prompt), diagnose the exact mechanism and cite `file:Lx-Ly` spans.
-2. **Refactoring & Blast-Radius Planning (`T5`–`T8`)**: Audit where a subsystem boundary or contract is defined and trace all direct and second-hop callers affected by a proposed change.
-3. **End-to-End Multi-File Code Edits + Test Verification (`T9`–`T12`)**: Implement a real feature across multiple files in an isolated worktree and pass both the repository's existing test suite and a held-out behavioral verification spec.
+The suite spans **6 repositories** (`plexer`, `kohls-admin`, `flux`, `sert`, and 2 unseen holdouts `building-tools` and `z`) in JavaScript, Luau, Rust, and Python (1,028 to 5,878 symbols and up to 9,594 edges). Tasks fall into 3 categories:
 
-#### Strict Experimental Controls (Enforced by `bench/grade.js`)
+1. **Bug and behavior diagnosis (`T1`–`T4`):** Diagnose the root mechanism behind a symptom or edge case described in domain terms and cite `file:Lx-Ly` spans.
+2. **Refactoring and blast-radius planning (`T5`–`T8`):** Locate a subsystem contract and trace all direct and second-hop callers affected by a proposed change.
+3. **Multi-file code edits and test verification (`T9`–`T12`):** Implement a feature across multiple files in an isolated worktree and pass both the existing test suite and a held-out verification spec.
 
-1. **Zero Prompt Leakage & Zero Answer-Key Leakage**:
-   - Prompts describe symptoms, behaviors, or user-visible contracts—never internal helper names or file paths that only exist in the index.
-   - Isolated worktrees are exported via `git archive HEAD` with `bench/`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.claude/`, `.cursor/`, `.gemini/`, and `.agents/` stripped, and `grade.js` fails any run that accesses `bench/tasks.js`.
-2. **Unseen Holdout Repositories**: `T4` (`z`), `T8` (`building-tools`), and `T12` (`building-tools`) run on repositories that were never used to tune `plexer`'s retrieval weights or skill instructions.
-3. **Strict Prompt, Effort & Environment Symmetry**:
-   - Within each model tier, `cold` and `plexer` run with the exact same model, explicit `--effort` flag, tool permissions, and task prompt (`0` symmetry violations across all 96 transcripts).
-   - The `cold` arm sets `PLEXER_DISABLE_HOOKS=1` in the child environment so lifecycle hooks (`PreInvocation`, `UserPromptSubmit`, `PostToolUse`, `Stop`) never fire in `cold`, while the `plexer` arm enables `plexer`'s standard Turn-1 prompt-context and post-edit blast-radius hooks (`PLEXER_DISABLE_HOOKS=0`).
-   - For Antigravity (`argon-low` and `argon-medium`), [`bench/run-agy-ab.js`](run-agy-ab.js) drives `agy -p --agent bench-{cold,plexer} --model gemini-4-argon-{low,medium} --effort {low,medium} --dangerously-skip-permissions --disable-slash-commands` with `inheritCustomizations: false` and `inheritMcp: false`.
-   - For Claude Code (`sonnet` and `opus`), [`bench/run-claude-ab.js`](run-claude-ab.js) passes `--model {sonnet,opus} --effort medium --setting-sources "" --disable-slash-commands --strict-mcp-config --tools "Bash,Read,Edit,Write,Grep,Glob"` (adding `--settings <hook-settings.json>` only on the `plexer` arm).
+#### Experimental Controls (`bench/grade.js`)
 
-#### Unified Token Accounting (`bench/grade.js`)
+1. **No prompt or answer-key leakage:**
+   - Prompts describe user-visible behavior and symptoms rather than internal helper names or file paths.
+   - Worktrees are exported via `git archive HEAD` with `bench/`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.claude/`, `.cursor/`, `.gemini/`, and `.agents/` stripped. `grade.js` fails any run that accesses `bench/tasks.js`.
+2. **Unseen holdout repositories:** `T4` (`z`), `T8` (`building-tools`), and `T12` (`building-tools`) run on repositories never used to tune retrieval weights or skill instructions.
+3. **Prompt, effort, and environment symmetry:**
+   - Within each model tier, `cold` and `plexer` run with the exact same model, `--effort` flag, tool permissions, and task prompt (`0` symmetry violations across all 96 transcripts).
+   - The `cold` arm sets `PLEXER_DISABLE_HOOKS=1` so lifecycle hooks never fire. The `plexer` arm enables Turn-1 prompt-context and post-edit blast-radius hooks (`PLEXER_DISABLE_HOOKS=0`).
+   - For Antigravity, [`bench/run-agy-ab.js`](run-agy-ab.js) runs `agy -p --agent bench-{cold,plexer} --model gemini-4-argon-{low,medium} --effort {low,medium} --dangerously-skip-permissions --disable-slash-commands` with `inheritCustomizations: false` and `inheritMcp: false`.
+   - For Claude Code, [`bench/run-claude-ab.js`](run-claude-ab.js) passes `--model {sonnet,opus} --effort medium --setting-sources "" --disable-slash-commands --strict-mcp-config --tools "Bash,Read,Edit,Write,Grep,Glob"` and adds `--settings <hook-settings.json>` only on the `plexer` arm.
 
-Why do raw cumulative input token totals differ in magnitude between Antigravity (`agy`) and Claude Code (`claude`)? [`bench/grade.js`](grade.js) tracks five distinct token metrics from the underlying provider transcripts so every dimension is transparent and apples-to-apples:
+#### Token Accounting (`bench/grade.js`)
 
-1. **Tool Output Tokens (`toolOutputTokens = ceil(bytes / 4)`)**: Exact volume of tool output text (`view_file`/`Read`, `run_command`/`Bash`, `grep_search`/`Grep`, `plexer` CLI stdout, test runner output) ingested into the conversation.
-2. **Final Context Window Tokens (`finalContextTokens`)**: Total context window size (`input + cache_read + cache_creation`) on the **final LLM turn** of each task—measuring the net context footprint accumulated by the end of the session without quadratic turn-count multiplication.
-3. **Uncached vs. Cached Cumulative Input Tokens (`uncachedInputTokens` + `cachedInputTokens` = `cumulativeInputTokens`)**:
+[`bench/grade.js`](grade.js) tracks five separate token metrics from provider transcripts so Antigravity (`agy`) and Claude Code (`claude`) runs can be compared directly:
+
+1. **Tool Output Tokens (`toolOutputTokens = ceil(bytes / 4)`):** Total volume of tool output (`view_file`/`Read`, `run_command`/`Bash`, `grep_search`/`Grep`, `plexer` stdout, and test runner output) added to the conversation.
+2. **Final Context Window Tokens (`finalContextTokens`):** Total context window size (`input + cache_read + cache_creation`) on the final LLM turn of each task. This measures the net context accumulated by the end of the session without turn-count multiplication.
+3. **Uncached and Cached Cumulative Input Tokens (`uncachedInputTokens` + `cachedInputTokens` = `cumulativeInputTokens`):**
    - Every LLM turn re-sends the conversation history to that point, so `cumulativeInputTokens` scales as $\mathcal{O}(\text{turns} \times \text{context})$.
-   - **Claude Code** caches the system prompt and tool definitions after Turn 1 (`99.98%` of input tokens are `cachedInputTokens` at `0.1x` cost; `uncachedInputTokens` is only ~8–15 tokens/turn) and finishes in 24–79 turns across 12 tasks.
-   - **Antigravity (`argon-low` / `argon-medium`)** uses granular line-range `view_file` calls (55–107 turns across 12 tasks) and bills ~15–20% of each turn's prompt as `uncachedInputTokens` alongside `cachedInputTokens`. Because `plexer` cuts both the per-turn tool output and the number of turns, it reduces Antigravity's cumulative input tokens by **47–68%** on `T1`–`T12` and **25–59%** on `SWE-bench Pro V2`.
-4. **Model Output Tokens (`totalModelOutputTokens`)**: Total generated tokens (assistant text, tool-call arguments, and thinking tokens; on Claude Code read from the top-level `result` event's `usage.output_tokens`).
+   - **Claude Code** caches the system prompt and tool definitions after Turn 1 (`99.98%` of input tokens are `cachedInputTokens` at `0.1x` cost, with only ~8–15 `uncachedInputTokens` per turn) and finishes in 24–79 turns across 12 tasks.
+   - **Antigravity (`argon-low` and `argon-medium`)** makes more granular line-range `view_file` calls (55–107 turns across 12 tasks) and bills ~15–20% of each turn's prompt as `uncachedInputTokens`. Because `plexer` cuts both tool output per turn and total turns, it reduces Antigravity's cumulative input tokens by **47–72%** on `T1`–`T12` and **25–34%** on `SWE-bench Pro V2`.
+4. **Model Output Tokens (`totalModelOutputTokens`):** Total generated tokens including assistant text, tool-call arguments, and thinking tokens. On Claude Code, this is read from the top-level `result` event's `usage.output_tokens`.
 
 ---
 
-### Multi-Model Summary (`T1`–`T12` Across 4 Explicit Model Configurations)
+### Multi-Model Summary (`T1`–`T12` Across 4 Model Configurations)
 
 ```bash
 node bench/run-agy-ab.js argon-low 4 both all
@@ -73,7 +79,7 @@ node bench/run-claude-ab.js opus 4 both all medium
 | **Claude Sonnet 5.5** (`--effort medium`) | `PASSED (0)` | 94/96 → **96/96 (+2.1%)** | 76 → **25 (-67.1%)** (**`10W/2T/0L`**) | 45,198 → **12,368 (-72.6%)** (**`12W/0T/0L`**) | 187.9k → **161.2k (-14.2%)** | 0.65M → **0.41M (-36.7%)** | 96.7s → **62.0s (-35.9%)** (**`11W/0T/1L`**) |
 | **4-Model Total (`48` Task-Model Pairs)** | `PASSED (0)` | 380/384 → **384/384 (100%)** | 449 → **198 (-55.9%)** (`42W/4T/2L`) | 626,369 → **234,386 (-62.6%)** (**`48W/0T/0L`**) | 1,460.0k → **931.3k (-36.2%)** | 9.41M → **3.91M (-58.5%)** | 2,779.7s → **1,826.1s (-34.3%)** (`41W/0T/7L`) |
 
-#### Separated Token Accounting Table (`T1`–`T12` Totals)
+#### Separated Token Accounting (`T1`–`T12` Totals)
 
 | Model Configuration | Arm | Turns | Tool Output Tok | Final Context Tok | Uncached Input Tok | Cached Input Tok | Cumulative Input Tok | Model Output Tok |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -88,7 +94,9 @@ node bench/run-claude-ab.js opus 4 both all medium
 
 ---
 
-### Tier 1: Antigravity `argon-low` (`gemini-4-argon-low --effort low`) — Per-Task Breakdown (`-58.9%` Tool Tok `12W/0T/0L`, `-41.4%` Final Context, `-45.2%` Calls `9W/2T/1L`, `-5.5%` Search Time, `96/96`)
+### Tier 1: Antigravity `argon-low` (`gemini-4-argon-low --effort low`)
+
+Cuts tool output tokens by `-58.9%` (`12W/0T/0L`), final context by `-41.4%`, tool calls by `-45.2%` (`9W/2T/1L`), and search time by `-5.5%` (`96/96` score).
 
 | Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -108,7 +116,9 @@ node bench/run-claude-ab.js opus 4 both all medium
 
 ---
 
-### Tier 2: Antigravity `argon-medium` (`gemini-4-argon-medium --effort medium`) — Per-Task Breakdown (`-62.4%` Tool Tok `12W/0T/0L`, `-45.2%` Final Context, `-55.5%` Calls `11W/0T/1L`, `-49.9%` Search Time `10W/0T/2L`, `96/96`)
+### Tier 2: Antigravity `argon-medium` (`gemini-4-argon-medium --effort medium`)
+
+Cuts tool output tokens by `-62.4%` (`12W/0T/0L`), final context by `-45.2%`, tool calls by `-55.5%` (`11W/0T/1L`), and search time by `-49.9%` (`10W/0T/2L`, `96/96` score).
 
 | Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -128,7 +138,9 @@ node bench/run-claude-ab.js opus 4 both all medium
 
 ---
 
-### Tier 3: Claude Opus 5.5 (`claude -p --model claude-opus-5-5 --effort medium`) — Per-Task Breakdown (`-71.3%` Tool Tok `12W/0T/0L`, `-65.4%` Calls `12W/0T/0L`, `-62.6%` Search Time `12W/0T/0L`, `94/96 → 96/96`)
+### Tier 3: Claude Opus 5.5 (`claude -p --model claude-opus-5-5 --effort medium`)
+
+Cuts tool output tokens by `-71.3%` (`12W/0T/0L`), tool calls by `-65.4%` (`12W/0T/0L`), and search time by `-62.6%` (`12W/0T/0L`), while raising score from `94/96` to `96/96`.
 
 | Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -148,7 +160,9 @@ node bench/run-claude-ab.js opus 4 both all medium
 
 ---
 
-### Tier 4: Claude Sonnet 5.5 (`claude -p --model claude-sonnet-5-5 --effort medium`) — Per-Task Breakdown (`-72.6%` Tool Tok `12W/0T/0L`, `-67.1%` Calls `10W/2T/0L`, `-35.9%` Search Time `11W/0T/1L`, `94/96 → 96/96`)
+### Tier 4: Claude Sonnet 5.5 (`claude -p --model claude-sonnet-5-5 --effort medium`)
+
+Cuts tool output tokens by `-72.6%` (`12W/0T/0L`), tool calls by `-67.1%` (`10W/2T/0L`), and search time by `-35.9%` (`11W/0T/1L`), while raising score from `94/96` to `96/96`.
 
 | Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -170,12 +184,12 @@ node bench/run-claude-ab.js opus 4 both all medium
 
 ## 2. External Multi-Language Benchmark: `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`)
 
-To validate `plexer` on an external, independently authored benchmark spanning multiple languages and large open-source repositories, [`bench/run-swebench-ab.js`](run-swebench-ab.js) evaluates an 8-task stratified subset (`S1`–`S8`, 2 tasks per language across **Python**, **Go**, **JavaScript**, and **TypeScript**) from **`ScaleAI/SWE-bench_Pro` V2** across all 4 model configurations:
+[`bench/run-swebench-ab.js`](run-swebench-ab.js) evaluates an 8-task stratified subset (`S1`–`S8`, 2 tasks per language across Python, Go, JavaScript, and TypeScript) from **`ScaleAI/SWE-bench_Pro` V2** across all 4 model configurations:
 
-- **`S1` & `S2` (Python, `qutebrowser/qutebrowser`)**: WebKit `NetworkReply` Qt 5.15 `errorOccurred` signal migration (`S1`) and multi-file `KeyMode` / `EventFilter` handling (`S2`).
-- **`S3` & `S4` (Go, `flipt-io/flipt`)**: Authentication cleanup service gating (`ShouldRunCleanup`) across `internal/cleanup`, `internal/cmd`, and `internal/config` (`S3`), and evaluation rollout caching (`GetEvaluationRollouts`) across `internal/storage/cache` and `internal/storage` (`S4`).
-- **`S5` & `S6` (JavaScript, `NodeBB/NodeBB`)**: User email confirmation refactor across `src/middleware` and `src/user` (`S5`), and queued-post topic merging (`updateQueuedPostsTopic`) across `src/posts/queue.js` and `src/topics/merge.js` (`S6`).
-- **`S7` & `S8` (TypeScript, `tutao/tutanota`)**: Desktop download manager error handling across `src/desktop/DesktopDownloadManager.ts` and `DesktopNetworkClient.ts` (`S7`), and device credential encryption facade updates across `src/api/worker/facades` and `src/misc/credentials` (`S8`).
+- **`S1` & `S2` (Python, `qutebrowser/qutebrowser`):** WebKit `NetworkReply` Qt 5.15 `errorOccurred` signal migration (`S1`) and multi-file `KeyMode` / `EventFilter` handling (`S2`).
+- **`S3` & `S4` (Go, `flipt-io/flipt`):** Authentication cleanup service gating (`ShouldRunCleanup`) across `internal/cleanup`, `internal/cmd`, and `internal/config` (`S3`), and evaluation rollout caching (`GetEvaluationRollouts`) across `internal/storage/cache` and `internal/storage` (`S4`).
+- **`S5` & `S6` (JavaScript, `NodeBB/NodeBB`):** User email confirmation refactor across `src/middleware` and `src/user` (`S5`), and queued-post topic merging (`updateQueuedPostsTopic`) across `src/posts/queue.js` and `src/topics/merge.js` (`S6`).
+- **`S7` & `S8` (TypeScript, `tutao/tutanota`):** Desktop download manager error handling across `src/desktop/DesktopDownloadManager.ts` and `DesktopNetworkClient.ts` (`S7`), and device credential encryption facade updates across `src/api/worker/facades` and `src/misc/credentials` (`S8`).
 
 ```bash
 node bench/run-swebench-ab.js argon-low 4 both all
@@ -195,11 +209,11 @@ node bench/run-swebench-ab.js opus 4 both all
 
 ---
 
-## 3. Trail-Code (`@trailhq/trail-code@0.25.0`) Live 3-Arm & Offline Head-to-Head
+## 3. Trail-Code (`@trailhq/trail-code@0.25.0`) Comparison
 
-### Live 3-Arm Evaluation (`cold` vs. `trail` `@trailhq/trail-code@0.25.0` vs. `plexer`)
+### Live 3-Arm Evaluation (`cold` vs. `trail` vs. `plexer`)
 
-[`bench/run-agy-ab.js`](run-agy-ab.js) and [`bench/run-swebench-ab.js`](run-swebench-ab.js) support a 3rd live arm (`trail` via [`bench/trail-live-helper.js`](trail-live-helper.js)) across all 4 models on the shared non-Luau engineering tasks (`T4, T5, T9`) and `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`):
+[`bench/run-agy-ab.js`](run-agy-ab.js) and [`bench/run-swebench-ab.js`](run-swebench-ab.js) run a 3rd live arm (`trail` via [`bench/trail-live-helper.js`](trail-live-helper.js)) across all 4 models on the shared non-Luau tasks (`T4, T5, T9`) and `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`):
 
 | Model & Suite | `plexer` Calls / Tool Tok / CumIn / Search / Score | `trail` Calls / Tool Tok / CumIn / Search / Score | `cold` Calls / Tool Tok / CumIn / Search / Score |
 | :--- | :---: | :---: | :---: |
@@ -214,7 +228,7 @@ node bench/run-swebench-ab.js opus 4 both all
 
 ### Trail-Comparable Metric Table (`node bench/trail-table.js`)
 
-Trail-Code (`trailhq/trail-code`, published as `@trailhq/trail-code`) reports per-task means on read-only Q&A prompts (`--max-turns 10`) using **uncached input tokens** (`input_tokens + cache_creation_input_tokens`) and **cache-aware cost** (`1·input + 1.25·cache_write + 0.1·cache_read + 5·output`) by pre-running `ask "<question>" --source` and prepending the output directly to the prompt. [`bench/trail-table.js`](trail-table.js) computes those exact metrics alongside cumulative input tokens and search wall time across our recorded Claude Code sessions:
+Trail-Code (`@trailhq/trail-code`) reports per-task means on read-only Q&A prompts (`--max-turns 10`) by pre-running `ask "<question>" --source` and prepending the output to the prompt. It tracks **uncached input tokens** (`input_tokens + cache_creation_input_tokens`) and **cache-aware cost** (`1·input + 1.25·cache_write + 0.1·cache_read + 5·output`). [`bench/trail-table.js`](trail-table.js) computes those same metrics alongside cumulative input tokens and search wall time across our Claude Code sessions:
 
 ```bash
 node bench/trail-table.js --suite qa
@@ -233,7 +247,7 @@ node bench/trail-table.js --suite swe
 
 ### Offline Head-to-Head vs. `@trailhq/trail-code@0.25.0` (`node bench/graft-arm.js`)
 
-[`bench/graft-arm.js`](graft-arm.js) evaluates `plexer` head-to-head against `@trailhq/trail-code@0.25.0` across all 11 shared Rust/JS/TS/Python/Go tasks (`T4`, `T5`, `T9`, `S1`–`S8`), comparing `plexer`'s `UserPromptSubmit` hook against both `graft-hook` (`trail ask <prompt> --json -n 3`, pointers only) and `graft-push` (`trail ask <prompt> --source`, Trail-Code's benchmark push bundle):
+[`bench/graft-arm.js`](graft-arm.js) compares `plexer`'s `UserPromptSubmit` hook against `@trailhq/trail-code@0.25.0` across all 11 shared Rust, JS, TS, Python, and Go tasks (`T4`, `T5`, `T9`, `S1`–`S8`). It tests both `graft-hook` (`trail ask <prompt> --json -n 3`, pointers only) and `graft-push` (`trail ask <prompt> --source`, Trail-Code's benchmark push bundle):
 
 ```bash
 node bench/graft-arm.js
@@ -245,12 +259,12 @@ node bench/graft-arm.js
 | `graft-hook` (`ask --json -n 3`) | 141 tok | 44.7% | 0.0% | 5.6% | 49.0s | 139k |
 | `graft-push` (`ask --source`) | 6,006 tok | 66.7% | 4.0% | 8.5% | 48.1s | 193k |
 
-### 3-Tier Offline Optimization Harness (`node bench/eval-fast.js`)
+### 3-Tier Offline Optimization Suite (`node bench/eval-fast.js`)
 
-To iterate on retrieval ranking, named-definition pinning (`src/claude/pin.js`), and hook budgets in `<5s` at `$0` API cost without overfitting, [`bench/eval-fast.js`](eval-fast.js) combines:
-1. **Transcript-Mined Ground Truth (`bench/replay.js` → `bench/needed-spans.json`)**: Every line range and symbol that `cold` agents actually read/grepped across all 20 tasks, plus SWE-bench gold patch hunks.
-2. **Coverage Metrics (`bench/needcov.js`)**: `NeedCov` (weighted fraction of needed lines already inlined with `L<n>:` numbers at Turn 0) and `LocCov` (fraction of needed symbols pointed to or inlined at Turn 0), reported separately on the holdout set (`T4`, `T8`, `T12`).
-3. **Live-Calibrated Cost Model (`bench/cost-model.js` & `bench/turn-model.json`)**: Per-family linear models fit on the 80 recorded live runs (`wall R² = 0.92` on Opus, `cum R² = 0.90–0.92` with exact `1.0 × (turns + 1) × t0Tok` physical Turn-0 re-billing).
+[`bench/eval-fast.js`](eval-fast.js) evaluates retrieval ranking, named-definition pinning (`src/claude/pin.js`), and hook budgets in under 5s at `$0` API cost:
+1. **Transcript-mined ground truth (`bench/replay.js` → `bench/needed-spans.json`):** Captures every line range and symbol that `cold` agents read or grepped across all 20 tasks, plus SWE-bench gold patch hunks.
+2. **Coverage metrics (`bench/needcov.js`):** Computes `NeedCov` (weighted share of needed lines inlined with `L<n>:` numbers at Turn 0) and `LocCov` (share of needed symbols pointed to or inlined at Turn 0), with separate holdout reporting (`T4`, `T8`, `T12`).
+3. **Live-calibrated cost model (`bench/cost-model.js` & `bench/turn-model.json`):** Uses per-family linear models fit on the 80 recorded live runs (`wall R² = 0.92` on Opus, `cum R² = 0.90–0.92` with `1.0 × (turns + 1) × t0Tok` Turn-0 re-billing).
 
 ```bash
 node bench/eval-fast.js
@@ -260,21 +274,19 @@ node bench/eval-fast.js --quiet --set editMergedBytes=3200
 
 ---
 
-## 4. Deterministic Engine & Retrieval Benchmark (`npm run bench`)
+## 4. Engine & Retrieval Benchmark (`npm run bench`)
 
-### Methodology
-
-[`bench/run.js`](run.js) benchmarks the `plexer` engine directly across 6 repositories (`plexer`, `kohls-admin`, `flux`, `sert`, `building-tools`, and `z`, totaling **17,551 symbols** and **32,566 graph edges**) and **24 de-leaked natural-language intent queries**:
+[`bench/run.js`](run.js) benchmarks the `plexer` engine across 6 repositories (`plexer`, `kohls-admin`, `flux`, `sert`, `building-tools`, and `z`, totaling **17,551 symbols** and **32,566 graph edges**) and **24 natural-language intent queries**:
 
 ```bash
 npm run bench
-# Or emit raw JSON metrics:
+# Emit raw JSON metrics:
 node bench/run.js --json
 ```
 
-### Results Across 6 Repositories (24 De-Leaked Intent Queries)
+### Results Across 6 Repositories (24 Intent Queries)
 
-- **Retrieval Accuracy**: **100.0% Recall@1 (24/24)** · **100.0% Recall@3 (24/24)** · **100.0% Recall@5 (24/24)** · **1.000 MRR** (vs. `@trailhq/trail-code@0.25.0` `20.8% Recall@1` / `0.250 MRR` across all 6 repos and `62.5% Recall@1` / `0.750 MRR` on shared non-Luau repos)
+- **Retrieval accuracy:** **100.0% Recall@1 (24/24)**, **100.0% Recall@3 (24/24)**, **100.0% Recall@5 (24/24)**, and **1.000 MRR**. By comparison, `@trailhq/trail-code@0.25.0` reaches `20.8% Recall@1` / `0.250 MRR` across all 6 repos and `62.5% Recall@1` / `0.750 MRR` on the shared non-Luau repos.
 
 | Repository | Graph Size (Nodes / Edges) | `wiring.json` | `check` | `ask --source` Latency & Tokens (vs Raw Files) | `callers` (`d=2`) | `skeleton` | `map` |
 | :--- | ---: | ---: | ---: | :--- | ---: | ---: | ---: |
