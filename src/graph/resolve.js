@@ -132,6 +132,7 @@ function buildResolutionIndex(nodes, rawEdges, opts) {
     }
     const classParents = new Map();
     const classTraits = new Map();
+    const reexportsByFile = new Map();
     for (const e of rawEdges) {
         if (e.relation === "extends" && e.name) {
             const ownName = byId.get(e.source)?.name;
@@ -142,6 +143,9 @@ function buildResolutionIndex(nodes, rawEdges, opts) {
             const ownName = byId.get(e.source)?.name;
             if (ownName)
                 pushMap(classTraits, ownName, e.name);
+        }
+        else if (e.relation === "reexports" && e.specifier) {
+            pushMap(reexportsByFile, e.source, e);
         }
     }
     return {
@@ -156,6 +160,7 @@ function buildResolutionIndex(nodes, rawEdges, opts) {
         phpFilesBySuffix,
         classParents,
         classTraits,
+        reexportsByFile,
         hasGoModules,
     };
 }
@@ -170,42 +175,88 @@ function resolveImportTargetForFile(spec, file, resIdx, opts) {
         return resolveRustUse(spec, file, resIdx.byId, resIdx.rustCrateRoots);
     if (file.endsWith(".php"))
         return resolvePhpUse(spec, resIdx.phpFilesBySuffix);
-    return resolveImport(spec, file, resIdx.byId);
+    return resolveImport(spec, file, resIdx.byId, resIdx, opts);
 }
-function resolveReferenceEdge(e, resIdx, emitResolvedEdge) {
-    const { byId, perFileName, globalName, phpFilesBySuffix } = resIdx;
+function resolveExportedSymbolInFile(targetFile, name, kinds, resIdx, opts, visited = new Set()) {
+    if (visited.size >= 5 || visited.has(targetFile) || !resIdx.byId.has(targetFile))
+        return null;
+    const allInFile = resIdx.perFileName.get(targetFile)?.get(name) ?? [];
+    let candidates = kinds ? allInFile.filter((n) => kinds.includes(n.kind)) : allInFile;
+    if (candidates.length === 0 && allInFile.length === 1) {
+        candidates = allInFile;
+    }
+    if (candidates.length === 1) {
+        return { node: candidates[0], typeOnly: false };
+    }
+    if (candidates.length > 1) {
+        return null;
+    }
+    const reexports = resIdx.reexportsByFile?.get(targetFile);
+    if (!reexports || reexports.length === 0)
+        return null;
+    const nextVisited = new Set(visited);
+    nextVisited.add(targetFile);
+    for (const r of reexports) {
+        if (r.star || r.exportedName !== name)
+            continue;
+        const nextFile = resolveImportTargetForFile(r.specifier, targetFile, resIdx, opts);
+        if (!resIdx.byId.has(nextFile))
+            continue;
+        const hit = resolveExportedSymbolInFile(nextFile, r.localName || name, kinds, resIdx, opts, nextVisited);
+        if (hit)
+            return { node: hit.node, typeOnly: Boolean(r.typeOnly || hit.typeOnly) };
+    }
+    const starHits = new Map();
+    for (const r of reexports) {
+        if (!r.star)
+            continue;
+        const nextFile = resolveImportTargetForFile(r.specifier, targetFile, resIdx, opts);
+        if (!resIdx.byId.has(nextFile))
+            continue;
+        const hit = resolveExportedSymbolInFile(nextFile, name, kinds, resIdx, opts, nextVisited);
+        if (hit) {
+            const prev = starHits.get(hit.node.id);
+            const combinedTypeOnly = Boolean(r.typeOnly || hit.typeOnly);
+            if (!prev || (prev.typeOnly && !combinedTypeOnly))
+                starHits.set(hit.node.id, { node: hit.node, typeOnly: combinedTypeOnly });
+        }
+    }
+    if (starHits.size === 1)
+        return [...starHits.values()][0];
+    return null;
+}
+function resolveReferenceEdge(e, resIdx, emitResolvedEdge, opts) {
+    const { byId, perFileName, globalName } = resIdx;
     if (e.specifier) {
-        const targetFile = e.file.endsWith(".php")
-            ? resolvePhpUse(e.specifier, phpFilesBySuffix)
-            : resolveImport(e.specifier, e.file, byId);
+        const targetFile = resolveImportTargetForFile(e.specifier, e.file, resIdx, opts);
         if (!byId.has(targetFile))
             return;
-        const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
-        if (candidates.length === 1)
-            emitResolvedEdge(e.source, candidates[0].id, "references", "extracted");
+        const found = resolveExportedSymbolInFile(targetFile, e.name, null, resIdx, opts);
+        if (found)
+            emitResolvedEdge(e.source, found.node.id, "references", "extracted", Boolean(e.typeOnly || found.typeOnly));
     }
     else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
         const refKinds = ["class", "interface", "trait", "enum"];
         const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
         if (hit && hit.id !== e.source)
-            emitResolvedEdge(e.source, hit.id, "references", hit.confidence);
+            emitResolvedEdge(e.source, hit.id, "references", hit.confidence, Boolean(e.typeOnly));
     }
     else if (e.file.endsWith(".java") && byId.get(e.source)?.origin === "ast") {
         const hit = resolveName(e.name, e.file, ["interface"], perFileName, globalName);
         const anno = hit ? byId.get(hit.id) : undefined;
         if (hit && hit.id !== e.source && anno?.signature?.includes("@interface"))
-            emitResolvedEdge(e.source, hit.id, "references", hit.confidence);
+            emitResolvedEdge(e.source, hit.id, "references", hit.confidence, Boolean(e.typeOnly));
         else
-            emitResolvedEdge(e.source, e.name, "references", "inferred");
+            emitResolvedEdge(e.source, e.name, "references", "inferred", Boolean(e.typeOnly));
     }
     else if (byId.get(e.source)?.origin === "generic") {
         const refKinds = ["class", "interface", "struct", "enum", "type", "module"];
         const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
         if (hit && hit.id !== e.source)
-            emitResolvedEdge(e.source, hit.id, "references", hit.confidence);
+            emitResolvedEdge(e.source, hit.id, "references", hit.confidence, Boolean(e.typeOnly));
     }
 }
-function resolveCallEdge(e, resIdx, emitResolvedEdge) {
+function resolveCallEdge(e, resIdx, emitResolvedEdge, opts) {
     const { byId, perFileName, globalName, ownerMethod, classParents, classTraits } = resIdx;
     if (e.viaMember) {
         if (!e.recvType)
@@ -214,7 +265,7 @@ function resolveCallEdge(e, resIdx, emitResolvedEdge) {
         if (hit === "ambiguous")
             return;
         if (hit) {
-            emitResolvedEdge(e.source, hit.id, "calls", hit.confidence);
+            emitResolvedEdge(e.source, hit.id, "calls", hit.confidence, Boolean(e.typeOnly));
             return;
         }
         if (!e.implicitSelf)
@@ -227,24 +278,50 @@ function resolveCallEdge(e, resIdx, emitResolvedEdge) {
             : e.file.endsWith(".java")
                 ? ["class", "struct", "enum", "interface"]
                 : ["function"]);
-    let hit = resolveName(e.name, e.file, callKinds, perFileName, globalName);
+    if (!e.viaMember && e.specifier) {
+        const targetFile = resolveImportTargetForFile(e.specifier, e.file, resIdx, opts);
+        if (byId.has(targetFile)) {
+            let found = resolveExportedSymbolInFile(targetFile, e.name, callKinds, resIdx, opts);
+            if (!found && PY_EXT.test(e.file))
+                found = resolveExportedSymbolInFile(targetFile, e.name, PY_CTOR_KINDS, resIdx, opts);
+            if (found) {
+                emitResolvedEdge(e.source, found.node.id, "calls", "extracted", Boolean(e.typeOnly || found.typeOnly));
+            }
+            return;
+        }
+        if (!e.file.endsWith(".php") && !PY_EXT.test(e.file))
+            return;
+    }
+    const lookupFile = !e.viaMember && e.specifier ? "" : e.file;
+    let hit = resolveName(e.name, lookupFile, callKinds, perFileName, globalName);
     if (!hit && PY_EXT.test(e.file))
-        hit = resolveName(e.name, e.file, PY_CTOR_KINDS, perFileName, globalName);
+        hit = resolveName(e.name, lookupFile, PY_CTOR_KINDS, perFileName, globalName);
     if (!hit && SWIFT_EXT.test(e.file))
-        hit = resolveName(e.name, e.file, SWIFT_CTOR_KINDS, perFileName, globalName);
+        hit = resolveName(e.name, lookupFile, SWIFT_CTOR_KINDS, perFileName, globalName);
     if (hit)
-        emitResolvedEdge(e.source, hit.id, "calls", hit.confidence);
+        emitResolvedEdge(e.source, hit.id, "calls", hit.confidence, Boolean(e.typeOnly));
 }
 export function resolveEdges(nodes, rawEdges, opts = {}) {
     const resIdx = buildResolutionIndex(nodes, rawEdges, opts);
     const out = [];
-    const seen = new Set();
-    const emitResolvedEdge = (source, target, relation, confidence) => {
+    const seen = new Map();
+    const emitResolvedEdge = (source, target, relation, confidence, typeOnly = false) => {
         const key = `${source}\0${relation}\0${target}`;
-        if (seen.has(key))
+        const existing = seen.get(key);
+        if (existing) {
+            if (!typeOnly && existing.typeOnly)
+                delete existing.typeOnly;
             return;
-        seen.add(key);
-        out.push({ source, target, relation, confidence });
+        }
+        const edge = {
+            source,
+            target,
+            relation,
+            confidence,
+            ...(typeOnly ? { typeOnly: true } : {}),
+        };
+        seen.set(key, edge);
+        out.push(edge);
     };
     resolveLuauEdges(nodes, rawEdges, emitResolvedEdge, opts);
     for (const e of rawEdges) {
@@ -254,18 +331,18 @@ export function resolveEdges(nodes, rawEdges, opts = {}) {
             emitResolvedEdge(e.source, e.targetId, "contains", "extracted");
         }
         else if (e.relation === "imports" && e.specifier) {
-            emitResolvedEdge(e.source, resolveImportTargetForFile(e.specifier, e.file, resIdx, opts), "imports", "extracted");
+            emitResolvedEdge(e.source, resolveImportTargetForFile(e.specifier, e.file, resIdx, opts), "imports", "extracted", Boolean(e.typeOnly));
         }
         else if (e.relation === "extends" || e.relation === "implements") {
             const kinds = e.relation === "implements" ? ["interface", "trait"] : ["class", "interface"];
             const hit = resolveName(e.name, e.file, kinds, resIdx.perFileName, resIdx.globalName);
-            emitResolvedEdge(e.source, hit?.id ?? e.name, e.relation, hit?.confidence ?? "inferred");
+            emitResolvedEdge(e.source, hit?.id ?? e.name, e.relation, hit?.confidence ?? "inferred", Boolean(e.typeOnly));
         }
         else if (e.relation === "references" && e.name) {
-            resolveReferenceEdge(e, resIdx, emitResolvedEdge);
+            resolveReferenceEdge(e, resIdx, emitResolvedEdge, opts);
         }
         else if (e.relation === "calls") {
-            resolveCallEdge(e, resIdx, emitResolvedEdge);
+            resolveCallEdge(e, resIdx, emitResolvedEdge, opts);
         }
     }
     return out;
@@ -403,22 +480,266 @@ function resolveTraitMember(type, name, file, ownerMethod, classTraits, argCount
  * Resolve a module specifier to a file node id when it points inside the repo;
  * otherwise return the raw specifier (external package or unresolved path).
  */
-function resolveImport(spec, file, byId) {
-    if (!spec.startsWith("."))
-        return spec;
-    // Belt-and-braces: `node.path` is posix by construction (`../util/paths.js`),
-    // but this also accepts a hand-written or hand-edited graph.
-    const dir = posix.dirname(toPosixPath(file));
-    const base = posix.normalize(posix.join(dir, spec));
-    const noExt = base.replace(/\.(js|jsx|mjs|cjs|ts|tsx|py)$/, "");
+function probeImportPath(rawBase, byId, isPython = false) {
+    const base = posix.normalize(rawBase).replace(/^\.\//, "");
+    if (!base || base === ".") {
+        if (isPython && byId.has("__init__.py"))
+            return "__init__.py";
+        return null;
+    }
+    const noExt = base.replace(/\.(js|jsx|mjs|cjs|mts|cts|ts|tsx|py|pyi)$/, "");
     const candidates = [
         base,
         ...IMPORT_EXTS.map((e) => noExt + e),
         ...IMPORT_EXTS.map((e) => `${noExt}/index${e}`),
+        ...(isPython ? [`${noExt}/__init__.py`, `${noExt}/__init__.pyi`] : [`${noExt}/__init__.py`]),
     ];
-    for (const c of candidates)
+    for (const c of candidates) {
         if (byId.has(c))
             return c;
+    }
+    return null;
+}
+function extractPackageTargets(entry) {
+    if (!entry)
+        return [];
+    if (typeof entry === "string")
+        return [entry];
+    if (Array.isArray(entry))
+        return entry.flatMap((item) => extractPackageTargets(item));
+    if (typeof entry === "object") {
+        const order = ["source", "import", "default", "require", "module", "node", "browser", "types"];
+        const out = [];
+        const seen = new Set();
+        for (const k of order) {
+            if (k in entry) {
+                seen.add(k);
+                out.push(...extractPackageTargets(entry[k]));
+            }
+        }
+        for (const [k, v] of Object.entries(entry)) {
+            if (!seen.has(k))
+                out.push(...extractPackageTargets(v));
+        }
+        return out;
+    }
+    return [];
+}
+function matchExportMap(map, key) {
+    if (!map || typeof map !== "object")
+        return [];
+    if (key in map)
+        return extractPackageTargets(map[key]);
+    const out = [];
+    for (const [pattern, val] of Object.entries(map)) {
+        if (!pattern.includes("*"))
+            continue;
+        const [prefix, suffix] = pattern.split("*");
+        if (key.startsWith(prefix) && key.endsWith(suffix) && key.length >= prefix.length + suffix.length) {
+            const star = key.slice(prefix.length, key.length - suffix.length);
+            for (const t of extractPackageTargets(val)) {
+                out.push(t.replace(/\*/g, star));
+            }
+        }
+    }
+    return out;
+}
+function probePackageTarget(pkgDir, target, byId) {
+    const joined = pkgDir ? posix.join(pkgDir, target) : target;
+    const direct = probeImportPath(joined, byId, false);
+    if (direct)
+        return direct;
+    const srcMapped = target.replace(/^(?:\.\/)?(dist|build|lib|out)\//, "./src/");
+    if (srcMapped !== target) {
+        const fallback = probeImportPath(pkgDir ? posix.join(pkgDir, srcMapped) : srcMapped, byId, false);
+        if (fallback)
+            return fallback;
+    }
+    return null;
+}
+function resolvePythonImportSpec(spec, posixFile, byId, opts) {
+    if (spec.startsWith(".")) {
+        const m = /^(\.+)(.*)$/.exec(spec);
+        if (m) {
+            const dots = m[1].length;
+            const rest = m[2];
+            const dir = posix.dirname(posixFile);
+            const up = dots > 1 ? Array(dots - 1).fill("..").join("/") : "";
+            const baseDir = up ? posix.normalize(posix.join(dir, up)) : dir;
+            const relSub = rest ? rest.replace(/\./g, "/") : "";
+            const targetBase = relSub
+                ? (baseDir === "." ? relSub : posix.join(baseDir, relSub))
+                : (baseDir === "." ? "" : baseDir);
+            const hit = probeImportPath(targetBase, byId, true);
+            if (hit)
+                return hit;
+        }
+        return spec;
+    }
+    const slashSpec = spec.replace(/\./g, "/");
+    const fileDir = posix.dirname(posixFile);
+    const pyBases = [
+        slashSpec,
+        `src/${slashSpec}`,
+        ...(fileDir !== "." ? [`${fileDir}/${slashSpec}`] : []),
+    ];
+    if (opts?.scopes?.length) {
+        for (const s of opts.scopes) {
+            if (s.prefix) {
+                pyBases.push(`${s.prefix}/${slashSpec}`, `${s.prefix}/src/${slashSpec}`);
+            }
+        }
+    }
+    for (const cand of pyBases) {
+        const hit = probeImportPath(cand, byId, true);
+        if (hit)
+            return hit;
+    }
+    return spec;
+}
+
+function resolveTsConfigPaths(spec, posixFile, byId, tsConfigs) {
+    for (const cfg of tsConfigs) {
+        const cfgDir = cfg.dir === "." ? "" : cfg.dir;
+        if (cfgDir && !pathUnderPrefix(posixFile, cfgDir))
+            continue;
+        const rawBase = cfg.baseUrl ? (cfgDir ? posix.join(cfgDir, cfg.baseUrl) : cfg.baseUrl) : cfgDir;
+        const baseDir = rawBase === "." ? "" : posix.normalize(rawBase);
+        if (cfg.paths && typeof cfg.paths === "object") {
+            for (const [pattern, targets] of Object.entries(cfg.paths)) {
+                if (!Array.isArray(targets))
+                    continue;
+                if (!pattern.includes("*")) {
+                    if (pattern !== spec)
+                        continue;
+                    for (const t of targets) {
+                        if (typeof t !== "string")
+                            continue;
+                        const cand = baseDir ? posix.join(baseDir, t) : t;
+                        const hit = probeImportPath(cand, byId, false);
+                        if (hit)
+                            return hit;
+                    }
+                }
+                else {
+                    const [prefix, suffix] = pattern.split("*");
+                    if (!spec.startsWith(prefix) || !spec.endsWith(suffix) || spec.length < prefix.length + suffix.length)
+                        continue;
+                    const star = spec.slice(prefix.length, spec.length - suffix.length);
+                    for (const t of targets) {
+                        if (typeof t !== "string")
+                            continue;
+                        const mapped = t.replace(/\*/g, star);
+                        const cand = baseDir ? posix.join(baseDir, mapped) : mapped;
+                        const hit = probeImportPath(cand, byId, false);
+                        if (hit)
+                            return hit;
+                    }
+                }
+            }
+        }
+        if (cfg.baseUrl) {
+            const cand = baseDir ? posix.join(baseDir, spec) : spec;
+            const hit = probeImportPath(cand, byId, false);
+            if (hit)
+                return hit;
+        }
+    }
+    return null;
+}
+
+function resolveSelfPackageExport(spec, byId, packageConfigs) {
+    for (const pkg of packageConfigs) {
+        if (!pkg.name)
+            continue;
+        if (spec !== pkg.name && !spec.startsWith(`${pkg.name}/`))
+            continue;
+        const pkgDir = pkg.dir === "." ? "" : pkg.dir;
+        const subpath = spec === pkg.name ? "." : `./${spec.slice(pkg.name.length + 1)}`;
+        if (pkg.exports) {
+            let targets = [];
+            if (typeof pkg.exports === "string" || Array.isArray(pkg.exports)) {
+                if (subpath === ".")
+                    targets = extractPackageTargets(pkg.exports);
+            }
+            else if (typeof pkg.exports === "object") {
+                const keys = Object.keys(pkg.exports);
+                const isSubpathMap = keys.some((k) => k.startsWith("."));
+                if (isSubpathMap) {
+                    targets = matchExportMap(pkg.exports, subpath);
+                }
+                else if (subpath === ".") {
+                    targets = extractPackageTargets(pkg.exports);
+                }
+            }
+            for (const t of targets) {
+                const hit = probePackageTarget(pkgDir, t, byId);
+                if (hit)
+                    return hit;
+            }
+        }
+        if (subpath === ".") {
+            const rootCands = [
+                pkgDir ? `${pkgDir}/src/index` : "src/index",
+                pkgDir ? `${pkgDir}/index` : "index",
+            ];
+            for (const c of rootCands) {
+                const hit = probeImportPath(c, byId, false);
+                if (hit)
+                    return hit;
+            }
+        }
+        else {
+            const relSub = subpath.slice(2);
+            const subCands = [
+                pkgDir ? `${pkgDir}/${relSub}` : relSub,
+                pkgDir ? `${pkgDir}/src/${relSub}` : `src/${relSub}`,
+            ];
+            for (const c of subCands) {
+                const hit = probeImportPath(c, byId, false);
+                if (hit)
+                    return hit;
+            }
+        }
+    }
+    return null;
+}
+
+function resolveImport(spec, file, byId, _resIdx = null, opts = {}) {
+    const posixFile = toPosixPath(file);
+    if (PY_EXT.test(posixFile)) {
+        return resolvePythonImportSpec(spec, posixFile, byId, opts);
+    }
+    if (spec.startsWith(".")) {
+        const dir = posix.dirname(posixFile);
+        const base = posix.normalize(posix.join(dir, spec));
+        const hit = probeImportPath(base, byId, false);
+        return hit || spec;
+    }
+    if (spec.startsWith("#") && opts?.packageConfigs?.length) {
+        for (const pkg of opts.packageConfigs) {
+            const pkgDir = pkg.dir === "." ? "" : pkg.dir;
+            if (pkgDir && !pathUnderPrefix(posixFile, pkgDir))
+                continue;
+            if (!pkg.imports || typeof pkg.imports !== "object")
+                continue;
+            for (const t of matchExportMap(pkg.imports, spec)) {
+                const hit = probePackageTarget(pkgDir, t, byId);
+                if (hit)
+                    return hit;
+            }
+        }
+    }
+    if (opts?.tsConfigs?.length) {
+        const tsHit = resolveTsConfigPaths(spec, posixFile, byId, opts.tsConfigs);
+        if (tsHit)
+            return tsHit;
+    }
+    if (opts?.packageConfigs?.length) {
+        const pkgHit = resolveSelfPackageExport(spec, byId, opts.packageConfigs);
+        if (pkgHit)
+            return pkgHit;
+    }
     return spec;
 }
 /**

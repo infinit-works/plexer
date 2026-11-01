@@ -7,6 +7,7 @@
  *   GET /api/context-graph empty metadata envelope (blast graph in exported view)
  *   GET /api/code-graph    plexer/.graph/wiring.json passthrough (404 until generated)
  *   GET /api/source        repo-jailed source line excerpt for inspector preview
+ *   GET /api/health        health snapshot + per-file findings from plexer/.health/state.json
  *   GET /events            SSE; fs.watch on the context dir, debounced 300ms
  */
 import { createServer } from "node:http";
@@ -23,7 +24,7 @@ export function buildVizHealthPayload(contextDir) {
     const scores = computeScoreSnapshot(state);
     const byFile = {};
     let openCount = 0;
-    const sevRank = { high: 3, medium: 2, low: 1 };
+    const sevRank = { critical: 4, high: 3, medium: 2, low: 1 };
     for (const iss of Object.values(state.issues || {})) {
         if (iss.status !== "open" || iss.suppressed || !iss.file) continue;
         openCount += 1;
@@ -81,17 +82,19 @@ function sendJson(res, status, body) {
 }
 function listen(server, port) {
     return new Promise((resolve, reject) => {
+        const onListening = () => {
+            server.removeListener("error", onError);
+            resolve(true);
+        };
         const onError = (err) => {
+            server.removeListener("listening", onListening);
             if (err.code === "EADDRINUSE")
                 resolve(false);
             else
                 reject(err);
         };
         server.once("error", onError);
-        server.listen(port, "127.0.0.1", () => {
-            server.removeListener("error", onError);
-            resolve(true);
-        });
+        server.listen(port, "127.0.0.1", onListening);
     });
 }
 function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot) {
@@ -258,6 +261,7 @@ export async function startVizServer(opts) {
             for (const client of sseClients)
                 client.end();
             sseClients.clear();
+            server.closeAllConnections?.();
             return new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
         },
     };

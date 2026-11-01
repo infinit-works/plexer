@@ -13,15 +13,18 @@
  * not of everything the file happens to define. The file node is seeded too, so
  * importers (whose edge targets the file, not the symbol) are still found.
  */
-import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { isTestPath } from "../ask/ask.js";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached } from "../graph/load.js";
+import { linkTestsForGraph } from "../graph/test-links.js";
 import { impactOfMany, parseWalkDepth } from "../graph/traverse.js";
-import { pushMap } from "../util/paths.js";
+import { globToRegExp, parseLayerRuleEntry, pushMap, toPosixPath } from "../util/paths.js";
+import { readJson } from "../util/state.js";
 import { changedFiles, refExists } from "./diff.js";
 import { spanRange } from "./evidence.js";
+import { analyzeGitHistory, untouchedCoChanges } from "./history.js";
 import { dirLabel, moduleIndex, parentDir, shortLabel } from "./modules.js";
 /**
  * The innermost symbols whose spans overlap any changed range in `path`.
@@ -61,11 +64,16 @@ function blastRadiusFromDir(dir, rawOpts) {
         throw new Error(`could not read a diff in ${root} — is this a git repository?`);
     const parsedDepth = parseWalkDepth(dirOpts.depth, 2);
     const depth = Number.isNaN(parsedDepth) ? 2 : parsedDepth;
-    return blastRadiusIn(loaded, contextDir, diff.files, diff.basis, depth);
+    return blastRadiusIn(loaded, contextDir, diff.files, diff.basis, depth, {
+        rootDir: root,
+        layerRules: dirOpts.layerRules ?? dirOpts.layer_rules,
+        gitHistory: dirOpts.gitHistory,
+    });
 }
 function indexBlastGraphNodes(graph) {
     const fileNodes = new Map();
     const symbolsByFile = new Map();
+    const edgesBySource = new Map();
     for (const n of graph.nodes) {
         if (n.kind === "file") {
             fileNodes.set(n.path, n);
@@ -76,10 +84,28 @@ function indexBlastGraphNodes(graph) {
             continue;
         pushMap(symbolsByFile, n.path, { node: n, ...b });
     }
-    return { fileNodes, symbolsByFile };
+    for (const e of graph.edges) {
+        if (e.relation === "contains")
+            continue;
+        pushMap(edgesBySource, e.source, e);
+    }
+    return { fileNodes, symbolsByFile, edgesBySource };
+}
+function isHitTypeOnly(h, seedIds, edgesBySource, typeOnlyByNodeId) {
+    if (h.typeOnly === true)
+        return true;
+    const srcEdges = edgesBySource.get(h.node.id) ?? [];
+    const targetMatches = srcEdges.filter((e) =>
+        h.depth === 1 ? seedIds.has(e.target) || (h.via && e.target === h.via.id) : h.via ? e.target === h.via.id : seedIds.has(e.target),
+    );
+    if (targetMatches.length > 0 && targetMatches.every((e) => Boolean(e.typeOnly)))
+        return true;
+    if (h.depth > 1 && h.via && typeOnlyByNodeId.get(h.via.id) === true)
+        return true;
+    return false;
 }
 function collectBlastSeedsAndImpacts(graph, changed, depth) {
-    const { fileNodes, symbolsByFile } = indexBlastGraphNodes(graph);
+    const { fileNodes, symbolsByFile, edgesBySource } = indexBlastGraphNodes(graph);
     const seeds = [];
     const unindexed = [];
     const deleted = [];
@@ -113,19 +139,28 @@ function collectBlastSeedsAndImpacts(graph, changed, depth) {
         // One walk PER CHANGED FILE, not one walk over every seed at once.
         // The FILE node is a seed only when no symbol matched.
         const walkSeeds = symbolSeeds.length > 0 ? symbolSeeds : [fileNode];
+        const seedIds = new Set(walkSeeds.map((s) => s.id));
         seedNodes.set(file.path, walkSeeds);
         const hits = impactOfMany(graph, walkSeeds, depth, "in");
+        const typeOnlyByNodeId = new Map();
         for (const h of hits) {
             if (!hasNode(h))
                 continue;
-            const hit = toImpacted(h);
+            const typeOnly = isHitTypeOnly(h, seedIds, edgesBySource, typeOnlyByNodeId);
+            typeOnlyByNodeId.set(h.node.id, typeOnly);
+            const hit = toImpacted(h, typeOnly);
             const prev = merged.get(hit.id);
             if (!prev)
                 merged.set(hit.id, { hit, from: new Set([file.path]) });
             else {
                 prev.from.add(file.path);
+                const combinedTypeOnly = Boolean(prev.hit.typeOnly && hit.typeOnly);
                 if (hit.depth < prev.hit.depth)
-                    prev.hit = hit;
+                    prev.hit = combinedTypeOnly ? hit : { ...hit, typeOnly: undefined };
+                else if (prev.hit.typeOnly && ! combinedTypeOnly)
+                    delete prev.hit.typeOnly;
+                if (!prev.hit.typeOnly)
+                    delete prev.hit.typeOnly;
             }
         }
     }
@@ -140,7 +175,7 @@ export function blastRadius(graph, changed, basis = "working tree", opts = { dep
     const origins = new Map([...merged].map(([id, m]) => [id, m.from]));
     const index = opts.modules ?? emptyIndex();
     const grouped = groupByModule(impacted, changed, origins, index);
-    return {
+    const res = {
         basis,
         depth: opts.depth,
         changed,
@@ -152,6 +187,18 @@ export function blastRadius(graph, changed, basis = "working tree", opts = { dep
         testModules: grouped.testModules,
         areas: changedAreas(graph, changed, seedNodes, index, grouped.modules),
     };
+    if (opts?.gitHistory) {
+        const coChanges = untouchedCoChanges(opts.gitHistory, changed.map((c) => c.path), graph);
+        if (coChanges.length > 0)
+            res.coChanges = coChanges;
+    }
+    const directLayerRules = opts?.layerRules ?? opts?.layer_rules;
+    if (Array.isArray(directLayerRules) && directLayerRules.length > 0) {
+        const violations = collectLayerViolations(graph, changed, directLayerRules);
+        if (violations.length > 0)
+            res.layerViolations = violations;
+    }
+    return res;
 }
 function collectBlastTestIncoming(graph) {
     const nodeById = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
@@ -168,12 +215,14 @@ function collectBlastTestIncoming(graph) {
         at.add(path);
         incoming.set(e.target, at);
     }
-    return { inDegree, incoming };
+    const testLinks = linkTestsForGraph(graph);
+    return { inDegree, incoming, testLinks };
 }
-function buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegree) {
+function buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegree, testLinks) {
     const area = {
         label: dir, labelSource: "symbol", key: dir,
         files: [], seeds: 0, tests: "none", testFiles: [], changedTestFiles: [],
+        companionTestFiles: [],
         reached: 0, behavioural: 0, unreached: [], seedNames: [],
     };
     const areaCandidates = [];
@@ -189,6 +238,17 @@ function buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegre
                     area.testFiles.push(t);
                 if (changedTests.has(t) && !area.changedTestFiles.includes(t))
                     area.changedTestFiles.push(t);
+            }
+            if (testLinks) {
+                const links = testLinks.testsForSymbol(node.id, path, true);
+                for (const { testFile, kind } of links) {
+                    if (!area.testFiles.includes(testFile))
+                        area.testFiles.push(testFile);
+                    if (changedTests.has(testFile) && !area.changedTestFiles.includes(testFile))
+                        area.changedTestFiles.push(testFile);
+                    if ((kind === "module_import" || kind === "stem_companion") && !area.companionTestFiles.includes(testFile))
+                        area.companionTestFiles.push(testFile);
+                }
             }
             areaCandidates.push({ name: node.name, behavioural, degree: inDegree.get(node.id) ?? 0 });
             if (!behavioural)
@@ -210,7 +270,7 @@ function buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegre
  */
 function changedAreas(graph, changed, seedNodes, index, modules) {
     const changedTests = new Set(changed.filter((c) => isTestPath(c.path)).map((c) => c.path));
-    const { inDegree, incoming } = collectBlastTestIncoming(graph);
+    const { inDegree, incoming, testLinks } = collectBlastTestIncoming(graph);
     const groups = new Map();
     for (const path of seedNodes.keys()) {
         if (isTestPath(path))
@@ -222,7 +282,7 @@ function changedAreas(graph, changed, seedNodes, index, modules) {
     const byKey = new Map();
     const reachByArea = new Map();
     for (const [dir, paths] of groups) {
-        const area = buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegree);
+        const area = buildChangedArea(dir, paths, seedNodes, incoming, changedTests, inDegree, testLinks);
         byKey.set(dir, area);
         const concept = sharedConcept(area.files, index);
         area.label = concept ?? hubLabel(area.seedNames, area.key);
@@ -230,6 +290,7 @@ function changedAreas(graph, changed, seedNodes, index, modules) {
         area.files.sort();
         area.testFiles.sort();
         area.changedTestFiles.sort();
+        area.companionTestFiles.sort();
         area.tests =
             area.behavioural === 0 ? "na"
                 : area.changedTestFiles.length > 0 ? "changed"
@@ -243,7 +304,8 @@ function changedAreas(graph, changed, seedNodes, index, modules) {
 function collectBlastHealthHotspots(contextDir, changed, impacted) {
     const stateFile = contextDir ? join(contextDir, ".health", "state.json") : "";
     if (!stateFile || !existsSync(stateFile)) return [];
-    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    const state = readJson(stateFile);
+    if (!state || typeof state !== "object") return [];
     const changedSet = new Set(changed.map((c) => c.path));
     const impactedSet = new Set(
         impacted.filter((i) => i.depth === 1 && !changedSet.has(i.path)).map((i) => i.path),
@@ -285,12 +347,118 @@ function collectBlastHealthHotspots(contextDir, changed, impacted) {
     );
 }
 
+function loadLayerRules(contextDir, opts = {}) {
+    if (Array.isArray(opts.layerRules))
+        return opts.layerRules.map(parseLayerRuleEntry).filter(Boolean);
+    if (Array.isArray(opts.layer_rules))
+        return opts.layer_rules.map(parseLayerRuleEntry).filter(Boolean);
+    if (!contextDir)
+        return [];
+    const cfgFile = join(contextDir, ".health", "config.json");
+    const planFile = join(contextDir, ".health", "plan.json");
+    const parsedCfg = existsSync(cfgFile) ? readJson(cfgFile) : null;
+    const parsedPlan = existsSync(planFile) ? readJson(planFile) : null;
+    const rawEntries = [
+        ...(Array.isArray(parsedCfg?.layer_rules) ? parsedCfg.layer_rules : []),
+        ...(Array.isArray(parsedCfg?.layerRules) ? parsedCfg.layerRules : []),
+        ...(Array.isArray(parsedPlan?.policies) ? parsedPlan.policies : []),
+        ...(Array.isArray(parsedCfg?.policies) ? parsedCfg.policies : []),
+    ];
+    return rawEntries.map(parseLayerRuleEntry).filter(Boolean);
+}
+
+function collectLayerViolations(graph, changed, rules) {
+    if (!Array.isArray(rules) || rules.length === 0 || !graph?.edges || !graph?.nodes)
+        return [];
+    const changedSet = new Set(changed.filter((c) => c.status !== "deleted").map((c) => c.path));
+    if (changedSet.size === 0)
+        return [];
+    const compiledRules = [];
+    for (const rawRule of rules) {
+        const rule = parseLayerRuleEntry(rawRule);
+        if (!rule)
+            continue;
+        const ruleFrom = rule.from;
+        const toList = Array.isArray(rule.to) ? rule.to : rule.to ? [rule.to] : [];
+        if (!ruleFrom || toList.length === 0)
+            continue;
+        compiledRules.push({
+            ruleFrom,
+            fromRe: globToRegExp(ruleFrom),
+            toRes: toList.map((t) => ({ ruleTo: t, re: globToRegExp(t) })),
+            allowTypeOnly: Boolean(rule.allowTypeOnly),
+            reason: rule.reason,
+        });
+    }
+    if (compiledRules.length === 0)
+        return [];
+    const byId = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
+    const violations = [];
+    const seen = new Set();
+    for (const e of graph.edges) {
+        if (e.relation === "contains")
+            continue;
+        const sourceFile = byId.get(e.source)?.path ?? (byId.has(e.source) ? e.source : null);
+        const targetFile = byId.get(e.target)?.path ?? (byId.has(e.target) ? e.target : null);
+        if (!sourceFile || !targetFile || sourceFile === targetFile)
+            continue;
+        if (!changedSet.has(sourceFile))
+            continue;
+        const normSource = toPosixPath(sourceFile).replace(/^\.\//, "");
+        const normTarget = toPosixPath(targetFile).replace(/^\.\//, "");
+        for (const rule of compiledRules) {
+            if (rule.allowTypeOnly && e.typeOnly)
+                continue;
+            if (!rule.fromRe.test(normSource))
+                continue;
+            for (const { ruleTo, re } of rule.toRes) {
+                if (!re.test(normTarget))
+                    continue;
+                const key = `${sourceFile}\0${targetFile}\0${rule.ruleFrom}\0${ruleTo}`;
+                if (seen.has(key))
+                    continue;
+                seen.add(key);
+                violations.push({
+                    sourceFile,
+                    targetFile,
+                    relation: e.relation,
+                    ruleFrom: rule.ruleFrom,
+                    ruleTo,
+                    reason: rule.reason ?? `${rule.ruleFrom} cannot depend on ${ruleTo}`,
+                });
+            }
+        }
+    }
+    return violations.sort(
+        (a, b) =>
+            a.sourceFile.localeCompare(b.sourceFile) ||
+            a.targetFile.localeCompare(b.targetFile) ||
+            a.ruleFrom.localeCompare(b.ruleFrom) ||
+            a.ruleTo.localeCompare(b.ruleTo),
+    );
+}
+
 /** Convenience wrapper: build the module index from a context dir. */
-export function blastRadiusIn(graph, contextDir, changed, basis, depth) {
+export function blastRadiusIn(graph, contextDir, changed, basis, depth, opts = {}) {
     const res = blastRadius(graph, changed, basis, { depth, modules: moduleIndex(contextDir) });
     const hotspots = collectBlastHealthHotspots(contextDir, changed, res.impacted);
     if (hotspots.length > 0) {
         res.healthHotspots = hotspots;
+    }
+    const rootDir = opts.rootDir ?? (contextDir ? dirname(resolve(contextDir)) : null);
+    const history = opts.gitHistory ?? (rootDir && existsSync(rootDir) ? analyzeGitHistory(rootDir, contextDir) : null);
+    if (history) {
+        const coChanges = untouchedCoChanges(history, changed.map((c) => c.path), graph);
+        if (coChanges.length > 0) {
+            res.coChanges = coChanges;
+        }
+    }
+    const rules = loadLayerRules(contextDir, opts);
+    if (rules.length > 0) {
+        const violations = collectLayerViolations(graph, changed, rules);
+        if (violations.length > 0) {
+            res.layerViolations = violations;
+        }
     }
     return res;
 }
@@ -300,10 +468,12 @@ function hasNode(h) {
     // rendered as a box with no file behind it.
     return h.node !== null;
 }
-function toImpacted(h) {
+function toImpacted(h, typeOnly = false) {
+    const isTypeOnly = Boolean(h.typeOnly || typeOnly);
     return {
         id: h.node.id, name: h.node.name, kind: h.node.kind,
         path: h.node.path, span: h.node.span, relation: h.relation, depth: h.depth,
+        ...(isTypeOnly ? { typeOnly: true } : {}),
     };
 }
 function emptyIndex() {

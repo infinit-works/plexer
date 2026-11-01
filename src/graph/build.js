@@ -7,7 +7,7 @@
  * costs only the files that changed while producing output byte-identical to a
  * cold build.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
 import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
@@ -69,6 +69,144 @@ function readGoModules(root, repoFiles) {
     }
     return mods;
 }
+function parseJsonc(raw) {
+    const out = [];
+    let i = 0;
+    let inString = false;
+    while (i < raw.length) {
+        const ch = raw[i];
+        if (inString) {
+            out.push(ch);
+            if (ch === "\\" && i + 1 < raw.length) {
+                out.push(raw[i + 1]);
+                i += 2;
+                continue;
+            }
+            if (ch === '"')
+                inString = false;
+            i++;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            out.push(ch);
+            i++;
+            continue;
+        }
+        if (ch === "/" && raw[i + 1] === "/") {
+            i += 2;
+            while (i < raw.length && raw[i] !== "\n")
+                i++;
+            continue;
+        }
+        if (ch === "/" && raw[i + 1] === "*") {
+            i += 2;
+            while (i < raw.length && !(raw[i] === "*" && raw[i + 1] === "/"))
+                i++;
+            i += 2;
+            continue;
+        }
+        if (ch === "}" || ch === "]") {
+            for (let k = out.length - 1; k >= 0; k--) {
+                const prev = out[k];
+                if (prev === " " || prev === "\t" || prev === "\r" || prev === "\n" || prev === "")
+                    continue;
+                if (prev === ",")
+                    out[k] = "";
+                break;
+            }
+        }
+        out.push(ch);
+        i++;
+    }
+    return JSON.parse(out.join(""));
+}
+function readTsConfigFile(filePath) {
+    let parsed = null;
+    try {
+        parsed = parseJsonc(readFileSync(filePath, "utf8"));
+    }
+    catch {
+        /* ignore invalid/unreadable tsconfig.json */
+    }
+    return parsed;
+}
+function resolveExtendedTsConfigPath(configFile, extRaw) {
+    if (!extRaw.startsWith(".") && !extRaw.startsWith("/"))
+        return null;
+    const candidate = resolve(dirname(configFile), extRaw);
+    try {
+        if (existsSync(candidate) && statSync(candidate).isFile())
+            return candidate;
+    }
+    catch {
+        /* ignore stat errors */
+    }
+    if (existsSync(`${candidate}.json`))
+        return `${candidate}.json`;
+    const nested = join(candidate, "tsconfig.json");
+    return existsSync(nested) ? nested : null;
+}
+function readTsConfigs(root, repoFiles) {
+    const configs = [];
+    for (const f of repoFiles) {
+        const b = basename(f);
+        if (b !== "tsconfig.json" && b !== "jsconfig.json")
+            continue;
+        const parsed = readTsConfigFile(f);
+        if (!parsed || typeof parsed !== "object")
+            continue;
+        let baseUrl = parsed.compilerOptions?.baseUrl;
+        let paths = parsed.compilerOptions?.paths;
+        if (typeof parsed.extends === "string" && (baseUrl === undefined || paths === undefined)) {
+            const extPath = resolveExtendedTsConfigPath(f, parsed.extends);
+            if (extPath) {
+                const parentCfg = readTsConfigFile(extPath);
+                if (parentCfg?.compilerOptions) {
+                    if (baseUrl === undefined && typeof parentCfg.compilerOptions.baseUrl === "string") {
+                        const absParentBase = resolve(dirname(extPath), parentCfg.compilerOptions.baseUrl);
+                        baseUrl = relPosix(dirname(f), absParentBase) || ".";
+                    }
+                    if (parentCfg.compilerOptions.paths && typeof parentCfg.compilerOptions.paths === "object") {
+                        paths = paths ? { ...parentCfg.compilerOptions.paths, ...paths } : parentCfg.compilerOptions.paths;
+                    }
+                }
+            }
+        }
+        const dir = relPosix(root, dirname(f));
+        configs.push({
+            dir,
+            baseUrl: typeof baseUrl === "string" ? baseUrl : null,
+            paths: paths && typeof paths === "object" ? paths : null,
+        });
+    }
+    configs.sort((a, b) => b.dir.length - a.dir.length || a.dir.localeCompare(b.dir));
+    return configs;
+}
+function readPackageConfigs(root, repoFiles) {
+    const pkgs = [];
+    for (const f of repoFiles) {
+        if (basename(f) !== "package.json")
+            continue;
+        try {
+            const parsed = JSON.parse(readFileSync(f, "utf8"));
+            if (!parsed || typeof parsed !== "object")
+                continue;
+            const dir = relPosix(root, dirname(f));
+            pkgs.push({
+                dir,
+                name: typeof parsed.name === "string" ? parsed.name : null,
+                exports: parsed.exports ?? null,
+                imports: parsed.imports ?? null,
+            });
+        }
+        catch {
+            /* ignore invalid/unreadable package.json */
+        }
+    }
+    pkgs.sort((a, b) => b.dir.length - a.dir.length || a.dir.localeCompare(b.dir));
+    return pkgs;
+}
 function resolverConfigHash(root, repoFiles, scopes, goModules) {
     const configFiles = [];
     const seen = new Set();
@@ -77,7 +215,10 @@ function resolverConfigHash(root, repoFiles, scopes, goModules) {
         ...scopes.filter((s) => s.prefix).map((s) => join(root, s.prefix, ".luaurc")),
         ...repoFiles.filter((f) => {
             const b = basename(f);
-            return b === ".luaurc" || b.endsWith(".project.json");
+            return (b === ".luaurc" ||
+                b.endsWith(".project.json") ||
+                /^(?:ts|js)config(?:\..+)?\.json$/.test(b) ||
+                b === "package.json");
         }),
     ];
     for (const f of candidates) {
@@ -166,6 +307,8 @@ export async function buildGraph(dir, opts = {}) {
     });
     const scopes = applyMinSubstanceGuard(discoveredScopes, nodes);
     const goModules = readGoModules(root, repoFiles);
+    const tsConfigs = readTsConfigs(root, repoFiles);
+    const packageConfigs = readPackageConfigs(root, repoFiles);
     const configHash = resolverConfigHash(root, repoFiles, scopes, goModules);
     const prior = opts.reuse === false ? null : readGraph(wiringPath(outDir));
     const priorAskIndex = opts.reuse === false ? null : readAskIndex(outDir);
@@ -184,7 +327,7 @@ export async function buildGraph(dir, opts = {}) {
             writeFingerprint(outDir, entries, opts.onlyDirs, root);
     }
     else {
-        edges = resolveEdges(nodes, rawEdges, { goModules, root });
+        edges = resolveEdges(nodes, rawEdges, { goModules, root, scopes, tsConfigs, packageConfigs });
         graph = {
             meta: {
                 version: 1,

@@ -3,11 +3,13 @@
  * under `<contextDir>/.health/`.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 import {
     CONFIG_FILE,
     DEFAULT_TARGET_STRICT_SCORE,
+    DETECTOR_CATEGORY,
     DETECTOR_STALE_DIMENSIONS,
     HEALTH_DIR,
     PLAN_FILE,
@@ -34,10 +36,13 @@ export function configFilePath(contextDir) {
 export function emptyHealthConfig() {
     return {
         target_strict_score: DEFAULT_TARGET_STRICT_SCORE,
+        issue_noise_budget: 10,
+        issue_noise_global_budget: 0,
         commit_tracking_enabled: true,
         commit_pr: null,
         needs_rescan: false,
         layers: [],
+        layer_rules: [],
         excludes: [],
         suppressions: {},
         zones: {},
@@ -51,6 +56,10 @@ export function loadHealthConfig(contextDir) {
     return {
         ...emptyHealthConfig(),
         ...raw,
+        issue_noise_budget:
+            typeof raw.issue_noise_budget === "number" ? raw.issue_noise_budget : 10,
+        issue_noise_global_budget:
+            typeof raw.issue_noise_global_budget === "number" ? raw.issue_noise_global_budget : 0,
         layers: Array.isArray(raw.layers)
             ? raw.layers
             : typeof raw.layers === "string"
@@ -59,6 +68,7 @@ export function loadHealthConfig(contextDir) {
                     .map((s) => s.trim())
                     .filter(Boolean)
               : [],
+        layer_rules: Array.isArray(raw.layer_rules) ? raw.layer_rules : [],
         excludes: Array.isArray(raw.excludes) ? raw.excludes : [],
         suppressions:
             raw.suppressions && typeof raw.suppressions === "object" ? raw.suppressions : {},
@@ -138,8 +148,12 @@ export function emptyLivingPlan() {
         scan_count_at_last_resolve: 0,
         resolves_since_last_scan: 0,
         scan_gate_skipped: false,
+        promoted_ids: [],
+        policies: [],
         queue_order: [],
         clusters: {},
+        skipped: {},
+        annotations: {},
         focus_cluster: null,
         triage: {
             completed: false,
@@ -169,8 +183,12 @@ export function loadLivingPlan(contextDir) {
     return {
         ...base,
         ...raw,
+        promoted_ids: Array.isArray(raw.promoted_ids) ? raw.promoted_ids : [],
+        policies: Array.isArray(raw.policies) ? raw.policies : [],
         queue_order: Array.isArray(raw.queue_order) ? raw.queue_order : [],
         clusters: raw.clusters && typeof raw.clusters === "object" ? raw.clusters : {},
+        skipped: raw.skipped && typeof raw.skipped === "object" ? raw.skipped : {},
+        annotations: raw.annotations && typeof raw.annotations === "object" ? raw.annotations : {},
         triage: {
             ...base.triage,
             ...(raw.triage && typeof raw.triage === "object" ? raw.triage : {}),
@@ -229,10 +247,60 @@ function markStaleSubjectiveAssessments(nextSubjective, nextIssues, changedIds, 
     return newlyStaleDims;
 }
 
-export const SUSPECT_DROP_THRESHOLD = 5;
+export const SUSPECT_DROP_THRESHOLD = 3;
 
-function computeSuspectDetectors(prevIssues, detectedIssues, forceResolve = false) {
-    if (forceResolve) return new Set();
+/**
+ * Check whether an issue or issue ID matches any configured suppression pattern or fingerprint.
+ * Supports `*` wildcards (e.g. `detector::*::rule` matching `detector::path/to/file.js::rule`).
+ */
+export function isSuppressedByPatterns(issueOrId, suppressions) {
+    if (!issueOrId || !suppressions) return false;
+    const isObj = typeof issueOrId === "object";
+    const id = isObj
+        ? issueOrId.id ||
+          mintIssueId(issueOrId.detector, issueOrId.file, issueOrId.identifier || issueOrId.line)
+        : String(issueOrId);
+    const idParts = id.split("::");
+    const detector = isObj ? issueOrId.detector || idParts[0] || "" : idParts[0] || "";
+    const file = isObj ? issueOrId.file || idParts[1] || "" : idParts[1] || "";
+    const identifier = isObj ? issueOrId.identifier || idParts.slice(2).join("::") : idParts.slice(2).join("::");
+
+    const entries =
+        Array.isArray(suppressions) || suppressions instanceof Set
+            ? [...suppressions].map((p) => (typeof p === "string" ? { pattern: p } : p))
+            : typeof suppressions === "object"
+              ? Object.entries(suppressions).map(([k, v]) =>
+                    typeof v === "object" && v !== null ? { pattern: v.pattern || k, ...v } : { pattern: k },
+                )
+              : [];
+
+    let issueFp = null;
+    if (isObj && detector && (identifier || issueOrId.summary)) {
+        issueFp = createHash("sha1")
+            .update(`${detector}::${identifier || ""}::${issueOrId.summary || ""}`)
+            .digest("hex")
+            .slice(0, 12);
+    }
+
+    for (const entry of entries) {
+        if (!entry) continue;
+        const pat = String(entry.pattern || "").trim();
+        if (!pat) continue;
+        if (pat === id) return true;
+        const exactRe = wildcardToRegExp(pat);
+        if (exactRe.test(id)) return true;
+        const substrRe = wildcardToRegExp(pat.includes("*") ? pat : `*${pat}*`);
+        if (substrRe.test(id)) return true;
+        if (!pat.includes("::") && (substrRe.test(file) || substrRe.test(identifier))) return true;
+        if (issueFp && Array.isArray(entry.fingerprints) && entry.fingerprints.includes(issueFp)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function computeSuspectDetectors(prevIssues, detectedIssues, forceResolve = false, isScopedScan = false) {
+    if (forceResolve || isScopedScan) return new Set();
     const prevOpenByDetector = new Map();
     for (const iss of Object.values(prevIssues || {})) {
         if (iss.detector === "review") continue;
@@ -263,11 +331,46 @@ function reconcileUnseenScanIssues(
     autoResolvedIds,
     suspectDetectors = new Set(),
     suspectHeldIds = [],
+    resurfacedIds = [],
+    reopenedIds = [],
+    scannedCategories = null,
 ) {
+    const catSet =
+        scannedCategories instanceof Set
+            ? scannedCategories
+            : Array.isArray(scannedCategories)
+              ? new Set(scannedCategories)
+              : null;
+
     for (const [id, prev] of Object.entries(prevIssues)) {
         if (seenIds.has(id)) continue;
         if (prev.detector === "review") {
             nextIssues[id] = prev;
+            continue;
+        }
+        const prevCat = prev.category || DETECTOR_CATEGORY[prev.detector] || null;
+        if (catSet && prevCat && !catSet.has(prevCat)) {
+            nextIssues[id] = prev;
+            continue;
+        }
+        if (
+            prev.status === "deferred" &&
+            prev.resurface_after_scan !== undefined &&
+            prev.resurface_after_scan !== null &&
+            scanNum >= Number(prev.resurface_after_scan)
+        ) {
+            const nextReopenCount = (prev.reopen_count || 0) + 1;
+            const resurfaced = {
+                ...prev,
+                status: "open",
+                suspect_hold: false,
+                reopen_count: nextReopenCount,
+                reopened_at_scan: scanNum,
+            };
+            delete resurfaced.resurface_after_scan;
+            nextIssues[id] = resurfaced;
+            resurfacedIds.push(id);
+            reopenedIds.push(id);
             continue;
         }
         if (prev.status === "fixed") {
@@ -278,7 +381,12 @@ function reconcileUnseenScanIssues(
                 verified_at_scan: prev.verified ? prev.verified_at_scan : scanNum,
             };
             if (!prev.verified) verifiedFixedIds.push(id);
-        } else if (prev.status === "open" || prev.status === "deferred") {
+        } else if (
+            prev.status === "open" ||
+            prev.status === "deferred" ||
+            prev.status === "triaged_out" ||
+            (prev.status === "wontfix" && !prev.suppressed)
+        ) {
             if (suspectDetectors.has(prev.detector)) {
                 nextIssues[id] = {
                     ...prev,
@@ -326,20 +434,23 @@ export function appendScoreHistory(state, scores, event = "scan") {
     }
 }
 
-function upsertDetectedScanIssue(item, id, prev, scanNum, nextIssues, newIds, reopenedIds) {
+function upsertDetectedScanIssue(item, id, prev, scanNum, nextIssues, newIds, reopenedIds, resurfacedIds = [], suppressions = null) {
+    const matchedSuppressed = suppressions ? isSuppressedByPatterns({ ...item, id }, suppressions) : false;
     if (!prev) {
         nextIssues[id] = {
             ...item,
             id,
-            status: "open",
+            status: matchedSuppressed ? "wontfix" : "open",
+            suppressed: matchedSuppressed,
             suspect_hold: false,
             verified: false,
+            reopen_count: 0,
             first_seen_scan: scanNum,
             last_seen_scan: scanNum,
             note: null,
             attestation: null,
         };
-        newIds.push(id);
+        if (!matchedSuppressed) newIds.push(id);
     } else if (prev.status === "fixed" || prev.status === "auto_resolved") {
         nextIssues[id] = {
             ...prev,
@@ -348,28 +459,61 @@ function upsertDetectedScanIssue(item, id, prev, scanNum, nextIssues, newIds, re
             status: "open",
             suspect_hold: false,
             verified: false,
+            reopen_count: (prev.reopen_count || 0) + 1,
             last_seen_scan: scanNum,
             reopened_at_scan: scanNum,
         };
         reopenedIds.push(id);
+    } else if (
+        prev.status === "deferred" &&
+        prev.resurface_after_scan !== undefined &&
+        prev.resurface_after_scan !== null &&
+        scanNum >= Number(prev.resurface_after_scan)
+    ) {
+        const resurfaced = {
+            ...prev,
+            ...item,
+            id,
+            status: "open",
+            suspect_hold: false,
+            verified: false,
+            reopen_count: (prev.reopen_count || 0) + 1,
+            last_seen_scan: scanNum,
+            reopened_at_scan: scanNum,
+        };
+        delete resurfaced.resurface_after_scan;
+        nextIssues[id] = resurfaced;
+        reopenedIds.push(id);
+        resurfacedIds.push(id);
     } else {
+        const isSupp = Boolean(prev.suppressed || matchedSuppressed);
         nextIssues[id] = {
             ...prev,
             ...item,
             id,
-            status: prev.status,
+            status: isSupp ? "wontfix" : prev.status,
             suspect_hold: false,
-            suppressed: Boolean(prev.suppressed),
+            suppressed: isSupp,
             last_seen_scan: scanNum,
         };
     }
 }
 
 /**
- * Merge newly detected mechanical issues into persistent `state`, computing the scan diff
- * (`newIssues`, `autoResolved`, `reopened`, `remainingOpen`, `suspectHeld`) and updating scan counters.
+ * Reconcile newly detected issues against `state.issues`, applying suspect detector protection,
+ * chronic reopener tracking (`reopen_count`), `--review-after <N>` auto-resurface, and wildcard suppressions.
  */
-export function mergeScanIntoState(state, detectedIssues, potentials, plan, opts = {}) {
+export function reconcileIssues(state, detectedIssues = [], scannedCategories = null, opts = {}) {
+    if (
+        scannedCategories &&
+        typeof scannedCategories === "object" &&
+        !Array.isArray(scannedCategories) &&
+        !(scannedCategories instanceof Set)
+    ) {
+        opts = scannedCategories;
+        scannedCategories = null;
+    }
+
     const prevIssues = state.issues || {};
     const nextIssues = {};
     const newIds = [];
@@ -377,21 +521,33 @@ export function mergeScanIntoState(state, detectedIssues, potentials, plan, opts
     const reopenedIds = [];
     const verifiedFixedIds = [];
     const suspectHeldIds = [];
+    const resurfacedIds = [];
     const seenIds = new Set();
 
-    const scanNum = (state.scan_count || 0) + 1;
-    const nowIso = new Date().toISOString();
+    const scanNum = Number(opts.scanNum ?? state.scan_count ?? 1);
+    const suppressions = opts.suppressions || state.suppressions || null;
 
-    for (const item of detectedIssues) {
+    for (const item of detectedIssues || []) {
         const id = item.id || mintIssueId(item.detector, item.file, item.identifier || item.line);
         seenIds.add(id);
-        upsertDetectedScanIssue(item, id, prevIssues[id], scanNum, nextIssues, newIds, reopenedIds);
+        upsertDetectedScanIssue(
+            item,
+            id,
+            prevIssues[id],
+            scanNum,
+            nextIssues,
+            newIds,
+            reopenedIds,
+            resurfacedIds,
+            suppressions,
+        );
     }
 
     const suspectDetectors = computeSuspectDetectors(
         prevIssues,
         detectedIssues,
         Boolean(opts.forceResolve),
+        Boolean(opts.isScopedScan),
     );
     reconcileUnseenScanIssues(
         prevIssues,
@@ -402,7 +558,44 @@ export function mergeScanIntoState(state, detectedIssues, potentials, plan, opts
         autoResolvedIds,
         suspectDetectors,
         suspectHeldIds,
+        resurfacedIds,
+        reopenedIds,
+        scannedCategories,
     );
+
+    state.issues = nextIssues;
+    return {
+        issues: nextIssues,
+        suspectDetectors: [...suspectDetectors],
+        suspect_detectors: [...suspectDetectors],
+        suspectSkipped: suspectDetectors.size > 0,
+        newIds,
+        newCount: newIds.length,
+        autoResolvedIds,
+        autoResolvedCount: autoResolvedIds.length,
+        verifiedFixedIds,
+        reopenedIds,
+        reopenedCount: reopenedIds.length,
+        suspectHeldIds,
+        resurfacedIds,
+        resurfacedCount: resurfacedIds.length,
+    };
+}
+
+/**
+ * Merge newly detected mechanical issues into persistent `state`, computing the scan diff
+ * (`newIssues`, `autoResolved`, `reopened`, `remainingOpen`, `suspectHeld`) and updating scan counters.
+ */
+export function mergeScanIntoState(state, detectedIssues, potentials, plan, opts = {}) {
+    const scanNum = (state.scan_count || 0) + 1;
+    const nowIso = new Date().toISOString();
+
+    const rec = reconcileIssues({ ...state, scan_count: scanNum }, detectedIssues, opts.scannedCategories || null, {
+        ...opts,
+        scanNum,
+    });
+    const nextIssues = rec.issues;
+    const { newIds, autoResolvedIds, reopenedIds, verifiedFixedIds, suspectHeldIds, suspectDetectors, resurfacedIds } = rec;
 
     const nextSubjective = opts.resetSubjective
         ? {}
@@ -436,14 +629,16 @@ export function mergeScanIntoState(state, detectedIssues, potentials, plan, opts
             auto_resolved_count: autoResolvedIds.length,
             verified_fixed_count: verifiedFixedIds.length,
             reopened_count: reopenedIds.length,
+            resurfaced_count: resurfacedIds.length,
             suspect_held_count: suspectHeldIds.length,
             open_count: openCount,
             new_ids: newIds,
             auto_resolved_ids: autoResolvedIds,
             verified_fixed_ids: verifiedFixedIds,
             reopened_ids: reopenedIds,
+            resurfaced_ids: resurfacedIds,
             suspect_held_ids: suspectHeldIds,
-            suspect_detectors: [...suspectDetectors],
+            suspect_detectors: suspectDetectors,
             stale_dimensions: [...newlyStaleDims],
         },
     };
@@ -647,6 +842,7 @@ export function recordCommitLog(rootDir, plan, opts = {}, state = null, config =
 
 export function wildcardToRegExp(pattern) {
     const escaped = String(pattern)
+        .replace(/\*+/g, "*")
         .replace(/[.+^${}()|[\]\\]/g, "\\$&")
         .replace(/\*/g, ".*")
         .replace(/\?/g, ".");

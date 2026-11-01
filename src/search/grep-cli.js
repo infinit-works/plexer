@@ -91,10 +91,15 @@ export function formatGrepResult(result) {
  * matches" when really some files were never searched at all. */
 export function zeroHitNote(result) {
     const base = `no hits for "${result.pattern}" in ${result.filesSearched} indexed files. The pattern may be too specific — retry plexer grep with a bare symbol name or short substring (drop the receiver, full signature, and regex anchors). All indexed code was searched; use raw grep -rn only for genuinely unindexed files (docs, configs, brand-new files)`;
-    const { files } = result.truncated;
-    if (files === 0)
+    const notes = [];
+    const { files } = result.truncated ?? { files: 0 };
+    if (files > 0)
+        notes.push(`${plural(files, "indexed file")} could not be read (stale graph? run plexer build)`);
+    if (result.ignoredDirs?.length > 0)
+        notes.push(`matches exist inside git-ignored paths (${result.ignoredDirs.join(", ")})`);
+    if (notes.length === 0)
         return base;
-    return `${base} — note: ${plural(files, "indexed file")} could not be read (stale graph? run plexer build)`;
+    return `${base} — note: ${notes.join("; ")}`;
 }
 /**
  * Resolve the graph at `dir` (respecting `--dir`), run `grepGraph`, and print

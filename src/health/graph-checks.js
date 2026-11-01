@@ -3,11 +3,34 @@
  * operating directly on `plexer`'s `wiring.json` graph + source lines.
  */
 import { basename, dirname } from "node:path";
+import { analyzeGitHistory } from "../blast/history.js";
 import { WALK_RELATIONS } from "../graph/relations.js";
+import { linkTestsForGraph } from "../graph/test-links.js";
+import { globToRegExp, parseLayerRuleEntry } from "../util/paths.js";
 import { spanRange } from "../util/span.js";
 import { classifyStemConvention } from "./concerns.js";
 import { mintIssueId } from "./state.js";
-import { SCORED_ZONES, hasInlineSuppression, isSupportOrBenchFile } from "./zones.js";
+import { SCORED_ZONES, classifyZone, hasInlineSuppression, isSupportOrBenchFile } from "./zones.js";
+
+export { globToRegExp, parseLayerRuleEntry };
+
+function resolveZone(zoneMap, filePath) {
+    if (zoneMap && typeof zoneMap.get === "function" && zoneMap.has(filePath)) {
+        return zoneMap.get(filePath);
+    }
+    if (zoneMap && typeof zoneMap === "object" && !(zoneMap instanceof Map) && zoneMap[filePath]) {
+        return zoneMap[filePath];
+    }
+    return classifyZone(filePath);
+}
+
+function matchesFileFilter(fileFilter, filePath) {
+    if (!fileFilter) return true;
+    if (typeof fileFilter === "function") return Boolean(fileFilter(filePath));
+    if (fileFilter instanceof Set) return fileFilter.has(filePath);
+    if (Array.isArray(fileFilter)) return fileFilter.includes(filePath);
+    return true;
+}
 
 const ENTRYPOINT_BASENAME_RE =
     /^(index|main|cli|server|app|mod|lib|init|plugin|setup|__init__|__main__)\.[a-z0-9]+$/i;
@@ -99,7 +122,47 @@ function findStronglyConnectedComponents(adj) {
     return sccs;
 }
 
-function buildGraphCheckTopology(graph) {
+function normalizeGraphShape(graph) {
+    if (!graph) return { nodes: [], edges: [] };
+    if (Array.isArray(graph.nodes)) {
+        const edges = (graph.edges || []).map((e) => ({
+            ...e,
+            source: e.source ?? e.from ?? e.fromFile,
+            target: e.target ?? e.to ?? e.toFile,
+            relation: e.relation || "imports",
+        }));
+        return { ...graph, nodes: graph.nodes, edges };
+    }
+    const nodes = [];
+    for (const f of graph.files || []) {
+        nodes.push({
+            id: f.id ?? f.path,
+            kind: "file",
+            path: f.path,
+            name: basename(f.path || ""),
+            lineCount: f.lineCount,
+        });
+        for (const sym of f.symbols || []) {
+            nodes.push({
+                ...sym,
+                id: sym.id ?? `${f.path}::${sym.name}`,
+                kind: sym.kind || "function",
+                path: sym.path || f.path,
+                exported: Boolean(sym.exported ?? sym.isExported),
+            });
+        }
+    }
+    const edges = (graph.edges || []).map((e) => ({
+        ...e,
+        source: e.source ?? e.from ?? e.fromFile,
+        target: e.target ?? e.to ?? e.toFile,
+        relation: e.relation || "imports",
+    }));
+    return { ...graph, nodes, edges };
+}
+
+function buildGraphCheckTopology(rawGraph) {
+    const graph = normalizeGraphShape(rawGraph);
     const nodeById = new Map();
     const symbolsByFile = new Map();
     const fileNodes = [];
@@ -121,6 +184,7 @@ function buildGraphCheckTopology(graph) {
     const incomingByTarget = new Map();
     const outgoingBySource = new Map();
     const fileImportOut = new Map();
+    const runtimeFileImportOut = new Map();
     const fileImportIn = new Map();
 
     const addEdgeMap = (map, k, v) => {
@@ -142,10 +206,22 @@ function buildGraphCheckTopology(graph) {
         if (srcNode && tgtNode && srcNode.path !== tgtNode.path) {
             addEdgeMap(fileImportOut, srcNode.path, tgtNode.path);
             addEdgeMap(fileImportIn, tgtNode.path, srcNode.path);
+            if (edge.typeOnly !== true) {
+                addEdgeMap(runtimeFileImportOut, srcNode.path, tgtNode.path);
+            }
         }
     }
 
-    return { nodeById, symbolsByFile, fileNodes, incomingByTarget, outgoingBySource, fileImportOut, fileImportIn };
+    return {
+        nodeById,
+        symbolsByFile,
+        fileNodes,
+        incomingByTarget,
+        outgoingBySource,
+        fileImportOut,
+        runtimeFileImportOut,
+        fileImportIn,
+    };
 }
 
 function checkDeadSymbolsAndWrappersInFile(fNode, lines, fileSymbols, importers, incomingByTarget, potentials, issues) {
@@ -162,25 +238,30 @@ function checkDeadSymbolsAndWrappersInFile(fNode, lines, fileSymbols, importers,
 
         if (!sym.exported) {
             potentials.dead_symbols += 1;
-            const shortName = sym.name.includes(".") ? sym.name.split(".").pop() : sym.name;
-            const nameOccurrences = lines.filter((l) => l.includes(shortName)).length;
-            if (externalCallers.length === 0 && nameOccurrences <= 1) {
-                issues.push({
-                    id: mintIssueId("dead_symbols", fNode.path, sym.name),
-                    detector: "dead_symbols",
-                    category: "dead",
-                    dimension: "code_quality",
-                    tier: "T2",
-                    confidence: "high",
-                    severity: "medium",
-                    file: fNode.path,
-                    line: range.start,
-                    end_line: range.end,
-                    span: sym.span,
-                    identifier: sym.name,
-                    summary: `Unreferenced internal ${sym.kind} \`${sym.name}\` has 0 callers in the graph or enclosing file.`,
-                    suggestion: `Delete dead ${sym.kind} \`${sym.name}\` at ${fNode.path}:${sym.span}.`,
-                });
+            if (externalCallers.length === 0) {
+                const shortName = sym.name.includes(".") ? sym.name.split(".").pop() : sym.name;
+                let nameOccurrences = 0;
+                for (let i = 0; i < lines.length && nameOccurrences <= 1; i++) {
+                    if (lines[i].includes(shortName)) nameOccurrences += 1;
+                }
+                if (nameOccurrences <= 1) {
+                    issues.push({
+                        id: mintIssueId("dead_symbols", fNode.path, sym.name),
+                        detector: "dead_symbols",
+                        category: "dead",
+                        dimension: "code_quality",
+                        tier: "T2",
+                        confidence: "high",
+                        severity: "medium",
+                        file: fNode.path,
+                        line: range.start,
+                        end_line: range.end,
+                        span: sym.span,
+                        identifier: sym.name,
+                        summary: `Unreferenced internal ${sym.kind} \`${sym.name}\` has 0 callers in the graph or enclosing file.`,
+                        suggestion: `Delete dead ${sym.kind} \`${sym.name}\` at ${fNode.path}:${sym.span}.`,
+                    });
+                }
             }
         } else if (!isEntrypointPath(fNode.path, fileSymbols)) {
             potentials.unreferenced_exports += 1;
@@ -342,13 +423,52 @@ function checkDeadAndWrapperIssues(ctx, readLines, zoneMap, ignoreRules, potenti
     }
 }
 
-function checkCycleAndDirectoryCouplingIssues(scoredFileAdj, potentials, issues) {
-    potentials.file_cycles = Math.max(1, scoredFileAdj.size);
-    const sccs = findStronglyConnectedComponents(scoredFileAdj);
+function buildRuntimeScoredFileAdj(rawGraph, zoneMap = null, fileFilter = null) {
+    const graph = normalizeGraphShape(rawGraph);
+    const nodeById = new Map((graph.nodes || []).map((n) => [n.id, n]));
+    const adj = new Map();
+    for (const n of graph.nodes || []) {
+        if (n.kind !== "file") continue;
+        const z = resolveZone(zoneMap, n.path);
+        if (!SCORED_ZONES.has(z)) continue;
+        if (!matchesFileFilter(fileFilter, n.path)) continue;
+        adj.set(n.path, new Set());
+    }
+    for (const e of graph.edges || []) {
+        if (e.typeOnly === true) continue;
+        if (!WALK_RELATIONS.has(e.relation)) continue;
+        const sNode = nodeById.get(e.source);
+        const tNode = nodeById.get(e.target);
+        const sPath = sNode?.path || (adj.has(e.source) ? e.source : null);
+        const tPath = tNode?.path || (adj.has(e.target) ? e.target : null);
+        if (!sPath || !tPath || sPath === tPath) continue;
+        if (!adj.has(sPath)) continue;
+        const tZone = resolveZone(zoneMap, tPath);
+        if (!SCORED_ZONES.has(tZone)) continue;
+        adj.get(sPath).add(tPath);
+    }
+    const out = new Map();
+    for (const [k, set] of adj.entries()) {
+        out.set(k, [...set]);
+    }
+    return out;
+}
+
+/**
+ * Detect circular file dependencies (`file_cycles`), skipping `e.typeOnly === true` edges.
+ */
+export function detectCircularDeps(graphOrAdj, zoneMap = null, fileFilter = null) {
+    const adj =
+        graphOrAdj instanceof Map
+            ? graphOrAdj
+            : buildRuntimeScoredFileAdj(graphOrAdj, zoneMap, fileFilter);
+    const sccs = findStronglyConnectedComponents(adj);
+    const out = [];
     for (const comp of sccs) {
+        if (fileFilter && !comp.some((f) => matchesFileFilter(fileFilter, f))) continue;
         const primary = comp[0];
         const cycleChain = [...comp, comp[0]].join(" → ");
-        issues.push({
+        out.push({
             id: mintIssueId("file_cycles", primary, `cycle_${comp.length}`),
             detector: "file_cycles",
             category: "coupling",
@@ -366,9 +486,19 @@ function checkCycleAndDirectoryCouplingIssues(scoredFileAdj, potentials, issues)
             suggestion: `Break the cycle by extracting shared types/helpers into a leaf module or inverting one dependency edge in ${cycleChain}.`,
         });
     }
+    return out;
+}
 
+/**
+ * Detect reciprocal directory cycles (`directory_cycles`), skipping `e.typeOnly === true` edges.
+ */
+export function detectDirectoryCycles(graphOrAdj, zoneMap = null, fileFilter = null) {
+    const adj =
+        graphOrAdj instanceof Map
+            ? graphOrAdj
+            : buildRuntimeScoredFileAdj(graphOrAdj, zoneMap, fileFilter);
     const dirEdges = new Map();
-    for (const [srcFile, targets] of scoredFileAdj.entries()) {
+    for (const [srcFile, targets] of adj.entries()) {
         const srcDir = dirname(srcFile);
         if (srcDir === ".") continue;
         for (const tgtFile of targets) {
@@ -378,7 +508,7 @@ function checkCycleAndDirectoryCouplingIssues(scoredFileAdj, potentials, issues)
             dirEdges.set(key, (dirEdges.get(key) || 0) + 1);
         }
     }
-    potentials.directory_cycles = Math.max(1, dirEdges.size);
+    const out = [];
     const seenDirPairs = new Set();
     for (const [key, abCount] of dirEdges.entries()) {
         const [dirA, dirB] = key.split(" -> ");
@@ -387,7 +517,7 @@ function checkCycleAndDirectoryCouplingIssues(scoredFileAdj, potentials, issues)
         const baCount = dirEdges.get(`${dirB} -> ${dirA}`) || 0;
         if (baCount > 0) {
             seenDirPairs.add(pairKey);
-            issues.push({
+            out.push({
                 id: mintIssueId("directory_cycles", dirA, basename(dirB)),
                 detector: "directory_cycles",
                 category: "coupling",
@@ -405,6 +535,17 @@ function checkCycleAndDirectoryCouplingIssues(scoredFileAdj, potentials, issues)
             });
         }
     }
+    return out;
+}
+
+function checkCycleAndDirectoryCouplingIssues(runtimeScoredFileAdj, potentials, issues) {
+    potentials.file_cycles = Math.max(1, runtimeScoredFileAdj.size);
+    const fileCycleIssues = detectCircularDeps(runtimeScoredFileAdj);
+    issues.push(...fileCycleIssues);
+
+    const dirCycleIssues = detectDirectoryCycles(runtimeScoredFileAdj);
+    potentials.directory_cycles = Math.max(1, runtimeScoredFileAdj.size);
+    issues.push(...dirCycleIssues);
 }
 
 function checkImportAffinityIssues(scoredFileAdj, fileImportIn, zoneMap, potentials, issues) {
@@ -917,51 +1058,69 @@ function checkSignatureVarianceIssues(ctx, readLines, zoneMap, ignoreRules, pote
     }
 }
 
-function checkTestHealthIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues) {
-    const { nodeById, symbolsByFile, fileNodes, incomingByTarget, fileImportIn } = ctx;
-    const testFiles = fileNodes.filter(
-        (f) => (zoneMap.get(f.path) || "production") === "test" && !isSupportOrBenchFile(f.path),
-    );
-    if (testFiles.length > 0) {
-        for (const fNode of fileNodes) {
-            const zone = zoneMap.get(fNode.path) || "production";
-            if (zone !== "production") continue;
-            if (ignoreRules.isIgnored(fNode.path, "tests")) continue;
+/**
+ * Detect high-fan-in production hubs that lack covering tests (`symbol_call`, `module_import`, or `stem_companion`).
+ */
+export function detectUntestedHubs(rawGraph, zoneMap = null, config = null, fileFilter = null, ctx = null, ignoreRules = null, potentials = null) {
+    const graph = normalizeGraphShape(rawGraph);
+    const topo = ctx || buildGraphCheckTopology(graph);
+    const { nodeById, symbolsByFile, fileNodes, incomingByTarget, fileImportIn } = topo;
+    const testLinks = linkTestsForGraph(graph);
+    const minProdImporters = Number(config?.untested_hub_threshold ?? config?.min_hub_importers ?? 6);
+    const found = [];
 
-            potentials.untested_hubs += 1;
-            const importers = [...(fileImportIn.get(fNode.path) || [])];
-            const fileSymbols = symbolsByFile.get(fNode.path) || [];
-            for (const sym of fileSymbols) {
-                for (const callerId of incomingByTarget.get(sym.id) || []) {
-                    const callerNode = nodeById.get(callerId);
-                    if (callerNode && callerNode.path !== fNode.path) {
-                        importers.push(callerNode.path);
-                    }
+    for (const fNode of fileNodes) {
+        const zone = resolveZone(zoneMap, fNode.path);
+        if (zone !== "production") continue;
+        if (ignoreRules && ignoreRules.isIgnored(fNode.path, "tests")) continue;
+        if (!matchesFileFilter(fileFilter, fNode.path)) continue;
+
+        if (potentials) potentials.untested_hubs += 1;
+        const importers = [...(fileImportIn.get(fNode.path) || [])];
+        const fileSymbols = symbolsByFile.get(fNode.path) || [];
+        for (const sym of fileSymbols) {
+            for (const callerId of incomingByTarget.get(sym.id) || []) {
+                const callerNode = nodeById.get(callerId);
+                if (callerNode && callerNode.path !== fNode.path) {
+                    importers.push(callerNode.path);
                 }
             }
-            const uniqueImporters = [...new Set(importers)];
-            const prodImporters = uniqueImporters.filter((p) => (zoneMap.get(p) || "production") === "production");
-            const testImporters = uniqueImporters.filter((p) => (zoneMap.get(p) || "production") === "test");
-
-            if (prodImporters.length >= 6 && testImporters.length === 0) {
-                issues.push({
-                    id: mintIssueId("untested_hubs", fNode.path, "untested_hub"),
-                    detector: "untested_hubs",
-                    category: "tests",
-                    dimension: "test_health",
-                    tier: "T3",
-                    confidence: "medium",
-                    severity: prodImporters.length >= 10 ? "high" : "medium",
-                    file: fNode.path,
-                    line: 1,
-                    end_line: 1,
-                    span: "L1-L1",
-                    identifier: basename(fNode.path),
-                    summary: `High-fan-in production hub \`${fNode.path}\` (${prodImporters.length} production dependents) has 0 direct test callers or importers.`,
-                    suggestion: `Add unit tests covering the core contracts and edge cases of \`${fNode.path}\`.`,
-                });
-            }
         }
+        const uniqueImporters = [...new Set(importers)];
+        const prodImporters = uniqueImporters.filter((p) => resolveZone(zoneMap, p) === "production");
+        const testImporters = uniqueImporters.filter((p) => resolveZone(zoneMap, p) === "test");
+        const linkedTests = testLinks.testsForFile(fNode.path);
+
+        if (prodImporters.length >= minProdImporters && testImporters.length === 0 && linkedTests.length === 0) {
+            found.push({
+                id: mintIssueId("untested_hubs", fNode.path, "untested_hub"),
+                detector: "untested_hubs",
+                category: "tests",
+                dimension: "test_health",
+                tier: "T3",
+                confidence: "medium",
+                severity: prodImporters.length >= 10 ? "high" : "medium",
+                file: fNode.path,
+                line: 1,
+                end_line: 1,
+                span: "L1-L1",
+                identifier: basename(fNode.path),
+                summary: `High-fan-in production hub \`${fNode.path}\` (${prodImporters.length} production dependents) has 0 direct test callers, module imports, or companion test files.`,
+                suggestion: `Add unit tests covering the core contracts and edge cases of \`${fNode.path}\`.`,
+            });
+        }
+    }
+    return found;
+}
+
+function checkTestHealthIssues(graph, ctx, readLines, zoneMap, ignoreRules, config, potentials, issues) {
+    const { fileNodes } = ctx;
+    const testFiles = fileNodes.filter(
+        (f) => resolveZone(zoneMap, f.path) === "test" && !isSupportOrBenchFile(f.path),
+    );
+    if (testFiles.length > 0) {
+        const hubIssues = detectUntestedHubs(graph, zoneMap, config, null, ctx, ignoreRules, potentials);
+        issues.push(...hubIssues);
     }
 
     const ASSERT_RE =
@@ -1138,10 +1297,260 @@ function checkLayerViolationIssues(scoredFileAdj, config, ignoreRules, potential
     }
 }
 
+const LAYER_CHECK_RELATIONS = new Set(["imports", "calls", "references", "extends", "implements"]);
+
+/**
+ * Evaluate explicit glob `config.layer_rules` (`{ from, to, allowTypeOnly, reason }`)
+ * and inline `forbid: <from> -> <to>` entries in `plan?.policies` across `graph.edges`.
+ */
+export function detectLayerViolations(rawGraph, zoneMap = null, config = null, fileFilter = null, plan = null) {
+    const graph = normalizeGraphShape(rawGraph);
+    const rawRules = [];
+    const entries = [
+        ...(Array.isArray(config?.layer_rules) ? config.layer_rules : []),
+        ...(Array.isArray(config?.layerRules) ? config.layerRules : []),
+        ...(Array.isArray(plan?.policies) ? plan.policies : []),
+        ...(Array.isArray(config?.policies) ? config.policies : []),
+    ];
+    for (const entry of entries) {
+        const parsed = parseLayerRuleEntry(entry);
+        if (!parsed) continue;
+        const toList = Array.isArray(parsed.to) ? parsed.to : [parsed.to];
+        for (const to of toList) {
+            if (!rawRules.some((r) => r.from === parsed.from && r.to === to)) {
+                rawRules.push({
+                    from: parsed.from,
+                    to,
+                    allowTypeOnly: parsed.allowTypeOnly !== false,
+                    reason: parsed.reason || null,
+                });
+            }
+        }
+    }
+
+    if (rawRules.length === 0) return [];
+
+    const compiledRules = rawRules.map((r) => ({
+        ...r,
+        fromRe: globToRegExp(r.from),
+        toRe: globToRegExp(r.to),
+    }));
+
+    const nodeById = new Map((graph?.nodes || []).map((n) => [n.id, n]));
+    const out = [];
+    const seenViolations = new Set();
+
+    for (const edge of graph?.edges || []) {
+        if (!LAYER_CHECK_RELATIONS.has(edge.relation)) continue;
+        const sNode = nodeById.get(edge.source);
+        const tNode = nodeById.get(edge.target);
+        const srcPath = (sNode?.path || "").replace(/\\/g, "/");
+        const tgtPath = (tNode?.path || "").replace(/\\/g, "/");
+        if (!srcPath || !tgtPath || srcPath === tgtPath) continue;
+
+        const srcZone = resolveZone(zoneMap, srcPath);
+        if (!SCORED_ZONES.has(srcZone)) continue;
+        if (!matchesFileFilter(fileFilter, srcPath)) continue;
+
+        for (const rule of compiledRules) {
+            if (edge.typeOnly === true && rule.allowTypeOnly !== false) continue;
+            if (rule.fromRe.test(srcPath) && rule.toRe.test(tgtPath)) {
+                const dedupKey = `${srcPath}::${tgtPath}::${rule.from}->${rule.to}`;
+                if (seenViolations.has(dedupKey)) continue;
+                seenViolations.add(dedupKey);
+
+                const range = spanRange(sNode?.span) || { start: edge.line || 1, end: edge.line || 1 };
+                const ln = edge.line || range.start || 1;
+                out.push({
+                    id: mintIssueId(
+                        "layer_violation",
+                        srcPath,
+                        `${rule.from}_to_${rule.to}_${basename(tgtPath)}`,
+                    ),
+                    detector: "layer_violation",
+                    category: "coupling",
+                    dimension: "security",
+                    tier: "T4",
+                    confidence: "high",
+                    severity: "high",
+                    file: srcPath,
+                    target_file: tgtPath,
+                    line: ln,
+                    end_line: ln,
+                    span: `L${ln}-L${ln}`,
+                    identifier: `${rule.from} -> ${rule.to}`,
+                    summary: `Layer boundary violation: \`${srcPath}\` (\`${rule.from}\`) ${edge.relation} \`${tgtPath}\` (\`${rule.to}\`)${rule.reason ? ` — ${rule.reason}` : ""}.`,
+                    suggestion: `Remove or invert the forbidden dependency from \`${srcPath}\` to \`${tgtPath}\` (${rule.from} -> ${rule.to}).`,
+                });
+            }
+        }
+    }
+
+    return out;
+}
+
+/**
+ * Detect hidden temporal co-change coupling between production files in different directories
+ * (`coCommits >= 4`, `couplingRatio >= 0.65`) that have zero direct static edges in `graph.edges`.
+ */
+export function detectTemporalCoupling(
+    rawGraph,
+    rootDir,
+    contextDir = null,
+    zoneMap = null,
+    config = null,
+    fileFilter = null,
+) {
+    if (!rootDir) return [];
+    const graph = normalizeGraphShape(rawGraph);
+    const history = config?.gitHistory || analyzeGitHistory(rootDir, contextDir);
+    if (!history || !history.coChanges) return [];
+
+    const byId = new Map((graph?.nodes || []).map((n) => [n.id, n]));
+    const prodFiles = new Set();
+    for (const n of graph?.nodes || []) {
+        if (n.kind !== "file") continue;
+        const z = resolveZone(zoneMap, n.path);
+        if (SCORED_ZONES.has(z)) prodFiles.add(n.path.replace(/\\/g, "/"));
+    }
+
+    const staticPairs = new Set();
+    for (const e of graph?.edges || []) {
+        if (e.relation === "contains") continue;
+        const sNode = byId.get(e.source);
+        const tNode = byId.get(e.target);
+        const sf = (sNode?.path || (prodFiles.has(e.source) ? e.source : "")).replace(/\\/g, "/");
+        const tf = (tNode?.path || (prodFiles.has(e.target) ? e.target : "")).replace(/\\/g, "/");
+        if (sf && tf && sf !== tf) {
+            staticPairs.add(`${sf}\0${tf}`);
+            staticPairs.add(`${tf}\0${sf}`);
+        }
+    }
+
+    const out = [];
+    const seenPairs = new Set();
+    for (const [rawSrc, partners] of Object.entries(history.coChanges)) {
+        const srcFile = rawSrc.replace(/\\/g, "/");
+        if (!prodFiles.has(srcFile)) continue;
+        for (const entry of partners || []) {
+            const partnerFile = String(entry.partner || "").replace(/\\/g, "/");
+            if (!prodFiles.has(partnerFile)) continue;
+            if (dirname(srcFile) === dirname(partnerFile)) continue;
+            if (Number(entry.coCommits || 0) < 4 || Number(entry.couplingRatio || 0) < 0.65) {
+                continue;
+            }
+            if (staticPairs.has(`${srcFile}\0${partnerFile}`)) continue;
+
+            const [fileA, fileB] = [srcFile, partnerFile].sort();
+            const pairKey = `${fileA}\0${fileB}`;
+            if (seenPairs.has(pairKey)) continue;
+            seenPairs.add(pairKey);
+
+            if (!matchesFileFilter(fileFilter, fileA) && !matchesFileFilter(fileFilter, fileB)) {
+                continue;
+            }
+
+            out.push({
+                id: mintIssueId("temporal_coupling", fileA, basename(fileB)),
+                detector: "temporal_coupling",
+                category: "coupling",
+                dimension: "code_quality",
+                tier: "T2",
+                confidence: "medium",
+                severity: "medium",
+                file: fileA,
+                partner_file: fileB,
+                co_commits: entry.coCommits,
+                coupling_ratio: entry.couplingRatio,
+                line: 1,
+                end_line: 1,
+                span: "L1-L1",
+                identifier: `${basename(fileA)} <-> ${basename(fileB)}`,
+                summary: `Hidden temporal coupling: \`${fileA}\` and \`${fileB}\` co-changed in ${entry.coCommits} commits (${Math.round(entry.couplingRatio * 100)}% coupling) across different directories with 0 direct static graph edges.`,
+                suggestion: `Extract the shared schema, constant, or contract linking \`${fileA}\` and \`${fileB}\` into an explicit imported module.`,
+            });
+        }
+    }
+
+    return out;
+}
+
+function runCouplingAndLayerGraphChecks(
+    graph,
+    ctx,
+    zoneMap,
+    ignoreRules,
+    wantCoupling,
+    config,
+    opts,
+    potentials,
+    issues,
+) {
+    const scoredFileAdj = new Map();
+    const runtimeScoredFileAdj = new Map();
+    for (const fNode of ctx.fileNodes) {
+        const zone = zoneMap.get(fNode.path) || "production";
+        if (!SCORED_ZONES.has(zone)) continue;
+        if (ignoreRules.isIgnored(fNode.path, "coupling")) continue;
+        const outs = [...(ctx.fileImportOut.get(fNode.path) || [])].filter((t) =>
+            SCORED_ZONES.has(zoneMap.get(t) || "production"),
+        );
+        const runtimeOuts = [...(ctx.runtimeFileImportOut.get(fNode.path) || [])].filter((t) =>
+            SCORED_ZONES.has(zoneMap.get(t) || "production"),
+        );
+        scoredFileAdj.set(fNode.path, outs);
+        runtimeScoredFileAdj.set(fNode.path, runtimeOuts);
+    }
+    checkCycleAndDirectoryCouplingIssues(runtimeScoredFileAdj, potentials, issues);
+    checkLayerViolationIssues(runtimeScoredFileAdj, config, ignoreRules, potentials, issues);
+
+    const explicitLayerViolations = detectLayerViolations(
+        graph,
+        zoneMap,
+        config,
+        opts.fileFilter || null,
+        opts.plan || null,
+    ).filter((iss) => !ignoreRules.isIgnored(iss.file, "layer_violation"));
+    const existingIds = new Set(issues.map((i) => i.id));
+    for (const lv of explicitLayerViolations) {
+        if (!existingIds.has(lv.id)) {
+            issues.push(lv);
+            existingIds.add(lv.id);
+        }
+    }
+
+    if (wantCoupling) {
+        potentials.temporal_coupling = Math.max(1, scoredFileAdj.size);
+        if (opts.rootDir) {
+            const tempIssues = detectTemporalCoupling(
+                graph,
+                opts.rootDir,
+                opts.contextDir || null,
+                zoneMap,
+                config,
+                opts.fileFilter || null,
+            ).filter((iss) => !ignoreRules.isIgnored(iss.file, "coupling"));
+            issues.push(...tempIssues);
+        }
+        checkImportAffinityIssues(scoredFileAdj, ctx.fileImportIn, zoneMap, potentials, issues);
+        const filesByDir = checkDirectoryShapeIssues(ctx.fileNodes, zoneMap, potentials, issues);
+        checkPrivateSymbolAccessIssues(ctx, zoneMap, ignoreRules, potentials, issues);
+        checkNamingInconsistencyIssues(filesByDir, potentials, issues);
+    }
+}
+
 /**
  * Run all graph & topology checks (`dead`, `coupling`, `cohesion`, `tests`).
  */
-export function runGraphChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, config = null) {
+export function runGraphChecks(
+    graph,
+    readLines,
+    zoneMap,
+    ignoreRules,
+    enabledCategories,
+    config = null,
+    opts = {},
+) {
     const issues = [];
     const potentials = {
         dead_symbols: 0,
@@ -1154,6 +1563,7 @@ export function runGraphChecks(graph, readLines, zoneMap, ignoreRules, enabledCa
         file_cycles: 0,
         directory_cycles: 0,
         layer_violation: 0,
+        temporal_coupling: 0,
         import_affinity_outliers: 0,
         private_imports: 0,
         flat_dirs: 0,
@@ -1179,25 +1589,17 @@ export function runGraphChecks(graph, readLines, zoneMap, ignoreRules, enabledCa
     }
 
     if (wantCoupling || wantSecurity) {
-        const scoredFileAdj = new Map();
-        for (const fNode of ctx.fileNodes) {
-            const zone = zoneMap.get(fNode.path) || "production";
-            if (!SCORED_ZONES.has(zone)) continue;
-            if (ignoreRules.isIgnored(fNode.path, "coupling")) continue;
-            const outs = [...(ctx.fileImportOut.get(fNode.path) || [])].filter((t) =>
-                SCORED_ZONES.has(zoneMap.get(t) || "production"),
-            );
-            scoredFileAdj.set(fNode.path, outs);
-        }
-        checkCycleAndDirectoryCouplingIssues(scoredFileAdj, potentials, issues);
-        checkLayerViolationIssues(scoredFileAdj, config, ignoreRules, potentials, issues);
-
-        if (wantCoupling) {
-            checkImportAffinityIssues(scoredFileAdj, ctx.fileImportIn, zoneMap, potentials, issues);
-            const filesByDir = checkDirectoryShapeIssues(ctx.fileNodes, zoneMap, potentials, issues);
-            checkPrivateSymbolAccessIssues(ctx, zoneMap, ignoreRules, potentials, issues);
-            checkNamingInconsistencyIssues(filesByDir, potentials, issues);
-        }
+        runCouplingAndLayerGraphChecks(
+            graph,
+            ctx,
+            zoneMap,
+            ignoreRules,
+            wantCoupling,
+            config,
+            opts,
+            potentials,
+            issues,
+        );
     }
 
     if (wantCohesion) {
@@ -1206,7 +1608,7 @@ export function runGraphChecks(graph, readLines, zoneMap, ignoreRules, enabledCa
     }
 
     if (wantTests) {
-        checkTestHealthIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
+        checkTestHealthIssues(graph, ctx, readLines, zoneMap, ignoreRules, config, potentials, issues);
     }
 
     return { issues, potentials };

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Plexer } from "../src/index.js";
+import { Plexer, buildGraph } from "../src/index.js";
 import { blastRadiusIn } from "../src/blast/blast.js";
 import { markdownReport, textReport } from "../src/blast/render.js";
 import { loadGraphCached } from "../src/graph/load.js";
@@ -453,7 +453,7 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             assert.equal(resetRes.status, "reset");
             assert.deepEqual(resetRes.plan.clusters, {});
 
-            // 10. MCP tool `plexer_health` (`status`, `tree`, `detect`)
+            // 10. MCP tool `plexer_health` (`status`, `tree`, `detect`, `show`, and disallowed `autofix`)
             const mcpRes = await callTool(tmp, "plexer_health", { action: "status" });
             assert.equal(mcpRes.isError, false);
             assert.ok(mcpRes.text.includes("plexer health"));
@@ -461,6 +461,19 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             const mcpTree = await callTool(tmp, "plexer_health", { action: "tree" });
             assert.equal(mcpTree.isError, false);
             assert.ok(mcpTree.text.includes("plexer health tree"));
+
+            const mcpShow = await callTool(tmp, "plexer_health", { action: "show" });
+            assert.equal(mcpShow.isError, false);
+            assert.ok(mcpShow.text.trim().length > 0 && mcpShow.text.includes("plexer health show"));
+
+            const mcpBadAction = await callTool(tmp, "plexer_health", { action: "autofix" });
+            assert.equal(mcpBadAction.isError, true);
+            assert.ok(mcpBadAction.text.includes("invalid health action"));
+
+            assert.throws(
+                () => px.health(tmp, { action: "move", src: "src/Server/Util.luau", dst: "../outside", dryRun: true }),
+                Error,
+            );
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }
@@ -964,6 +977,260 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             const txtBlast = textReport(blastRes);
             assert.ok(mdBlast.includes("Health hotspots on touched/impacted files"));
             assert.ok(txtBlast.includes("health hotspots"));
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("supports Pillar 2 & 3 health upgrades: score drag/impact, offline squarified treemap, rich plan/cluster steps, chronic/suspect guards, review personas/similarity/sha256, typeOnly cycles, layer rules, and temporal coupling", async () => {
+        const { execFileSync } = await import("node:child_process");
+        const { computeScoreSnapshot, computeScoreImpact } = await import("../src/health/scoring.js");
+        const { reconcileIssues } = await import("../src/health/state.js");
+        const { mergeReviewBatches } = await import("../src/health/review.js");
+        const { detectCircularDeps } = await import("../src/health/graph-checks.js");
+
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-health-pillar23-"));
+        try {
+            execFileSync("git", ["init", "-q"], { cwd: tmp });
+            execFileSync("git", ["config", "user.email", "dev@example.com"], { cwd: tmp });
+            execFileSync("git", ["config", "user.name", "Dev"], { cwd: tmp });
+
+            mkdirSync(join(tmp, "src", "client"), { recursive: true });
+            mkdirSync(join(tmp, "src", "server"), { recursive: true });
+
+            // Create 4 co-change commits between src/client/ui.ts and src/server/handler.ts without static edges
+            for (let i = 1; i <= 4; i++) {
+                writeFileSync(
+                    join(tmp, "src", "client", "ui.ts"),
+                    `export function renderUi(): number {\n  console.log("debug ui ${i}");\n  return ${i};\n}\n`,
+                );
+                writeFileSync(
+                    join(tmp, "src", "server", "handler.ts"),
+                    `export function runServer(): number {\n  console.log("debug srv ${i}");\n  return ${i * 10};\n}\n`,
+                );
+                execFileSync("git", ["add", "."], { cwd: tmp });
+                execFileSync("git", ["commit", "-q", "-m", `co-change ${i}`], { cwd: tmp });
+            }
+
+            // Add a type-only cycle between peerA.ts and peerB.ts (must NOT trigger circular_deps)
+            // and a forbidden layer import from client/bridge.ts -> server/handler.ts
+            writeFileSync(
+                join(tmp, "src", "client", "peerA.ts"),
+                'import type { PeerB } from "./peerB";\nexport interface PeerA { b?: PeerB; }\nexport function useA(): number { return 1; }\n',
+            );
+            writeFileSync(
+                join(tmp, "src", "client", "peerB.ts"),
+                'import type { PeerA } from "./peerA";\nexport interface PeerB { a?: PeerA; }\nexport function useB(): number { return 2; }\n',
+            );
+            writeFileSync(
+                join(tmp, "src", "client", "bridge.ts"),
+                'import { runServer } from "../server/handler";\nexport function callBridge(): number { return runServer(); }\n',
+            );
+
+            await buildGraph(tmp);
+            const px = new Plexer();
+
+            // Add a policy with inline `forbid:` layer boundary rule
+            const polAdd = px.health(tmp, {
+                action: "plan",
+                subAction: "policy",
+                policyAction: "add",
+                rule: "forbid: src/client/** -> src/server/**",
+            });
+            assert.equal(polAdd.ok, true);
+            assert.equal(polAdd.policies.length, 1);
+
+            const scanRes = px.health(tmp, { action: "scan" });
+            assert.ok(scanRes.queue.total_open >= 2);
+
+            // Verify type-only cycle did NOT trigger circular_deps
+            const loadedG = loadGraphCached(join(tmp, "plexer"));
+            const cycRes = detectCircularDeps(loadedG, new Map());
+            assert.equal(
+                cycRes.some((iss) => iss.file.includes("peerA") || iss.file.includes("peerB")),
+                false,
+                "typeOnly imports must not trigger runtime circular_deps",
+            );
+
+            // Verify layer_violation and temporal_coupling fired
+            const showAll = px.health(tmp, { action: "show", noBudget: true, max: "all" });
+            assert.ok(
+                showAll.items.some((iss) => iss.detector === "layer_violation" && iss.file === "src/client/bridge.ts"),
+                "inline forbid policy must trigger layer_violation on src/client/bridge.ts",
+            );
+            assert.ok(
+                showAll.items.some((iss) => iss.detector === "temporal_coupling"),
+                "4 co-commits without static edge between ui.ts and handler.ts must trigger temporal_coupling",
+            );
+
+            // Score drag & computeScoreImpact
+            assert.ok(
+                typeof scanRes.scores.dimensions.code_quality.overall_drag === "number" &&
+                    scanRes.scores.dimensions.code_quality.overall_drag > 0,
+                "failing dimension must report positive overall_drag",
+            );
+            const stateDisk = JSON.parse(readFileSync(join(tmp, "plexer", ".health", "state.json"), "utf8"));
+            const impact = computeScoreImpact(stateDisk, "layer_violation");
+            assert.ok(impact.deltaStrict >= 0, "computeScoreImpact returns deltaStrict");
+
+            // Next with --explain and --group
+            const nextExplain = px.health(tmp, { action: "next", explain: true, count: 5 });
+            assert.ok(nextExplain.queue.items.length >= 1);
+            assert.ok(
+                nextExplain.queue.items[0].explanation && nextExplain.queue.items[0].explanation.includes("Tier"),
+                "next --explain attaches ranking rationale",
+            );
+            const nextGrouped = px.health(tmp, { action: "next", group: "detector", count: 5 });
+            assert.equal(nextGrouped.queue.group_mode, "detector");
+            assert.ok(Array.isArray(nextGrouped.queue.groups) && nextGrouped.queue.groups.length >= 1);
+
+            // Plan describe, note, promote, backlog, reorder up/down
+            const firstId = showAll.items[0].id;
+            const descRes = px.health(tmp, {
+                action: "plan",
+                subAction: "describe",
+                patterns: [firstId],
+                text: "Custom architectural description",
+            });
+            assert.equal(descRes.updated_ids.length, 1);
+
+            const noteRes = px.health(tmp, {
+                action: "plan",
+                subAction: "note",
+                patterns: [firstId],
+                text: "Track root cause in bridge",
+            });
+            assert.equal(noteRes.updated_ids.length, 1);
+
+            const promRes = px.health(tmp, {
+                action: "plan",
+                subAction: "promote",
+                patterns: [firstId],
+                position: "top",
+            });
+            assert.ok(promRes.promoted_ids.includes(firstId));
+
+            const backRes = px.health(tmp, {
+                action: "plan",
+                subAction: "backlog",
+                patterns: [firstId],
+            });
+            assert.ok(backRes.demoted_ids.includes(firstId));
+
+            // Skip with --review-after 1 -> resurfaces on next scan, and reopen twice -> chronic
+            px.health(tmp, {
+                action: "plan",
+                subAction: "skip",
+                patterns: [firstId],
+                reviewAfter: 1,
+                confirm: true,
+            });
+            // Rescan triggers resurface_after_scan and increments reopen_count
+            px.health(tmp, { action: "scan" });
+            px.health(tmp, { action: "plan", subAction: "skip", patterns: [firstId], confirm: true });
+            px.health(tmp, { action: "plan", subAction: "reopen", patterns: [firstId] });
+            const chronicShow = px.health(tmp, { action: "show", chronic: true });
+            assert.ok(
+                chronicShow.items.some((iss) => iss.id === firstId && iss.reopen_count >= 2),
+                "show --chronic surfaces issue reopened >= 2 times",
+            );
+
+            // Structured cluster steps, export YAML, import, and merge
+            px.health(tmp, {
+                action: "plan",
+                subAction: "cluster",
+                clusterAction: "create",
+                clusterName: "arch-cleanup",
+                patterns: [firstId],
+                addStep: "Decouple client bridge",
+                detail: "Move RPC call behind typed transport",
+                effort: "medium",
+            });
+            const stepDone = px.health(tmp, {
+                action: "plan",
+                subAction: "cluster",
+                clusterAction: "update",
+                clusterName: "arch-cleanup",
+                doneStep: 1,
+            });
+            assert.equal(stepDone.cluster.steps[0].done, true);
+
+            const expYaml = px.health(tmp, {
+                action: "plan",
+                subAction: "cluster",
+                clusterAction: "export",
+                clusterName: "arch-cleanup",
+                format: "yaml",
+            });
+            assert.ok(expYaml.exported.includes("Decouple client bridge"));
+
+            // Suspect detector zero-drop protection in reconcileIssues
+            const mockState = {
+                scan_count: 5,
+                issues: {
+                    "detA::f1::r": { id: "detA::f1::r", detector: "detA", status: "open", file: "f1.ts" },
+                    "detA::f2::r": { id: "detA::f2::r", detector: "detA", status: "open", file: "f2.ts" },
+                    "detA::f3::r": { id: "detA::f3::r", detector: "detA", status: "open", file: "f3.ts" },
+                },
+                suppressions: [],
+            };
+            const recGuard = reconcileIssues(mockState, [], null, { isScopedScan: false, forceResolve: false });
+            assert.ok(recGuard.suspectDetectors.includes("detA"), "3->0 drop without forceResolve flags suspect detector");
+            assert.equal(mockState.issues["detA::f1::r"].status, "open", "suspect detector issues remain open");
+
+            // Repair state from plan
+            const repairRes = px.health(tmp, { action: "plan", subAction: "repair-state" });
+            assert.equal(repairRes.ok, true);
+
+            // Offline squarified treemap HTML check (zero external HTTP scripts)
+            const vizOut = px.health(tmp, { action: "viz" });
+            const treemapHtml = readFileSync(vizOut.output_path, "utf8");
+            assert.ok(treemapHtml.includes("function squarify"), "treemap embeds offline squarify algorithm");
+            assert.ok(treemapHtml.includes('data-mode="churn"'), "treemap includes churn color mode");
+            assert.equal(/<script[^>]+src=["']https?:/i.test(treemapHtml), false, "treemap must have zero external CDN scripts");
+
+            // Review personas, retrospective, packet_sha256, and similarity deduplication
+            const prepRev = px.health(tmp, { action: "review", prepare: true });
+            assert.ok(prepRev.packet_sha256 && prepRev.packet_sha256.length === 64, "query records packet_sha256");
+            assert.ok(prepRev.batches[0].persona && prepRev.batches[0].persona.id, "batches rotate reviewer personas");
+            const blindJson = JSON.parse(readFileSync(prepRev.blind_packet_path, "utf8"));
+            assert.ok(blindJson.retrospective, "blind packet includes retrospective context");
+
+            const batchDir = join(tmp, "batches-merge");
+            mkdirSync(batchDir, { recursive: true });
+            writeFileSync(
+                join(batchDir, "batch-1.raw.txt"),
+                JSON.stringify({
+                    assessments: { high_level_elegance: 85 },
+                    findings: [
+                        {
+                            dimension: "high_level_elegance",
+                            identifier: "f1",
+                            summary: "Client bridge directly calls server handler module violating layer boundary",
+                            suggestion: "Extract a shared contract interface and invoke via transport adapter",
+                            related_files: ["src/client/bridge.ts"],
+                        },
+                    ],
+                }),
+            );
+            writeFileSync(
+                join(batchDir, "batch-2.raw.txt"),
+                JSON.stringify({
+                    assessments: { high_level_elegance: 83 },
+                    findings: [
+                        {
+                            dimension: "high_level_elegance",
+                            identifier: "f2",
+                            summary: "Client bridge directly calls server handler module violating layer boundary rules",
+                            suggestion: "Extract a shared contract interface and invoke via transport adapter layer",
+                            related_files: ["src/client/bridge.ts", "src/server/handler.ts"],
+                        },
+                    ],
+                }),
+            );
+            const merged = mergeReviewBatches(batchDir, { similarity: 0.7 });
+            assert.equal(merged.findings.length, 1, "near-duplicate findings across batches must be merged via similarity");
+            assert.equal(merged.findings[0].related_files.length, 2, "merged finding unions related_files");
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }

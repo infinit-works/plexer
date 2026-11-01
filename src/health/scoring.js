@@ -25,6 +25,10 @@ import { healthDir } from "./state.js";
 const MAX_REVIEW_ISSUES_FOR_SPAN = 15;
 const REVIEW_ISSUE_PENALTY_SPAN = 40.0;
 
+function round(val, decimals = 2) {
+    return Number(Number(val || 0).toFixed(decimals));
+}
+
 function fileCappedFailureUnits(weightedCount) {
     if (weightedCount <= 0) return 0;
     if (weightedCount <= 2.0) return Math.min(1.0, weightedCount * 0.5);
@@ -33,10 +37,10 @@ function fileCappedFailureUnits(weightedCount) {
 }
 
 function countsTowardVariant(issue, variant) {
-    if (issue.suppressed) return false;
     const st = issue.status || "open";
     if (st === "false_positive") return false;
     if (variant === "lenient") {
+        if (issue.suppressed) return false;
         // `open`, `deferred`, `triaged_out` count as failures; `wontfix`, `fixed`, `auto_resolved` do not
         return st === "open" || st === "deferred" || st === "triaged_out";
     }
@@ -49,6 +53,7 @@ function countsTowardVariant(issue, variant) {
         if (st === "fixed" && !issue.verified) return true;
         return st === "open" || st === "deferred" || st === "triaged_out" || st === "wontfix";
     }
+    if (issue.suppressed) return false;
     return st === "open";
 }
 
@@ -63,7 +68,7 @@ function computeMechanicalDimensionScore(dimDef, allIssues, potentials, variant)
     const matchingIssues = allIssues.filter(
         (iss) =>
             iss.detector !== "review" &&
-            (iss.dimension === dimDef.id || detSet.has(iss.detector)) &&
+            (iss.dimension ? iss.dimension === dimDef.id : detSet.has(iss.detector)) &&
             countsTowardVariant(iss, variant),
     );
 
@@ -87,17 +92,25 @@ function computeMechanicalDimensionScore(dimDef, allIssues, potentials, variant)
 
     const rawScore = Math.max(0, Math.min(100, ((potential - weightedFailures) / potential) * 100));
     const dampening = Math.min(1.0, potential / SAMPLE_DAMPENING_THRESHOLD);
-    const effectiveWeight = dimDef.weight * Math.max(0.25, dampening);
+    const sampleFactor = Math.max(0.25, dampening);
+    const effectiveWeight = dimDef.weight * sampleFactor;
+    const roundedScore = round(rawScore, 2);
 
     return {
         id: dimDef.id,
         name: dimDef.name,
         pool: "mechanical",
         potential,
-        failures: Number(weightedFailures.toFixed(2)),
+        failures: round(weightedFailures, 2),
         open_count: matchingIssues.length,
-        score: Number(rawScore.toFixed(1)),
-        effective_weight: Number(effectiveWeight.toFixed(3)),
+        score: roundedScore,
+        strict: roundedScore,
+        weight: dimDef.weight,
+        sample_factor: round(sampleFactor, 3),
+        effective_weight: round(effectiveWeight, 3),
+        pool_share: 0,
+        overall_per_point: 0,
+        overall_drag: 0,
     };
 }
 
@@ -111,8 +124,11 @@ function calcMechanicalPool(allIssues, potentials, variant) {
         weightedSum += res.score * res.effective_weight;
         totalWeight += res.effective_weight;
     }
+    for (const d of Object.values(dims)) {
+        d.pool_share = totalWeight > 0 ? round(d.effective_weight / totalWeight, 4) : 0;
+    }
     const poolScore = totalWeight > 0 ? weightedSum / totalWeight : 100.0;
-    return { poolScore: Number(poolScore.toFixed(1)), dims };
+    return { poolScore: round(poolScore, 2), totalWeight, dims };
 }
 
 function reviewIssuesByDim(allIssues, variant) {
@@ -144,10 +160,16 @@ function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
                 name: sDef.name,
                 pool: "subjective",
                 score: null,
+                strict: null,
                 lenient_score: null,
                 assessment_score: null,
                 open_review_issues: Math.ceil(openRevWeight),
                 weight: sDef.weight,
+                sample_factor: 0,
+                effective_weight: 0,
+                pool_share: 0,
+                overall_per_point: 0,
+                overall_drag: 0,
                 assessed_at: null,
                 stale: false,
                 stale_reason: null,
@@ -173,8 +195,8 @@ function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
               )
             : 0;
 
-    const strictDimScore = Math.max(0, Number((rawAssessment - strictPenalty).toFixed(1)));
-    const lenientDimScore = Math.max(0, Number((rawAssessment - lenientPenalty).toFixed(1)));
+    const strictDimScore = Math.max(0, round(rawAssessment - strictPenalty, 2));
+    const lenientDimScore = Math.max(0, round(rawAssessment - lenientPenalty, 2));
 
     return {
         hasScore: true,
@@ -186,10 +208,16 @@ function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
             name: sDef.name,
             pool: "subjective",
             score: strictDimScore,
+            strict: strictDimScore,
             lenient_score: lenientDimScore,
-            assessment_score: Number(rawAssessment.toFixed(1)),
+            assessment_score: round(rawAssessment, 1),
             open_review_issues: Math.ceil(openRevWeight),
             weight: sDef.weight,
+            sample_factor: 1,
+            effective_weight: sDef.weight,
+            pool_share: 0,
+            overall_per_point: 0,
+            overall_drag: 0,
             assessed_at: entry.assessed_at || null,
             stale: Boolean(entry.stale),
             stale_reason: entry.stale_reason || null,
@@ -198,26 +226,12 @@ function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
     };
 }
 
-/**
- * Compute full score snapshot (`strict`, `overall`, `objective`, `verified`) + dimension breakdown.
- */
-export function computeScoreSnapshot(state) {
-    const allIssues = Object.values(state.issues || {});
-    const potentials = state.potentials || {};
-    const rawSubjAssessments = state.subjective_assessments || {};
-
+function computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, lenientReviewIssues) {
     const subjAssessments = {};
     for (const [k, v] of Object.entries(rawSubjAssessments)) {
         const norm = normalizeDimensionKey(k);
         if (norm) subjAssessments[norm] = v;
     }
-
-    const lenientMech = calcMechanicalPool(allIssues, potentials, "lenient");
-    const strictMech = calcMechanicalPool(allIssues, potentials, "strict");
-    const verifiedMech = calcMechanicalPool(allIssues, potentials, "verified");
-
-    const lenientReviewIssues = reviewIssuesByDim(allIssues, "lenient");
-    const strictReviewIssues = reviewIssuesByDim(allIssues, "strict");
 
     const subjDims = {};
     let subjLenientWeightedSum = 0;
@@ -248,19 +262,65 @@ export function computeScoreSnapshot(state) {
         }
     }
 
+    for (const sDef of Object.values(SUBJECTIVE_DIMENSIONS)) {
+        const d = subjDims[sDef.id];
+        if (d && d.score !== null && subjTotalWeight > 0) {
+            d.pool_share = round(d.effective_weight / subjTotalWeight, 4);
+            d.overall_per_point = round(d.pool_share * SUBJECTIVE_POOL_WEIGHT, 4);
+            d.overall_drag = round((100 - d.strict) * d.overall_per_point, 2);
+        }
+    }
+
     const subjectiveStrictPoolScore =
         hasSubjectiveScores && subjTotalWeight > 0
-            ? Number((subjStrictWeightedSum / subjTotalWeight).toFixed(1))
+            ? round(subjStrictWeightedSum / subjTotalWeight, 2)
             : null;
     const subjectiveLenientPoolScore =
         hasSubjectiveScores && subjTotalWeight > 0
-            ? Number((subjLenientWeightedSum / subjTotalWeight).toFixed(1))
+            ? round(subjLenientWeightedSum / subjTotalWeight, 2)
             : null;
+
+    return {
+        subjDims,
+        hasSubjectiveScores,
+        subjectiveStrictPoolScore,
+        subjectiveLenientPoolScore,
+    };
+}
+
+/**
+ * Compute full score snapshot (`strict`, `overall`, `objective`, `verified`) + dimension breakdown.
+ */
+export function computeScoreSnapshot(state) {
+    const allIssues = Object.values(state?.issues || {});
+    const potentials = state?.potentials || {};
+    const rawSubjAssessments = state?.subjective_assessments || state?.dimension_scores || {};
+
+    const lenientMech = calcMechanicalPool(allIssues, potentials, "lenient");
+    const strictMech = calcMechanicalPool(allIssues, potentials, "strict");
+    const verifiedMech = calcMechanicalPool(allIssues, potentials, "verified");
+
+    const lenientReviewIssues = reviewIssuesByDim(allIssues, "lenient");
+    const strictReviewIssues = reviewIssuesByDim(allIssues, "strict");
+
+    const {
+        subjDims,
+        hasSubjectiveScores,
+        subjectiveStrictPoolScore,
+        subjectiveLenientPoolScore,
+    } = computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, lenientReviewIssues);
+
+    const mechPoolFactor = hasSubjectiveScores ? MECHANICAL_POOL_WEIGHT : 1.0;
+    for (const d of Object.values(strictMech.dims)) {
+        d.lenient_score = lenientMech.dims[d.id]?.score ?? d.score;
+        d.overall_per_point = round(d.pool_share * mechPoolFactor, 4);
+        d.overall_drag = round((100 - d.strict) * d.overall_per_point, 2);
+    }
 
     const blend = (mechScore, subjScore) =>
         subjScore === null
             ? mechScore
-            : Number((mechScore * MECHANICAL_POOL_WEIGHT + subjScore * SUBJECTIVE_POOL_WEIGHT).toFixed(1));
+            : round(mechScore * MECHANICAL_POOL_WEIGHT + subjScore * SUBJECTIVE_POOL_WEIGHT, 2);
 
     const overall = blend(lenientMech.poolScore, subjectiveLenientPoolScore);
     const strict = blend(strictMech.poolScore, subjectiveStrictPoolScore);
@@ -271,18 +331,94 @@ export function computeScoreSnapshot(state) {
         .filter((d) => d.stale)
         .map((d) => d.id);
 
+    const allDimensions = { ...strictMech.dims, ...subjDims };
+    for (const sDef of Object.values(SUBJECTIVE_DIMENSIONS)) {
+        if (sDef.short_id && sDef.short_id !== sDef.id && subjDims[sDef.id]) {
+            Object.defineProperty(allDimensions, sDef.short_id, {
+                value: subjDims[sDef.id],
+                enumerable: false,
+                configurable: true,
+            });
+        }
+    }
+
     return {
         strict,
         overall,
         objective,
         verified,
-        wontfix_gap: Number(Math.max(0, overall - strict).toFixed(1)),
+        wontfix_gap: round(Math.max(0, overall - strict), 2),
         wontfix_count: wontfixCount,
         has_subjective: hasSubjectiveScores,
         subjective_pool_score: subjectiveStrictPoolScore,
         stale_dimensions: staleDimensions,
+        dimensions: allDimensions,
         mechanical_dimensions: strictMech.dims,
         subjective_dimensions: subjDims,
+    };
+}
+
+/**
+ * Simulate marking the given open issue IDs (Array/Set) or detector name as `fixed`
+ * and compute `{ deltaStrict, deltaOverall, deltaObjective }`.
+ */
+export function computeScoreImpact(state, targetIssueIdsOrDetector, baselineScores = null) {
+    if (!state || !state.issues) {
+        return { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
+    }
+    const oldScores = baselineScores || computeScoreSnapshot(state);
+    const issuesMap = state.issues;
+    const targetIds = new Set();
+
+    if (typeof targetIssueIdsOrDetector === "string") {
+        const key = targetIssueIdsOrDetector.trim();
+        if (issuesMap[key]) {
+            targetIds.add(key);
+        } else {
+            for (const iss of Object.values(issuesMap)) {
+                if (iss.detector === key) targetIds.add(iss.id);
+            }
+        }
+    } else if (Array.isArray(targetIssueIdsOrDetector) || targetIssueIdsOrDetector instanceof Set) {
+        for (const item of targetIssueIdsOrDetector) {
+            if (typeof item === "string") {
+                if (issuesMap[item]) targetIds.add(item);
+            } else if (item && typeof item === "object" && item.id) {
+                targetIds.add(item.id);
+            }
+        }
+    }
+
+    if (targetIds.size === 0) {
+        return { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
+    }
+
+    const simIssues = { ...issuesMap };
+    let changed = false;
+    for (const id of targetIds) {
+        const existing = simIssues[id];
+        if (!existing || existing.status === "fixed" || existing.status === "auto_resolved") continue;
+        simIssues[id] = {
+            ...existing,
+            status: "fixed",
+            verified: true,
+        };
+        changed = true;
+    }
+
+    if (!changed) {
+        return { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
+    }
+
+    const newScores = computeScoreSnapshot({
+        ...state,
+        issues: simIssues,
+    });
+
+    return {
+        deltaStrict: round(newScores.strict - oldScores.strict, 2),
+        deltaOverall: round(newScores.overall - oldScores.overall, 2),
+        deltaObjective: round(newScores.objective - oldScores.objective, 2),
     };
 }
 

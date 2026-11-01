@@ -74,6 +74,7 @@ export const MECHANICAL_DIMENSIONS = {
             "language_traps",
             "reactive_smells",
             "luau_quality",
+            "temporal_coupling",
         ],
     },
     duplication: {
@@ -118,6 +119,75 @@ export const ALL_CATEGORIES = [
     "security",
 ];
 
+export const DETECTOR_CATEGORY = {
+    duplicates: "duplicates",
+    dead_symbols: "dead",
+    unreferenced_exports: "dead",
+    orphaned_files: "dead",
+    single_importer_files: "dead",
+    passthrough_wrappers: "dead",
+    facade_modules: "dead",
+    delegation_heavy_classes: "cohesion",
+    file_cycles: "coupling",
+    directory_cycles: "coupling",
+    layer_violation: "coupling",
+    temporal_coupling: "coupling",
+    import_affinity_outliers: "coupling",
+    private_imports: "coupling",
+    flat_dirs: "coupling",
+    package_census: "coupling",
+    naming_inconsistencies: "coupling",
+    signature_variance: "cohesion",
+    low_cohesion_files: "cohesion",
+    monster_functions: "cohesion",
+    god_classes: "cohesion",
+    untested_hubs: "tests",
+    hollow_tests: "tests",
+    silent_catches: "catches",
+    type_bypasses: "types",
+    enum_bypasses: "types",
+    dict_keys: "types",
+    stale_deprecations: "slop",
+    ai_slop: "slop",
+    debug_logs: "slop",
+    language_traps: "traps",
+    reactive_smells: "traps",
+    luau_quality: "traps",
+    security_traps: "security",
+    roblox_security: "security",
+};
+
+export const REVIEWER_PERSONAS = [
+    {
+        name: "Pragmatist",
+        id: "pragmatist",
+        bias: "Simplicity, directness, and deleting unnecessary indirection or speculative abstractions.",
+        question:
+            "Can this layer, wrapper, or abstraction be deleted or inlined without losing real domain capability?",
+    },
+    {
+        name: "Architect",
+        id: "architect",
+        bias: "Module boundaries, dependency direction, contract coherence, and long-term structural seams.",
+        question:
+            "Where do module boundaries leak internal state, invert layer dependencies, or blur domain responsibilities?",
+    },
+    {
+        name: "Bug Hunter",
+        id: "bug_hunter",
+        bias: "Edge-case failures, silent error swallowing, race conditions, trust boundaries, and incomplete state transitions.",
+        question:
+            "What inputs, failure modes, or ordering assumptions will silently corrupt state or fail in production?",
+    },
+    {
+        name: "Migrator",
+        id: "migrator",
+        bias: "Incomplete migrations, parallel legacy/modern paths, convention drift, and compatibility shims that outlived their rollout.",
+        question:
+            "Where are two competing patterns or half-finished migrations forcing readers to hold duplicate mental models?",
+    },
+];
+
 export const ATTEST_RESOLVE_EXAMPLE =
     "I have reviewed this fix in code, verified callers/tests remain intact, and I am not gaming the score.";
 export const ATTEST_WONTFIX_EXAMPLE =
@@ -150,6 +220,7 @@ export const DETECTOR_STALE_DIMENSIONS = {
     file_cycles: ["cross_module_architecture", "dependency_health"],
     directory_cycles: ["cross_module_architecture", "dependency_health"],
     layer_violation: ["cross_module_architecture", "high_level_elegance"],
+    temporal_coupling: ["cross_module_architecture", "dependency_health"],
     low_cohesion_files: ["design_coherence", "abstraction_fitness"],
     monster_functions: ["design_coherence", "abstraction_fitness", "logic_clarity"],
     god_classes: ["design_coherence", "abstraction_fitness", "logic_clarity"],

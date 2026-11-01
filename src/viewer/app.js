@@ -2613,8 +2613,8 @@ function drawFeaturedNodes(featuredNodes, k, invSqrtK) {
     if (fileHealth && fileHealth.count > 0 && bodyAlpha > 0.3) {
       ctx.globalAlpha = bodyAlpha * 0.78;
       ctx.strokeStyle =
-        fileHealth.max_severity === "high"
-          ? "#ef4444"
+        fileHealth.max_severity === "critical" || fileHealth.max_severity === "high"
+          ? "#f87171"
           : fileHealth.max_severity === "medium"
             ? "#f59e0b"
             : "#38bdf8";

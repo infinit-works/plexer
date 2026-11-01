@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * `plexer` CLI — structural codebase context graph ($0, offline, WASM tree-sitter + Luau/Roblox).
- * Commands: build, ask, read, callers, callees, impact, skeleton, grep, map, blast, viz, mcp, check, init, setup, retract, version.
+ * Commands: build, ask, read, callers, callees, impact, skeleton, grep, map, blast, health, viz, mcp, check, init, setup, retract, version.
  */
 import { Command } from "commander";
 import { existsSync, statSync } from "node:fs";
@@ -482,7 +482,7 @@ program
 
 program
     .command("mcp")
-    .description("Serve the graph over MCP (stdio) — exposes plexer_find_code, plexer_read, plexer_trace_calls, plexer_find_all, plexer_file_api, plexer_repo_map, plexer_blast and plexer_check_freshness")
+    .description("Serve the graph over MCP (stdio) — exposes plexer_find_code, plexer_read, plexer_trace_calls, plexer_find_all, plexer_file_api, plexer_repo_map, plexer_blast, plexer_health and plexer_check_freshness")
     .argument(...DIR_ARG)
     .action(async (dirArg) => {
         const dir = queryRoot(dirArg);
@@ -684,6 +684,7 @@ program
     .description("Token-budgeted repo orientation — directory clusters, per-directory hubs, and global hotspots from the wiring graph ($0, offline)")
     .argument(...DIR_ARG)
     .option("--max-dirs <n>", "max directory entries shown, rest counted into dropped (default 16)")
+    .option("--churn", "include git commit churn × complexity hotspots")
     .option("--json", "output as JSON")
     .option(...NO_REFRESH_FLAG)
     .action(async (dirArg, opts) => {
@@ -706,9 +707,18 @@ program
             return;
         }
         const { formatRepoMap } = await import("../src/graph/map.js");
+        const contextDir = contextDirFor(root, globalOpts.dir);
+        let gitHistory = null;
+        if (opts.churn) {
+            const { analyzeGitHistory } = await import("../src/blast/history.js");
+            gitHistory = analyzeGitHistory(root, contextDir);
+        }
         let map;
         try {
-            map = engineFrom().map(root, { maxDirs: maxDirsW });
+            map = engineFrom().map(root, {
+                maxDirs: maxDirsW,
+                ...(gitHistory ? { gitHistory } : {}),
+            });
         } catch (err) {
             console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
             process.exit(1);
@@ -738,13 +748,32 @@ program
     .option("--to <cluster>", "target cluster name for `plan cluster move`")
     .option("--status <st>", "filter `show` by status (open, fixed, wontfix, deferred, false_positive)")
     .option("--chronic", "filter `show` to recurring or reopened issues across multiple scans")
+    .option("--no-budget", "bypass per-detector noise budget cap in `show`")
     .option("--code", "inline source code excerpts in `show`")
+    .option("--group <mode>", "group `next` items by item (default), file, or detector")
+    .option("--explain", "include ranking and score-impact rationale in `next`")
+    .option("--include-skipped", "include deferred/wontfix issues in `next`")
+    .option("--review-after <n>", "resurface deferred issue automatically after N scans (`plan skip`)")
+    .option("-t, --offset <n>", "numeric step offset for `plan reorder ... up|down`")
+    .option("--add-step <title>", "add an action step to a cluster (`plan cluster create|update`)")
+    .option("--update-step <n>", "update action step index N on a cluster")
+    .option("--done-step <n>", "mark action step index N done on a cluster")
+    .option("--undone-step <n>", "mark action step index N undone on a cluster")
+    .option("--steps-file <file>", "load cluster action steps from a file")
+    .option("--effort <level>", "effort tag for a cluster step (trivial, small, medium, large)")
+    .option("--issue-refs <ids>", "comma-separated issue IDs referenced by a cluster step")
+    .option("--stage-prompt <stage>", "print dynamic prompt for a triage stage")
+    .option("--confirm-existing", "fast-track re-confirm an existing triage plan")
+    .option("--similarity <n>", "Jaccard similarity threshold for `review --merge` deduplication (default 0.8)")
+    .option("--retrospective", "include historical resolution context in `review --prepare`")
+    .option("--stall-kill-seconds <n>", "kill hung review/triage batch subprocess after N idle seconds (default 120)")
+    .option("--max-retries <n>", "retry failed review/triage batch subprocesses N times (default 1)")
     .option("--note <text>", "resolution, skip, suppress, or commit-log note")
     .option("--confirm", "confirm issue resolution")
     .option("--attest <text>", "explicit attestation for resolve, permanent skip, suppress, or review import")
     .option("--permanent", "mark skipped issue as permanent `wontfix`")
     .option("--force", "bypass scan gate on resolve")
-    .option("--force-resolve", "bypass suspect-disappearance guard on scan when a detector drops from >=5 to 0")
+    .option("--force-resolve", "bypass suspect-disappearance guard on scan when a detector drops from >=3 to 0")
     .option("--stage <name>", "triage stage (strategize, observe, reflect, organize, enrich, sense-check, commit, complete)")
     .option("--report <text>", "triage stage report")
     .option("--complete", "complete triage and commit strategy")
@@ -794,6 +823,7 @@ program
             ...opts,
             contextDir: globalOpts.dir,
             noBadge: opts.badge === false,
+            noBudget: opts.budget === false,
         });
     });
 

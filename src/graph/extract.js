@@ -464,13 +464,16 @@ function emitExtractedCallEdge(node, ctx, edges) {
     const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
     if (!callee)
         return;
+    const imported = !callee.viaMember ? ctx.importedSymbols.get(callee.name) : undefined;
     const callEdge = {
         source: ctx.parentId,
         relation: "calls",
-        name: callee.name,
+        name: imported ? (imported.isDefault ? callee.name : imported.name) : callee.name,
         viaMember: callee.viaMember,
         file: ctx.rel,
         ...(callee.kinds ? { kinds: callee.kinds } : {}),
+        ...(imported?.specifier ? { specifier: imported.specifier } : {}),
+        ...(imported?.typeOnly ? { typeOnly: true } : {}),
     };
     const argCount = ctx.lang === "java" ? javaArgCount(node) : ctx.lang === "swift" ? swiftArgCount(node) : undefined;
     if (argCount !== undefined)
@@ -553,13 +556,36 @@ function walk(node, ctx, out, edges, minted) {
         }
     }
     const callTypes = CALL_TYPES[ctx.lang];
+    const isTsOrTsx = ctx.lang === "typescript" || ctx.lang === "tsx";
     if (isImport(node, ctx.lang)) {
         const spec = importSpecifier(node, ctx.lang);
-        if (spec)
-            edges.push({ source: ctx.rel, relation: "imports", specifier: spec, file: ctx.rel });
+        if (spec) {
+            const typeOnly = isTsOrTsx && isTsTypeOnlyImport(node);
+            edges.push({
+                source: ctx.rel,
+                relation: "imports",
+                specifier: spec,
+                file: ctx.rel,
+                ...(typeOnly ? { typeOnly: true } : {}),
+            });
+            if (ctx.lang === "python" &&
+                node.type === "import_from_statement" &&
+                (ctx.rel === "__init__.py" || ctx.rel.endsWith("/__init__.py"))) {
+                emitPythonInitReexports(node, spec, ctx, edges);
+            }
+        }
         return;
     }
+    else if (isTsOrTsx && node.type === "export_statement") {
+        emitTsExportEdges(node, ctx, edges);
+    }
     else if (callTypes.has(node.type)) {
+        if (isTsOrTsx && node.type === "call_expression") {
+            const dynSpec = tsCallImportSpecifier(node);
+            if (dynSpec) {
+                edges.push({ source: ctx.rel, relation: "imports", specifier: dynSpec, file: ctx.rel });
+            }
+        }
         emitExtractedCallEdge(node, ctx, edges);
     }
     else if (ctx.lang === "php" && node.type === "use_declaration") {
@@ -578,9 +604,10 @@ function walk(node, ctx, out, edges, minted) {
             edges.push({
                 source: ctx.parentId,
                 relation: "references",
-                name: imported.name,
+                name: imported.isDefault ? node.text : imported.name,
                 specifier: imported.specifier,
                 file: ctx.rel,
+                ...(imported.typeOnly ? { typeOnly: true } : {}),
             });
         }
     }
@@ -607,8 +634,12 @@ function collectImportedSymbols(root, lang) {
                 const specifier = importSpecifier(node, lang);
                 if (!specifier)
                     return;
-                collectTsImportBindings(node, specifier, out);
+                const stmtTypeOnly = isTsStatementTypeKeyword(node, "import");
+                collectTsImportBindings(node, specifier, out, stmtTypeOnly);
                 return;
+            }
+            if (node.type === "variable_declarator") {
+                collectTsRequireBindings(node, out);
             }
             for (const child of node.namedChildren)
                 visitImportNode(child);
@@ -616,9 +647,72 @@ function collectImportedSymbols(root, lang) {
         visitImportNode(root);
         return out;
     }
+    if (lang === "python")
+        return collectPythonImportedSymbols(root);
     if (lang === "php")
         return collectPhpImportedSymbols(root);
     return new Map();
+}
+function collectPythonImportedSymbols(root) {
+    const out = new Map();
+    const visitPyNode = (node) => {
+        if (node.type === "import_from_statement") {
+            const specifier = importSpecifier(node, "python");
+            if (specifier) {
+                for (const item of pythonFromImportItems(node)) {
+                    const effectiveSpec = /^\.+$/.test(specifier) ? `${specifier}${item.name}` : specifier;
+                    out.set(item.local, { name: item.name, specifier: effectiveSpec });
+                }
+            }
+            return;
+        }
+        for (const child of node.namedChildren)
+            visitPyNode(child);
+    };
+    visitPyNode(root);
+    return out;
+}
+function pythonFromImportItems(node) {
+    const items = [];
+    const modNode = node.childForFieldName("module_name") ??
+        node.namedChildren.find((c) => c.type === "dotted_name" || c.type === "relative_import");
+    for (const child of node.namedChildren) {
+        if (sameSyntaxNode(child, modNode) || child.type === "wildcard_import")
+            continue;
+        if (child.type === "aliased_import") {
+            const orig = child.childForFieldName("name")?.text ?? child.namedChildren[0]?.text;
+            const alias = child.childForFieldName("alias")?.text ?? child.namedChildren[1]?.text;
+            if (orig)
+                items.push({ name: orig, local: alias || orig });
+        }
+        else if (child.type === "dotted_name" || child.type === "identifier") {
+            items.push({ name: child.text, local: child.text });
+        }
+    }
+    return items;
+}
+function emitPythonInitReexports(node, spec, ctx, edges) {
+    if (node.namedChildren.some((c) => c.type === "wildcard_import")) {
+        edges.push({
+            source: ctx.rel,
+            relation: "reexports",
+            specifier: spec,
+            star: true,
+            file: ctx.rel,
+        });
+        return;
+    }
+    for (const item of pythonFromImportItems(node)) {
+        const effectiveSpec = /^\.+$/.test(spec) ? `${spec}${item.name}` : spec;
+        edges.push({
+            source: ctx.rel,
+            relation: "reexports",
+            specifier: effectiveSpec,
+            exportedName: item.local,
+            localName: item.name,
+            file: ctx.rel,
+        });
+    }
 }
 /** PHP `use` bindings: local alias → { exported name, FQN specifier }. */
 function collectPhpImportedSymbols(root) {
@@ -751,16 +845,191 @@ function javaAnnotationTypeName(anno) {
         return nameNode.text;
     return null;
 }
-function collectTsImportBindings(node, specifier, out) {
+function isTsStatementTypeKeyword(node, keyword) {
+    const trimmed = node.text.trim();
+    const re = keyword === "import" ? /^import\s+type\b/ : /^export\s+type\b/;
+    if (re.test(trimmed))
+        return true;
+    return Boolean(node.children?.some((c) => !c.isNamed && c.type === "type"));
+}
+function isTsTypeSpecifier(spec) {
+    if (spec.children?.some((c) => !c.isNamed && c.type === "type"))
+        return true;
+    return /^type\s+(?!as\b)/.test(spec.text.trim());
+}
+function isTsTypeOnlyImport(node) {
+    if (isTsStatementTypeKeyword(node, "import"))
+        return true;
+    const clause = node.namedChildren.find((c) => c.type === "import_clause");
+    if (!clause)
+        return false;
+    if (clause.namedChildren.some((c) => c.type === "identifier" || c.type === "namespace_import"))
+        return false;
+    const named = clause.namedChildren.find((c) => c.type === "named_imports");
+    if (!named)
+        return false;
+    const specs = named.namedChildren.filter((c) => c.type === "import_specifier");
+    return specs.length > 0 && specs.every((s) => isTsTypeSpecifier(s));
+}
+function collectTsImportBindings(node, specifier, out, stmtTypeOnly = false) {
+    if (node.type === "import_clause") {
+        const defId = node.namedChildren.find((c) => c.type === "identifier");
+        if (defId) {
+            out.set(defId.text, {
+                name: "default",
+                local: defId.text,
+                specifier,
+                isDefault: true,
+                ...(stmtTypeOnly ? { typeOnly: true } : {}),
+            });
+        }
+    }
     if (node.type === "import_specifier") {
         const name = node.childForFieldName("name")?.text;
         const local = node.childForFieldName("alias")?.text ?? name;
-        if (name && local)
-            out.set(local, { name, specifier });
+        const typeOnly = stmtTypeOnly || isTsTypeSpecifier(node);
+        if (name && local) {
+            out.set(local, {
+                name,
+                specifier,
+                ...(typeOnly ? { typeOnly: true } : {}),
+            });
+        }
         return;
     }
     for (const child of node.namedChildren)
-        collectTsImportBindings(child, specifier, out);
+        collectTsImportBindings(child, specifier, out, stmtTypeOnly);
+}
+function tsCallImportSpecifier(node) {
+    const fn = node.childForFieldName("function");
+    if (!fn)
+        return null;
+    const isRequire = fn.type === "identifier" && fn.text === "require";
+    const isDynamicImport = fn.type === "import" || fn.text === "import";
+    if (!isRequire && !isDynamicImport)
+        return null;
+    const args = node.childForFieldName("arguments");
+    const firstArg = args?.namedChildren[0];
+    if (firstArg?.type !== "string")
+        return null;
+    const frag = firstArg.namedChildren.find((c) => c.type === "string_fragment");
+    return frag?.text ?? firstArg.text.replace(/^['"]|['"]$/g, "");
+}
+function isRequireDeclarator(node) {
+    if (node.type !== "variable_declarator")
+        return false;
+    const value = node.childForFieldName("value");
+    if (value?.type !== "call_expression")
+        return false;
+    const fn = value.childForFieldName("function");
+    return fn?.type === "identifier" && fn.text === "require" && Boolean(tsCallImportSpecifier(value));
+}
+function collectTsRequireBindings(node, out) {
+    const value = node.childForFieldName("value");
+    if (value?.type !== "call_expression")
+        return;
+    const fn = value.childForFieldName("function");
+    if (fn?.type !== "identifier" || fn.text !== "require")
+        return;
+    const specifier = tsCallImportSpecifier(value);
+    if (!specifier)
+        return;
+    const nameNode = node.childForFieldName("name");
+    if (!nameNode)
+        return;
+    if (nameNode.type === "identifier") {
+        out.set(nameNode.text, {
+            name: "default",
+            local: nameNode.text,
+            specifier,
+            isDefault: true,
+        });
+        return;
+    }
+    if (nameNode.type === "object_pattern") {
+        for (const prop of nameNode.namedChildren) {
+            if (prop.type === "shorthand_property_identifier_pattern" || prop.type === "shorthand_property_identifier") {
+                out.set(prop.text, { name: prop.text, specifier });
+            }
+            else if (prop.type === "object_assignment_pattern") {
+                const left = prop.childForFieldName("left");
+                if (left?.text)
+                    out.set(left.text, { name: left.text, specifier });
+            }
+            else if (prop.type === "pair_pattern") {
+                const key = prop.childForFieldName("key")?.text;
+                const val = prop.childForFieldName("value");
+                const local = (val?.type === "identifier" ? val.text : val?.childForFieldName("left")?.text) ?? key;
+                if (key && local)
+                    out.set(local, { name: key, specifier });
+            }
+        }
+    }
+}
+function emitTsExportEdges(node, ctx, edges) {
+    const isExportType = isTsStatementTypeKeyword(node, "export");
+    const spec = importSpecifier(node, ctx.lang);
+    const exportClause = node.namedChildren.find((c) => c.type === "export_clause");
+    const specifiers = exportClause ? exportClause.namedChildren.filter((c) => c.type === "export_specifier") : [];
+    if (spec) {
+        const allSpecsTypeOnly = specifiers.length > 0 && specifiers.every((s) => isTsTypeSpecifier(s));
+        const importTypeOnly = isExportType || allSpecsTypeOnly;
+        edges.push({
+            source: ctx.rel,
+            relation: "imports",
+            specifier: spec,
+            file: ctx.rel,
+            ...(importTypeOnly ? { typeOnly: true } : {}),
+        });
+        if (exportClause) {
+            for (const s of specifiers) {
+                const orig = s.childForFieldName("name")?.text;
+                const alias = s.childForFieldName("alias")?.text;
+                const specTypeOnly = isExportType || isTsTypeSpecifier(s);
+                if (orig) {
+                    edges.push({
+                        source: ctx.rel,
+                        relation: "reexports",
+                        specifier: spec,
+                        exportedName: alias || orig,
+                        localName: orig,
+                        file: ctx.rel,
+                        ...(specTypeOnly ? { typeOnly: true } : {}),
+                    });
+                }
+            }
+        }
+        else if (!node.namedChildren.some((c) => c.type === "namespace_export")) {
+            edges.push({
+                source: ctx.rel,
+                relation: "reexports",
+                specifier: spec,
+                star: true,
+                file: ctx.rel,
+                ...(isExportType ? { typeOnly: true } : {}),
+            });
+        }
+        return;
+    }
+    if (exportClause) {
+        for (const s of specifiers) {
+            const orig = s.childForFieldName("name")?.text;
+            const alias = s.childForFieldName("alias")?.text;
+            const imported = orig ? ctx.importedSymbols.get(orig) : undefined;
+            if (imported) {
+                const specTypeOnly = Boolean(imported.typeOnly || isExportType || isTsTypeSpecifier(s));
+                edges.push({
+                    source: ctx.rel,
+                    relation: "reexports",
+                    specifier: imported.specifier,
+                    exportedName: alias || orig,
+                    localName: imported.isDefault ? orig : imported.name,
+                    file: ctx.rel,
+                    ...(specTypeOnly ? { typeOnly: true } : {}),
+                });
+            }
+        }
+    }
 }
 /**
  * Do these two wrappers stand for the same syntax node? `===` does not answer that:
@@ -792,7 +1061,7 @@ function withoutShadowedImports(imports, definition) {
                 shadowed.add(name.text);
             return;
         }
-        if (node.type === "variable_declarator") {
+        if (node.type === "variable_declarator" && !isRequireDeclarator(node)) {
             const name = node.childForFieldName("name");
             if (name?.type === "identifier")
                 shadowed.add(name.text);
@@ -834,6 +1103,15 @@ function isDirectCallee(node, callTypes) {
 /** Definition/declaration identifiers name a new binding; they do not use one. */
 function isDeclarationName(node) {
     const parent = node.parent;
+    if (parent?.type === "export_specifier" ||
+        parent?.type === "import_specifier" ||
+        parent?.type === "namespace_export" ||
+        parent?.type === "shorthand_property_identifier_pattern")
+        return true;
+    if (parent?.type === "pair_pattern" && sameSyntaxNode(parent.childForFieldName("value"), node))
+        return true;
+    if (parent?.type === "object_assignment_pattern" && sameSyntaxNode(parent.childForFieldName("left"), node))
+        return true;
     return sameSyntaxNode(parent?.childForFieldName("name"), node);
 }
 function describeTypeScriptSpecial(node, ctx) {

@@ -11,9 +11,11 @@ import { ensureFreshChildren, ensureFreshGraph, refreshNote } from '../graph/ref
 import { contextDirFor } from '../context/node-file.js';
 import { resolveSymbol, edgeWalk, parseWalkDepth } from '../graph/traverse.js';
 import { headerOf, hitLine, looseNoteFor, quoteFor, renderMatchBlock } from '../graph/traverse-cli.js';
+import { linkTestsForGraph } from '../graph/test-links.js';
 import { fileReader, wordRe } from '../blast/evidence.js';
 import { blastRadiusIn } from '../blast/blast.js';
 import { changedFiles, refExists } from '../blast/diff.js';
+import { analyzeGitHistory } from '../blast/history.js';
 import { markdownReport, mermaidDiagram, textReport } from '../blast/render.js';
 import { grepGraph } from '../search/grep.js';
 import { formatGrepResult, zeroHitNote } from '../search/grep-cli.js';
@@ -171,6 +173,7 @@ export const TOOLS = [
             type: 'object',
             properties: {
                 max_dirs: { type: 'number', description: 'max directory entries shown (default 16)' },
+                churn: { type: 'boolean', description: 'Include git churn hotspots when true.' },
                 dir: DIR_PROP,
             },
         },
@@ -291,6 +294,7 @@ function parsePatternList(raw) {
  * its BFS depth (for transitive `depth>1` walks). */
 function renderMatches(root, direction, showDepth, matches, hitsFor, graph, withSource = false, full = false) {
     const read = fileReader(root);
+    const testLinks = graph ? linkTestsForGraph(graph) : null;
     const seenSourceIds = new Set();
     const maxCap = full ? 8800 : 5800;
     const singleCap = full ? 8000 : 5400;
@@ -304,6 +308,8 @@ function renderMatches(root, direction, showDepth, matches, hitsFor, graph, with
                 source: withSource && remaining > 0,
                 seenSourceIds,
                 sourceBudget,
+                graph,
+                testLinks,
             });
             totalBytes += sourceBudget.bytes;
             return block;
@@ -439,6 +445,28 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
             return { text: federateMap(root, dirOverride, { maxDirs: parseMaxDirs(args) }), isError: false };
         case 'plexer_blast':
             return workspaceBlast(root, dirOverride, args);
+        case 'plexer_health': {
+            const ws = readWorkspace(root, dirOverride);
+            const children = ws?.children?.length
+                ? ws.children
+                : loadWorkspaceGraphs(root, dirOverride).loaded.map((l) => l.child);
+            if (children.length === 0)
+                return { text: NO_GRAPH, isError: true };
+            const chunks = [];
+            for (const child of children) {
+                const childPath = typeof child === 'string' ? child : child.path;
+                const childName = typeof child === 'string' ? child : (child.name ?? child.path);
+                const res = singleHealth(join(root, childPath), args, dirOverride);
+                if (res.isError && res.text !== NO_GRAPH)
+                    return res;
+                if (!res.isError) {
+                    chunks.push(`=== ${childName} ===\n${res.text.trimEnd()}`);
+                }
+            }
+            if (chunks.length === 0)
+                return { text: NO_GRAPH, isError: true };
+            return { text: `${chunks.join('\n\n')}\n`, isError: false };
+        }
         case 'plexer_check_freshness': {
             const { text } = await federateCheck(root, dirOverride);
             return { text, isError: false };
@@ -599,13 +627,52 @@ function singleFindAll(root, args, dirOverride) {
     return { text: chunks.join('\n\n'), isError: false };
 }
 
+const ALLOWED_MCP_HEALTH_ACTIONS = new Set(['scan', 'next', 'backlog', 'status', 'show', 'tree', 'detect', 'prompt']);
+
+function formatShowHealthText(res) {
+    if (res.view === 'concerns') {
+        const lines = [`concerns (${res.count ?? 0}):`];
+        for (const c of res.concerns ?? []) {
+            lines.push(`- [${c.type ?? 'concern'}] ${c.file ?? ''} — ${c.summary ?? ''}`);
+        }
+        return `${lines.join('\n')}\n`;
+    }
+    if (res.view === 'dimension') {
+        const d = res.dimension ?? {};
+        const scoreStr = d.score !== null && d.score !== undefined ? `${d.score}%` : 'unassessed';
+        const lines = [`plexer health show ${d.id ?? d.name ?? ''} (${scoreStr}, ${res.count ?? 0} issues):`];
+        for (const iss of res.items ?? []) {
+            lines.push(`- [${iss.tier}/${iss.severity}] ${iss.id} — ${iss.summary}`);
+        }
+        return `${lines.join('\n')}\n`;
+    }
+    const lines = [`plexer health show — ${res.count ?? 0} of ${res.total_matching ?? res.count ?? 0} issues:`];
+    for (const iss of res.items ?? []) {
+        lines.push(`- [${iss.tier}/${iss.severity}] ${iss.id} — ${iss.summary}`);
+    }
+    return `${lines.join('\n')}\n`;
+}
+
 function singleHealth(root, args, dirOverride) {
+    const action = typeof args.action === 'string' ? args.action.toLowerCase() : 'scan';
+    if (!ALLOWED_MCP_HEALTH_ACTIONS.has(action)) {
+        return {
+            text: `invalid health action "${action}" — allowed: ${[...ALLOWED_MCP_HEALTH_ACTIONS].join(', ')}`,
+            isError: true,
+        };
+    }
     const w = loadGraphCached(contextDirFor(root, dirOverride));
     if (!w)
         return { text: NO_GRAPH, isError: true };
+    const patterns = args.pattern
+        ? [String(args.pattern)]
+        : Array.isArray(args.patterns)
+            ? args.patterns.map(String)
+            : undefined;
     const res = health(root, {
         contextDir: dirOverride,
-        action: typeof args.action === 'string' ? args.action : 'scan',
+        action,
+        patterns,
         detector: typeof args.detector === 'string' ? args.detector : undefined,
         diff: args.diff === true ? (typeof args.base === 'string' ? args.base : true) : undefined,
         base: typeof args.base === 'string' ? args.base : undefined,
@@ -614,16 +681,19 @@ function singleHealth(root, args, dirOverride) {
         skip: typeof args.skip === 'string' ? args.skip : undefined,
         max: typeof args.max === 'number' ? args.max : 10,
     });
-    if (args.action === 'prompt') {
+    if (action === 'prompt') {
         return { text: res.prompt, isError: false };
     }
-    if (args.action === 'tree') {
+    if (action === 'tree') {
         return { text: res.tree_text, isError: false };
     }
-    if (args.action === 'detect') {
+    if (action === 'detect') {
         return { text: JSON.stringify(res, null, 2), isError: false };
     }
     const fmt = args.format === 'json' ? 'json' : args.format === 'markdown' ? 'markdown' : 'text';
+    if (action === 'show' && fmt !== 'json') {
+        return { text: formatShowHealthText(res), isError: false };
+    }
     const text = fmt === 'json'
         ? JSON.stringify(res, null, 2)
         : fmt === 'markdown'
@@ -671,7 +741,10 @@ async function callSingleTool(root, name, args, dirOverride) {
             const w = loadGraphCached(contextDirFor(root, dirOverride));
             if (!w)
                 return { text: NO_GRAPH, isError: true };
-            const map = buildRepoMap(w, { maxDirs: parseMaxDirs(args) });
+            const map = buildRepoMap(w, {
+                maxDirs: parseMaxDirs(args),
+                gitHistory: args.churn === true ? analyzeGitHistory(root) : undefined,
+            });
             return { text: formatRepoMap(map), isError: false };
         }
         case 'plexer_blast':

@@ -97,7 +97,7 @@ Don't be lazy. Large refactors and small detailed fixes — do both with equal e
 is too big or too small. Fix things properly, not minimally. Use `plexer callers`, `plexer blast`,
 and `plexer health move` to verify blast radius and update all callers cleanly.
 
-Use `plexer health plan` / `plexer health plan queue` to reorder priorities or cluster related
+Use `plexer health plan` / `plexer health plan reorder` to reorder priorities or cluster related
 issues (`plexer health plan cluster create <name>`). When subjective review is surfaced by `next`,
 run `plexer health review --prepare`, evaluate dimensions blindly against
 `plexer/.health/review_packet_blind.json`, and import with `plexer health review --import`.

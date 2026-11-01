@@ -9,12 +9,14 @@
  * human text and wires the CLI command; `mcp/tools.js` renders the same
  * shape for the `plexer_find_all` tool.
  */
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { isTestPath } from "../ask/ask.js";
 import { escapeRegExp, spanRange } from "../util/span.js";
 import { computeInDegree } from "../util/id.js";
 import { assertPrefixIndexed, normalizePathPrefix, pathUnderPrefix, pushMap } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
+import { compileSafeUserRegex, findIgnoredMatchDirs } from "./user-regexp.js";
 const DEFAULT_MAX_HITS = 120;
 const DEFAULT_MAX_HITS_PER_SYMBOL = 8;
 const MAX_HIT_TEXT = 160;
@@ -78,15 +80,31 @@ function collectGrepFileMatches(fileNodes, repoRoot, textCache, isSimpleFixed, p
     let totalMatchedLines = 0;
     let truncatedFiles = 0;
     for (const file of fileNodes) {
-        let text = textCache.get(file.path);
-        if (text === undefined) {
+        const absPath = join(repoRoot, file.path);
+        let st = null;
+        try {
+            st = statSync(absPath);
+        }
+        catch {
+            st = null;
+        }
+        const cached = textCache.get(file.path);
+        let text;
+        if (cached !== undefined && st && st.mtimeMs === cached.mtimeMs && st.size === cached.size) {
+            text = cached.text;
+        }
+        else {
             try {
-                text = readSourceFile(join(repoRoot, file.path));
+                text = st ? readSourceFile(absPath) : null;
             }
             catch {
                 text = null;
             }
-            textCache.set(file.path, text);
+            textCache.set(file.path, {
+                mtimeMs: st ? st.mtimeMs : -1,
+                size: st ? st.size : -1,
+                text,
+            });
         }
         if (text === null) {
             truncatedFiles++;
@@ -189,7 +207,7 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
             ? pattern.split(/\\?\||\|/).map(escapeRegExp).join("|")
             : escapeRegExp(pattern)
         : pattern.replace(/\\\|/g, "|");
-    const regex = new RegExp(source, opts.ignoreCase ? "i" : "");
+    const regex = compileSafeUserRegex(source, opts.ignoreCase ? "i" : "");
     const inDegree = computeInDegree(graph);
     const inPrefix = opts.in ? normalizePathPrefix(opts.in) : undefined;
     if (inPrefix)
@@ -245,12 +263,17 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
         }
         keptGroups.push(g);
     }
+    const ignoredDirs =
+        totalMatchedLines === 0 && repoRoot
+            ? findIgnoredMatchDirs(repoRoot, (text) => (isSimpleFixed ? text.includes(pattern) : regex.test(text)))
+            : [];
     return {
         pattern,
         filesSearched: fileNodes.length,
         totalHits: totalMatchedLines,
         groups: keptGroups,
         truncated: { files: truncatedFiles, hits: truncatedHits },
+        ...(ignoredDirs.length > 0 ? { ignoredDirs } : {}),
     };
 }
 

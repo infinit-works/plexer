@@ -5,7 +5,7 @@
  */
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { health } from "./health.js";
+import { health, healthAsync } from "./health.js";
 import { formatHealthMarkdown, formatHealthText } from "./render.js";
 
 const KNOWN_ACTIONS = new Set([
@@ -39,19 +39,56 @@ function isDirArg(candidate) {
     }
 }
 
+function parsePositionTail(rest, allowUpDown = false) {
+    if (rest.length >= 2) {
+        const prev = rest[rest.length - 2]?.toLowerCase();
+        const last = rest[rest.length - 1];
+        if (prev === "before" || prev === "after") {
+            return { position: prev, target: last, patterns: rest.slice(0, -2) };
+        }
+        if (allowUpDown && (prev === "up" || prev === "down") && !Number.isNaN(Number(last))) {
+            return { position: prev, offset: Number(last), patterns: rest.slice(0, -2) };
+        }
+    }
+    const posCandidate = rest[rest.length - 1]?.toLowerCase();
+    const validPos = allowUpDown
+        ? ["top", "bottom", "before", "after", "up", "down"]
+        : ["top", "bottom", "before", "after"];
+    if (validPos.includes(posCandidate)) {
+        return { position: posCandidate, patterns: rest.slice(0, -1) };
+    }
+    return { position: "top", patterns: rest };
+}
+
 function parsePlanCliSubargs(args, callOpts) {
     const sub = (args[0] || "show").toLowerCase();
     callOpts.subAction = sub;
     const rest = args.slice(1);
-    if (sub === "resolve" || sub === "skip" || sub === "reopen") {
+    if (sub === "resolve" || sub === "skip" || sub === "reopen" || sub === "unskip" || sub === "backlog") {
         callOpts.patterns = rest;
+    } else if (sub === "promote") {
+        const parsed = parsePositionTail(rest, false);
+        callOpts.position = parsed.position;
+        if (parsed.target) callOpts.target = parsed.target;
+        callOpts.patterns = parsed.patterns;
     } else if (sub === "reorder") {
-        const posCandidate = rest[rest.length - 1]?.toLowerCase();
-        if (["top", "bottom", "before", "after"].includes(posCandidate)) {
-            callOpts.position = posCandidate;
+        const parsed = parsePositionTail(rest, true);
+        callOpts.position = parsed.position;
+        if (parsed.target) callOpts.target = parsed.target;
+        if (parsed.offset !== undefined) callOpts.offset = parsed.offset;
+        callOpts.patterns = parsed.patterns;
+    } else if (sub === "describe") {
+        if (!callOpts.description && rest.length >= 2) {
+            callOpts.description = rest[rest.length - 1];
             callOpts.patterns = rest.slice(0, -1);
         } else {
-            callOpts.position = "top";
+            callOpts.patterns = rest;
+        }
+    } else if (sub === "note") {
+        if (!callOpts.note && rest.length >= 2) {
+            callOpts.note = rest[rest.length - 1];
+            callOpts.patterns = rest.slice(0, -1);
+        } else {
             callOpts.patterns = rest;
         }
     } else if (sub === "cluster") {
@@ -61,9 +98,29 @@ function parsePlanCliSubargs(args, callOpts) {
             callOpts.clusterName = null;
         } else if (cAct === "move") {
             callOpts.patterns = rest.slice(1);
+        } else if (cAct === "merge") {
+            callOpts.clusterName = rest[1];
+            callOpts.targetCluster = rest[2];
+            callOpts.patterns = rest.slice(2);
+        } else if (cAct === "export") {
+            callOpts.clusterName = rest[1];
+            if (rest[2]) callOpts.exportFormat = rest[2];
+        } else if (cAct === "import") {
+            callOpts.importFile = rest[1] || callOpts.file || callOpts.import;
+            callOpts.clusterName = rest[1];
         } else {
             callOpts.clusterName = rest[1];
             callOpts.patterns = rest.slice(2);
+        }
+    } else if (sub === "policy") {
+        callOpts.policyAction = (rest[0] || "list").toLowerCase();
+        if (rest.length > 1) callOpts.rule = rest.slice(1).join(" ");
+    } else if (sub === "scan-gate" || sub === "scangate") {
+        if (rest[0] === "reset") callOpts.reset = true;
+        if (rest[0] === "skip") callOpts.skip = true;
+    } else if (sub === "triage") {
+        if (rest[0] && !callOpts.stagePrompt && !callOpts["stage-prompt"]) {
+            callOpts.stagePrompt = rest[0];
         }
     } else if (sub === "focus") {
         callOpts.clusterName = rest[0] || null;
@@ -195,7 +252,7 @@ function printCommitLogResult(result) {
     return true;
 }
 
-function printHealthMutationResult(action, result) {
+function printPlanSubcommandResult(action, result) {
     if (action === "resolve" || result.action === "plan_resolve") {
         if (result.status === "scan_gate_blocked" || result.status === "not_found") {
             console.error(`✗ ${result.message}`);
@@ -207,14 +264,76 @@ function printHealthMutationResult(action, result) {
         return true;
     }
     if (result.action === "plan_skip") {
-        if (result.status === "attestation_invalid" || result.status === "not_found") {
-            console.error(`✗ ${result.message}`);
+        if (result.status === "attestation_invalid" || result.status === "not_found" || result.status === "confirm_required") {
+            console.error(`✗ ${result.message || result.error}`);
             process.exitCode = 1;
             return true;
         }
         console.log(`✓ Marked ${result.skipped_ids.length} finding(s) as ${result.status}: ${result.skipped_ids.join(", ")}`);
         return true;
     }
+    if (result.action === "plan_unskip") {
+        if (result.status === "not_found") {
+            console.error(`✗ ${result.message}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Unskipped ${result.unskipped_ids.length} finding(s): ${result.unskipped_ids.join(", ")}`);
+        return true;
+    }
+    if (result.action === "plan_promote") {
+        console.log(`✓ Promoted ${(result.promoted_ids || []).length} finding(s) into active queue.`);
+        return true;
+    }
+    if (result.action === "plan_backlog") {
+        console.log(`✓ Demoted ${(result.demoted_ids || []).length} finding(s) to backlog.`);
+        return true;
+    }
+    if (result.action === "plan_describe" || result.action === "plan_note") {
+        if (!result.ok) {
+            console.error(`✗ ${result.error || result.message}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Annotated ${(result.updated_ids || []).length} finding(s).`);
+        return true;
+    }
+    if (result.action === "plan_policy") {
+        if (!result.ok) {
+            console.error(`✗ ${result.error}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Policy (${result.sub_action}): ${(result.policies || []).length} active policy rule(s).`);
+        return true;
+    }
+    if (result.action === "plan_scan_gate") {
+        if (!result.ok) {
+            console.error(`✗ ${result.error}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Scan gate status: ${result.status}`);
+        return true;
+    }
+    if (result.action === "plan_repair_state") {
+        console.log(`✓ Repaired state from plan (${(result.repaired_ids || []).length} issue(s) synced).`);
+        return true;
+    }
+    if (result.action === "plan_triage" && result.prompt) {
+        console.log(result.prompt);
+        return true;
+    }
+    if (result.action === "plan_cluster" && result.exported) {
+        console.log(result.exported);
+        return true;
+    }
+    if (result.action === "plan_commit_log") return printCommitLogResult(result);
+    return false;
+}
+
+function printHealthMutationResult(action, result) {
+    if (printPlanSubcommandResult(action, result)) return true;
     if (action === "autofix") {
         if (result.git_dirty_warning) console.log(`  ⚠ ${result.git_dirty_warning}`);
         console.log(
@@ -226,7 +345,6 @@ function printHealthMutationResult(action, result) {
         }
         return true;
     }
-    if (result.action === "plan_commit_log") return printCommitLogResult(result);
     if (result.action === "review_run_batches") {
         if (result.status === "failed" || result.status === "error") {
             console.error(`✗ review --run-batches failed (${result.batches_completed}/${result.batches_attempted} completed)`);
@@ -265,7 +383,10 @@ function printHealthMutationResult(action, result) {
 
 export async function runHealthCommand(defaultDir, positionalArgs = [], opts = {}) {
     const { action, dir, callOpts } = parseHealthCliArgs(defaultDir, positionalArgs, opts);
-    const result = await health(dir, callOpts);
+    const result =
+        callOpts.runStages || callOpts.runBatches
+            ? await healthAsync(dir, callOpts)
+            : await health(dir, callOpts);
     const format = opts.format || (opts.json ? "json" : opts.markdown ? "markdown" : "text");
 
     if (format === "json") {

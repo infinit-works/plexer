@@ -20,16 +20,25 @@ import { detectDuplicates } from "./duplicates.js";
 import { runGraphChecks } from "./graph-checks.js";
 import { computeHeadline, computeReminders } from "./narrative.js";
 import {
+    annotatePlanIssues,
     buildExecutionQueue,
+    buildTriageStagePrompt,
+     compareIssuesByPriority,
+    demotePlanItemsToBacklog,
     managePlanCluster,
+    managePlanPolicy,
+    manageScanGate,
     matchIssueIds,
+    promotePlanItems,
     pruneExcludedIssues,
     reopenIssues,
     reorderPlanQueue,
+    repairStateFromPlan,
     resetLivingPlan,
     resolveIssues,
     skipIssues,
     suppressIssues,
+    unskipIssues,
     updateTriageStage,
 } from "./queue.js";
 import {
@@ -139,7 +148,11 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
         potentials.duplicates = dupRes.potential;
     }
 
-    const graphRes = runGraphChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, config);
+    const graphRes = runGraphChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, config, {
+        rootDir,
+        contextDir: opts.contextDir || null,
+        plan: opts.plan || null,
+    });
     allIssues.push(...graphRes.issues);
     Object.assign(potentials, graphRes.potentials);
 
@@ -191,7 +204,7 @@ function handleHealthConfigAction(action, contextDir, config, state, plan, opts)
                     .filter(Boolean);
             } else if (val === "true") val = true;
             else if (val === "false") val = false;
-            else if (val !== "" && !Number.isNaN(Number(val))) val = Number(val);
+            else if (typeof val === "string" && val.trim() !== "" && !Number.isNaN(Number(val))) val = Number(val);
             config[opts.key] = val;
             saveHealthConfig(contextDir, config);
         } else if (sub === "unset" && opts.key) {
@@ -339,8 +352,7 @@ function handlePlanCommitLogSubAction(root, contextDir, state, plan, config, opt
     };
 }
 
-function handleHealthPlanAction(root, contextDir, state, plan, config, totalProdFiles, opts) {
-    const sub = (opts.subAction || "show").toLowerCase();
+function handlePlanQueueMutationSubAction(sub, contextDir, state, plan, opts) {
     if (sub === "reset") {
         const res = resetLivingPlan(state, plan);
         saveLivingPlan(contextDir, plan);
@@ -372,13 +384,90 @@ function handleHealthPlanAction(root, contextDir, state, plan, config, totalProd
         saveLivingPlan(contextDir, plan);
         return { action: "plan_reopen", ...res };
     }
+    if (sub === "unskip") {
+        const res = unskipIssues(state, plan, opts.patterns || []);
+        saveHealthState(contextDir, state);
+        saveLivingPlan(contextDir, plan);
+        return { action: "plan_unskip", ...res };
+    }
+    if (sub === "promote") {
+        const res = promotePlanItems(
+            state,
+            plan,
+            opts.patterns || [],
+            opts.position || "top",
+            opts.target || null,
+        );
+        saveLivingPlan(contextDir, plan);
+        return { action: "plan_promote", ...res };
+    }
+    if (sub === "backlog") {
+        const res = demotePlanItemsToBacklog(state, plan, opts.patterns || []);
+        saveLivingPlan(contextDir, plan);
+        return { action: "plan_backlog", ...res };
+    }
+    if (sub === "describe" || sub === "note") {
+        const payload =
+            sub === "describe"
+                ? { description: opts.description ?? opts.text ?? opts.note ?? "" }
+                : { note: opts.note ?? opts.text ?? opts.description ?? "" };
+        const res = annotatePlanIssues(state, plan, opts.patterns || [], payload);
+        saveHealthState(contextDir, state);
+        saveLivingPlan(contextDir, plan);
+        return { action: `plan_${sub}`, ...res };
+    }
     if (sub === "reorder") {
-        const res = reorderPlanQueue(state, plan, opts.patterns || [], opts.position || "top", opts.target);
+        const res = reorderPlanQueue(
+            state,
+            plan,
+            opts.patterns || [],
+            opts.position || "top",
+            opts.target,
+            opts,
+        );
         saveLivingPlan(contextDir, plan);
         return { action: "plan_reorder", ...res };
     }
+    return null;
+}
+
+function handleHealthPlanAction(root, contextDir, state, plan, config, totalProdFiles, opts) {
+    const sub = (opts.subAction || "show").toLowerCase();
+    const queueMutation = handlePlanQueueMutationSubAction(sub, contextDir, state, plan, opts);
+    if (queueMutation) return queueMutation;
+
+    if (sub === "policy") {
+        const pSub = opts.policyAction || opts.clusterAction || "list";
+        const ruleOrIdx =
+            opts.rule ??
+            opts.target ??
+            (Array.isArray(opts.patterns) && opts.patterns.length > 0
+                ? opts.patterns.join(" ")
+                : null);
+        const res = managePlanPolicy(plan, pSub, ruleOrIdx, config);
+        saveLivingPlan(contextDir, plan);
+        saveHealthConfig(contextDir, config);
+        return { action: "plan_policy", ...res };
+    }
+    if (sub === "scan-gate") {
+        const res = manageScanGate(state, plan, opts);
+        if (res.ok) saveLivingPlan(contextDir, plan);
+        return { action: "plan_scan_gate", ...res };
+    }
+    if (sub === "repair-state") {
+        const res = repairStateFromPlan(state, plan);
+        saveHealthState(contextDir, state);
+        return { action: "plan_repair_state", ...res };
+    }
     if (sub === "cluster") {
-        const cRes = managePlanCluster(state, plan, opts.clusterAction || "list", opts.clusterName, opts.patterns || [], opts);
+        const cRes = managePlanCluster(
+            state,
+            plan,
+            opts.clusterAction || "list",
+            opts.clusterName,
+            opts.patterns || [],
+            opts,
+        );
         saveLivingPlan(contextDir, plan);
         return { action: "plan_cluster", ...cRes };
     }
@@ -388,6 +477,16 @@ function handleHealthPlanAction(root, contextDir, state, plan, config, totalProd
         return { action: "plan_focus", focus_cluster: plan.focus_cluster };
     }
     if (sub === "triage") {
+        if (opts.stagePrompt) {
+            const prompt = buildTriageStagePrompt(opts.stagePrompt, state, plan);
+            return {
+                action: "plan_triage",
+                stage: String(opts.stagePrompt).toLowerCase(),
+                stage_prompt: prompt,
+                prompt,
+                triage: plan.triage,
+            };
+        }
         if (opts.runStages) {
             return runTriageStages(root, contextDir, state, plan, opts).then((res) => {
                 saveLivingPlan(contextDir, plan);
@@ -405,7 +504,7 @@ function handleHealthPlanAction(root, contextDir, state, plan, config, totalProd
     return { action: "plan", plan, queue, scores: computeScoreSnapshot(state) };
 }
 
-function handleHealthShowAction(graph, state, zoneMap, readLines, opts) {
+function handleHealthShowAction(graph, state, config, zoneMap, readLines, opts) {
     const firstPat = opts.patterns && opts.patterns.length === 1 ? String(opts.patterns[0]).trim() : "";
     const lowerPat = firstPat.toLowerCase();
 
@@ -430,7 +529,7 @@ function handleHealthShowAction(graph, state, zoneMap, readLines, opts) {
         const detSet = isMechDim ? new Set(MECHANICAL_DIMENSIONS[dimId].detectors) : new Set(["review"]);
         const dimIssues = Object.values(state.issues || {}).filter((iss) => {
             if (opts.status && iss.status !== opts.status.toLowerCase()) return false;
-            if (isMechDim) return iss.detector !== "review" && (iss.dimension === dimId || detSet.has(iss.detector));
+            if (isMechDim) return iss.detector !== "review" && (iss.dimension ? iss.dimension === dimId : detSet.has(iss.detector));
             return iss.detector === "review" && normalizeDimensionKey(iss.dimension) === dimId;
         });
         return {
@@ -450,10 +549,36 @@ function handleHealthShowAction(graph, state, zoneMap, readLines, opts) {
             : Object.keys(state.issues || {}).filter((id) => !statusFilter || statusFilter.has(state.issues[id].status));
     let items = ids.map((id) => state.issues[id]).filter(Boolean);
     if (opts.chronic) {
-        items = items.filter(
-            (iss) => Boolean(iss.reopened_at_scan) || Number(iss.last_seen_scan || 1) - Number(iss.first_seen_scan || 1) >= 1,
+        const hasAnyReopenCount = Object.values(state.issues || {}).some(
+            (i) => (i.reopen_count || 0) > 0,
+        );
+        items = items.filter((iss) =>
+            hasAnyReopenCount
+                ? (iss.reopen_count || 0) >= 2
+                : (iss.reopen_count || 0) >= 2 ||
+                  Number(iss.last_seen_scan || 1) - Number(iss.first_seen_scan || 1) >= 1,
         );
     }
+
+    items.sort((a, b) => compareIssuesByPriority(a, b));
+    const totalBeforeBudget = items.length;
+    if (!opts.noBudget) {
+        const perDetBudget = Number(config?.issue_noise_budget ?? 10);
+        const globalBudget = Number(config?.issue_noise_global_budget ?? 0);
+        if (perDetBudget > 0) {
+            const detCounts = new Map();
+            items = items.filter((iss) => {
+                const c = detCounts.get(iss.detector) || 0;
+                if (c >= perDetBudget) return false;
+                detCounts.set(iss.detector, c + 1);
+                return true;
+            });
+        }
+        if (globalBudget > 0 && items.length > globalBudget) {
+            items = items.slice(0, globalBudget);
+        }
+    }
+
     const sliced = opts.max && opts.max !== "all" ? items.slice(0, Number(opts.max)) : items;
     const enriched = opts.code
         ? sliced.map((iss) => {
@@ -467,10 +592,19 @@ function handleHealthShowAction(graph, state, zoneMap, readLines, opts) {
           })
         : sliced;
 
-    return { action: "show", view: "issues", chronic: Boolean(opts.chronic), count: items.length, items: enriched };
+    return {
+        action: "show",
+        view: "issues",
+        chronic: Boolean(opts.chronic),
+        no_budget: Boolean(opts.noBudget),
+        total_matching: totalBeforeBudget,
+        hidden_by_budget: Math.max(0, totalBeforeBudget - items.length),
+        count: enriched.length,
+        items: enriched,
+    };
 }
 
-function handleHealthReviewAction(root, contextDir, graph, state, config, zoneMap, readLines, totalProdFiles, opts) {
+function handleHealthReviewAction(root, contextDir, graph, state, config, plan, zoneMap, readLines, totalProdFiles, opts) {
     if (opts.runBatches) {
         return runReviewBatches(
             root,
@@ -481,7 +615,7 @@ function handleHealthReviewAction(root, contextDir, graph, state, config, zoneMa
             zoneMap,
             readLines,
             totalProdFiles,
-            opts,
+            { ...opts, plan },
         ).then((res) => {
             const scores = computeScoreSnapshot(state);
             if (res.status === "imported" || res.status === "target_anchored_reset") {
@@ -497,16 +631,19 @@ function handleHealthReviewAction(root, contextDir, graph, state, config, zoneMa
         });
     }
     if (opts.prepare) {
-        const prep = prepareReview(contextDir, graph, state, zoneMap, readLines, opts);
+        const prep = prepareReview(contextDir, graph, state, zoneMap, readLines, { ...opts, plan });
         saveHealthState(contextDir, state);
         return { action: "review_prepare", ...prep };
     }
     if (opts.merge) {
-        const merged = mergeReviewBatches(opts.mergeDir || healthDir(contextDir));
+        const merged = mergeReviewBatches(opts.mergeDir || healthDir(contextDir), {
+            similarity: opts.similarity,
+        });
         return { action: "review_merge", merged };
     }
     if (opts.importFile || opts.importPayload) {
         const imp = importReview(state, config, opts.importPayload || resolve(root, opts.importFile), {
+            contextDir,
             allowPartial: opts.allowPartial,
             manualOverride: opts.manualOverride,
             attestedExternal: opts.attestedExternal,
@@ -527,15 +664,18 @@ function handleHealthReviewAction(root, contextDir, graph, state, config, zoneMa
             review_coverage: detectReviewCoverage(state, totalProdFiles),
         };
     }
-    const prep = prepareReview(contextDir, graph, state, zoneMap, readLines, opts);
+    const prep = prepareReview(contextDir, graph, state, zoneMap, readLines, { ...opts, plan });
     saveHealthState(contextDir, state);
     return { action: "review_prepare", ...prep };
 }
 
 function ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, persist = false) {
     if ((state.scan_count || 0) === 0) {
-        const det = runMechanicalDetectors(graph, root, config, opts);
-        const merged = mergeScanIntoState(state, det.issues, det.potentials, plan, opts);
+        const det = runMechanicalDetectors(graph, root, config, { ...opts, contextDir, plan });
+        const merged = mergeScanIntoState(state, det.issues, det.potentials, plan, {
+            ...opts,
+            suppressions: config.suppressions,
+        });
         Object.assign(state, merged.state);
         if (persist) {
             const scores = computeScoreSnapshot(state);
@@ -547,7 +687,7 @@ function ensureInitialHealthScan(graph, root, contextDir, config, state, plan, o
 }
 
 function runHealthScanAction(root, contextDir, graph, config, state, plan, totalProdFiles, opts) {
-    const det = runMechanicalDetectors(graph, root, config, opts);
+    const det = runMechanicalDetectors(graph, root, config, { ...opts, contextDir, plan });
     const isScopedQuery = Boolean(opts.diff || opts.in || opts.only || opts.skip || opts.stateless);
 
     let activeState = state;
@@ -559,7 +699,7 @@ function runHealthScanAction(root, contextDir, graph, config, state, plan, total
             det.issues,
             det.potentials,
             null,
-            { ...opts, forceResolve: true },
+            { ...opts, isScopedScan: true, forceResolve: true, suppressions: config.suppressions },
         );
         activeState = ephemeral.state;
         diff = ephemeral.diff;
@@ -568,6 +708,7 @@ function runHealthScanAction(root, contextDir, graph, config, state, plan, total
             scanPath: opts.scanPath || ".",
             resetSubjective: opts.resetSubjective,
             forceResolve: opts.forceResolve,
+            suppressions: config.suppressions,
         });
         activeState = merged.state;
         diff = merged.diff;
@@ -586,7 +727,13 @@ function runHealthScanAction(root, contextDir, graph, config, state, plan, total
     }
 
     const maxItems = opts.max === "all" ? 9999 : Number(opts.max) || 10;
-    const queue = buildExecutionQueue(activeState, plan, { count: maxItems, totalProdFiles });
+    const queue = buildExecutionQueue(activeState, plan, {
+        count: maxItems,
+        group: opts.group,
+        explain: opts.explain,
+        includeSkipped: opts.includeSkipped,
+        totalProdFiles,
+    });
     const headline = computeHeadline(activeState, scores, plan, config);
     const reminders = computeReminders(activeState, scores, plan, config, "scan", totalProdFiles);
 
@@ -612,6 +759,9 @@ function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config
         backlog: isBacklog,
         count: opts.count || (isBacklog ? 20 : 5),
         cluster: opts.cluster,
+        group: opts.group,
+        explain: opts.explain,
+        includeSkipped: opts.includeSkipped,
         totalProdFiles,
     });
     const base = {
@@ -628,6 +778,107 @@ function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config
         base.history = state.history || [];
     }
     return base;
+}
+
+function handleHealthToolAction(
+    action,
+    root,
+    contextDir,
+    graph,
+    config,
+    state,
+    plan,
+    zoneMap,
+    readLines,
+    totalProdFiles,
+    opts,
+) {
+    if (action === "autofix") {
+        const ignoreRules = loadIgnoreRules(root, config.excludes);
+        const afRes = runAutofix(root, graph, zoneMap, ignoreRules, opts.fixer || "all", {
+            dryRun: opts.dryRun,
+            state,
+            plan,
+        });
+        const scores = computeScoreSnapshot(state);
+        if (!opts.dryRun && afRes.reconciled_issue_ids?.length > 0) {
+            appendScoreHistory(state, scores, "autofix");
+            saveHealthState(contextDir, state);
+            saveLivingPlan(contextDir, plan);
+            if (!opts.noBadge) emitScorecardBadge(contextDir, scores, state);
+        }
+        return {
+            action: "autofix",
+            ...afRes,
+            scores,
+        };
+    }
+    if (action === "move") {
+        return { action: "move", ...moveFileOrDir(root, graph, opts.src, opts.dst, { dryRun: opts.dryRun }) };
+    }
+    if (action === "detect") {
+        const detName = opts.detector || (opts.patterns && opts.patterns[0]) || "all";
+        const detRes = runMechanicalDetectors(graph, root, config, {
+            ...opts,
+            contextDir,
+            plan,
+            detector: detName === "all" ? null : detName,
+        });
+        return {
+            action: "detect",
+            detector: detName,
+            count: detRes.issues.length,
+            potentials: detRes.potentials,
+            items: detRes.issues,
+        };
+    }
+    if (action === "tree") {
+        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, false);
+        return { action: "tree", tree_text: generateHealthTreeText(graph, state, zoneMap, readLines, opts) };
+    }
+    if (action === "viz") {
+        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, false);
+        return {
+            action: "viz",
+            ...generateHealthTreemapHtml(contextDir, graph, state, zoneMap, readLines, {
+                ...opts,
+                rootDir: root,
+            }),
+        };
+    }
+    if (action === "suppress") {
+        const pattern = opts.pattern || (opts.patterns && opts.patterns[0]) || "";
+        const res = suppressIssues(state, config, plan, pattern, opts);
+        const scores = computeScoreSnapshot(state);
+        if (res.status === "suppressed") {
+            appendScoreHistory(state, scores, "suppress");
+            saveHealthConfig(contextDir, config);
+            saveHealthState(contextDir, state);
+            saveLivingPlan(contextDir, plan);
+        }
+        return {
+            action: "suppress",
+            ...res,
+            scores,
+            reminders: computeReminders(state, scores, plan, config, "suppress", totalProdFiles),
+        };
+    }
+    if (action === "resolve") {
+        const res = resolveIssues(state, plan, opts.patterns || [], opts);
+        const scores = computeScoreSnapshot(state);
+        if (res.status === "resolved") {
+            appendScoreHistory(state, scores, "resolve");
+            saveHealthState(contextDir, state);
+            saveLivingPlan(contextDir, plan);
+        }
+        return {
+            action: "resolve",
+            ...res,
+            scores,
+            reminders: computeReminders(state, scores, plan, config, "resolve", totalProdFiles),
+        };
+    }
+    return null;
 }
 
 export function health(dir, opts = {}) {
@@ -656,72 +907,43 @@ export function health(dir, opts = {}) {
     const readLines = fileReader(root);
 
     if (action === "zone") return handleHealthZoneAction(contextDir, graph, config, state, opts);
-    if (action === "autofix") {
-        const ignoreRules = loadIgnoreRules(root, config.excludes);
-        const afRes = runAutofix(root, graph, zoneMap, ignoreRules, opts.fixer || "all", {
-            dryRun: opts.dryRun,
-            state,
-            plan,
-        });
-        const scores = computeScoreSnapshot(state);
-        if (!opts.dryRun && afRes.reconciled_issue_ids?.length > 0) {
-            appendScoreHistory(state, scores, "autofix");
-            saveHealthState(contextDir, state);
-            saveLivingPlan(contextDir, plan);
-            if (!opts.noBadge) emitScorecardBadge(contextDir, scores, state);
-        }
-        return {
-            action: "autofix",
-            ...afRes,
-            scores,
-        };
-    }
-    if (action === "move") {
-        return { action: "move", ...moveFileOrDir(root, graph, opts.src, opts.dst, { dryRun: opts.dryRun }) };
-    }
-    if (action === "detect") {
-        const detName = opts.detector || (opts.patterns && opts.patterns[0]) || "all";
-        const detRes = runMechanicalDetectors(graph, root, config, { ...opts, detector: detName === "all" ? null : detName });
-        return { action: "detect", detector: detName, count: detRes.issues.length, potentials: detRes.potentials, items: detRes.issues };
-    }
-    if (action === "tree") {
-        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, false);
-        return { action: "tree", tree_text: generateHealthTreeText(graph, state, zoneMap, readLines, opts) };
-    }
-    if (action === "viz") {
-        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, false);
-        return { action: "viz", ...generateHealthTreemapHtml(contextDir, graph, state, zoneMap, readLines, opts) };
-    }
-    if (action === "suppress") {
-        const pattern = opts.pattern || (opts.patterns && opts.patterns[0]) || "";
-        const res = suppressIssues(state, config, plan, pattern, opts);
-        const scores = computeScoreSnapshot(state);
-        if (res.status === "suppressed") {
-            appendScoreHistory(state, scores, "suppress");
-            saveHealthConfig(contextDir, config);
-            saveHealthState(contextDir, state);
-            saveLivingPlan(contextDir, plan);
-        }
-        return { action: "suppress", ...res, scores, reminders: computeReminders(state, scores, plan, config, "suppress", totalProdFiles) };
-    }
+    const toolRes = handleHealthToolAction(
+        action,
+        root,
+        contextDir,
+        graph,
+        config,
+        state,
+        plan,
+        zoneMap,
+        readLines,
+        totalProdFiles,
+        opts,
+    );
+    if (toolRes) return toolRes;
     if (action === "review") {
-        return handleHealthReviewAction(root, contextDir, graph, state, config, zoneMap, readLines, totalProdFiles, opts);
-    }
-    if (action === "resolve") {
-        const res = resolveIssues(state, plan, opts.patterns || [], opts);
-        const scores = computeScoreSnapshot(state);
-        if (res.status === "resolved") {
-            appendScoreHistory(state, scores, "resolve");
-            saveHealthState(contextDir, state);
-            saveLivingPlan(contextDir, plan);
-        }
-        return { action: "resolve", ...res, scores, reminders: computeReminders(state, scores, plan, config, "resolve", totalProdFiles) };
+        return handleHealthReviewAction(
+            root,
+            contextDir,
+            graph,
+            state,
+            config,
+            plan,
+            zoneMap,
+            readLines,
+            totalProdFiles,
+            opts,
+        );
     }
     if (action === "plan") return handleHealthPlanAction(root, contextDir, state, plan, config, totalProdFiles, opts);
-    if (action === "show") return handleHealthShowAction(graph, state, zoneMap, readLines, opts);
+    if (action === "show") return handleHealthShowAction(graph, state, config, zoneMap, readLines, opts);
     if (action === "next" || action === "backlog" || action === "status") {
         return handleHealthQueueOrStatusAction(action, graph, root, contextDir, config, state, plan, totalProdFiles, opts);
     }
 
     return runHealthScanAction(root, contextDir, graph, config, state, plan, totalProdFiles, opts);
+}
+
+export async function healthAsync(dir, opts = {}) {
+    return await health(dir, { ...opts, _allowAsync: true });
 }

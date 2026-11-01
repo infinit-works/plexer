@@ -37,7 +37,7 @@ export async function runBlastCommand(dir, opts) {
         console.error(`✗ could not read a diff in ${root} — is this a git repository?`);
         process.exit(1);
     }
-    const report = blastRadiusIn(graph, contextDir, diff.files, diff.basis, depth);
+    const report = blastRadiusIn(graph, contextDir, diff.files, diff.basis, depth, { rootDir: root });
     if (opts.owners !== false) {
         const { attachOwners, diffAuthors, localIdentity } = await import("./owners.js");
         // Everyone who wrote a commit in this range, plus whatever the caller named.

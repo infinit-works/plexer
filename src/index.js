@@ -11,6 +11,7 @@ import { resolveSymbol, edgeWalk, parseWalkDepth } from "./graph/traverse.js";
 import { runCallersCommand } from "./graph/traverse-cli.js";
 import { buildRepoMap, formatRepoMap } from "./graph/map.js";
 import { blastRadius, blastRadiusIn } from "./blast/blast.js";
+import { analyzeGitHistory } from "./blast/history.js";
 import { textReport, markdownReport, mermaidDiagram } from "./blast/render.js";
 import { startVizServer } from "./viz/serve.js";
 import { exportViz } from "./viz/export.js";
@@ -70,12 +71,17 @@ export class Plexer {
         const { graph } = this.#requireGraph(dir);
         const direction = opts.direction === "out" ? "out" : "in";
         const depth = parseWalkDepth(opts.depth, 1);
+        if (Number.isNaN(depth))
+            throw new RangeError("depth must be a positive integer or 'all'");
         const matches = resolveSymbol(graph, symbol, opts.in ? { in: opts.in } : {});
         return matches.map((m) => ({ symbol: m, hits: edgeWalk(graph, m, direction, depth) }));
     }
     map(dir, opts = {}) {
-        const { graph } = this.#requireGraph(dir);
-        return buildRepoMap(graph, opts);
+        const { root, contextDir, graph } = this.#requireGraph(dir);
+        const mapOpts = opts.churn && !opts.gitHistory
+            ? { ...opts, gitHistory: analyzeGitHistory(root, contextDir, { since: opts.since }) }
+            : opts;
+        return buildRepoMap(graph, mapOpts);
     }
     health(dir, opts = {}) {
         return health(dir, { ...opts, contextDir: this.cfg.contextDir });

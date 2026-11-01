@@ -125,6 +125,31 @@ export function markdownReport(r, opts = {}) {
         for (const line of caveats)
             out.push(line);
     }
+    if (Array.isArray(r.coChanges) && r.coChanges.length > 0) {
+        out.push("");
+        out.push("<details>");
+        out.push(`<summary><strong>Co-change warnings (untouched partners)</strong> — ${plural(r.coChanges.length, "file")}</summary>`);
+        out.push("");
+        for (const c of r.coChanges) {
+            const pct = Math.round((c.couplingRatio ?? (c.totalCommits ? c.coCommits / c.totalCommits : 0)) * 100);
+            const edgeTag = !c.hasStaticEdge ? " `[no static edge]`" : "";
+            out.push(`- **\`${c.partner}\`** ← \`${c.source}\` — ${c.coCommits}/${c.totalCommits} (${pct}%)${edgeTag}`);
+        }
+        out.push("");
+        out.push("</details>");
+    }
+    if (Array.isArray(r.layerViolations) && r.layerViolations.length > 0) {
+        out.push("");
+        out.push("<details>");
+        out.push(`<summary><strong>Layer boundary violations</strong> — ${plural(r.layerViolations.length, "violation")}</summary>`);
+        out.push("");
+        for (const v of r.layerViolations) {
+            const reason = v.reason ? ` — ${v.reason}` : "";
+            out.push(`- **\`${v.sourceFile}\`** → **\`${v.targetFile}\`** (${v.relation}, rule \`${v.ruleFrom}\` → \`${v.ruleTo}\`)${reason}`);
+        }
+        out.push("");
+        out.push("</details>");
+    }
     if (Array.isArray(r.healthHotspots) && r.healthHotspots.length > 0) {
         const totalIssues = r.healthHotspots.reduce((acc, h) => acc + h.count, 0);
         out.push("");
@@ -304,7 +329,8 @@ function detailSections(r, symbols, evidence) {
             for (const s of mod.symbols) {
                 if (listed++ >= MAX_SYMBOLS_LISTED)
                     break;
-                out.push(`- \`${s.path}:${s.span}\` — ${s.name} (${s.relation}, depth ${s.depth})`);
+                const relLabel = s.typeOnly ? `${s.relation} (type-only)` : s.relation;
+                out.push(`- \`${s.path}:${s.span}\` — ${s.name} (${relLabel}, depth ${s.depth})`);
                 // The line that reaches the diff, quoted from the same helper the hosted
                 // panel uses — a comment that disagreed with the page it links to would be
                 // worse than one that said less. Collapsed, so the comment stays short.
@@ -406,7 +432,8 @@ export function textReport(r) {
     for (const mod of r.modules) {
         lines.push(`${mod.label} — ${plural(mod.symbols.length, "symbol")} in ${plural(mod.files.length, "file")}`);
         for (const s of mod.symbols.slice(0, 25)) {
-            lines.push(`  ${s.relation} ← ${s.name} (${s.path}:${s.span}) [depth ${s.depth}]`);
+            const relLabel = s.typeOnly ? `${s.relation} (type-only)` : s.relation;
+            lines.push(`  ${relLabel} ← ${s.name} (${s.path}:${s.span}) [depth ${s.depth}]`);
         }
         const hidden = mod.symbols.length - 25;
         if (hidden > 0)
@@ -430,6 +457,23 @@ export function textReport(r) {
     }
     for (const line of caveatLines(r))
         lines.push(line.replace(/⚠️ /, "⚠ "), "");
+    if (Array.isArray(r.coChanges) && r.coChanges.length > 0) {
+        lines.push("Co-change warnings (untouched partners)");
+        for (const c of r.coChanges.slice(0, 8)) {
+            const pct = Math.round((c.couplingRatio ?? (c.totalCommits ? c.coCommits / c.totalCommits : 0)) * 100);
+            const edgeTag = !c.hasStaticEdge ? " [no static edge]" : "";
+            lines.push(`  ${c.partner} ← ${c.source} — ${c.coCommits}/${c.totalCommits} (${pct}%)${edgeTag}`);
+        }
+        lines.push("");
+    }
+    if (Array.isArray(r.layerViolations) && r.layerViolations.length > 0) {
+        lines.push(`Layer boundary violations (${plural(r.layerViolations.length, "violation")})`);
+        for (const v of r.layerViolations) {
+            const reason = v.reason ? ` — ${v.reason}` : "";
+            lines.push(`  ${v.sourceFile} → ${v.targetFile} (${v.relation}, rule ${v.ruleFrom} → ${v.ruleTo})${reason}`);
+        }
+        lines.push("");
+    }
     if (Array.isArray(r.healthHotspots) && r.healthHotspots.length > 0) {
         const totalIssues = r.healthHotspots.reduce((acc, h) => acc + h.count, 0);
         lines.push(`health hotspots (${plural(totalIssues, "open finding")} in ${plural(r.healthHotspots.length, "file")})`);

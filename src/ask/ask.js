@@ -49,7 +49,7 @@ function loadCorpus(outDir) {
  * the results (they still matter for "where are the tests") but below the real
  * definition. Covers Go (`_test.go`), JS/TS (`.test.` / `.spec.`), and test dirs. */
 export function isTestPath(path) {
-    return /(?:^|\/)(?:__tests__|tests?|specs?|bench|benchmarks?|fixtures?|__mocks__|mocks?)\/|\.(?:test|spec|bench|mock)\.[a-z0-9]+$|_(?:test|mock)\.(?:go|py|rb|ts|js|tsx|jsx)$|(^|\/)(?:test_[^/]+|mock_[^/]+|conftest)\.(?:py|go|ts|js)$/i.test(path || "");
+    return /(?:^|\/)(?:__tests__|tests?|testdata|specs?|bench|benchmarks?|fixtures?|__mocks__|mocks?)\/|\.(?:test|spec|bench|mock)\.[a-z0-9]+$|_(?:test|spec|bench|mock)\.(?:go|py|rb|rs|luau|lua|ts|js|tsx|jsx|mjs|cjs)$|(?:^|\/)(?:test_[^/]+|mock_[^/]+|conftest)\.(?:py|go|rb|rs|luau|lua|ts|js)$/i.test(path || "");
 }
 export function isGeneratedPath(path) {
     return /\.pb\.(?:go|ts|js|cc|h)$|_pb2(?:_grpc)?\.py$|\.(?:generated|gen)\.[a-z0-9]+$|(?:\b|^)(?:generated|__generated__)\//i.test(path || "");

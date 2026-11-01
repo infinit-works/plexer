@@ -118,3 +118,92 @@ export function assertPrefixIndexed(graph, prefix) {
         return;
     throw new Error(`nothing indexed under "${prefix}/"${scopesHereClause(scopesOfGraph(graph))} (or any path prefix)`);
 }
+
+/**
+ * Compile a repo-relative glob pattern (`*`, `**`, `?`, or a plain directory prefix)
+ * into a RegExp matching posix-normalized paths.
+ */
+export function globToRegExp(globPat) {
+    let pat = String(globPat || "")
+        .trim()
+        .replace(/\\/g, "/")
+        .replace(/^\.\//, "");
+    if (!pat) return /^$/;
+    if (!pat.includes("*") && !pat.includes("?")) {
+        const clean = stripTrailingSlashes(pat);
+        if (!clean) return /^$/;
+        const esc = clean.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`^${esc}(?:/.*)?$`);
+    }
+    if (pat.endsWith("/")) pat = `${pat}**`;
+    let rx = "^";
+    let i = 0;
+    while (i < pat.length) {
+        if (pat.slice(i, i + 4) === "/**/") {
+            rx += "(?:/.+/|/)";
+            i += 4;
+        } else if (i === 0 && pat.slice(0, 3) === "**/") {
+            rx += "(?:.+/)?";
+            i += 3;
+        } else if (i + 3 === pat.length && pat.slice(i) === "/**") {
+            rx += "(?:/.*)?";
+            i += 3;
+        } else if (pat.slice(i, i + 2) === "**") {
+            rx += ".*";
+            i += 2;
+        } else if (pat[i] === "*") {
+            rx += "[^/]*";
+            i += 1;
+        } else if (pat[i] === "?") {
+            rx += "[^/]";
+            i += 1;
+        } else {
+            rx += pat[i].replace(/[.+^${}()|[\]\\]/g, "\\$&");
+            i += 1;
+        }
+    }
+    rx += "$";
+    return new RegExp(rx);
+}
+
+/**
+ * Parse a `forbid: <from> -> <to>` policy string into a structured layer boundary rule.
+ */
+export function parsePolicyLayerRule(policyStr) {
+    if (typeof policyStr !== "string") return null;
+    const match = /^forbid\s*:\s*(\S+)\s*->\s*(\S+?)(?:\s*(?:\((.+)\)|—\s*(.+)|#\s*(.+)))?$/i.exec(
+        policyStr.trim(),
+    );
+    if (!match) return null;
+    return {
+        from: match[1].trim(),
+        to: match[2].trim(),
+        allowTypeOnly: true,
+        reason: (match[3] || match[4] || match[5] || policyStr.trim()).trim(),
+    };
+}
+
+/**
+ * Normalize a layer rule entry (an object from `layer_rules`/`layerRules` or a
+ * `forbid: <from> -> <to>` string from `policies`) into `{ from, to, allowTypeOnly, reason }`.
+ */
+export function parseLayerRuleEntry(entry) {
+    if (typeof entry === "string") return parsePolicyLayerRule(entry);
+    if (!entry || typeof entry !== "object") return null;
+    const rawFrom = entry.from ?? entry.source;
+    const rawTo = entry.to ?? entry.target ?? entry.forbid ?? entry.disallow;
+    const from = rawFrom ? String(rawFrom).trim() : "";
+    const to = Array.isArray(rawTo)
+        ? rawTo.map((t) => String(t ?? "").trim()).filter(Boolean)
+        : rawTo
+          ? String(rawTo).trim()
+          : "";
+    if (!from || (Array.isArray(to) ? to.length === 0 : !to)) return null;
+    const rawAllowTypeOnly = entry.allowTypeOnly ?? entry.allow_type_only;
+    return {
+        from,
+        to,
+        ...(rawAllowTypeOnly !== undefined ? { allowTypeOnly: Boolean(rawAllowTypeOnly) } : {}),
+        reason: entry.reason ?? entry.message ?? null,
+    };
+}

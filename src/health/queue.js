@@ -4,10 +4,20 @@
  * resolve/skip/reopen with scan-gate protection, attested `suppress`, and 4-stage triage.
  */
 import { createHash } from "node:crypto";
-import { ATTEST_RESOLVE_EXAMPLE, ATTEST_WONTFIX_EXAMPLE, TRIAGE_STAGES } from "./constants.js";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { parsePolicyLayerRule } from "../util/paths.js";
+import {
+    ATTEST_RESOLVE_EXAMPLE,
+    ATTEST_WONTFIX_EXAMPLE,
+    DETECTOR_CATEGORY,
+    MECHANICAL_DIMENSIONS,
+    TRIAGE_STAGES,
+} from "./constants.js";
 import { detectReviewCoverage } from "./review.js";
-import { buildAutoClusters } from "./scoring.js";
+import { buildAutoClusters, computeScoreImpact, computeScoreSnapshot } from "./scoring.js";
 import { emptyLivingPlan, wildcardToRegExp } from "./state.js";
+
+export { parsePolicyLayerRule };
 
 const TIER_ORDER = { T1: 1, T2: 2, T3: 3, T4: 4 };
 const SEVERITY_ORDER = { critical: 1, high: 2, medium: 3, low: 4 };
@@ -24,10 +34,14 @@ export function validateAttestation(attestation) {
     return hasNotGaming && hasReviewed;
 }
 
-export function compareIssuesByPriority(a, b, customOrderIndex = new Map()) {
+export function compareIssuesByPriority(a, b, customOrderIndex = new Map(), promotedSet = new Set()) {
     const idxA = customOrderIndex.has(a.id) ? customOrderIndex.get(a.id) : 999999;
     const idxB = customOrderIndex.has(b.id) ? customOrderIndex.get(b.id) : 999999;
     if (idxA !== idxB) return idxA - idxB;
+
+    const pA = promotedSet.has(a.id) ? 0 : 1;
+    const pB = promotedSet.has(b.id) ? 0 : 1;
+    if (pA !== pB) return pA - pB;
 
     const tA = TIER_ORDER[a.tier] || 3;
     const tB = TIER_ORDER[b.tier] || 3;
@@ -40,24 +54,42 @@ export function compareIssuesByPriority(a, b, customOrderIndex = new Map()) {
     return String(a.id).localeCompare(String(b.id));
 }
 
-/**
- * Build the prioritized execution queue for `plexer health next` (or `backlog`).
- */
-export function buildExecutionQueue(state, plan, opts = {}) {
-    const isBacklog = Boolean(opts.backlog);
+function collectPrioritizedOpenIssues(state, plan, allClusters, isBacklog, includeSkipped, focusCluster) {
     const customOrderIndex = new Map();
-    (plan?.queue_order || []).forEach((id, idx) => customOrderIndex.set(id, idx));
+    const rawOrder = plan?.queue_order || [];
+    let orderPos = 0;
+    for (const token of rawOrder) {
+        if (typeof token === "string" && token.startsWith("cluster:")) {
+            const cName = token.slice("cluster:".length);
+            const cl = allClusters[cName];
+            for (const cid of cl?.issue_ids || []) {
+                if (!customOrderIndex.has(cid)) customOrderIndex.set(cid, orderPos++);
+            }
+        } else if (!customOrderIndex.has(token)) {
+            customOrderIndex.set(token, orderPos++);
+        }
+    }
+
+    const promotedSet = new Set();
+    for (const p of plan?.promoted_ids || []) {
+        if (typeof p === "string" && p.startsWith("cluster:")) {
+            const cName = p.slice("cluster:".length);
+            for (const cid of allClusters[cName]?.issue_ids || []) promotedSet.add(cid);
+        } else {
+            promotedSet.add(p);
+        }
+    }
 
     const allIssues = Object.values(state.issues || {});
     let openIssues = allIssues
-        .filter((i) => i.status === "open" && !i.suppressed)
-        .sort((a, b) => compareIssuesByPriority(a, b, customOrderIndex));
+        .filter((i) => {
+            if (includeSkipped) {
+                return i.status === "open" || i.status === "deferred" || i.status === "wontfix";
+            }
+            return i.status === "open" && !i.suppressed;
+        })
+        .sort((a, b) => compareIssuesByPriority(a, b, customOrderIndex, promotedSet));
 
-    const manualClusters = plan?.clusters || {};
-    const autoClusters = buildAutoClusters(state.issues);
-    const allClusters = { ...autoClusters, ...manualClusters };
-
-    // Filter out issues belonging to clusters whose `depends_on` clusters still have open issues (unless in backlog mode)
     if (!isBacklog) {
         const blockedIssueIds = new Set();
         for (const c of Object.values(allClusters)) {
@@ -81,27 +113,67 @@ export function buildExecutionQueue(state, plan, opts = {}) {
         }
     }
 
-    const focusCluster = opts.cluster || (!isBacklog ? plan?.focus_cluster : null);
     if (focusCluster && allClusters[focusCluster]) {
         const memberSet = new Set(allClusters[focusCluster].issue_ids || []);
         openIssues = openIssues.filter((i) => memberSet.has(i.id));
     }
+    return openIssues;
+}
 
-    const items = [];
-    for (const iss of openIssues) {
-        const resolveCmd = `plexer health resolve "${iss.id}" --note "<what you fixed>" --confirm`;
-        const skipCmd = `plexer health plan skip --permanent "${iss.id}" --note "<why intentional>" --attest "${ATTEST_WONTFIX_EXAMPLE}"`;
-        items.push({
-            ...iss,
-            resolve_command: resolveCmd,
-            skip_command: skipCmd,
-            attest_example: ATTEST_RESOLVE_EXAMPLE,
+function buildGroupedExecutionQueueItems(state, items, groupMode, explain, baselineScores = null) {
+    if (groupMode !== "file" && groupMode !== "detector") return null;
+    const buckets = new Map();
+    for (const it of items) {
+        const gKey = groupMode === "file" ? it.file || "repo" : it.detector || "unknown";
+        let arr = buckets.get(gKey);
+        if (!arr) {
+            arr = [];
+            buckets.set(gKey, arr);
+        }
+        arr.push(it);
+    }
+    const groupedItems = [];
+    for (const [gKey, gList] of buckets.entries()) {
+        const gImpact = computeScoreImpact(
+            state,
+            gList.map((i) => i.id),
+            baselineScores,
+        );
+        const first = gList[0];
+        const gDim = first?.dimension || "code_quality";
+        groupedItems.push({
+            id: `group::${groupMode}::${gKey}`,
+            group_type: groupMode,
+            key: gKey,
+            file: groupMode === "file" ? gKey : first?.file || "repo",
+            detector: groupMode === "detector" ? gKey : first?.detector || "multiple",
+            dimension: gDim,
+            tier: first?.tier || "T3",
+            severity: first?.severity || "medium",
+            span: first?.span || "L1-L1",
+            count: gList.length,
+            open_count: gList.length,
+            score_impact: gImpact.deltaStrict,
+            score_impact_detail: gImpact,
+            summary: `${gKey} (${gList.length} open finding(s))`,
+            issue_ids: gList.map((i) => i.id),
+            items: gList,
+            resolve_command: first?.resolve_command,
+            ...(explain
+                ? {
+                      explanation: `Tier ${first?.tier || "T3"}, ${first?.severity || "medium"} severity, ${gDim} drag, estimated +${gImpact.deltaStrict.toFixed(1)} strict pts`,
+                      why: `Tier ${first?.tier || "T3"}, ${first?.severity || "medium"} severity, ${gDim} drag, estimated +${gImpact.deltaStrict.toFixed(1)} strict pts`,
+                  }
+                : {}),
         });
     }
+    groupedItems.sort((a, b) => b.score_impact - a.score_impact || b.count - a.count);
+    return groupedItems;
+}
 
-    // Surface subjective review step when mechanical queue is clear and review is unassessed or stale
+function buildQueueWorkflowSteps(state, plan, items, isBacklog, totalProdFiles) {
     const workflowSteps = [];
-    const cov = detectReviewCoverage(state, opts.totalProdFiles || 1);
+    const cov = detectReviewCoverage(state, totalProdFiles || 1);
     if (!isBacklog && items.length === 0 && cov.stale && state.scan_count > 0) {
         workflowSteps.push({
             type: "workflow_review",
@@ -112,8 +184,6 @@ export function buildExecutionQueue(state, plan, opts = {}) {
             primary_command: "plexer health review --prepare",
         });
     }
-
-    // Surface triage step when triage was previously completed and is now stale
     if (!isBacklog && plan?.triage?.completed && isTriageStale(plan, state)) {
         workflowSteps.push({
             type: "workflow_triage",
@@ -124,22 +194,88 @@ export function buildExecutionQueue(state, plan, opts = {}) {
                 'plexer health plan triage --stage strategize --report "<updated strategy>"',
         });
     }
+    return workflowSteps;
+}
 
+/**
+ * Build the prioritized execution queue for `plexer health next` (or `backlog`).
+ */
+export function buildExecutionQueue(state, plan, opts = {}) {
+    const isBacklog = Boolean(opts.backlog);
+    const includeSkipped = Boolean(opts.includeSkipped);
+    const explain = Boolean(opts.explain);
+    const groupMode = opts.group ? String(opts.group).toLowerCase() : "item";
+
+    const manualClusters = plan?.clusters || {};
+    const autoClusters = buildAutoClusters(state.issues);
+    const allClusters = { ...autoClusters, ...manualClusters };
+    const focusCluster = opts.cluster || (!isBacklog ? plan?.focus_cluster : null);
+
+    const openIssues = collectPrioritizedOpenIssues(
+        state,
+        plan,
+        allClusters,
+        isBacklog,
+        includeSkipped,
+        focusCluster,
+    );
+
+    const scores = computeScoreSnapshot(state);
+    const items = [];
+    for (const iss of openIssues) {
+        const resolveCmd = `plexer health resolve "${iss.id}" --note "<what you fixed>" --confirm`;
+        const skipCmd = `plexer health plan skip --permanent "${iss.id}" --note "<why intentional>" --attest "${ATTEST_WONTFIX_EXAMPLE}"`;
+        const impact = computeScoreImpact(state, [iss.id], scores);
+        const scoreImpact = impact.deltaStrict;
+        const dimId = iss.dimension || "code_quality";
+        const dimObj = scores.mechanical_dimensions?.[dimId] || scores.subjective_dimensions?.[dimId];
+        const dimDrag = dimObj?.overall_drag ?? 0;
+        const explanation = explain
+            ? `Tier ${iss.tier || "T3"}, ${iss.severity || "medium"} severity, ${dimId} drag (${dimDrag} pts), estimated +${scoreImpact.toFixed(1)} strict pts`
+            : undefined;
+
+        items.push({
+            ...iss,
+            score_impact: scoreImpact,
+            score_impact_detail: impact,
+            ...(explain ? { explanation, why: explanation } : {}),
+            resolve_command: resolveCmd,
+            skip_command: skipCmd,
+            attest_example: ATTEST_RESOLVE_EXAMPLE,
+        });
+    }
+
+    const workflowSteps = buildQueueWorkflowSteps(state, plan, items, isBacklog, opts.totalProdFiles);
     const limit = Number(opts.count) > 0 ? Number(opts.count) : isBacklog ? 20 : 5;
-    return {
-        total_open: items.length,
-        focus_cluster: focusCluster || null,
-        clusters: Object.values(allClusters).map((c) => ({
+    const groupedItems = buildGroupedExecutionQueueItems(state, items, groupMode, explain, scores);
+
+    const clustersOut = Object.values(allClusters).map((c) => {
+        const cImpact = computeScoreImpact(state, c.issue_ids || [], scores);
+        return {
             name: c.name,
             auto: Boolean(c.auto),
             depends_on: c.depends_on || [],
+            steps: c.steps || [],
+            score_impact: cImpact.deltaStrict,
+            score_impact_detail: cImpact,
             open_count: (c.issue_ids || []).filter(
                 (id) => state.issues?.[id]?.status === "open" && !state.issues?.[id]?.suppressed,
             ).length,
             total_count: (c.issue_ids || []).length,
-        })),
+        };
+    });
+
+    const activeItems = groupedItems ? groupedItems.slice(0, limit) : items.slice(0, limit);
+    return {
+        total_open: items.length,
+        group: groupMode,
+        group_mode: groupMode,
+        focus_cluster: focusCluster || null,
+        clusters: clustersOut,
         workflow_steps: workflowSteps,
-        items: items.slice(0, limit),
+        ...(groupedItems ? { groups: groupedItems } : {}),
+        items: activeItems,
+        next_items: activeItems,
         all_items: items,
     };
 }
@@ -189,9 +325,10 @@ export function resolveIssues(state, plan, patterns, opts = {}) {
         };
     }
 
-    const resolvesSinceScan = Number(plan.resolves_since_last_scan || 0);
-    if (resolvesSinceScan >= 10 && !opts.force && !plan.scan_gate_skipped) {
+    const resolvesSinceScan = Number(plan?.resolves_since_last_scan || 0);
+    if (resolvesSinceScan >= 10 && !opts.force && !opts.forceResolve && !plan?.scan_gate_skipped) {
         return {
+            ok: false,
             status: "scan_gate_blocked",
             resolved_ids: [],
             message:
@@ -206,29 +343,33 @@ export function resolveIssues(state, plan, patterns, opts = {}) {
     for (const id of matchedIds) {
         const iss = state.issues[id];
         iss.status = "fixed";
-        iss.verified = false;
+        iss.suspect_hold = false;
+        iss.verified = Boolean(opts.forceResolve);
         iss.note = note;
         iss.attestation = attestation;
         iss.resolved_at = new Date().toISOString();
     }
 
-    plan.resolves_since_last_scan = resolvesSinceScan + matchedIds.length;
-    plan.scan_count_at_last_resolve = state.scan_count;
-    const uncomm = new Set(plan.uncommitted_resolved || []);
-    for (const id of matchedIds) uncomm.add(id);
-    plan.uncommitted_resolved = [...uncomm];
+    if (plan) {
+        plan.resolves_since_last_scan = resolvesSinceScan + matchedIds.length;
+        plan.scan_count_at_last_resolve = state.scan_count;
+        const uncomm = new Set(plan.uncommitted_resolved || []);
+        for (const id of matchedIds) uncomm.add(id);
+        plan.uncommitted_resolved = [...uncomm];
 
-    plan.log = [
-        ...(plan.log || []),
-        {
-            action: "resolve",
-            issue_ids: matchedIds,
-            note,
-            at: new Date().toISOString(),
-        },
-    ];
+        plan.log = [
+            ...(plan.log || []),
+            {
+                action: "resolve",
+                issue_ids: matchedIds,
+                note,
+                at: new Date().toISOString(),
+            },
+        ];
+    }
 
     return {
+        ok: true,
         status: "resolved",
         resolved_ids: matchedIds,
         suggested_commit: `git commit -m "chore(health): resolve ${matchedIds.length} finding(s) (${matchedIds[0].split("::")[0]})"`,
@@ -242,6 +383,7 @@ export function resolveIssues(state, plan, patterns, opts = {}) {
 export function skipIssues(state, plan, patterns, opts = {}) {
     if (opts.permanent && opts.attest !== undefined && !validateAttestation(opts.attest)) {
         return {
+            ok: false,
             status: "attestation_invalid",
             skipped_ids: [],
             message: `Permanent skip (--permanent) attestation must include "reviewed" and "not gaming". Example: --attest "${ATTEST_WONTFIX_EXAMPLE}"`,
@@ -254,37 +396,108 @@ export function skipIssues(state, plan, patterns, opts = {}) {
     }
     if (matchedIds.length === 0) {
         return {
+            ok: false,
             status: "not_found",
             skipped_ids: [],
             message: `No open issues matched pattern: ${Array.isArray(patterns) ? patterns.join(", ") : patterns}`,
         };
     }
 
-    const newStatus = opts.permanent ? "wontfix" : "deferred";
-    const note = opts.note || (opts.permanent ? "Intentional pattern" : "Deferred for later");
-    const attestation = opts.attest || (opts.permanent ? ATTEST_WONTFIX_EXAMPLE : null);
+    if (matchedIds.length > 5 && !opts.confirm) {
+        return {
+            ok: false,
+            status: "confirm_required",
+            skipped_ids: [],
+            error: "Skipping more than 5 issues requires --confirm.",
+            message: "Skipping more than 5 issues requires --confirm.",
+        };
+    }
+
+    const isFalsePositive = Boolean(opts.falsePositive || opts.kind === "false_positive");
+    const isPermanent = Boolean(opts.permanent || opts.kind === "wontfix");
+    const newStatus = isFalsePositive ? "false_positive" : isPermanent ? "wontfix" : "deferred";
+    const note = opts.note || (isPermanent || isFalsePositive ? "Intentional pattern" : "Deferred for later");
+    const attestation = opts.attest || (isPermanent ? ATTEST_WONTFIX_EXAMPLE : null);
+    const reviewAfter =
+        opts.reviewAfter !== undefined && opts.reviewAfter !== null && Number(opts.reviewAfter) > 0
+            ? Number(opts.reviewAfter)
+            : null;
+    const nowIso = new Date().toISOString();
+
+    if (plan && (!plan.skipped || typeof plan.skipped !== "object")) {
+        plan.skipped = {};
+    }
 
     for (const id of matchedIds) {
         const iss = state.issues[id];
         iss.status = newStatus;
         iss.note = note;
         iss.attestation = attestation;
-        iss.skipped_at = new Date().toISOString();
+        iss.skipped_at = nowIso;
+        if (reviewAfter !== null) {
+            iss.resurface_after_scan = (state.scan_count || 0) + reviewAfter;
+        }
+        if (plan?.skipped) {
+            plan.skipped[id] = {
+                id,
+                status: newStatus,
+                note,
+                attestation,
+                resurface_after_scan: iss.resurface_after_scan ?? null,
+                skipped_at: nowIso,
+            };
+        }
     }
 
-    plan.log = [
-        ...(plan.log || []),
-        {
-            action: newStatus,
-            issue_ids: matchedIds,
-            note,
-            at: new Date().toISOString(),
-        },
-    ];
+    if (plan) {
+        plan.log = [
+            ...(plan.log || []),
+            {
+                action: newStatus,
+                issue_ids: matchedIds,
+                note,
+                at: nowIso,
+            },
+        ];
+    }
 
     return {
+        ok: true,
         status: newStatus,
         skipped_ids: matchedIds,
+    };
+}
+
+/**
+ * Restore `deferred` or `wontfix` issues back to `open` (`plexer health plan unskip`).
+ */
+export function unskipIssues(state, plan, patterns) {
+    const matchedIds = matchIssueIds(state, patterns, new Set(["deferred", "wontfix", "false_positive"]));
+    for (const id of matchedIds) {
+        const iss = state.issues[id];
+        iss.status = "open";
+        iss.suppressed = false;
+        iss.reopen_count = (iss.reopen_count || 0) + 1;
+        delete iss.resurface_after_scan;
+        if (plan?.skipped && typeof plan.skipped === "object") {
+            delete plan.skipped[id];
+        }
+    }
+    if (plan) {
+        plan.log = [
+            ...(plan.log || []),
+            {
+                action: "unskip",
+                issue_ids: matchedIds,
+                at: new Date().toISOString(),
+            },
+        ];
+    }
+    return {
+        ok: true,
+        status: "unskipped",
+        unskipped_ids: matchedIds,
+        reopened_ids: matchedIds,
     };
 }
 
@@ -377,19 +590,29 @@ export function reopenIssues(state, plan, patterns) {
         new Set(["fixed", "wontfix", "deferred", "false_positive", "auto_resolved"]),
     );
     for (const id of matchedIds) {
-        state.issues[id].status = "open";
-        state.issues[id].verified = false;
-        state.issues[id].suppressed = false;
+        const iss = state.issues[id];
+        if (["fixed", "wontfix", "deferred", "auto_resolved"].includes(iss.status)) {
+            iss.reopen_count = (iss.reopen_count || 0) + 1;
+        }
+        iss.status = "open";
+        iss.verified = false;
+        iss.suppressed = false;
+        delete iss.resurface_after_scan;
+        if (plan?.skipped && typeof plan.skipped === "object") {
+            delete plan.skipped[id];
+        }
     }
-    plan.log = [
-        ...(plan.log || []),
-        {
-            action: "reopen",
-            issue_ids: matchedIds,
-            at: new Date().toISOString(),
-        },
-    ];
-    return { reopened_ids: matchedIds };
+    if (plan) {
+        plan.log = [
+            ...(plan.log || []),
+            {
+                action: "reopen",
+                issue_ids: matchedIds,
+                at: new Date().toISOString(),
+            },
+        ];
+    }
+    return { ok: true, reopened_ids: matchedIds };
 }
 
 function parseDependsOnList(dependsOn, fallback = []) {
@@ -399,8 +622,367 @@ function parseDependsOnList(dependsOn, fallback = []) {
         .filter(Boolean);
 }
 
+function parseStepsMarkdownText(rawText) {
+    const lines = String(rawText || "")
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+    const steps = [];
+    for (const line of lines) {
+        if (line.startsWith("#")) continue;
+        const bulletMatch = /^(?:[-*+]|\d+[.)])\s+(?:\[([ xX])\]\s+)?(.+)$/.exec(line);
+        const done = bulletMatch ? String(bulletMatch[1] || "").toLowerCase() === "x" : false;
+        const title = (bulletMatch ? bulletMatch[2] : line).trim();
+        if (!title) continue;
+        steps.push({
+            index: steps.length + 1,
+            title,
+            detail: "",
+            effort: "medium",
+            issue_refs: [],
+            done,
+            status: done ? "done" : "pending",
+        });
+    }
+    return steps;
+}
+
+function resolveClusterStepIndex(cluster, rawIdx) {
+    const steps = Array.isArray(cluster.steps) ? cluster.steps : [];
+    const n = Number(rawIdx);
+    if (!Number.isFinite(n)) return -1;
+    if (n === 0) {
+        cluster._zeroBasedSteps = true;
+        return steps.length > 0 ? 0 : -1;
+    }
+    if (cluster._zeroBasedSteps && n >= 0 && n < steps.length) {
+        return n;
+    }
+    if (n >= 1 && n <= steps.length) {
+        return n - 1;
+    }
+    if (n >= 0 && n < steps.length) {
+        return n;
+    }
+    return -1;
+}
+
+function applyClusterStepMutations(cluster, opts = {}) {
+    if (!Array.isArray(cluster.steps)) cluster.steps = [];
+    let mutated = false;
+
+    if (opts.stepsFile) {
+        const raw = existsSync(opts.stepsFile)
+            ? readFileSync(opts.stepsFile, "utf8")
+            : String(opts.stepsFile);
+        const parsedSteps = parseStepsMarkdownText(raw);
+        for (const st of parsedSteps) {
+            cluster.steps.push({
+                ...st,
+                index: cluster.steps.length + 1,
+            });
+        }
+        mutated = true;
+    }
+
+    if (opts.addStep && opts.updateStep === undefined) {
+        const effortCandidate = String(opts.effort || "medium").toLowerCase();
+        const effort = ["trivial", "small", "medium", "large"].includes(effortCandidate)
+            ? effortCandidate
+            : "medium";
+        cluster.steps.push({
+            index: cluster.steps.length + 1,
+            title: String(opts.addStep).trim(),
+            detail: opts.detail ? String(opts.detail) : "",
+            effort,
+            issue_refs: parseDependsOnList(opts.issueRefs, []),
+            done: false,
+            status: "pending",
+        });
+        mutated = true;
+    }
+
+    if (opts.updateStep !== undefined && opts.updateStep !== null) {
+        const idx = resolveClusterStepIndex(cluster, opts.updateStep);
+        if (idx >= 0 && cluster.steps[idx]) {
+            const st = cluster.steps[idx];
+            if (opts.title || opts.addStep) st.title = String(opts.title || opts.addStep).trim();
+            if (opts.detail !== undefined) st.detail = String(opts.detail);
+            if (opts.effort !== undefined) st.effort = String(opts.effort).toLowerCase();
+            if (opts.issueRefs !== undefined) {
+                st.issue_refs = parseDependsOnList(opts.issueRefs, st.issue_refs || []);
+            }
+            mutated = true;
+        }
+    }
+
+    if (opts.doneStep !== undefined && opts.doneStep !== null) {
+        const idx = resolveClusterStepIndex(cluster, opts.doneStep);
+        if (idx >= 0 && cluster.steps[idx]) {
+            cluster.steps[idx].done = true;
+            cluster.steps[idx].status = "done";
+            mutated = true;
+        }
+    }
+
+    if (opts.undoneStep !== undefined && opts.undoneStep !== null) {
+        const idx = resolveClusterStepIndex(cluster, opts.undoneStep);
+        if (idx >= 0 && cluster.steps[idx]) {
+            cluster.steps[idx].done = false;
+            cluster.steps[idx].status = "pending";
+            mutated = true;
+        }
+    }
+
+    return mutated;
+}
+
+function serializeClusterExport(cluster, format = "json") {
+    const fmt = String(format || "json").toLowerCase();
+    const clean = {
+        name: cluster.name,
+        auto: Boolean(cluster.auto),
+        depends_on: cluster.depends_on || [],
+        issue_ids: cluster.issue_ids || [],
+        steps: (cluster.steps || []).map((s, i) => ({
+            index: s.index ?? i + 1,
+            title: s.title,
+            detail: s.detail || "",
+            effort: s.effort || "medium",
+            issue_refs: s.issue_refs || [],
+            done: Boolean(s.done),
+            status: s.done ? "done" : "pending",
+        })),
+    };
+    if (fmt === "yaml" || fmt === "yml") {
+        const lines = [
+            `name: ${JSON.stringify(clean.name)}`,
+            `auto: ${clean.auto}`,
+            `depends_on: ${JSON.stringify(clean.depends_on)}`,
+            `issue_ids: ${JSON.stringify(clean.issue_ids)}`,
+            "steps:",
+        ];
+        if (clean.steps.length === 0) {
+            lines[lines.length - 1] = "steps: []";
+        } else {
+            for (const s of clean.steps) {
+                lines.push(`  - index: ${s.index}`);
+                lines.push(`    title: ${JSON.stringify(s.title)}`);
+                lines.push(`    detail: ${JSON.stringify(s.detail)}`);
+                lines.push(`    effort: ${JSON.stringify(s.effort)}`);
+                lines.push(`    issue_refs: ${JSON.stringify(s.issue_refs)}`);
+                lines.push(`    done: ${s.done}`);
+            }
+        }
+        return lines.join("\n") + "\n";
+    }
+    if (fmt === "text" || fmt === "markdown" || fmt === "md") {
+        const lines = [
+            `# Cluster: ${clean.name}`,
+            `Depends on: ${clean.depends_on.join(", ") || "none"}`,
+            `Issues (${clean.issue_ids.length}): ${clean.issue_ids.join(", ")}`,
+            "",
+            "## Steps",
+        ];
+        for (const s of clean.steps) {
+            lines.push(
+                `- [${s.done ? "x" : " "}] ${s.title} (${s.effort})${s.detail ? ` — ${s.detail}` : ""}`,
+            );
+        }
+        return lines.join("\n") + "\n";
+    }
+    return JSON.stringify(clean, null, 2);
+}
+
+function parseClusterImportPayload(rawInput) {
+    if (rawInput && typeof rawInput === "object") return rawInput;
+    const text = existsSync(String(rawInput || ""))
+        ? readFileSync(String(rawInput), "utf8")
+        : String(rawInput || "");
+    const trimmed = text.trim();
+    if (trimmed.startsWith("{")) {
+        return JSON.parse(trimmed);
+    }
+    // Parse YAML or Markdown export format
+    const nameMatch = /^(?:name:\s*(.+)|#\s*Cluster:\s*(.+))$/m.exec(trimmed);
+    const rawName = (nameMatch?.[1] || nameMatch?.[2] || "imported_cluster").trim();
+    const name = rawName.replace(/^["']|["']$/g, "");
+
+    let dependsOn = [];
+    const depMatch = /^depends_on:\s*(\[.*\])$/m.exec(trimmed);
+    if (depMatch) {
+        try {
+            dependsOn = JSON.parse(depMatch[1]);
+        } catch {
+            dependsOn = [];
+        }
+    }
+
+    let issueIds = [];
+    const issMatch = /^issue_ids:\s*(\[.*\])$/m.exec(trimmed);
+    if (issMatch) {
+        try {
+            issueIds = JSON.parse(issMatch[1]);
+        } catch {
+            issueIds = [];
+        }
+    }
+
+    const steps = [];
+    const yamlStepBlocks = trimmed.split(/\n\s*-\s+index:\s*/);
+    if (yamlStepBlocks.length > 1) {
+        for (let i = 1; i < yamlStepBlocks.length; i++) {
+            const blk = yamlStepBlocks[i];
+            const tMatch = /title:\s*(.+)/m.exec(blk);
+            const dMatch = /detail:\s*(.+)/m.exec(blk);
+            const eMatch = /effort:\s*(.+)/m.exec(blk);
+            const doneMatch = /done:\s*(true|false)/m.exec(blk);
+            const unq = (v) => String(v || "").trim().replace(/^["']|["']$/g, "");
+            const isDone = doneMatch ? doneMatch[1] === "true" : false;
+            steps.push({
+                index: i,
+                title: unq(tMatch?.[1] || `Step ${i}`),
+                detail: unq(dMatch?.[1] || ""),
+                effort: unq(eMatch?.[1] || "medium"),
+                issue_refs: [],
+                done: isDone,
+                status: isDone ? "done" : "pending",
+            });
+        }
+    } else {
+        steps.push(...parseStepsMarkdownText(trimmed));
+    }
+
+    return { name, auto: false, depends_on: dependsOn, issue_ids: issueIds, steps };
+}
+
+function mergePlanClusters(plan, allClusters, clusterName, patterns, opts) {
+    const srcName = clusterName || opts.src;
+    const tgtName = opts.target || opts.to || (Array.isArray(patterns) ? patterns[0] : patterns);
+    const srcCluster = plan.clusters[srcName] || allClusters[srcName];
+    if (!srcCluster || !tgtName) {
+        return {
+            ok: false,
+            sub_action: "merge",
+            status: "not_found",
+            message: `Cannot merge "${srcName}" into "${tgtName}"`,
+        };
+    }
+    const tgtCluster = plan.clusters[tgtName] ||
+        allClusters[tgtName] || {
+            name: tgtName,
+            auto: false,
+            issue_ids: [],
+            depends_on: [],
+            steps: [],
+        };
+    const mergedSteps = [...(tgtCluster.steps || []), ...(srcCluster.steps || [])].map((s, idx) => ({
+        ...s,
+        index: idx + 1,
+    }));
+    plan.clusters[tgtName] = {
+        ...tgtCluster,
+        name: tgtName,
+        auto: false,
+        issue_ids: [...new Set([...(tgtCluster.issue_ids || []), ...(srcCluster.issue_ids || [])])],
+        depends_on: [...new Set([...(tgtCluster.depends_on || []), ...(srcCluster.depends_on || [])])].filter(
+            (d) => d !== tgtName && d !== srcName,
+        ),
+        steps: mergedSteps,
+    };
+    delete plan.clusters[srcName];
+    for (const c of Object.values(plan.clusters)) {
+        if (Array.isArray(c.depends_on)) {
+            c.depends_on = [...new Set(c.depends_on.map((d) => (d === srcName ? tgtName : d)).filter((d) => d !== c.name))];
+        }
+    }
+    if (plan.focus_cluster === srcName) plan.focus_cluster = tgtName;
+    return {
+        ok: true,
+        sub_action: "merge",
+        merged_from: srcName,
+        merged_into: tgtName,
+        cluster: plan.clusters[tgtName],
+        clusters: plan.clusters,
+    };
+}
+
+function mutatePlanClusterMembers(state, plan, allClusters, sub, clusterName, patterns, opts) {
+    if (sub === "update" && clusterName) {
+        const existing = plan.clusters[clusterName] || allClusters[clusterName];
+        if (!existing) {
+            return { ok: false, sub_action: "update", status: "not_found", message: `Cluster "${clusterName}" not found` };
+        }
+        const updated = {
+            ...existing,
+            name: clusterName,
+            auto: false,
+            depends_on: parseDependsOnList(opts.dependsOn, existing.depends_on || []),
+            steps: Array.isArray(existing.steps) ? [...existing.steps] : [],
+        };
+        applyClusterStepMutations(updated, opts);
+        plan.clusters[clusterName] = updated;
+        return { ok: true, sub_action: "update", cluster: plan.clusters[clusterName], clusters: plan.clusters };
+    }
+
+    if (sub === "move") {
+        const toCluster = opts.to || clusterName;
+        const matched = matchIssueIds(state, patterns);
+        for (const c of Object.values(plan.clusters)) {
+            c.issue_ids = (c.issue_ids || []).filter((id) => !matched.includes(id));
+        }
+        const existing = plan.clusters[toCluster] || {
+            name: toCluster,
+            auto: false,
+            issue_ids: [],
+            depends_on: [],
+            steps: [],
+        };
+        existing.issue_ids = [...new Set([...(existing.issue_ids || []), ...matched])];
+        plan.clusters[toCluster] = existing;
+        return { ok: true, sub_action: "move", cluster: existing, moved_ids: matched, clusters: plan.clusters };
+    }
+
+    if (sub === "add" && clusterName) {
+        const matched = matchIssueIds(state, patterns);
+        const existing = plan.clusters[clusterName] || {
+            name: clusterName,
+            auto: false,
+            issue_ids: [],
+            depends_on: [],
+            steps: [],
+        };
+        existing.issue_ids = [...new Set([...(existing.issue_ids || []), ...matched])];
+        applyClusterStepMutations(existing, opts);
+        plan.clusters[clusterName] = existing;
+        return { ok: true, sub_action: "add", cluster: existing, clusters: plan.clusters };
+    }
+
+    if (sub === "remove" && clusterName) {
+        const matched = new Set(matchIssueIds(state, patterns));
+        const existing = plan.clusters[clusterName];
+        if (existing) existing.issue_ids = (existing.issue_ids || []).filter((id) => !matched.has(id));
+        return { ok: true, sub_action: "remove", cluster: existing || null, clusters: plan.clusters };
+    }
+
+    if (clusterName) {
+        const existing = plan.clusters[clusterName] || {};
+        const created = {
+            ...existing,
+            name: clusterName,
+            auto: false,
+            issue_ids: patterns && patterns.length > 0 ? matchIssueIds(state, patterns) : existing.issue_ids || [],
+            depends_on: parseDependsOnList(opts.dependsOn, existing.depends_on || []),
+            steps: Array.isArray(existing.steps) ? [...existing.steps] : [],
+        };
+        applyClusterStepMutations(created, opts);
+        plan.clusters[clusterName] = created;
+    }
+    return { ok: true, sub_action: "create", cluster: clusterName ? plan.clusters[clusterName] : null, clusters: plan.clusters };
+}
+
 /**
- * Manage living plan clusters (`create`, `add`, `remove`, `move`, `update`, `delete`, `list`, `show`).
+ * Manage living plan clusters (`create`, `add`, `remove`, `move`, `merge`, `export`, `import`, `update`, `delete`, `list`, `show`).
  */
 export function managePlanCluster(state, plan, subAction = "list", clusterName = null, patterns = [], opts = {}) {
     if (!plan.clusters) plan.clusters = {};
@@ -410,11 +992,13 @@ export function managePlanCluster(state, plan, subAction = "list", clusterName =
 
     if (sub === "list") {
         return {
+            ok: true,
             sub_action: "list",
             clusters: Object.values(allClusters).map((c) => ({
                 name: c.name,
                 auto: Boolean(c.auto),
                 depends_on: c.depends_on || [],
+                steps: c.steps || [],
                 issue_ids: c.issue_ids || [],
                 open_count: (c.issue_ids || []).filter((id) => state.issues?.[id]?.status === "open").length,
             })),
@@ -424,70 +1008,69 @@ export function managePlanCluster(state, plan, subAction = "list", clusterName =
     if (sub === "show") {
         const target = allClusters[clusterName];
         if (!target) {
-            return { sub_action: "show", status: "not_found", message: `Cluster "${clusterName}" not found` };
+            return { ok: false, sub_action: "show", status: "not_found", message: `Cluster "${clusterName}" not found` };
         }
         return {
+            ok: true,
             sub_action: "show",
-            cluster: { ...target, issues: (target.issue_ids || []).map((id) => state.issues?.[id]).filter(Boolean) },
+            cluster: {
+                ...target,
+                steps: target.steps || [],
+                issues: (target.issue_ids || []).map((id) => state.issues?.[id]).filter(Boolean),
+            },
         };
     }
 
     if (sub === "delete" && clusterName) {
         delete plan.clusters[clusterName];
         if (plan.focus_cluster === clusterName) plan.focus_cluster = null;
-        return { sub_action: "delete", deleted: clusterName, clusters: plan.clusters };
+        return { ok: true, sub_action: "delete", deleted: clusterName, clusters: plan.clusters };
     }
 
-    if (sub === "update" && clusterName) {
-        const existing = plan.clusters[clusterName] || allClusters[clusterName];
-        if (!existing) {
-            return { sub_action: "update", status: "not_found", message: `Cluster "${clusterName}" not found` };
+    if (sub === "merge") {
+        return mergePlanClusters(plan, allClusters, clusterName, patterns, opts);
+    }
+
+    if (sub === "export") {
+        const target = allClusters[clusterName];
+        if (!target) {
+            return { ok: false, sub_action: "export", status: "not_found", message: `Cluster "${clusterName}" not found` };
         }
-        plan.clusters[clusterName] = {
-            ...existing,
-            name: clusterName,
-            auto: false,
-            depends_on: parseDependsOnList(opts.dependsOn, existing.depends_on || []),
-        };
-        return { sub_action: "update", cluster: plan.clusters[clusterName], clusters: plan.clusters };
-    }
-
-    if (sub === "move") {
-        const toCluster = opts.to || clusterName;
-        const matched = matchIssueIds(state, patterns);
-        for (const c of Object.values(plan.clusters)) {
-            c.issue_ids = (c.issue_ids || []).filter((id) => !matched.includes(id));
+        const fmt = opts.format || "json";
+        const content = serializeClusterExport(target, fmt);
+        if (opts.output) {
+            writeFileSync(opts.output, content, "utf8");
         }
-        const existing = plan.clusters[toCluster] || { name: toCluster, auto: false, issue_ids: [], depends_on: [] };
-        existing.issue_ids = [...new Set([...(existing.issue_ids || []), ...matched])];
-        plan.clusters[toCluster] = existing;
-        return { sub_action: "move", cluster: existing, moved_ids: matched, clusters: plan.clusters };
-    }
-
-    if (sub === "add" && clusterName) {
-        const matched = matchIssueIds(state, patterns);
-        const existing = plan.clusters[clusterName] || { name: clusterName, auto: false, issue_ids: [], depends_on: [] };
-        existing.issue_ids = [...new Set([...(existing.issue_ids || []), ...matched])];
-        plan.clusters[clusterName] = existing;
-        return { sub_action: "add", cluster: existing, clusters: plan.clusters };
-    }
-
-    if (sub === "remove" && clusterName) {
-        const matched = new Set(matchIssueIds(state, patterns));
-        const existing = plan.clusters[clusterName];
-        if (existing) existing.issue_ids = (existing.issue_ids || []).filter((id) => !matched.has(id));
-        return { sub_action: "remove", cluster: existing || null, clusters: plan.clusters };
-    }
-
-    if (clusterName) {
-        plan.clusters[clusterName] = {
-            name: clusterName,
-            auto: false,
-            issue_ids: matchIssueIds(state, patterns),
-            depends_on: parseDependsOnList(opts.dependsOn, []),
+        return {
+            ok: true,
+            sub_action: "export",
+            format: fmt,
+            cluster: target,
+            content,
+            exported: content,
         };
     }
-    return { sub_action: "create", clusters: plan.clusters };
+
+    if (sub === "import") {
+        const src = opts.file || opts.content || clusterName || (Array.isArray(patterns) ? patterns[0] : patterns);
+        const imported = parseClusterImportPayload(src);
+        const cName = imported.name || "imported_cluster";
+        plan.clusters[cName] = {
+            name: cName,
+            auto: false,
+            issue_ids: Array.isArray(imported.issue_ids) ? imported.issue_ids : [],
+            depends_on: Array.isArray(imported.depends_on) ? imported.depends_on : [],
+            steps: Array.isArray(imported.steps) ? imported.steps : [],
+        };
+        return {
+            ok: true,
+            sub_action: "import",
+            cluster: plan.clusters[cName],
+            clusters: plan.clusters,
+        };
+    }
+
+    return mutatePlanClusterMembers(state, plan, allClusters, sub, clusterName, patterns, opts);
 }
 
 /**
@@ -501,44 +1084,111 @@ export function resetLivingPlan(state, plan) {
     return { status: "reset", plan };
 }
 
+function normalizeReorderQueueArgs(arg1, arg2, arg3, arg4, arg5, arg6) {
+    let state = arg1;
+    let plan = arg2;
+    let patterns = arg3;
+    let position = arg4 || "top";
+    let targetPattern = arg5;
+    let opts = arg6 || {};
+
+    if (arg1 && !arg1.issues && (Array.isArray(arg1.queue_order) || Array.isArray(arg2) || typeof arg2 === "string")) {
+        state = { issues: {} };
+        plan = arg1;
+        patterns = arg2;
+        position = typeof arg3 === "string" ? arg3 : "top";
+        if (arg4 && typeof arg4 === "object" && !Array.isArray(arg4)) {
+            targetPattern = null;
+            opts = arg4;
+        } else {
+            targetPattern = arg4;
+            opts = arg5 || {};
+        }
+    }
+    return { state, plan, patterns, position, targetPattern, opts };
+}
+
+function resolveMovingQueueIds(state, plan, patterns, currentOrder) {
+    const movingIds = [];
+    const patList = Array.isArray(patterns) ? patterns : [patterns];
+    const autoClusters = buildAutoClusters(state?.issues || {});
+    const allClusters = { ...autoClusters, ...(plan.clusters || {}) };
+
+    for (const p of patList) {
+        if (!p) continue;
+        const cleanCluster = String(p).startsWith("cluster:") ? String(p).slice("cluster:".length) : p;
+        if (allClusters[cleanCluster]) {
+            movingIds.push(...(allClusters[cleanCluster].issue_ids || []));
+        } else {
+            const matched = matchIssueIds(state, [p]);
+            if (matched.length > 0) {
+                movingIds.push(...matched);
+            } else if (currentOrder.includes(p)) {
+                movingIds.push(p);
+            }
+        }
+    }
+    return movingIds;
+}
+
 /**
- * Reorder items or clusters in `plan.queue_order` (`top`, `bottom`, `before`, `after`).
+ * Reorder items or clusters in `plan.queue_order` (`top`, `bottom`, `before`, `after`, `up`, `down`).
  */
-export function reorderPlanQueue(state, plan, patterns, position = "top", targetPattern = null) {
+export function reorderPlanQueue(arg1, arg2, arg3 = "top", arg4 = null, arg5 = null, arg6 = {}) {
+    const { state, plan, patterns, position, targetPattern, opts } = normalizeReorderQueueArgs(
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5,
+        arg6,
+    );
+
     const currentOrder =
         plan.queue_order && plan.queue_order.length > 0
             ? [...plan.queue_order]
-            : Object.values(state.issues || {})
+            : Object.values(state?.issues || {})
                   .filter((i) => i.status === "open")
                   .sort((a, b) => compareIssuesByPriority(a, b))
                   .map((i) => i.id);
 
-    const movingIds = [];
-    const patList = Array.isArray(patterns) ? patterns : [patterns];
-    const autoClusters = buildAutoClusters(state.issues);
-    const allClusters = { ...autoClusters, ...(plan.clusters || {}) };
-
-    for (const p of patList) {
-        if (allClusters[p]) {
-            movingIds.push(...(allClusters[p].issue_ids || []));
-        } else {
-            movingIds.push(...matchIssueIds(state, [p]));
-        }
-    }
-
+    const movingIds = resolveMovingQueueIds(state, plan, patterns, currentOrder);
     const movingSet = new Set(movingIds);
+    const firstIdx = currentOrder.findIndex((id) => movingSet.has(id));
     const rest = currentOrder.filter((id) => !movingSet.has(id));
+    const pos = String(position || "top").toLowerCase();
 
-    if (position === "bottom") {
+    if (pos === "bottom") {
         plan.queue_order = [...rest, ...movingSet];
-    } else if ((position === "before" || position === "after") && targetPattern) {
+    } else if (pos === "up" || pos === "down") {
+        const rawOffset =
+            opts?.offset ??
+            (typeof targetPattern === "number" ||
+            (typeof targetPattern === "string" && /^\d+$/.test(targetPattern))
+                ? Number(targetPattern)
+                : 1);
+        const offset = Math.max(1, Number(rawOffset) || 1);
+        if (firstIdx === -1) {
+            plan.queue_order = pos === "up" ? [...movingSet, ...rest] : [...rest, ...movingSet];
+        } else {
+            const nonMovingBefore = currentOrder
+                .slice(0, firstIdx)
+                .filter((id) => !movingSet.has(id)).length;
+            const insertAt =
+                pos === "up"
+                    ? Math.max(0, nonMovingBefore - offset)
+                    : Math.min(rest.length, nonMovingBefore + offset);
+            rest.splice(insertAt, 0, ...movingSet);
+            plan.queue_order = rest;
+        }
+    } else if ((pos === "before" || pos === "after") && targetPattern) {
         const targetIds = matchIssueIds(state, [targetPattern]);
-        const anchor = targetIds[0];
+        const anchor = targetIds[0] || targetPattern;
         const idx = rest.indexOf(anchor);
         if (idx === -1) {
             plan.queue_order = [...movingSet, ...rest];
         } else {
-            const insertAt = position === "after" ? idx + 1 : idx;
+            const insertAt = pos === "after" ? idx + 1 : idx;
             rest.splice(insertAt, 0, ...movingSet);
             plan.queue_order = rest;
         }
@@ -547,9 +1197,328 @@ export function reorderPlanQueue(state, plan, patterns, position = "top", target
     }
 
     return {
+        ok: true,
         moved_count: movingSet.size,
-        position,
+        position: pos,
         queue_order: plan.queue_order,
+    };
+}
+
+/**
+ * Promote matched issue IDs or `cluster:<name>` into `plan.promoted_ids` and position them in `plan.queue_order`.
+ */
+export function promotePlanItems(state, plan, patterns, position = "top", targetPattern = null) {
+    if (!Array.isArray(plan.promoted_ids)) plan.promoted_ids = [];
+    const patList = Array.isArray(patterns) ? patterns : [patterns];
+    const autoClusters = buildAutoClusters(state.issues);
+    const allClusters = { ...autoClusters, ...(plan.clusters || {}) };
+    const addedPromotions = [];
+
+    for (const rawPat of patList) {
+        if (!rawPat) continue;
+        const p = String(rawPat).trim();
+        if (p.startsWith("cluster:")) {
+            addedPromotions.push(p);
+        } else if (allClusters[p]) {
+            addedPromotions.push(`cluster:${p}`);
+            addedPromotions.push(...(allClusters[p].issue_ids || []));
+        } else {
+            addedPromotions.push(...matchIssueIds(state, [p]));
+        }
+    }
+
+    plan.promoted_ids = [...new Set([...plan.promoted_ids, ...addedPromotions])];
+    if (Array.isArray(plan.deferred_ids)) {
+        const promoSet = new Set(addedPromotions);
+        plan.deferred_ids = plan.deferred_ids.filter((id) => !promoSet.has(id));
+    }
+    const reordered = reorderPlanQueue(state, plan, patList, position, targetPattern);
+    return {
+        ok: true,
+        promoted_ids: plan.promoted_ids,
+        added_ids: addedPromotions,
+        ...reordered,
+    };
+}
+
+/**
+ * Demote matched items or `cluster:<name>` from `plan.promoted_ids` and `plan.queue_order` (`plexer health plan backlog`).
+ */
+export function demotePlanItemsToBacklog(state, plan, patterns) {
+    if (!Array.isArray(plan.promoted_ids)) plan.promoted_ids = [];
+    if (!Array.isArray(plan.queue_order)) plan.queue_order = [];
+    if (!Array.isArray(plan.deferred_ids)) plan.deferred_ids = [];
+    const patList = Array.isArray(patterns) ? patterns : [patterns];
+    const autoClusters = buildAutoClusters(state.issues);
+    const allClusters = { ...autoClusters, ...(plan.clusters || {}) };
+    const toRemove = new Set();
+
+    for (const rawPat of patList) {
+        if (!rawPat) continue;
+        const p = String(rawPat).trim();
+        if (p.startsWith("cluster:")) {
+            toRemove.add(p);
+            const cName = p.slice("cluster:".length);
+            for (const cid of allClusters[cName]?.issue_ids || []) toRemove.add(cid);
+        } else if (allClusters[p]) {
+            toRemove.add(`cluster:${p}`);
+            for (const cid of allClusters[p].issue_ids || []) toRemove.add(cid);
+        } else {
+            for (const id of matchIssueIds(state, [p])) toRemove.add(id);
+        }
+    }
+
+    plan.promoted_ids = plan.promoted_ids.filter((id) => !toRemove.has(id));
+    plan.queue_order = plan.queue_order.filter((id) => !toRemove.has(id));
+    plan.deferred_ids = [...new Set([...plan.deferred_ids, ...toRemove])];
+    return {
+        ok: true,
+        demoted_ids: [...toRemove],
+        deferred_ids: plan.deferred_ids,
+        promoted_ids: plan.promoted_ids,
+        queue_order: plan.queue_order,
+    };
+}
+
+/**
+ * Annotate issues with custom description (`plan describe`) or note (`plan note`).
+ */
+export function annotatePlanIssues(state, plan, patterns, { description, note } = {}) {
+    const matchedIds = matchIssueIds(state, patterns);
+    if (plan && (!plan.annotations || typeof plan.annotations !== "object")) {
+        plan.annotations = {};
+    }
+    const nowIso = new Date().toISOString();
+
+    for (const id of matchedIds) {
+        const iss = state.issues[id];
+        if (!iss) continue;
+        if (description !== undefined && description !== null) {
+            iss.custom_description = String(description);
+            iss.description = iss.custom_description;
+        }
+        if (note !== undefined && note !== null) {
+            const noteStr = String(note);
+            iss.note = iss.note && iss.note !== "Fixed in code" ? `${iss.note}\n${noteStr}` : noteStr;
+        }
+        if (plan?.annotations) {
+            plan.annotations[id] = {
+                ...(plan.annotations[id] || {}),
+                ...(description !== undefined && description !== null
+                    ? {
+                          description: iss.custom_description,
+                          custom_description: iss.custom_description,
+                      }
+                    : {}),
+                ...(note !== undefined && note !== null ? { note: iss.note } : {}),
+                updated_at: nowIso,
+            };
+        }
+    }
+
+    return {
+        ok: true,
+        updated_ids: matchedIds,
+        annotations: plan?.annotations || {},
+    };
+}
+
+/**
+ * Manage architectural policies in `plan.policies` (`plan policy [list|add|remove]`).
+ */
+export function managePlanPolicy(plan, subAction = "list", ruleOrIdx = null, config = null) {
+    if (!Array.isArray(plan.policies)) plan.policies = [];
+    const sub = String(subAction || "list").toLowerCase();
+
+    if (sub === "add" && ruleOrIdx) {
+        const text = String(ruleOrIdx).trim();
+        if (text && !plan.policies.includes(text)) {
+            plan.policies.push(text);
+        }
+        const parsedRule = parsePolicyLayerRule(text);
+        if (parsedRule && config) {
+            if (!Array.isArray(config.layer_rules)) config.layer_rules = [];
+            const exists = config.layer_rules.some(
+                (r) => r.from === parsedRule.from && r.to === parsedRule.to,
+            );
+            if (!exists) config.layer_rules.push(parsedRule);
+        }
+    } else if (sub === "remove" && ruleOrIdx !== null && ruleOrIdx !== undefined) {
+        const raw = String(ruleOrIdx).trim();
+        if (/^\d+$/.test(raw)) {
+            const n = Number(raw);
+            const idx = n >= 0 && n < plan.policies.length ? n : n - 1;
+            if (idx >= 0 && idx < plan.policies.length) {
+                plan.policies.splice(idx, 1);
+            }
+        } else {
+            plan.policies = plan.policies.filter((p) => p !== raw);
+        }
+    }
+
+    const layerRules = plan.policies.map(parsePolicyLayerRule).filter(Boolean);
+    return {
+        ok: true,
+        sub_action: sub,
+        policies: plan.policies,
+        layer_rules: layerRules,
+    };
+}
+
+/**
+ * Manage scan-gate (`plan scan-gate [--skip --note "<min 50 chars>" | --reset]`).
+ */
+export function manageScanGate(state, plan, opts = {}) {
+    if (opts.reset || opts.subAction === "reset") {
+        plan.scan_gate_skipped = false;
+        delete plan.scan_gate_note;
+        plan.resolves_since_last_scan = 0;
+        return {
+            ok: true,
+            status: "reset",
+            scan_gate_skipped: false,
+            resolves_since_last_scan: 0,
+        };
+    }
+    if (opts.skip || opts.subAction === "skip") {
+        const note = String(opts.note || "").trim();
+        if (note.length < 50) {
+            return {
+                ok: false,
+                status: "note_too_short",
+                error: "Skipping scan-gate requires a --note of at least 50 characters.",
+                message: "Skipping scan-gate requires a --note of at least 50 characters.",
+            };
+        }
+        plan.scan_gate_skipped = true;
+        plan.scan_gate_note = note;
+        return {
+            ok: true,
+            status: "skipped",
+            scan_gate_skipped: true,
+            note,
+        };
+    }
+    return {
+        ok: true,
+        status: "status",
+        scan_gate_skipped: Boolean(plan.scan_gate_skipped),
+        resolves_since_last_scan: Number(plan.resolves_since_last_scan || 0),
+        note: plan.scan_gate_note || null,
+    };
+}
+
+function collectPlanReferencedIssueMetadata(plan) {
+    const referencedIds = new Set();
+
+    for (const c of Object.values(plan?.clusters || {})) {
+        for (const id of c?.issue_ids || []) {
+            if (typeof id === "string" && !id.startsWith("cluster:")) referencedIds.add(id);
+        }
+    }
+    for (const id of plan?.queue_order || []) {
+        if (typeof id === "string" && !id.startsWith("cluster:")) referencedIds.add(id);
+    }
+    for (const id of plan?.promoted_ids || []) {
+        if (typeof id === "string" && !id.startsWith("cluster:")) referencedIds.add(id);
+    }
+    for (const id of plan?.uncommitted_resolved || []) {
+        if (typeof id === "string") referencedIds.add(id);
+    }
+
+    const skippedMap = new Map();
+    if (Array.isArray(plan?.skipped)) {
+        for (const item of plan.skipped) {
+            if (typeof item === "string") {
+                referencedIds.add(item);
+                skippedMap.set(item, { status: "deferred" });
+            } else if (item && typeof item === "object" && item.id) {
+                referencedIds.add(item.id);
+                skippedMap.set(item.id, item);
+            }
+        }
+    } else if (plan?.skipped && typeof plan.skipped === "object") {
+        for (const [id, meta] of Object.entries(plan.skipped)) {
+            referencedIds.add(id);
+            skippedMap.set(id, typeof meta === "object" && meta !== null ? meta : { status: "deferred" });
+        }
+    }
+
+    const annotationsObj =
+        plan?.annotations && typeof plan.annotations === "object" ? plan.annotations : {};
+    for (const id of Object.keys(annotationsObj)) {
+        referencedIds.add(id);
+    }
+    return { referencedIds, skippedMap, annotationsObj };
+}
+
+/**
+ * Reconstruct missing or corrupted entries in `state.issues` from `plan.clusters`,
+ * `plan.queue_order`, `plan.skipped`, and `plan.annotations` (`plexer health plan repair-state`).
+ */
+export function repairStateFromPlan(state, plan) {
+    if (!state.issues || typeof state.issues !== "object") state.issues = {};
+    const { referencedIds, skippedMap, annotationsObj } = collectPlanReferencedIssueMetadata(plan);
+
+    const repairedIds = [];
+    for (const id of referencedIds) {
+        const existing = state.issues[id];
+        const isCorrupt = !existing || typeof existing !== "object" || !existing.id || !existing.detector;
+        if (isCorrupt) {
+            const parts = String(id).split("::");
+            const detector = parts[0] || "unknown";
+            const file = parts[1] || "repo";
+            const identifier = parts.slice(2).join("::") || "item";
+            const resolvedDim =
+                Object.values(MECHANICAL_DIMENSIONS).find((d) => d.detectors.includes(detector))?.id ||
+                "code_quality";
+            state.issues[id] = {
+                id,
+                detector,
+                category: DETECTOR_CATEGORY[detector] || "code_quality",
+                dimension: resolvedDim,
+                tier: "T3",
+                confidence: "medium",
+                severity: "medium",
+                file,
+                line: 1,
+                end_line: 1,
+                span: "L1-L1",
+                identifier,
+                summary: `Reconstructed ${detector} finding (${identifier})`,
+                status: "open",
+                verified: false,
+                reconstructed: true,
+                ...(existing && typeof existing === "object" ? existing : {}),
+            };
+            repairedIds.push(id);
+        }
+
+        if (skippedMap.has(id)) {
+            const sk = skippedMap.get(id);
+            state.issues[id].status = sk.status || "deferred";
+            if (sk.note) state.issues[id].note = sk.note;
+            if (sk.resurface_after_scan != null) {
+                state.issues[id].resurface_after_scan = sk.resurface_after_scan;
+            }
+        }
+
+        if (annotationsObj[id]) {
+            const ann = annotationsObj[id];
+            if (ann.custom_description || ann.description) {
+                state.issues[id].custom_description = ann.custom_description || ann.description;
+            }
+            if (ann.note) {
+                state.issues[id].note = ann.note;
+            }
+        }
+    }
+
+    return {
+        ok: true,
+        status: "repaired",
+        repaired_count: repairedIds.length,
+        repaired_ids: repairedIds,
     };
 }
 
@@ -581,6 +1550,55 @@ export function isTriageStale(plan, state, mechanicalGrowthThreshold = 0.1) {
     return false;
 }
 
+const STAGE_GUIDANCE = {
+    strategize:
+        "Assess overall score drag across mechanical and subjective dimensions, identify high-leverage architectural root causes, and define the overarching remediation strategy.",
+    observe:
+        "Inspect open mechanical and subjective review findings, hotspot files, and recurring patterns across directories before proposing local edits.",
+    reflect:
+        "Trace cross-module dependencies and root causes behind finding clusters to distinguish symptoms from structural seams.",
+    organize:
+        "Group related findings into execution clusters (`plexer health plan cluster create`), set `depends_on` ordering, and promote top-priority items.",
+    enrich:
+        "Add structured cluster steps (`--add-step`), custom descriptions (`plan describe`), and engineering notes (`plan note`) to guide execution.",
+    "sense-check":
+        "Verify the execution queue order against score drag, blast radius, and architectural policies (`plan policy`).",
+    commit:
+        "Finalize and commit the living triage plan (`plexer health plan triage --stage commit --report \"...\"`).",
+};
+
+/**
+ * Build a tailored prompt for a specific triage stage (`plexer health plan triage --stage-prompt <stage>`).
+ */
+export function buildTriageStagePrompt(stage, state = null, plan = null) {
+    const stg = String(stage || "observe").toLowerCase();
+    if (!TRIAGE_STAGES.includes(stg)) {
+        throw new Error(
+            `Invalid triage stage "${stg}" — must be one of: ${TRIAGE_STAGES.join(", ")}`,
+        );
+    }
+    const openIssues = Object.values(state?.issues || {}).filter(
+        (i) => i.status === "open" && !i.suppressed,
+    );
+    const activeClusters = Object.keys(plan?.clusters || {});
+    const policies = plan?.policies || [];
+
+    return [
+        `# Living Plan Triage — Stage: ${stg}`,
+        "",
+        `## Objective`,
+        STAGE_GUIDANCE[stg] || "Analyze findings and update the living triage plan.",
+        "",
+        `## Current Context`,
+        `- Open findings: ${openIssues.length}`,
+        `- Active clusters: ${activeClusters.length > 0 ? activeClusters.join(", ") : "none"}`,
+        `- Active policies: ${policies.length > 0 ? policies.join("; ") : "none"}`,
+        "",
+        `## Next Command`,
+        `\`plexer health plan triage --stage ${stg} --report "<your ${stg} synthesis>"\``,
+    ].join("\n");
+}
+
 /**
  * Update a triage stage (`strategize`, `observe`, `reflect`, `organize`, `enrich`,
  * `sense-check`, `commit`, or `complete`).
@@ -593,6 +1611,18 @@ export function updateTriageStage(plan, opts = {}, state = null) {
         plan.triage.stages = {};
     }
 
+    if (opts.stagePrompt) {
+        const prompt = buildTriageStagePrompt(opts.stagePrompt, state, plan);
+        return {
+            ok: true,
+            stage: String(opts.stagePrompt).toLowerCase(),
+            stage_prompt: prompt,
+            prompt,
+            triage: plan.triage,
+            stale: state ? isTriageStale(plan, state) : false,
+        };
+    }
+
     const snapshotStateCounts = () => {
         if (!state?.issues) return;
         const allIssues = Object.values(state.issues);
@@ -603,6 +1633,23 @@ export function updateTriageStage(plan, opts = {}, state = null) {
             (i) => i.status === "open" && !i.suppressed && i.detector !== "review",
         ).length;
     };
+
+    if (opts.confirmExisting) {
+        const nowIso = new Date().toISOString();
+        plan.triage.completed = true;
+        plan.triage.confirmed_at = nowIso;
+        if (!plan.triage.strategy) {
+            plan.triage.strategy = opts.strategy || opts.report || "Confirmed existing triage plan";
+        }
+        snapshotStateCounts();
+        return {
+            ok: true,
+            stage: "confirm-existing",
+            confirmed: true,
+            triage: plan.triage,
+            stale: false,
+        };
+    }
 
     const rawStage = opts.stage ? String(opts.stage).toLowerCase() : null;
     if (opts.complete || rawStage === "complete" || rawStage === "commit") {
@@ -618,6 +1665,7 @@ export function updateTriageStage(plan, opts = {}, state = null) {
         plan.triage.completed_at = nowIso;
         snapshotStateCounts();
         return {
+            ok: true,
             stage: rawStage === "commit" ? "commit" : "complete",
             triage: plan.triage,
             stale: false,
@@ -635,6 +1683,7 @@ export function updateTriageStage(plan, opts = {}, state = null) {
         updated_at: new Date().toISOString(),
     };
     return {
+        ok: true,
         stage,
         triage: plan.triage,
         stale: state ? isTriageStale(plan, state) : false,

@@ -3,7 +3,7 @@
  * (`plexer health move <src> <dst> [--dry-run]`) with JS/TS, Python, and Luau/Roblox support.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, extname, join, posix, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { spanRange } from "../util/span.js";
 import { detectGitContext } from "./state.js";
 import { SCORED_ZONES } from "./zones.js";
@@ -422,10 +422,11 @@ function computeRobloxScriptRequire(fromFileRel, toFileRel) {
 
 function rewriteMovedFileImports(raw, fileRel, effectiveFileRel, ext, movePairs, allFiles) {
     let updated = raw;
+    const movedOldSet = new Set(movePairs.map((p) => p.oldPath));
     for (const { oldPath, newPath } of movePairs) {
-        if (fileRel === oldPath && effectiveFileRel === newPath && movePairs.length === 1) {
+        if (fileRel === oldPath && effectiveFileRel === newPath) {
             for (const otherRel of allFiles) {
-                if (otherRel === oldPath) continue;
+                if (movedOldSet.has(otherRel)) continue;
                 const oldSpecWithExt = computeRelativeSpecifier(oldPath, otherRel, true);
                 const oldSpecNoExt = computeRelativeSpecifier(oldPath, otherRel, false);
                 const newSpecWithExt = computeRelativeSpecifier(newPath, otherRel, true);
@@ -461,9 +462,10 @@ function rewriteMovedFileImports(raw, fileRel, effectiveFileRel, ext, movePairs,
             const oldMod = oldPath.replace(/\.py$/i, "").replace(/\//g, ".");
             const newMod = newPath.replace(/\.py$/i, "").replace(/\//g, ".");
             if (oldMod !== newMod && updated.includes(oldMod)) {
+                const escapedOldMod = oldMod.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
                 updated = updated
-                    .replace(new RegExp(`\\bfrom\\s+${oldMod}\\b`, "g"), `from ${newMod}`)
-                    .replace(new RegExp(`\\bimport\\s+${oldMod}\\b`, "g"), `import ${newMod}`);
+                    .replace(new RegExp(`\\bfrom\\s+${escapedOldMod}\\b`, "g"), `from ${newMod}`)
+                    .replace(new RegExp(`\\bimport\\s+${escapedOldMod}\\b`, "g"), `import ${newMod}`);
             }
         }
 
@@ -498,6 +500,18 @@ export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
 
     const relSrc = toPosix(relative(rootDir, absSrc));
     const relDst = toPosix(relative(rootDir, absDst));
+    if (
+        !relSrc ||
+        relSrc === "." ||
+        relSrc.startsWith("..") ||
+        isAbsolute(relSrc) ||
+        !relDst ||
+        relDst === "." ||
+        relDst.startsWith("..") ||
+        isAbsolute(relDst)
+    ) {
+        throw new Error("moveFileOrDir paths must stay within repository root");
+    }
 
     const movePairs = [];
     if (srcStat.isDirectory()) {

@@ -30,6 +30,7 @@ import { buildRepoMap, formatRepoMap } from "./map.js";
 import { discoverWorkspaceChildren } from "./scopes.js";
 import { headerOf, hitJson, hitLine, looseNoteFor, quoteFor, renderMatchBlock, symbolJson } from "./traverse-cli.js";
 import { edgeWalk, resolveSymbol } from "./traverse.js";
+import { linkTestsForGraph } from "./test-links.js";
 import { ask, readSpans, sameHit, skeleton } from "../ask/ask.js";
 import { fileFirstRoundRobin, roundRobinQueues, } from "../ask/file-selection.js";
 import { fuseScopes, STRONG_FLOOR, HIGH_FLOOR } from "../ask/fuse.js";
@@ -682,9 +683,10 @@ export function federateCallers(root, override, symbol, opts = {}) {
         found = true;
         const results = matches.map((m) => ({ symbol: m, hits: edgeWalk(graph, m, direction, depth) }));
         const read = fileReader(join(root, child));
+        const testLinks = linkTestsForGraph(graph);
         const lines = [`## ${child}/`];
         for (const { symbol: sym, hits } of results) {
-            lines.push(renderMatchBlock(sym, hits, direction, showDepth, matches.length, read, { source: Boolean(opts.source) }));
+            lines.push(renderMatchBlock(sym, hits, direction, showDepth, matches.length, read, { source: Boolean(opts.source), graph, testLinks }));
             const entry = {
                 repo: child,
                 symbol: symbolJson({ ...sym, path: `${child}/${sym.path}` }),

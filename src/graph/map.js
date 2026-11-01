@@ -104,6 +104,39 @@ function computeDirEntries(nodes, inDegree, maxDirs, hubsPerDir, stripPrefix) {
     const dirs = dirEntries.slice(0, maxDirs);
     return { dirs, dropped };
 }
+function attachChurnHotspots(result, graph, fileNodes, inDegree, hotspots, hotspotsN, history) {
+    const fileHistory = history?.files ?? {};
+    for (const h of hotspots) {
+        const st = fileHistory[h.path];
+        h.churnCommits = st?.commits ?? 0;
+        h.churnScore = st?.churnScore ?? 0;
+    }
+    const fileInDegreeByPath = new Map();
+    for (const n of graph.nodes) {
+        if (!n.path)
+            continue;
+        fileInDegreeByPath.set(n.path, (fileInDegreeByPath.get(n.path) ?? 0) + (inDegree.get(n.id) ?? 0));
+    }
+    const churnHotspots = [];
+    for (const f of fileNodes) {
+        const st = fileHistory[f.path];
+        if (!st || (st.commits ?? 0) < 2)
+            continue;
+        const fileInDeg = fileInDegreeByPath.get(f.path) ?? 0;
+        const rawScore = (st.churnScore ?? 0) * Math.log2(2 + fileInDeg);
+        churnHotspots.push({
+            path: f.path,
+            commits: st.commits,
+            churnCommits: st.commits,
+            churnScore: st.churnScore,
+            inDegree: fileInDeg,
+            score: Math.round(rawScore * 100) / 100,
+        });
+    }
+    churnHotspots.sort((a, b) => b.score - a.score || b.commits - a.commits || a.path.localeCompare(b.path));
+    result.churnHotspots = churnHotspots.slice(0, hotspotsN);
+}
+
 /**
  * Build the repo map from an already-loaded `GraphV1`. Deterministic: same
  * graph in → byte-identical `RepoMap` out (modulo insertion order, which is
@@ -119,7 +152,8 @@ export function buildRepoMap(graph, opts = {}) {
     const maxDirs = opts.maxDirs ?? DEFAULT_MAX_DIRS;
     const hubsPerDir = opts.hubsPerDir ?? DEFAULT_HUBS_PER_DIR;
     const hotspotsN = opts.hotspots ?? DEFAULT_HOTSPOTS;
-    const isDefault = maxDirs === DEFAULT_MAX_DIRS && hubsPerDir === DEFAULT_HUBS_PER_DIR && hotspotsN === DEFAULT_HOTSPOTS;
+    const hasChurnOpts = Boolean(opts.gitHistory);
+    const isDefault = maxDirs === DEFAULT_MAX_DIRS && hubsPerDir === DEFAULT_HUBS_PER_DIR && hotspotsN === DEFAULT_HOTSPOTS && !hasChurnOpts;
     if (isDefault && graph._defaultRepoMap && graph._mapNodeLen === graph.nodes.length && graph._mapEdgeLen === graph.edges.length) {
         return graph._defaultRepoMap;
     }
@@ -167,6 +201,9 @@ export function buildRepoMap(graph, opts = {}) {
         hotspots,
         dropped,
     };
+    if (hasChurnOpts) {
+        attachChurnHotspots(result, graph, fileNodes, inDegree, hotspots, hotspotsN, opts.gitHistory);
+    }
     if (isDefault) {
         Object.defineProperty(graph, "_defaultRepoMap", { value: result, enumerable: false, configurable: true, writable: true });
         Object.defineProperty(graph, "_mapNodeLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
@@ -190,6 +227,10 @@ function formatDirLine(d) {
 }
 function formatHotspot(h) {
     return `${h.name} · ${h.kind} · ${h.path}:${h.span} · ${h.inDegree}←`;
+}
+function formatChurnHotspot(c) {
+    const commits = c.commits ?? c.churnCommits ?? 0;
+    return `${c.path} (${commits} commits, score ${c.score ?? c.churnScore ?? 0}, ${c.inDegree ?? 0}←)`;
 }
 function droppedNote(dropped) {
     if (dropped <= 0)
@@ -220,5 +261,8 @@ export function formatRepoMap(map) {
         lines.push("");
     }
     lines.push(`hotspots: ${map.hotspots.map(formatHotspot).join("  ")}`);
+    if (Array.isArray(map.churnHotspots) && map.churnHotspots.length > 0) {
+        lines.push(`churn hotspots: ${map.churnHotspots.map(formatChurnHotspot).join("  ")}`);
+    }
     return lines.join("\n") + "\n";
 }

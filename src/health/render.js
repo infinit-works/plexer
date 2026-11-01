@@ -2,6 +2,7 @@
  * Terminal (`text`), Markdown (`markdown`), and JSON (`json`) formatters for `plexer health`.
  */
 import { buildWorkflowGuide } from "./constants.js";
+import { SUSPECT_DROP_THRESHOLD } from "./state.js";
 
 function appendQueueLines(lines, queue) {
     lines.push("");
@@ -21,9 +22,13 @@ function appendQueueLines(lines, queue) {
     } else {
         for (let i = 0; i < queue.items.length; i++) {
             const it = queue.items[i];
+            const impactVal = Number(it.score_impact ?? it.score_impact_detail?.deltaStrict ?? 0);
+            const impactTag = impactVal > 0 ? ` (+${impactVal.toFixed(1)} pts)` : "";
+            const descText = it.custom_description || it.summary;
             lines.push(
-                `  ${i + 1}. [${it.tier} · ${it.severity} · ${it.detector}] ${it.file}:${it.span} — ${it.summary}`,
+                `  ${i + 1}. [${it.tier} · ${it.severity} · ${it.detector}] ${it.file}:${it.span} — ${descText}${impactTag}`,
             );
+            if (it.explanation) lines.push(`     Why: ${it.explanation}`);
             if (it.suggestion) lines.push(`     Fix: ${it.suggestion}`);
             if (it.resolve_command) lines.push(`     Resolve: \`${it.resolve_command}\``);
         }
@@ -34,7 +39,12 @@ function appendQueueLines(lines, queue) {
         if (activeClusters.length > 0) {
             lines.push("");
             lines.push(
-                `Clusters: ${activeClusters.map((c) => `${c.name} (${c.open_count})`).join(", ")}`,
+                `Clusters: ${activeClusters
+                    .map((c) => {
+                        const cImp = Number(c.score_impact ?? c.score_impact_detail?.deltaStrict ?? 0);
+                        return `${c.name} (${c.open_count}${cImp > 0 ? `, +${cImp.toFixed(1)} pts` : ""})`;
+                    })
+                    .join(", ")}`,
             );
         }
     }
@@ -71,7 +81,7 @@ export function formatHealthText(result) {
         );
         if (diff.suspect_held_count > 0) {
             lines.push(
-                `  ⚠ Suspect drop guard held ${diff.suspect_held_count} disappearance(s) because detector(s) [${(diff.suspect_detectors || []).join(", ")}] dropped from >=5 findings to 0. Pass --force-resolve to confirm.`,
+                `  ⚠ Suspect drop guard held ${diff.suspect_held_count} disappearance(s) because detector(s) [${(diff.suspect_detectors || []).join(", ")}] dropped from >=${SUSPECT_DROP_THRESHOLD} findings to 0. Pass --force-resolve to confirm.`,
             );
         }
     }
@@ -80,8 +90,12 @@ export function formatHealthText(result) {
         lines.push("");
         lines.push("Mechanical dimensions (25% pool):");
         for (const dim of Object.values(scores.mechanical_dimensions)) {
+            const dragTag =
+                Number(dim.overall_drag) > 0
+                    ? `  (drag: -${Number(dim.overall_drag).toFixed(2)} pts)`
+                    : "";
             lines.push(
-                `  ${dim.name.padEnd(22)} ${String(dim.score.toFixed(1) + "%").padStart(6)}  (${dim.open_count} open / ${dim.potential} checks)`,
+                `  ${dim.name.padEnd(22)} ${String(dim.score.toFixed(1) + "%").padStart(6)}  (${dim.open_count} open / ${dim.potential} checks)${dragTag}`,
             );
         }
     }
@@ -93,7 +107,11 @@ export function formatHealthText(result) {
         );
         for (const dim of Object.values(scores.subjective_dimensions)) {
             const label = dim.score === null ? "unassessed" : `${dim.score.toFixed(1)}%`;
-            lines.push(`  ${dim.name.padEnd(22)} ${label.padStart(10)}  (weight ${dim.weight})`);
+            const dragTag =
+                Number(dim.overall_drag) > 0
+                    ? `  (drag: -${Number(dim.overall_drag).toFixed(2)} pts)`
+                    : "";
+            lines.push(`  ${dim.name.padEnd(22)} ${label.padStart(10)}  (weight ${dim.weight})${dragTag}`);
         }
     }
 
@@ -138,12 +156,13 @@ export function formatHealthMarkdown(result) {
         lines.push(
             "",
             "### Mechanical Dimensions",
-            "| Dimension | Score | Open Findings | Checks |",
-            "| :--- | :---: | :---: | :---: |",
+            "| Dimension | Score | Open Findings | Checks | Drag |",
+            "| :--- | :---: | :---: | :---: | :---: |",
         );
         for (const dim of Object.values(scores.mechanical_dimensions || {})) {
+            const dragCell = Number(dim.overall_drag) > 0 ? `drag: -${Number(dim.overall_drag).toFixed(2)} pts` : "0 pts";
             lines.push(
-                `| **${dim.name}** | ${dim.score.toFixed(1)}% | ${dim.open_count} | ${dim.potential} |`,
+                `| **${dim.name}** | ${dim.score.toFixed(1)}% | ${dim.open_count} | ${dim.potential} | ${dragCell} |`,
             );
         }
     }
@@ -158,9 +177,12 @@ export function formatHealthMarkdown(result) {
     if (queue && queue.items.length > 0) {
         lines.push("", "### Prioritized Execution Queue (`plexer health next`)");
         for (const it of queue.items) {
+            const impactVal = Number(it.score_impact ?? it.score_impact_detail?.deltaStrict ?? 0);
+            const impactTag = impactVal > 0 ? ` (+${impactVal.toFixed(1)} pts)` : "";
             lines.push(
-                `- **\`[${it.tier} · ${it.severity} · ${it.detector}]\` \`${it.file}:${it.span}\`** — ${it.summary}`,
+                `- **\`[${it.tier} · ${it.severity} · ${it.detector}]\` \`${it.file}:${it.span}\`** — ${it.custom_description || it.summary}${impactTag}`,
             );
+            if (it.explanation) lines.push(`  - *Why:* ${it.explanation}`);
             if (it.suggestion) lines.push(`  - *Fix:* ${it.suggestion}`);
             if (it.resolve_command) lines.push(`  - *Resolve:* \`${it.resolve_command}\``);
         }

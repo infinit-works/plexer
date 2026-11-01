@@ -1306,6 +1306,290 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             rmSync(tmp, { recursive: true, force: true });
         }
     });
+
+    it("resolves import-bound calls with duplicate names/aliases, transitive JS/TS & Python barrels, tsconfig paths, package.json #imports, and typeOnly edges", async () => {
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-pillar1-test-"));
+        try {
+            execFileSync("git", ["init", "-q"], { cwd: tmp });
+            mkdirSync(join(tmp, "src", "core"), { recursive: true });
+            mkdirSync(join(tmp, "src", "utils"), { recursive: true });
+            mkdirSync(join(tmp, "py_pkg"), { recursive: true });
+
+            // tsconfig with JSONC comments and path alias
+            writeFileSync(
+                join(tmp, "tsconfig.json"),
+                [
+                    "{",
+                    "  // JSONC comment in tsconfig",
+                    '  "compilerOptions": {',
+                    '    "baseUrl": ".",',
+                    '    "paths": {',
+                    '      "@core/*": ["src/core/*"]',
+                    "    }",
+                    "  }",
+                    "}",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "package.json"),
+                JSON.stringify({
+                    name: "@acme/demo",
+                    imports: {
+                        "#utils/*": "./src/utils/*",
+                    },
+                }),
+            );
+
+            // Two files defining `parse` so global unique fallback would drop it without import-bound resolution
+            writeFileSync(
+                join(tmp, "src", "core", "parser-a.ts"),
+                "export function parse(input: string): string { return input.trim(); }\n",
+            );
+            writeFileSync(
+                join(tmp, "src", "core", "parser-b.ts"),
+                "export function parse(input: string): string { return input.toLowerCase(); }\nexport function extraHelper(): number { return 7; }\n",
+            );
+            // Multi-hop barrel: index.ts -> sub-barrel.ts -> parser-a.ts & parser-b.ts
+            writeFileSync(
+                join(tmp, "src", "core", "sub-barrel.ts"),
+                'export { parse as parseA } from "./parser-a";\nexport * from "./parser-b";\n',
+            );
+            writeFileSync(
+                join(tmp, "src", "core", "index.ts"),
+                'export { parseA } from "./sub-barrel";\nexport * from "./sub-barrel";\n',
+            );
+
+            writeFileSync(
+                join(tmp, "src", "utils", "helper.ts"),
+                "export interface ConfigShape { mode: string; }\nexport type ModeAlias = string;\nexport function formatOut(v: string): string { return v; }\n",
+            );
+            writeFileSync(
+                join(tmp, "src", "utils", "type-only-peer.ts"),
+                'import type { ConfigShape } from "./helper";\nexport function inspectType(c: ConfigShape): string { return c.mode; }\n',
+            );
+
+            writeFileSync(
+                join(tmp, "src", "consumer.ts"),
+                [
+                    'import { parseA as runParse, extraHelper } from "@core/index";',
+                    'import { formatOut } from "#utils/helper";',
+                    'import type { ConfigShape } from "#utils/helper";',
+                    "export function execute(cfg: ConfigShape): string {",
+                    "  const n = extraHelper();",
+                    '  return formatOut(runParse(cfg.mode + String(n)));',
+                    "}",
+                ].join("\n"),
+            );
+
+            // Python __init__.py barrel + aliased import call
+            writeFileSync(
+                join(tmp, "py_pkg", "impl.py"),
+                "def compute_metric(x):\n    return x + 1\n",
+            );
+            writeFileSync(
+                join(tmp, "py_pkg", "other.py"),
+                "def compute_metric(x):\n    return x + 2\n",
+            );
+            writeFileSync(
+                join(tmp, "py_pkg", "__init__.py"),
+                "from .impl import compute_metric\n",
+            );
+            writeFileSync(
+                join(tmp, "py_caller.py"),
+                "from py_pkg import compute_metric as cm\n\ndef run_py():\n    return cm(10)\n",
+            );
+
+            await buildGraph(tmp);
+            const g = JSON.parse(readFileSync(join(tmp, "plexer", ".graph", "wiring.json"), "utf8"));
+
+            const callToParseA = g.edges.find(
+                (e) =>
+                    e.source === "src/consumer.ts#execute" &&
+                    e.target === "src/core/parser-a.ts#parse" &&
+                    e.relation === "calls",
+            );
+            assert.ok(callToParseA, "aliased call through 2-hop barrel and @core/* path alias must resolve to parser-a.ts#parse");
+            assert.equal(callToParseA.confidence, "extracted");
+
+            const callToExtra = g.edges.find(
+                (e) =>
+                    e.source === "src/consumer.ts#execute" &&
+                    e.target === "src/core/parser-b.ts#extraHelper" &&
+                    e.relation === "calls",
+            );
+            assert.ok(callToExtra, "export * barrel routing must resolve extraHelper in parser-b.ts");
+            assert.equal(callToExtra.confidence, "extracted");
+
+            const callToFormatOut = g.edges.find(
+                (e) =>
+                    e.source === "src/consumer.ts#execute" &&
+                    e.target === "src/utils/helper.ts#formatOut" &&
+                    e.relation === "calls",
+            );
+            assert.ok(callToFormatOut, "package.json #utils/* subpath import must resolve formatOut");
+            assert.equal(callToFormatOut.confidence, "extracted");
+
+            const typeOnlyImportEdge = g.edges.find(
+                (e) =>
+                    e.source === "src/utils/type-only-peer.ts" &&
+                    e.target === "src/utils/helper.ts" &&
+                    e.relation === "imports",
+            );
+            assert.ok(typeOnlyImportEdge, "type-only import edge exists");
+            assert.equal(typeOnlyImportEdge.typeOnly, true, "import type edge must be flagged typeOnly: true");
+
+            const mixedImportEdge = g.edges.find(
+                (e) =>
+                    e.source === "src/consumer.ts" &&
+                    e.target === "src/utils/helper.ts" &&
+                    e.relation === "imports",
+            );
+            assert.ok(mixedImportEdge, "mixed runtime + type import edge exists");
+            assert.equal(Boolean(mixedImportEdge.typeOnly), false, "runtime import to same file must clear typeOnly");
+
+            const pyCallEdge = g.edges.find(
+                (e) =>
+                    e.source === "py_caller.py#run_py" &&
+                    e.target === "py_pkg/impl.py#compute_metric" &&
+                    e.relation === "calls",
+            );
+            assert.ok(pyCallEdge, "Python __init__.py barrel + aliased from-import call must resolve to py_pkg/impl.py#compute_metric");
+            assert.equal(pyCallEdge.confidence, "extracted");
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("guards grep against ReDoS, hints on git-ignored matches, and integrates temporal coupling, churn, companion tests, and layer rules", async () => {
+        const { compileSafeUserRegex } = await import("../src/search/user-regexp.js");
+        const { zeroHitNote } = await import("../src/search/grep-cli.js");
+        const { analyzeGitHistory, untouchedCoChanges } = await import("../src/blast/history.js");
+        const { linkTestsForGraph } = await import("../src/graph/test-links.js");
+        const { blastRadiusIn } = await import("../src/blast/blast.js");
+        const { textReport, markdownReport } = await import("../src/blast/render.js");
+        const { formatRepoMap } = await import("../src/graph/map.js");
+
+        assert.throws(
+            () => compileSafeUserRegex("(a+)+$"),
+            /catastrophic backtracking/,
+            "nested repeating quantifier must throw SyntaxError",
+        );
+        assert.ok(compileSafeUserRegex("^[a-zA-Z0-9_]+$").test("valid_ident_1"));
+
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-pillar3-test-"));
+        try {
+            execFileSync("git", ["init", "-q"], { cwd: tmp });
+            execFileSync("git", ["config", "user.email", "dev@example.com"], { cwd: tmp });
+            execFileSync("git", ["config", "user.name", "Dev"], { cwd: tmp });
+
+            writeFileSync(join(tmp, ".gitignore"), "dist/\n");
+            mkdirSync(join(tmp, "dist"), { recursive: true });
+            writeFileSync(join(tmp, "dist", "bundle.js"), "const SECRET_DIST_MARKER = 999;\n");
+
+            mkdirSync(join(tmp, "src", "client"), { recursive: true });
+            mkdirSync(join(tmp, "src", "server"), { recursive: true });
+            mkdirSync(join(tmp, "test"), { recursive: true });
+
+            // Commit 1..3: src/client/view.ts and src/server/rpc.ts co-change together without static import
+            for (let i = 1; i <= 3; i++) {
+                writeFileSync(
+                    join(tmp, "src", "client", "view.ts"),
+                    `export function renderView(): number { return ${i}; }\n`,
+                );
+                writeFileSync(
+                    join(tmp, "src", "server", "rpc.ts"),
+                    `export function handleRpc(): number { return ${i * 10}; }\n`,
+                );
+                writeFileSync(
+                    join(tmp, "test", "view.test.ts"),
+                    `// companion test for view.ts by stem\nexport function testRenderView() { return ${i}; }\n`,
+                );
+                execFileSync("git", ["add", "."], { cwd: tmp });
+                execFileSync("git", ["commit", "-q", "-m", `sync view and rpc ${i}`], { cwd: tmp });
+            }
+
+            // Now modify ONLY src/client/view.ts and add an illegal import to src/server/rpc.ts to test layer_rules
+            writeFileSync(
+                join(tmp, "src", "client", "view.ts"),
+                'import { handleRpc } from "../server/rpc";\nexport function renderView(): number { return handleRpc() + 1; }\n',
+            );
+
+            await buildGraph(tmp);
+            const g = JSON.parse(readFileSync(join(tmp, "plexer", ".graph", "wiring.json"), "utf8"));
+
+            // 1. Grep git-ignored zero-hit diagnostic
+            const grepRes = grepGraph(g, tmp, "SECRET_DIST_MARKER");
+            assert.equal(grepRes.totalHits, 0);
+            assert.ok(grepRes.ignoredDirs?.includes("dist/"), "grepGraph must detect match in git-ignored dist/");
+            assert.ok(zeroHitNote(grepRes).includes("dist/"), "zeroHitNote must mention git-ignored dist/");
+
+            // 2. Test-companion linking
+            const tLinks = linkTestsForGraph(g);
+            const viewTests = tLinks.testsForSymbol("src/client/view.ts#renderView", "src/client/view.ts", true);
+            assert.ok(
+                viewTests.some((t) => t.testFile === "test/view.test.ts" && t.kind === "stem_companion"),
+                "view.test.ts must link to src/client/view.ts via stem_companion",
+            );
+
+            // 3. Git temporal coupling & churn
+            const hist = analyzeGitHistory(tmp, join(tmp, "plexer"), { noCache: true });
+            assert.equal(hist.files["src/client/view.ts"]?.commits, 3);
+            const untouched = untouchedCoChanges(hist, ["src/client/view.ts"], g);
+            const rpcPartner = untouched.find((u) => u.partner === "src/server/rpc.ts");
+            assert.ok(rpcPartner, "untouchedCoChanges finds src/server/rpc.ts");
+            assert.equal(rpcPartner.couplingRatio, 1);
+
+            // 4. Blast radius with co-changes, companion tests, and layer_rules
+            mkdirSync(join(tmp, "plexer", ".health"), { recursive: true });
+            writeFileSync(
+                join(tmp, "plexer", ".health", "config.json"),
+                JSON.stringify({
+                    layer_rules: [
+                        {
+                            from: "src/client/**",
+                            to: "src/server/**",
+                            allowTypeOnly: true,
+                            reason: "Client must not directly import server implementation",
+                        },
+                    ],
+                }),
+            );
+            const blast = blastRadiusIn(
+                g,
+                join(tmp, "plexer"),
+                [{ path: "src/client/view.ts", status: "M", additions: 2, deletions: 1, ranges: [{ start: 1, end: 2 }], preview: [] }],
+                "working tree",
+                2,
+                { rootDir: tmp },
+            );
+            assert.ok(blast.coChanges?.some((c) => c.partner === "src/server/rpc.ts"), "blast includes untouched co-change partner");
+            assert.ok(blast.layerViolations?.length === 1, "blast detects client -> server layer rule violation");
+            assert.ok(
+                blast.areas[0]?.testFiles.includes("test/view.test.ts"),
+                "blast area links stem-companion test file test/view.test.ts",
+            );
+            const md = markdownReport(blast);
+            const txt = textReport(blast);
+            assert.ok(md.includes("src/server/rpc.ts") && txt.includes("src/server/rpc.ts"), "reports render co-change warnings");
+            assert.ok(md.includes("Layer boundary violations") && txt.includes("Layer boundary violations"), "reports render layer violations");
+
+            // 5. Repo map with churn hotspots + SDK callers depth validation
+            const repoMapWithChurn = buildRepoMap(g, { gitHistory: hist });
+            assert.ok(repoMapWithChurn.churnHotspots?.length > 0, "buildRepoMap computes churnHotspots when gitHistory provided");
+            assert.ok(formatRepoMap(repoMapWithChurn).includes("churn hotspots:"), "formatRepoMap renders churn hotspots line");
+
+            const px = new Plexer();
+            assert.throws(
+                () => px.callers(tmp, "renderView", { depth: 0 }),
+                RangeError,
+                "Plexer.prototype.callers must throw RangeError on invalid depth: 0",
+            );
+            const mapViaSdk = px.map(tmp, { churn: true });
+            assert.ok(mapViaSdk.churnHotspots?.length > 0, "px.map({ churn: true }) populates churnHotspots");
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
 });
 
 

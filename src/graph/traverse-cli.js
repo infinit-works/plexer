@@ -6,6 +6,7 @@ import { fileReader, needlesForName, referenceLines, spanRange } from "../util/s
 import { isTestPath } from "../ask/ask.js";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached } from "./load.js";
+import { linkTestsForGraph } from "./test-links.js";
 import { resolveSymbol, edgeWalk, parseWalkDepth } from "./traverse.js";
 
 const ARROW = { in: "←", out: "→" };
@@ -153,7 +154,25 @@ export function formatSymbolSource(symbol, read) {
     return `\`\`\`\n${body.join("\n")}\n\`\`\``;
 }
 
+function coveringTestsFooter(symbol, hits, direction, testLinks) {
+    if (direction !== "in" || !testLinks || !symbol?.id || !symbol?.path)
+        return null;
+    const directTestFiles = new Set();
+    for (const h of hits) {
+        if (h.depth === 1 && h.node?.path && isTestPath(h.node.path))
+            directTestFiles.add(h.node.path);
+    }
+    const allTests = testLinks.testsForSymbol(symbol.id, symbol.path, true);
+    const extra = allTests.filter(
+        (t) => (t.kind === "module_import" || t.kind === "stem_companion") && !directTestFiles.has(t.testFile),
+    );
+    if (extra.length === 0)
+        return null;
+    return `  covering tests: ${extra.map((t) => `${t.testFile} (${t.kind})`).join(", ")}`;
+}
+
 export function renderMatchBlock(symbol, hits, direction, showDepth, candidateCount, read, opts = {}) {
+    const testLinks = opts.testLinks ?? (opts.graph ? linkTestsForGraph(opts.graph) : null);
     const seenSourceIds = opts.seenSourceIds ?? new Set();
     const sourceBudget = opts.sourceBudget ?? { bytes: 0, maxBytes: 5400 };
     const head = headerOf(symbol);
@@ -169,6 +188,9 @@ export function renderMatchBlock(symbol, hits, direction, showDepth, candidateCo
     }
     if (hits.length === 0) {
         lines.push(looseNoteFor(direction, symbol.name, candidateCount));
+        const footer = coveringTestsFooter(symbol, hits, direction, testLinks);
+        if (footer)
+            lines.push(footer);
         return lines.join("\n");
     }
     const needles = needlesForName(symbol.name);
@@ -218,6 +240,9 @@ export function renderMatchBlock(symbol, hits, direction, showDepth, candidateCo
         sourceBudget.bytes += Buffer.byteLength(rendered, "utf8") + 1;
         lines.push(rendered);
     }
+    const footer = coveringTestsFooter(symbol, hits, direction, testLinks);
+    if (footer)
+        lines.push(footer);
     return lines.join("\n");
 }
 
@@ -340,18 +365,7 @@ export function resolveCliDepth(raw, defaultDepth = DEFAULT_DEPTH) {
     return d;
 }
 
-export function runCallersCommand(queryInput, dir, opts) {
-    const root = resolve(dir);
-    const contextDir = contextDirFor(root, opts.globalDir);
-    const graph = loadGraphCached(contextDir);
-    if (!graph) {
-        console.error(`✗ no graph found at ${contextDir} — run \`plexer build\` first`);
-        process.exit(1);
-    }
-    const queries = (Array.isArray(queryInput) ? queryInput : [queryInput]).filter(Boolean);
-    const direction = resolveDirection(opts.direction);
-    const depth = resolveCliDepth(opts.depth, DEFAULT_DEPTH);
-    const showDepth = depth > 1;
+function collectCallerMatchesForQueries(graph, root, queries, direction, depth, opts) {
     const allResults = [];
     const seenSymbolIds = new Set();
     for (const q of queries) {
@@ -362,7 +376,7 @@ export function runCallersCommand(queryInput, dir, opts) {
         catch (err) {
             console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
             process.exit(1);
-            return;
+            return null;
         }
         if (matches.length === 0) {
             if (!opts.json && direction === "in") {
@@ -391,6 +405,24 @@ export function runCallersCommand(queryInput, dir, opts) {
             allResults.push({ query: q, symbol, candidateCount: matches.length, hits });
         }
     }
+    return allResults;
+}
+
+export function runCallersCommand(queryInput, dir, opts) {
+    const root = resolve(dir);
+    const contextDir = contextDirFor(root, opts.globalDir);
+    const graph = loadGraphCached(contextDir);
+    if (!graph) {
+        console.error(`✗ no graph found at ${contextDir} — run \`plexer build\` first`);
+        process.exit(1);
+    }
+    const queries = (Array.isArray(queryInput) ? queryInput : [queryInput]).filter(Boolean);
+    const direction = resolveDirection(opts.direction);
+    const depth = resolveCliDepth(opts.depth, DEFAULT_DEPTH);
+    const showDepth = depth > 1;
+    const allResults = collectCallerMatchesForQueries(graph, root, queries, direction, depth, opts);
+    if (!allResults)
+        return;
     if (allResults.length === 0) {
         console.error(`✗ no symbol "${queries.join(", ")}" in the graph — check spelling or run plexer build`);
         process.exit(1);
@@ -413,6 +445,7 @@ export function runCallersCommand(queryInput, dir, opts) {
     const read = fileReader(root);
     const seenSourceIds = new Set();
     const seenHomonymCallerKeys = new Set();
+    const testLinks = direction === "in" ? linkTestsForGraph(graph) : null;
     const maxBytesPerSymbol = allResults.length > 1 ? Math.max(1200, Math.floor(5800 / allResults.length)) : 5400;
     let totalBytes = 0;
     for (let idx = 0; idx < allResults.length; idx++) {
@@ -434,6 +467,7 @@ export function runCallersCommand(queryInput, dir, opts) {
                 source: opts.source && remaining > 0,
                 seenSourceIds,
                 sourceBudget,
+                testLinks,
             }),
         );
         totalBytes += sourceBudget.bytes;

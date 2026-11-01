@@ -39,16 +39,21 @@ export interface GraphEdge {
 
 export interface GraphScope {
     prefix: string;
-    nodes: number;
+    label?: string;
+    markers?: string[];
+    nodes?: number;
 }
 
 export interface WiringGraph {
     meta: {
-        generated_at: string;
-        root: string;
-        files: number;
-        nodes: number;
-        edges: number;
+        version?: number;
+        nodeCount?: number;
+        edgeCount?: number;
+        generated_at?: string;
+        root?: string;
+        files?: number;
+        nodes?: number;
+        edges?: number;
         languages: string[];
         config_hash?: string;
         scopes?: GraphScope[];
@@ -190,6 +195,8 @@ export interface GrepOptions {
     fixed?: boolean;
     maxHits?: number;
     maxHitsPerSymbol?: number;
+    context?: number;
+    source?: boolean;
 }
 
 export interface GrepLineHit {
@@ -209,6 +216,7 @@ export interface GrepGroup {
     inDegree: number;
     hits: GrepLineHit[];
     omittedHits: number;
+    contextBlocks?: Array<Array<{ line: number; text: string; isMatch: boolean }>>;
 }
 
 export interface GrepResult {
@@ -220,6 +228,8 @@ export interface GrepResult {
         files: number;
         hits: number;
     };
+    ignoredDirs?: string[];
+    zeroHitHint?: string;
 }
 
 export interface EdgeWalkHit {
@@ -227,7 +237,7 @@ export interface EdgeWalkHit {
     node?: GraphNode;
     relation: EdgeRelation;
     depth: number;
-    via?: string;
+    via?: GraphNode | string;
     line?: number;
 }
 
@@ -235,17 +245,22 @@ export interface CallersOptions {
     direction?: "in" | "out";
     depth?: number | "all" | string;
     in?: string;
+    includeTests?: boolean;
 }
 
 export interface CallersMatch {
     symbol: GraphNode;
     hits: EdgeWalkHit[];
+    tests?: Array<{ path: string; confidence: string; reason?: string }>;
 }
 
 export interface RepoMapOptions {
     maxDirs?: number;
     hubsPerDir?: number;
     hotspots?: number;
+    churn?: boolean;
+    includeCoupling?: boolean;
+    gitHistory?: Record<string, unknown>;
 }
 
 export interface RepoMapHub {
@@ -254,6 +269,8 @@ export interface RepoMapHub {
     path: string;
     span: string;
     inDegree: number;
+    churnCommits?: number;
+    churnScore?: number;
 }
 
 export interface RepoMapEntry {
@@ -280,12 +297,18 @@ export interface RepoMapResult {
     }>;
     hotspots: RepoMapHub[];
     dropped: number;
+    churnHotspots?: Array<{ file: string; commits: number }>;
+    coupling?: Array<{ a: string; b: string; weight: number }>;
 }
 
 export interface BlastOptions {
     contextDir?: string;
     base?: string;
     depth?: number | "all" | string;
+    includeHistory?: boolean;
+    since?: string;
+    layerRules?: unknown[];
+    gitHistory?: Record<string, unknown>;
 }
 
 export interface BlastSeed {
@@ -312,7 +335,8 @@ export interface BlastImpactedSymbol {
     span: string;
     relation: EdgeRelation;
     depth: number;
-    behavioral: boolean;
+    behavioral?: boolean;
+    typeOnly?: boolean;
 }
 
 export interface BlastModuleGroup {
@@ -330,7 +354,8 @@ export interface BlastArea {
     key: string;
     files: string[];
     seeds: number;
-    tests: "covered" | "untouched" | "none";
+    tests: "na" | "changed" | "stale" | "none" | "covered" | "untouched";
+    companionTestFiles?: string[];
     testFiles: string[];
     changedTestFiles: string[];
     reached: number;
@@ -351,6 +376,13 @@ export interface BlastResult {
     testModules: BlastModuleGroup[];
     areas: BlastArea[];
     owners?: Array<{ name: string; commits: number }>;
+    coChanges?: unknown[];
+    untouchedCoChanges?: unknown[];
+    testLinks?: unknown[];
+    layerViolations?: unknown[];
+    healthHotspots?: unknown[];
+    reviewers?: Array<{ name: string; email?: string; commits: number; score?: number }>;
+    history?: Record<string, unknown>;
 }
 
 export type VizTab = "context" | "code" | "modules" | "symbols" | "outline";
@@ -402,7 +434,7 @@ export class Plexer {
     grep(dir: string, pattern: string, opts?: GrepOptions): GrepResult;
     callers(dir: string, symbol: string, opts?: CallersOptions): CallersMatch[];
     map(dir: string, opts?: RepoMapOptions): RepoMapResult;
-    health(dir: string, opts?: Record<string, unknown>): Record<string, unknown>;
+    health(dir: string, opts?: Record<string, unknown>): Record<string, unknown> | Promise<Record<string, unknown>>;
 }
 
 export function buildGraph(dir: string, opts?: BuildGraphOptions): Promise<BuildGraphResult>;
@@ -448,4 +480,7 @@ export function mermaidDiagram(blast: BlastResult): string | null;
 export function startVizServer(opts: VizServerOptions): Promise<{ url: string; port: number; close: () => Promise<void> }>;
 export function exportViz(opts: ExportVizOptions): ExportVizResult;
 export function startMcpServer(root?: string, dirOverride?: string, version?: string): void;
+export function health(dir: string, opts?: Record<string, unknown>): Record<string, unknown> | Promise<Record<string, unknown>>;
+export function formatHealthText(report: Record<string, unknown>): string;
+export function formatHealthMarkdown(report: Record<string, unknown>): string;
 
