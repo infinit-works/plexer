@@ -4,7 +4,7 @@
  */
 import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname, isAbsolute } from "node:path";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 
 const LOCK_STALE_MS = 300000;
 const SESSION_STALE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -165,24 +165,82 @@ export function projectDir(input) {
     return process.env.CLAUDE_PROJECT_DIR || input?.cwd || process.cwd();
 }
 
-/** Append an anchored `/<bareDir>/` entry to `<root>/.gitignore` if not already present. */
-export function appendGitignoreEntry(root, bareDir, note) {
-    const entry = `/${bareDir}/`;
-    const path = join(root, ".gitignore");
-    let current = "";
+/**
+ * Resolve `<gitCommonDir>/info/exclude` for a Git checkout (standard `.git` dir,
+ * linked worktree with `commondir`, or submodule `.git` file). Returns `null`
+ * when `root` is not a Git repository root.
+ */
+export function resolveGitExcludePath(root) {
     try {
-        current = readFileSync(path, "utf8");
+        const dot = join(root, ".git");
+        if (!existsSync(dot))
+            return null;
+        const st = statSync(dot);
+        if (st.isDirectory())
+            return join(dot, "info", "exclude");
+        if (!st.isFile())
+            return null;
+        const line = readFileSync(dot, "utf8").split("\n").find((l) => l.startsWith("gitdir:"));
+        if (line === undefined)
+            return null;
+        const target = line.slice("gitdir:".length).trim();
+        if (!target)
+            return null;
+        const gitdir = isAbsolute(target) ? target : resolve(root, target);
+        const commondirFile = join(gitdir, "commondir");
+        if (existsSync(commondirFile)) {
+            const rel = readFileSync(commondirFile, "utf8").trim();
+            if (rel) {
+                const common = isAbsolute(rel) ? rel : resolve(gitdir, rel);
+                if (existsSync(common) && statSync(common).isDirectory())
+                    return join(common, "info", "exclude");
+            }
+        }
+        if (existsSync(gitdir) && statSync(gitdir).isDirectory())
+            return join(gitdir, "info", "exclude");
+        return null;
     }
-    catch { /* no .gitignore yet */ }
-    const present = current.split(/\r?\n/).some((line) => {
+    catch (err) {
+        const noExcludePath = null;
+        void err;
+        return noExcludePath;
+    }
+}
+
+function hasIgnoreLine(content, bareDir, entry) {
+    return content.split(/\r?\n/).some((line) => {
         const value = line.trim();
         return value === entry || value === `${bareDir}/` || value === bareDir;
     });
-    if (present)
+}
+
+/**
+ * Append an anchored `/<bareDir>/` entry to `<root>`'s `.git/info/exclude` if not
+ * already ignored in `.gitignore` or `.git/info/exclude`. Never creates or dirties
+ * a tracked `.gitignore`, and skips non-git directories entirely.
+ */
+export function appendGitignoreEntry(root, bareDir, note) {
+    const entry = `/${bareDir}/`;
+    try {
+        const gitignore = readFileSync(join(root, ".gitignore"), "utf8");
+        if (hasIgnoreLine(gitignore, bareDir, entry))
+            return;
+    }
+    catch { /* no .gitignore */ }
+    const excludePath = resolveGitExcludePath(root);
+    if (!excludePath)
+        return;
+    let current = "";
+    try {
+        current = readFileSync(excludePath, "utf8");
+    }
+    catch { /* no info/exclude yet */ }
+    if (hasIgnoreLine(current, bareDir, entry))
         return;
     const gap = current === "" ? "" : current.endsWith("\n") ? "\n" : "\n\n";
     try {
-        writeFileSync(path, `${current}${gap}# ${note}\n${entry}\n`);
+        mkdirSync(dirname(excludePath), { recursive: true });
+        writeFileSync(excludePath, `${current}${gap}# ${note}\n${entry}\n`);
     }
     catch { /* best-effort */ }
 }

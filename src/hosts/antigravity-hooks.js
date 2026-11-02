@@ -12,7 +12,7 @@ import {
     handleStop,
 } from '../claude/hooks.js';
 import { ensureFreshGraph } from '../graph/refresh.js';
-import { hasPlexerIndex, isAutoBuildableRepo } from '../graph/root.js';
+import { hasAncestorRepoOrIndex, hasPlexerIndex, isAutoBuildableRepo, isBoundaryDir } from '../graph/root.js';
 import { agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo, resolveContextDir, readJson, writeJsonAtomic } from '../util/state.js';
 export { agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo };
 
@@ -278,22 +278,32 @@ export function parseAgyTranscript(transcriptPath, sessionState) {
 function findNearestRepoAncestor(startPath) {
     if (!startPath || typeof startPath !== 'string')
         return null;
-    let cur = resolve(startPath);
+    let startDir = resolve(startPath);
     try {
-        if (!statSync(cur).isDirectory())
-            cur = dirname(cur);
+        if (!statSync(startDir).isDirectory())
+            startDir = dirname(startDir);
     }
     catch {
-        cur = dirname(cur);
+        startDir = dirname(startDir);
     }
+    let cur = startDir;
     for (let i = 0; i < 25; i++) {
-        if (
-            hasPlexerIndex(cur) ||
-            existsSync(join(cur, 'plexer')) ||
-            existsSync(join(cur, 'sert.toml')) ||
-            existsSync(join(cur, 'default.project.json')) ||
-            existsSync(join(cur, '.git'))
-        ) {
+        if (isBoundaryDir(cur))
+            break;
+        const indexed = hasPlexerIndex(cur) || existsSync(join(cur, 'plexer', 'INDEX.md'));
+        if (indexed && (existsSync(join(cur, '.git')) || !hasAncestorRepoOrIndex(cur))) {
+            return cur;
+        }
+        const parent = dirname(cur);
+        if (parent === cur)
+            break;
+        cur = parent;
+    }
+    cur = startDir;
+    for (let i = 0; i < 25; i++) {
+        if (isBoundaryDir(cur))
+            break;
+        if (isAutoBuildableRepo(cur)) {
             return cur;
         }
         const parent = dirname(cur);

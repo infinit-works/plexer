@@ -258,8 +258,8 @@ function finalizeGraphBuildOutput(root, outDir, opts, graph, nodes, edges, sorte
     let cardStats = { written: 0, pruned: 0, files: [] };
     if (!opts.graphOnly) {
         ensureGitignored(root, outDir);
-        ensureSearchable(root, outDir);
         if (opts.cards === true) {
+            ensureSearchable(root, outDir);
             cardStats = writeCards(graph, outDir);
             writeIndex(outDir, cardStats.files, graph);
         }

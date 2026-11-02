@@ -38,20 +38,45 @@ export function hasPlexerIndex(dir) {
     return existsSync(wiringPath(contextDirFor(dir))) || existsSync(workspacePath(dir));
 }
 
+export function isBoundaryDir(resolved) {
+    const norm = resolved.replace(/\\/g, "/");
+    return (
+        resolved === "/" ||
+        resolved === resolve(homedir()) ||
+        resolved === resolve(tmpdir()) ||
+        /\/(?:\.gemini|\.agents|\.claude|\.codex)(?:\/|$)/.test(norm)
+    );
+}
+
+/**
+ * True when a strict ancestor of `dir` has a `.git` checkout or an existing
+ * plexer index. Prevents subdirectories with secondary markers (e.g.
+ * `test/default.project.json` or `packages/foo/package.json`) from hijacking
+ * their enclosing repository root.
+ */
+export function hasAncestorRepoOrIndex(dir) {
+    let cur = dirname(resolve(dir));
+    let prev = resolve(dir);
+    while (cur !== prev && !isBoundaryDir(cur)) {
+        if (existsSync(join(cur, ".git")) || hasPlexerIndex(cur))
+            return true;
+        prev = cur;
+        cur = dirname(cur);
+    }
+    return false;
+}
+
 /** True when `dir` is a project/repository root suitable for automatic initial indexing. */
 export function isAutoBuildableRepo(dir) {
     if (!dir || typeof dir !== "string")
         return false;
     const resolved = resolve(dir);
-    const norm = resolved.replace(/\\/g, "/");
-    if (
-        resolved === "/" ||
-        resolved === resolve(homedir()) ||
-        resolved === resolve(tmpdir()) ||
-        /\/(?:\.gemini|\.agents|\.claude|\.codex)(?:\/|$)/.test(norm)
-    ) {
+    if (isBoundaryDir(resolved))
         return false;
-    }
+    if (existsSync(join(resolved, ".git")))
+        return true;
+    if (hasAncestorRepoOrIndex(resolved))
+        return false;
     return REPO_ROOT_MARKERS.some((m) => existsSync(join(resolved, m)));
 }
 
@@ -62,7 +87,7 @@ export function nearestPlexerRoot(start, override) {
         return { root: from, levels: 0 };
     let dir = from;
     for (let levels = 0;; levels++) {
-        if (hasPlexerIndex(dir))
+        if (hasPlexerIndex(dir) && (existsSync(join(dir, ".git")) || !hasAncestorRepoOrIndex(dir)))
             return { root: dir, levels };
         const up = dirname(dir);
         if (up === dir)

@@ -32,6 +32,7 @@ import { claudeGlobalTargets } from './claude-global.js';
 import { claudeTargets } from '../claude/init.js';
 import { isPlexerAllowEntry, isPlexerFooterRegex, isPlexerStatusline } from '../claude/settings-merge.js';
 import { dirExists, isPlexerEntry, readJsonObject } from './config-write.js';
+import { resolveGitExcludePath } from '../util/state.js';
 // ---------------------------------------------------------------------------
 // primitive operations
 // ---------------------------------------------------------------------------
@@ -266,7 +267,7 @@ function stripCodexHooks(path, apply) {
  * wording, so it identifies the block. Entries are matched individually too, so
  * a hand-tidied file (comment deleted, entry kept) still retracts cleanly.
  */
-function stripIgnoreEntries(path, entries, apply) {
+function stripIgnoreEntries(path, entries, apply, { deleteIfBlank = true } = {}) {
     if (!existsSync(path))
         return 'absent';
     const text = readFileSync(path, 'utf8');
@@ -274,7 +275,7 @@ function stripIgnoreEntries(path, entries, apply) {
         .split('\n')
         .filter((l) => {
         const t = l.trim();
-        if (t.startsWith('#') && t.includes('plexer'))
+        if (t.startsWith('#') && (t.includes('plexer') || t.includes('.ignore before .gitignore, so this re-admits the tree to search only')))
             return false;
         return !entries.some((re) => re.test(t));
     })
@@ -285,9 +286,13 @@ function stripIgnoreEntries(path, entries, apply) {
     if (kept === text)
         return 'absent';
     if (!apply)
-        return isBlank(kept) ? 'deleted' : 'removed';
-    if (isBlank(kept))
-        return removeFile(path, true);
+        return isBlank(kept) && deleteIfBlank ? 'deleted' : 'removed';
+    if (isBlank(kept)) {
+        if (deleteIfBlank)
+            return removeFile(path, true);
+        writeFileSync(path, '');
+        return 'removed';
+    }
     writeFileSync(path, kept.endsWith('\n') ? kept : `${kept}\n`);
     return 'removed';
 }
@@ -442,12 +447,23 @@ function targets(repo, opts) {
     if (opts.cache !== false) {
         const cache = join(repo, 'plexer');
         const gitignore = join(repo, '.gitignore');
+        const gitExclude = resolveGitExcludePath(repo);
         const ignore = join(repo, '.ignore');
-        for (const t of [
+        const cacheTargets = [
             { hostId: 'graph', path: cache, what: 'local graph cache', scope: 'repo', run: (a) => removeDir(cache, a) },
             { hostId: 'graph', path: gitignore, what: 'plexer/ ignore entry', scope: 'repo', run: (a) => stripIgnoreEntries(gitignore, [/^\/?plexer\/?$/], a) },
             { hostId: 'graph', path: ignore, what: 'plexer/ search re-admit entries', scope: 'repo', run: (a) => stripIgnoreEntries(ignore, [/^!?plexer\/?$/, /^plexer\/\.(cache|graph)\/?$/], a) },
-        ])
+        ];
+        if (gitExclude) {
+            cacheTargets.push({
+                hostId: 'graph',
+                path: gitExclude,
+                what: 'plexer/ git exclude entry',
+                scope: 'repo',
+                run: (a) => stripIgnoreEntries(gitExclude, [/^\/?plexer\/?$/], a, { deleteIfBlank: false }),
+            });
+        }
+        for (const t of cacheTargets)
             enqueueTarget(t);
     }
     return out;

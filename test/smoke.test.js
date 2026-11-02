@@ -243,6 +243,30 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
                     { lastTouchedPath: join(homedir(), ".gemini/config/skills/review/SKILL.md") },
                 );
                 assert.equal(resolvedWithSkillRead, unindexedRepo, "skill path under .gemini must not hijack workspace root");
+
+                // Subdirectory with secondary marker (e.g. test/default.project.json) inside a .git repo
+                // must resolve to the enclosing .git root and never be treated as a standalone repo
+                const { isAutoBuildableRepo, nearestPlexerRoot } = await import("../src/graph/root.js");
+                mkdirSync(join(unindexedRepo, "test", "unit"), { recursive: true });
+                writeFileSync(join(unindexedRepo, "test", "default.project.json"), '{"name":"test"}\n');
+                assert.equal(
+                    isAutoBuildableRepo(join(unindexedRepo, "test")),
+                    false,
+                    "subdirectory with default.project.json inside a .git repo must not be auto-buildable",
+                );
+                assert.equal(
+                    nearestPlexerRoot(join(unindexedRepo, "test", "unit")).root,
+                    unindexedRepo,
+                    "nearestPlexerRoot must walk past test/default.project.json to the enclosing .git root",
+                );
+                assert.equal(
+                    resolveAgyRepoDir(
+                        { workspacePaths: [unindexedRepo] },
+                        { lastTouchedPath: join(unindexedRepo, "test", "unit", "Clock.spec.luau") },
+                    ),
+                    unindexedRepo,
+                    "resolveAgyRepoDir must resolve test/unit/*.spec.luau to enclosing .git root, not test/",
+                );
             } finally {
                 rmSync(indexedWs, { recursive: true, force: true });
                 rmSync(unindexedRepo, { recursive: true, force: true });
@@ -293,6 +317,10 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
 
                 assert.equal(existsSync(join(coldRepo, "plexer", ".graph", "wiring.json")), true, "cold repo must auto-build wiring.json on Turn 1");
                 assert.equal(existsSync(join(coldRepo, "plexer", "INDEX.md")), true, "cold repo must auto-build INDEX.md on Turn 1");
+                assert.equal(existsSync(join(coldRepo, ".gitignore")), false, "auto-build must not create or dirty tracked .gitignore");
+                assert.equal(existsSync(join(coldRepo, ".ignore")), false, "auto-build without --cards must not create .ignore");
+                const excludeText = readFileSync(join(coldRepo, ".git", "info", "exclude"), "utf8");
+                assert.ok(excludeText.includes("/plexer/"), "auto-build must write /plexer/ to .git/info/exclude");
                 assert.ok(Array.isArray(hookOut.injectSteps) && hookOut.injectSteps.length === 1, "PreInvocation must inject Turn-1 context on cold repo");
                 const hookMsg = hookOut.injectSteps[0].systemMessage?.systemMessage ?? hookOut.injectSteps[0].ephemeralMessage;
                 assert.ok(hookMsg.includes("compute_revenue_summary"), "PreInvocation must retrieve symbol from transcript_full.jsonl after stripping slash commands");

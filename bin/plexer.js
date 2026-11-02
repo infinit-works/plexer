@@ -87,7 +87,8 @@ function splitTrailingDir(arg, { requirePlexerDir = true } = {}) {
         try {
             if (existsSync(candidateDir) && statSync(candidateDir).isDirectory()) {
                 const absCand = resolve(candidateDir);
-                if (!requirePlexerDir || existsSync(join(absCand, "plexer")) || program.opts().dir) {
+                const hasIndex = hasPlexerIndex(absCand) || existsSync(join(absCand, "plexer")) || Boolean(program.opts().dir);
+                if (hasIndex || (!requirePlexerDir && isAutoBuildableRepo(absCand))) {
                     dirArg = rawList.pop();
                 }
             }
@@ -111,7 +112,9 @@ function queryRoot(dir) {
             console.error(`✗ directory not found: ${dir}`);
             process.exit(1);
         }
-        return resolved;
+        const { root, levels } = nearestPlexerRoot(resolved, program.opts().dir);
+        if (levels > 0) console.error(`[plexer] no plexer/ in ${dir} — answering from ${root}/plexer`);
+        return root;
     }
     const { root, levels } = nearestPlexerRoot(process.cwd(), program.opts().dir);
     if (levels > 0) console.error(`[plexer] no plexer/ here — answering from ${root}/plexer`);
