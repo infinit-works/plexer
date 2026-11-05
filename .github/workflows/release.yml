@@ -2,37 +2,42 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run tests and smoke-test tarball only; no npm or GitHub release
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}-${{ startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release') && github.sha || '' }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 
 jobs:
-  publish:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
 
-      - name: Ensure npm >= 11.5.1 for OIDC Trusted Publishing
-        run: npm install -g npm@latest
-
-      - name: Verify tag matches package.json
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          set -euo pipefail
-          tagged="${GITHUB_REF_NAME#v}"
-          declared="$(node -p "require('./package.json').version")"
-          if [ "$tagged" != "$declared" ]; then
-            echo "tag $GITHUB_REF_NAME does not match package.json version $declared" >&2
-            exit 1
-          fi
+      - name: Conventional Commits and CHANGELOG.md check
+        uses: kohltastrophe/release@v1.0.0
+        with:
+          mode: check
+          pr-title: ${{ github.event.pull_request.title }}
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
@@ -51,22 +56,68 @@ jobs:
           node "$pkg/bin/plexer.js" --version
           rm -f "$tarball"
 
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.MY_RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Release PR or Release
+        id: release
+        uses: kohltastrophe/release@v1.0.0
+        with:
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+      - name: Ensure npm >= 11.5.1 for OIDC Trusted Publishing
+        if: steps.release.outputs.should_release == 'true'
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        if: steps.release.outputs.should_release == 'true'
+        run: npm install --no-audit --no-fund
+
       - name: Stage publish to npm via OIDC Trusted Publisher
+        if: steps.release.outputs.should_release == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          if npm view "@plexer/cli@$version" version >/dev/null 2>&1; then
-            echo "@plexer/cli@$version is already on the registry; skipping publish"
+          if npm view "@plexer/cli@$VERSION" version >/dev/null 2>&1; then
+            echo "@plexer/cli@$VERSION is already on the registry; skipping publish"
           else
             npm stage publish --provenance=false --access public
           fi
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.release.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          NOTES_FILE: ${{ steps.release.outputs.notes_file }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
         run: |
           set -euo pipefail
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          flags=(--title "$TAG" --notes-file "$NOTES_FILE")
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            git push --force origin "$GITHUB_SHA:refs/tags/$TAG"
+            gh release edit "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file "$NOTES_FILE"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" "${flags[@]}"
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" "${flags[@]}"
           fi
