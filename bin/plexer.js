@@ -720,11 +720,13 @@ program
         }
         await refreshBefore(dir, opts);
         if (readWorkspace(root, globalOpts.dir)) {
+            const { analyzeGitHistory } = opts.churn ? await import("../src/blast/history.js") : {};
             runWorkspaceMap(root, globalOpts.dir, {
                 maxDirs: maxDirsW,
                 json: Boolean(opts.json),
                 churn: Boolean(opts.churn),
                 since: opts.since,
+                analyzeGitHistory,
             });
             return;
         }

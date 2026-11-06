@@ -244,75 +244,71 @@ export const AVAILABLE_DIRECTIVE_PHASES = [
  * Build the scan workflow guide.
  */
 export function buildWorkflowGuide(attestExample = ATTEST_RESOLVE_EXAMPLE) {
-    return [
-        "## INSTRUCTIONS FOR AGENTS — Workflow Guide",
-        "",
-        "Work the two loops: **outer** (`scan` → `score` → at target? → `rescan`) and",
-        "**inner** (`plan` → `next` → fix → `resolve` → repeat until queue clear).",
-        "",
-        "1. **Follow `next`**: `plexer health next` — the single source of truth for what to work on now.",
-        "   It is the execution queue from the living plan, surfaces auto-clustered batches,",
-        "   and tells you the exact file, lines, and resolve command to run.",
-        "   Use `plexer health backlog` only to inspect broader open work outside execution.",
-        "2. **Fix & resolve**: Fix the issue in code (using `plexer callers` / `plexer read`), then:",
-        `   \`plexer health resolve "<id>" --note "<what you did>" --confirm\``,
-        `   Or with explicit attestation: \`--attest "${attestExample}"\``,
-        "3. **Plan strategically**: `plexer health plan` / `plexer health plan cluster list` — reorder,",
-        "   cluster related issues (`plan cluster create`), and inspect the execution queue.",
-        "4. **Run auto-fixers**: `plexer health autofix <fixer> --dry-run` to preview, then apply.",
-        "   Use `plexer health move <src> <dst> --dry-run` to move files/dirs and auto-rewrite imports/requires.",
-        "5. **Explore topology**: `plexer health tree` (annotated directory/file health tree),",
-        "   `plexer health viz` (HTML treemap), or `plexer health detect <detector>` (fast single-detector run).",
-        "6. **Rescan**: `plexer health scan` — verify improvements and catch cascading effects.",
-        "7. **Subjective review**: `plexer health review --prepare` → run blind subagent reviews against",
-        "   `plexer/.health/review_packet_blind.json` (20 dimensions + holistic context & concerns) →",
-        "   `plexer health review --import <file>`.",
-        "8. **Triage**: `plexer health plan triage --stage observe|reflect|organize --report \"...\"`",
-        "   then `plexer health plan triage --complete --strategy \"...\"`.",
-        "9. **Check progress**: `plexer health status` — dimension scores dashboard.",
-        "",
-        "### Understanding Scores",
-        "- **Overall**: 25% mechanical + 75% subjective. Lenient — wontfix doesn't count against you.",
-        "- **Objective**: Mechanical detectors only (no subjective review component).",
-        "- **Strict**: Same as overall, but wontfix items and open review defects count against you. **THIS IS YOUR NORTH STAR.**",
-        "- **Verified**: Like strict, but only credits fixes the scanner has confirmed on rescan.",
-        "- Wontfix is not free — every wontfix (`plexer health plan skip --permanent` or `suppress`) requires attestation and widens the overall↔strict gap.",
-    ].join("\n");
+    return `## INSTRUCTIONS FOR AGENTS — Workflow Guide
+
+Work the two loops: **outer** (\`scan\` → \`score\` → at target? → \`rescan\`) and
+**inner** (\`plan\` → \`next\` → fix → \`resolve\` → repeat until queue clear).
+
+1. **Follow \`next\`**: \`plexer health next\` — the single source of truth for what to work on now.
+   It is the execution queue from the living plan, surfaces auto-clustered batches,
+   and tells you the exact file, lines, and resolve command to run.
+   Use \`plexer health backlog\` only to inspect broader open work outside execution.
+2. **Fix & resolve**: Fix the issue in code (using \`plexer callers\` / \`plexer read\`), then:
+   \`plexer health resolve "<id>" --note "<what you did>" --confirm\`
+   Or with explicit attestation: \`--attest "${attestExample}"\`
+3. **Plan strategically**: \`plexer health plan\` / \`plexer health plan cluster list\` — reorder,
+   cluster related issues (\`plan cluster create\`), and inspect the execution queue.
+4. **Run auto-fixers**: \`plexer health autofix <fixer> --dry-run\` to preview, then apply.
+   Use \`plexer health move <src> <dst> --dry-run\` to move files/dirs and auto-rewrite imports/requires.
+5. **Explore topology**: \`plexer health tree\` (annotated directory/file health tree),
+   \`plexer health viz\` (HTML treemap), or \`plexer health detect <detector>\` (fast single-detector run).
+6. **Rescan**: \`plexer health scan\` — verify improvements and catch cascading effects.
+7. **Subjective review**: \`plexer health review --prepare\` → run blind subagent reviews against
+   \`plexer/.health/review_packet_blind.json\` (20 dimensions + holistic context & concerns) →
+   \`plexer health review --import <file>\`.
+8. **Triage**: \`plexer health plan triage --stage observe|reflect|organize --report "..."\`
+   then \`plexer health plan triage --complete --strategy "..."\`.
+9. **Check progress**: \`plexer health status\` — dimension scores dashboard.
+
+### Understanding Scores
+- **Overall**: 25% mechanical + 75% subjective. Lenient — wontfix doesn't count against you.
+- **Objective**: Mechanical detectors only (no subjective review component).
+- **Strict**: Same as overall, but wontfix items and open review defects count against you. **THIS IS YOUR NORTH STAR.**
+- **Verified**: Like strict, but only credits fixes the scanner has confirmed on rescan.
+- Wontfix is not free — every wontfix (\`plexer health plan skip --permanent\` or \`suppress\`) requires attestation and widens the overall↔strict gap.`;
 }
 
 /**
  * Ready-to-paste Agent Loop Prompt (powered natively by plexer).
  */
 export function buildAgentLoopPrompt(targetPath = ".") {
-    return [
-        "I want you to systematically improve the quality of this codebase using `plexer health`.",
-        "Run ALL of the following:",
-        "",
-        "Before scanning, check for directories that should be excluded (vendor, build output,",
-        "generated code, packages, worktrees, etc.) and exclude obvious ones with `plexer health exclude <path>`.",
-        "Share any questionable candidates with me before excluding.",
-        "",
-        `plexer health scan ${targetPath}`,
-        "plexer health next",
-        "",
-        "Your goal is to get the **strict score** as high as possible (target >= 98). The scoring",
-        "resists gaming — the only way to improve it is to genuinely make the code better.",
-        "",
-        "THE LOOP: run `plexer health next`. It is the execution queue from the living plan, not the",
-        "whole backlog. It tells you what to fix now, which file and lines, and the exact",
-        "`plexer health resolve` command to run when done.",
-        "Fix it, resolve it, run `plexer health next` again. Over and over. This is your main job.",
-        "",
-        "Use `plexer health backlog` only when you need to inspect broader open work that is not",
-        "currently driving execution.",
-        "",
-        "Don't be lazy. Large refactors and small detailed fixes — do both with equal energy. No task",
-        "is too big or too small. Fix things properly, not minimally. Use `plexer callers`, `plexer blast`,",
-        "and `plexer health move` to verify blast radius and update all callers cleanly.",
-        "",
-        "Use `plexer health plan` / `plexer health plan cluster create <name>` to reorder priorities or",
-        "group related issues. When subjective review is surfaced by `next`, run `plexer health review --prepare`,",
-        "evaluate the 20 dimensions blindly against `plexer/.health/review_packet_blind.json`, and import with",
-        "`plexer health review --import`. Rescan periodically with `plexer health scan`.",
-    ].join("\n");
+    return `I want you to systematically improve the quality of this codebase using \`plexer health\`.
+Run ALL of the following:
+
+Before scanning, check for directories that should be excluded (vendor, build output,
+generated code, packages, worktrees, etc.) and exclude obvious ones with \`plexer health exclude <path>\`.
+Share any questionable candidates with me before excluding.
+
+plexer health scan ${targetPath}
+plexer health next
+
+Your goal is to get the **strict score** as high as possible (target >= 98). The scoring
+resists gaming — the only way to improve it is to genuinely make the code better.
+
+THE LOOP: run \`plexer health next\`. It is the execution queue from the living plan, not the
+whole backlog. It tells you what to fix now, which file and lines, and the exact
+\`plexer health resolve\` command to run when done.
+Fix it, resolve it, run \`plexer health next\` again. Over and over. This is your main job.
+
+Use \`plexer health backlog\` only when you need to inspect broader open work that is not
+currently driving execution.
+
+Don't be lazy. Large refactors and small detailed fixes — do both with equal energy. No task
+is too big or too small. Fix things properly, not minimally. Use \`plexer callers\`, \`plexer blast\`,
+and \`plexer health move\` to verify blast radius and update all callers cleanly.
+
+Use \`plexer health plan\` / \`plexer health plan cluster create <name>\` to reorder priorities or
+group related issues. When subjective review is surfaced by \`next\`, run \`plexer health review --prepare\`,
+evaluate the 20 dimensions blindly against \`plexer/.health/review_packet_blind.json\`, and import with
+\`plexer health review --import\`. Rescan periodically with \`plexer health scan\`.`;
 }

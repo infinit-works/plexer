@@ -91,7 +91,13 @@ export function runWorkspaceGrep(root, override, pattern, opts) {
         console.log(coverage);
 }
 export function runWorkspaceMap(root, override, opts = {}) {
-    const res = federateMap(root, override, { maxDirs: opts.maxDirs, json: opts.json });
+    const res = federateMap(root, override, {
+        maxDirs: opts.maxDirs,
+        json: opts.json,
+        churn: opts.churn,
+        since: opts.since,
+        analyzeGitHistory: opts.analyzeGitHistory,
+    });
     if (opts.json) {
         console.log(JSON.stringify(res, null, 2));
         return;

@@ -395,6 +395,39 @@ function workspaceBlast(root, dirOverride, args) {
     return { text: `${chunks.join('\n\n')}\n`, isError: false };
 }
 
+function workspaceHealth(root, dirOverride, args) {
+    const ws = readWorkspace(root, dirOverride);
+    const children = ws?.children?.length
+        ? ws.children
+        : loadWorkspaceGraphs(root, dirOverride).loaded.map((l) => l.child);
+    if (children.length === 0)
+        return { text: NO_GRAPH, isError: true };
+    const isJson = args.format === 'json';
+    const repos = {};
+    const chunks = [];
+    for (const child of children) {
+        const childPath = typeof child === 'string' ? child : child.path;
+        const childName = typeof child === 'string' ? child : (child.name ?? child.path);
+        const res = singleHealth(join(root, childPath), args, undefined);
+        if (res.isError && res.text !== NO_GRAPH)
+            return res;
+        if (!res.isError) {
+            if (isJson) {
+                repos[childName] = JSON.parse(res.text);
+            }
+            else {
+                chunks.push(`=== ${childName} ===\n${res.text.trimEnd()}`);
+            }
+        }
+    }
+    if (isJson ? Object.keys(repos).length === 0 : chunks.length === 0)
+        return { text: NO_GRAPH, isError: true };
+    if (isJson) {
+        return { text: `${JSON.stringify({ workspace: true, repos }, null, 2)}\n`, isError: false };
+    }
+    return { text: `${chunks.join('\n\n')}\n`, isError: false };
+}
+
 /** When the MCP server is rooted at a workspace parent, the ask/read/callers/grep/
  * map/check/file_api/blast tools federate across the children — identical to the CLI. */
 async function callWorkspaceTool(root, dirOverride, name, args) {
@@ -454,41 +487,18 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
         case 'plexer_find_all':
             return workspaceFindAll(root, dirOverride, args);
         case 'plexer_repo_map':
-            return { text: federateMap(root, dirOverride, { maxDirs: parseMaxDirs(args), churn: args.churn === true }), isError: false };
+            return {
+                text: federateMap(root, dirOverride, {
+                    maxDirs: parseMaxDirs(args),
+                    churn: args.churn === true,
+                    analyzeGitHistory,
+                }),
+                isError: false,
+            };
         case 'plexer_blast':
             return workspaceBlast(root, dirOverride, args);
-        case 'plexer_health': {
-            const ws = readWorkspace(root, dirOverride);
-            const children = ws?.children?.length
-                ? ws.children
-                : loadWorkspaceGraphs(root, dirOverride).loaded.map((l) => l.child);
-            if (children.length === 0)
-                return { text: NO_GRAPH, isError: true };
-            const isJson = args.format === 'json';
-            const repos = {};
-            const chunks = [];
-            for (const child of children) {
-                const childPath = typeof child === 'string' ? child : child.path;
-                const childName = typeof child === 'string' ? child : (child.name ?? child.path);
-                const res = singleHealth(join(root, childPath), args, undefined);
-                if (res.isError && res.text !== NO_GRAPH)
-                    return res;
-                if (!res.isError) {
-                    if (isJson) {
-                        repos[childName] = JSON.parse(res.text);
-                    }
-                    else {
-                        chunks.push(`=== ${childName} ===\n${res.text.trimEnd()}`);
-                    }
-                }
-            }
-            if (isJson ? Object.keys(repos).length === 0 : chunks.length === 0)
-                return { text: NO_GRAPH, isError: true };
-            if (isJson) {
-                return { text: `${JSON.stringify({ workspace: true, repos }, null, 2)}\n`, isError: false };
-            }
-            return { text: `${chunks.join('\n\n')}\n`, isError: false };
-        }
+        case 'plexer_health':
+            return workspaceHealth(root, dirOverride, args);
         case 'plexer_check_freshness': {
             const { text } = await federateCheck(root, dirOverride);
             return { text, isError: false };

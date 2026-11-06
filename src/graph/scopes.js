@@ -23,7 +23,7 @@
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { shouldSkipDir, walkDir } from "../ingest/fs.js";
+import { shouldSkipDir, walkDir } from "../util/fs.js";
 import {
     assertPrefixIndexed,
     pathUnderPrefix,

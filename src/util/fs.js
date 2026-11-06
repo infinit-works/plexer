@@ -4,6 +4,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { toPosixPath } from "./paths.js";
 /** Directories that are dependency/build output, never source. */
 export const SKIP_DIRS = new Set([
     "node_modules",
@@ -273,7 +274,7 @@ function gitVisibleFilesShallow(root, includes) {
  * segments is a skippable directory name — the final segment doubles as the
  * dot-FILE check (`.eslintrc.js` and friends are not source either). */
 function skippedPath(path, includes) {
-    return path.replace(/\\/g, "/").split("/").some((segment) => shouldSkipDir(segment, includes));
+    return toPosixPath(path).split("/").some((segment) => shouldSkipDir(segment, includes));
 }
 function walkFilesystem(dir, includes) {
     const out = [];

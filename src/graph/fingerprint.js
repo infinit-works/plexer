@@ -21,7 +21,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { CACHE_DIR } from "../context/node-file.js";
-import { shouldSkipDir } from "../ingest/fs.js";
+import { shouldSkipDir } from "../util/fs.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";

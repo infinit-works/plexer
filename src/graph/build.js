@@ -9,7 +9,7 @@
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { walkDir } from "../ingest/fs.js";
+import { walkDir } from "../util/fs.js";
 import { CACHE_DIR, contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";

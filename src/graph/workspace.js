@@ -34,7 +34,6 @@ import { linkTestsForGraph } from "./test-links.js";
 import { ask, readSpans, sameHit, skeleton } from "../ask/ask.js";
 import { roundRobinQueues } from "../ask/file-selection.js";
 import { fuseScopes, STRONG_FLOOR, HIGH_FLOOR } from "../ask/fuse.js";
-import { analyzeGitHistory } from "../blast/history.js";
 import { grepGraph } from "../search/grep.js";
 import { fileReader } from "../util/span.js";
 import { normalizePathPrefix } from "../util/paths.js";
@@ -388,8 +387,8 @@ export function federateMap(root, override, opts = {}) {
     const repos = [];
     const sections = wg.loaded.map(({ child, graph }) => {
         const childRoot = join(root, child);
-        const gitHistory = opts.churn
-            ? analyzeGitHistory(childRoot, contextDirFor(childRoot), opts.since ? { since: opts.since } : undefined)
+        const gitHistory = opts.churn && typeof opts.analyzeGitHistory === "function"
+            ? opts.analyzeGitHistory(childRoot, contextDirFor(childRoot), opts.since ? { since: opts.since } : undefined)
             : undefined;
         const map = buildRepoMap(graph, {
             ...(perChild !== undefined ? { maxDirs: perChild } : {}),

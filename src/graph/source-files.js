@@ -6,7 +6,7 @@
  */
 import { statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
-import { takeCachedStat, walkDir } from "../ingest/fs.js";
+import { takeCachedStat, walkDir } from "../util/fs.js";
 import { relPosix } from "../util/paths.js";
 import { readWalkConfig } from "../util/state.js";
 import { languageOf, depthExtensions } from "./extract.js";
