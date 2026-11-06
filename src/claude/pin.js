@@ -38,11 +38,12 @@ export function namedIdentifiers(prompt) {
         .replace(/Important:[\s\S]*$/gm, '');
     const found = new Map();
     const recordIdentifier = (name, strength, owner = null) => {
-        if (!name || (name.length < 4 && !owner) || STOP.has(name.toLowerCase()) || /^\d/.test(name)) return;
+        if (!name || (name.length < 4 && !owner) || STOP.has(name.toLowerCase()) || /^\d/.test(name)) return null;
         const key = owner ? `${owner}#${name}` : name;
         const e = found.get(key) ?? { name, owner, strength: 0, order: found.size };
         e.strength += strength;
         found.set(key, e);
+        return e;
     };
     for (const m of text.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`\s+in\s+`([A-Za-z_][A-Za-z0-9_]*)`/g)) {
         recordIdentifier(m[1], 3, m[2]);
@@ -56,7 +57,10 @@ export function namedIdentifiers(prompt) {
             const idx = id.index ?? 0;
             const after = span.slice(idx + id[0].length);
             if (/^[.:][A-Za-z_]/.test(after) && !/^[A-Z]/.test(id[0])) continue; // lowercase receiver prefix
-            recordIdentifier(id[0], /^\s*\(/.test(after) ? 2 : 1);
+            const before = span.slice(0, idx);
+            const qualMatch = /([A-Za-z_][A-Za-z0-9_]*)[.:]$/.exec(before);
+            const entry = recordIdentifier(id[0], /^\s*\(/.test(after) ? 2 : 1);
+            if (entry && qualMatch && !entry.qual) entry.qual = qualMatch[1];
         }
     }
     // Call syntax in prose without whitespace before `(` (`helper()`, `GetEvaluationRollouts(ctx)`), never English `word (`.
@@ -110,11 +114,26 @@ export function resolveNamedDefinitions(graph, prompt, { maxPins = 3, hintFiles 
         let defs = byBare.get(id.name) ?? [];
         if (id.owner) defs = defs.filter((n) => n.owner === id.owner);
         if (!defs.length) continue;
-        const compound = isCompoundId(id.name) || Boolean(id.owner);
+        const compound = isCompoundId(id.name) || Boolean(id.owner || id.qual);
+        if (defs.length > 1 && id.qual) {
+            const qLower = id.qual.toLowerCase();
+            const qualDefs = defs.filter((n) =>
+                (n.owner && n.owner.toLowerCase() === qLower) ||
+                basename(n.path).replace(/\.[a-z0-9]+$/i, '').toLowerCase() === qLower ||
+                (n.signature && (n.signature.includes(`${id.qual}.${id.name}`) || n.signature.includes(`${id.qual}:${id.name}`)))
+            );
+            if (qualDefs.length > 0) defs = qualDefs;
+        }
         if (defs.length > 1) {
             // An overloaded name is only pinned where the prompt names its file or ranked
             // retrieval already landed in that file.
-            const strongDefs = defs.filter((n) => fileNamedInPrompt(n.path, n) || topHints.has(n.path));
+            let strongDefs = defs.filter((n) => fileNamedInPrompt(n.path, n) || topHints.has(n.path));
+            if (strongDefs.length > 1) {
+                const exportedOrNamed = strongDefs.filter((n) => n.exported || fileNamedInPrompt(n.path, n));
+                if (exportedOrNamed.length > 0 && exportedOrNamed.length < strongDefs.length) {
+                    strongDefs = exportedOrNamed;
+                }
+            }
             defs = strongDefs.length > 0 ? strongDefs : defs.filter((n) => compound && defs.length <= 2 && hints.has(n.path));
             if (!defs.length || defs.length > 2) continue;
         } else if (hintFiles.length > 0) {
@@ -163,7 +182,7 @@ export function resolveNamedDefinitions(graph, prompt, { maxPins = 3, hintFiles 
     return [...ordered, ...deferred].slice(0, maxPins);
 }
 
-function collectPinRelationsAndDelegators(root, pinNode, graph, byId, fileCache, code, used, budgetBytes) {
+function collectPinRelationsAndDelegators(root, pinNode, graph, byId, fileCache, seenDelegators, code, used, budgetBytes) {
     const related = [];
     const seenRel = new Set();
     for (const e of graph?.edges ?? []) {
@@ -188,13 +207,17 @@ function collectPinRelationsAndDelegators(root, pinNode, graph, byId, fileCache,
                             fileCache.set(sn.path, dLines);
                         }
                         const dStart = Math.max(1, dsp[0] - 3);
-                        const dEnd = Math.min(dLines.length, dsp[1] + 3);
-                        const dBody = dLines.slice(dStart - 1, dEnd).map((l, i) => `L${dStart + i}: ${l}`).join('\n');
-                        const dBlock = `\n\n// delegator in ${sn.path}:L${dStart}-L${dEnd}\n${dBody}`;
-                        const dBytes = Buffer.byteLength(dBlock, 'utf8');
-                        if (used + dBytes <= budgetBytes) {
-                            code += dBlock;
-                            used += dBytes;
+                        const dEnd = Math.min(dLines.length, dsp[1] + 4);
+                        const dKey = sn.path;
+                        if (!seenDelegators.has(dKey)) {
+                            const dBody = dLines.slice(dStart - 1, dEnd).map((l, i) => `L${dStart + i}: ${l}`).join('\n');
+                            const dBlock = `\n\n// delegator in ${sn.path}:L${dStart}-L${dEnd}\n${dBody}`;
+                            const dBytes = Buffer.byteLength(dBlock, 'utf8');
+                            if (used + dBytes <= budgetBytes) {
+                                seenDelegators.add(dKey);
+                                code += dBlock;
+                                used += dBytes;
+                            }
                         }
                     } catch {
                         // ignore
@@ -218,9 +241,11 @@ export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 
     const hits = [];
     let used = 0;
     const fileCache = new Map();
+    const seenDelegators = new Set();
     const byId = graph?._byId ?? new Map((graph?.nodes ?? []).map((n) => [n.id, n]));
     for (const p of pins) {
-        const maxLinesPerPin = p.b - p.a > MAX_PIN_LINES ? 35 : (pins.length >= 2 ? 48 : MAX_PIN_LINES);
+        const spanLines = p.b - p.a + 1;
+        const maxLinesPerPin = spanLines > MAX_PIN_LINES ? 35 : (spanLines > 60 ? 44 : (pins.length >= 2 ? 48 : MAX_PIN_LINES));
         let lines = fileCache.get(p.node.path);
         if (!lines) {
             try {
@@ -260,7 +285,7 @@ export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 
             bytes = Buffer.byteLength(code, 'utf8');
         }
         used += bytes;
-        const relRes = collectPinRelationsAndDelegators(root, p.node, graph, byId, fileCache, code, used, budgetBytes);
+        const relRes = collectPinRelationsAndDelegators(root, p.node, graph, byId, fileCache, seenDelegators, code, used, budgetBytes);
         code = relRes.code;
         used = relRes.used;
         hits.push({

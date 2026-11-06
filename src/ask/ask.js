@@ -1570,7 +1570,7 @@ function inlinePrimaryHitSpan(h, hitIdx, hits, state) {
             state.inlinedHitCount++;
         return;
     }
-    const effectiveMaxHits = node?.kind === "file" ? maxHitsToInline + 1 : maxHitsToInline;
+    const effectiveMaxHits = node?.kind === "file" && !wantsCallSites ? maxHitsToInline + 1 : maxHitsToInline;
     if (state.inlinedHitCount >= effectiveMaxHits || state.totalInlinedBytes >= maxTotalBytes)
         return;
     let rawSpan = parseSpan(h.pointer);
@@ -1589,7 +1589,12 @@ function inlinePrimaryHitSpan(h, hitIdx, hits, state) {
     const lines = readLines(rawSpan.path);
     const { s, spanLen, effStart, effEnd } = resolveEditEnvelopePrimarySpan(h, node, rawSpan, lines, nodesByPath, editEnvelope);
     const isUnrequestedLargeType = node?.kind === "type" && spanLen > 24 && !qTerms.has("type") && !qTerms.has((node.name ?? "").toLowerCase());
-    if (isUnrequestedLargeType || (state.inlinedHitCount > 0 && ((spanLen > 500 && node?.kind !== "file") || (node?.kind === "type" && spanLen > 20))))
+    if (
+        isUnrequestedLargeType ||
+        (isMultiQuery && wantsCallSites && spanLen > 250 && node?.kind !== "file") ||
+        (isMultiQuery && hitIdx > 0 && (h.score ?? 0) < 0.86) ||
+        (state.inlinedHitCount > 0 && ((wantsCallSites && node?.kind === "file") || (spanLen > 500 && node?.kind !== "file") || (node?.kind === "type" && spanLen > 20)))
+    )
         return;
     const maxSpan = state.inlinedHitCount < 2 ? MAX_SPAN_LINES : 40;
     const isDominantTop = state.inlinedHitCount === 0 && (hits.length === 1 || (hits[0]?.score ?? 0) >= 1.15 * (hits[1]?.score ?? 0) || opts.maxHitsToInline === 1);
@@ -1693,11 +1698,12 @@ function scanTextHelperCalls(lines, sPath, nodeId, startLine, endLine, hop, viaT
         }
     }
 }
-function collectSameFileCandidatesForHit(meta, hitIdx, srcIdx, shownPointers, qTerms, qStems) {
+function collectSameFileCandidatesForHit(meta, hitIdx, srcIdx, shownPointers, qTerms, qStems, wantsCallSites = false) {
     const { node, s, lines, spanLen } = meta;
     const { nodesByPath } = srcIdx;
     const sameFileCands = new Map();
-    addGraphHelperNeighbours(node.id, 1, spanLen <= 55, false, node, s.path, srcIdx, shownPointers, sameFileCands);
+    const allowCallers = wantsCallSites ? spanLen <= 35 : spanLen <= 55;
+    addGraphHelperNeighbours(node.id, 1, allowCallers, false, node, s.path, srcIdx, shownPointers, sameFileCands);
     scanTextHelperCalls(lines, s.path, node.id, s.start, s.end, 1, false, nodesByPath, shownPointers, sameFileCands);
     if (sameFileCands.size === 0 || node.kind === "type" || node.kind === "interface" || node.kind === "struct" || hitIdx === 0) {
         const isTypeNode = node.kind === "type" || node.kind === "interface" || node.kind === "struct";
@@ -1753,11 +1759,13 @@ function collectSameFileCandidatesForHit(meta, hitIdx, srcIdx, shownPointers, qT
     }
     return sameFileCands;
 }
-function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms, qStems) {
+function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms, qStems, wantsCallSites = false) {
     const { node, s, spanLen } = meta;
+    if (wantsCallSites && !cand.isCallee && hSpanLen < 14 && spanLen > 10)
+        return null;
     let qMatchCount = 0;
     let hScore = (cand.hop === 1 ? 2 : 0) + (cand.fromGraph ? 3 : 0);
-    if (hSpanLen <= 22)
+    if (hSpanLen <= 22 && (cand.isCallee || spanLen <= 10))
         hScore += hSpanLen <= 8 ? 5.5 : 2;
     if (cand.isSameFile) {
         hScore += 2.0;
@@ -1822,7 +1830,7 @@ function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms,
         return null;
     return hScore;
 }
-function scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qStems) {
+function scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qStems, wantsCallSites = false) {
     const { node, lines, spanLen, effStart, effEnd, maxContiguous, hitQTerms } = meta;
     const scoredHelpers = [];
     for (const cand of sameFileCands.values()) {
@@ -1839,7 +1847,7 @@ function scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qSt
         const candLines = cand.isSameFile ? lines : readLines(cand.node.path);
         if (!candLines)
             continue;
-        const hScore = scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms, qStems);
+        const hScore = scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms, qStems, wantsCallSites);
         if (hScore !== null)
             scoredHelpers.push({ ...cand, cs, candLines, hSpanLen, hScore });
     }
@@ -1902,6 +1910,8 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
         if (state.totalInlinedBytes + bLen > effMaxTotal || hitHelperBytes + bLen > effMaxHit)
             continue;
         helperBlocks.push(block);
+        shownPointers.add(hCand.ptr);
+        (h.helperPointers ??= []).push(hCand.ptr);
         state.totalInlinedBytes += bLen;
         hitHelperBytes += bLen;
         hIdx++;
@@ -1911,6 +1921,7 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
                 nestedRanges.push({ start: hCand.cs.start, end: hCand.cs.end });
         }
     }
+    meta.attachedSameFileSpans = attachedSameFileSpans;
     let baseCode = h.code;
     if (nestedRanges.length > 0 && !full) {
         const dedupedParent = synthesizeCrux(lines, s.path, effStart, effEnd, hitQTerms, qStems, maxContiguous, nestedRanges);
@@ -2028,11 +2039,20 @@ function appendEditEnvelopeModuleReturn(h, hitIdx, s, lines, fileNodes, state) {
         }
     }
 }
-function collectOtherSymbolsInFile(fileNodes, excludeId, excludePointer, shownPointers, qTerms, qStems, qualifyDupOwners, maxItems) {
+function collectOtherSymbolsInFile(fileNodes, excludeId, excludePointer, shownPointers, qTerms, qStems, qualifyDupOwners, maxItems, coveredRanges = []) {
     const otherSyms = [];
     const seenOtherNames = new Map();
     const candidates = fileNodes
-        .filter((fn) => fn.span && (excludeId ? fn.id !== excludeId : `${fn.path}:${fn.span}` !== excludePointer) && !shownPointers.has(`${fn.path}:${fn.span}`))
+        .filter((fn) => {
+            if (!fn.span || (excludeId ? fn.id === excludeId : `${fn.path}:${fn.span}` === excludePointer) || shownPointers.has(`${fn.path}:${fn.span}`))
+                return false;
+            if (coveredRanges.length > 0) {
+                const sp = parseSpan(`${fn.path}:${fn.span}`);
+                if (sp && coveredRanges.some((r) => sp.start >= r.start && sp.end <= r.end))
+                    return false;
+            }
+            return true;
+        })
         .sort((a, b) => {
             const aFn = a.kind === "function" || a.kind === "method" ? 1 : 0;
             const bFn = b.kind === "function" || b.kind === "method" ? 1 : 0;
@@ -2086,16 +2106,17 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
         const { h, node, s, lines } = meta;
         if (!node || node.kind === "file" || !lines || !h.code)
             continue;
-        const sameFileCands = collectSameFileCandidatesForHit(meta, i, srcIdx, shownPointers, qTerms, qStems);
+        const sameFileCands = collectSameFileCandidatesForHit(meta, i, srcIdx, shownPointers, qTerms, qStems, wantsCallSites);
         if (sameFileCands.size > 0) {
-            const scoredHelpers = scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qStems);
+            const scoredHelpers = scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qStems, wantsCallSites);
             attachScoredHelpersToHit(meta, i, scoredHelpers, state);
         }
         if (editEnvelope && lines && h.code) {
             const fileNodes = srcIdx.nodesByPath.get(s.path) ?? [];
             prependEditEnvelopeBestType(h, i, node, s, lines, fileNodes, state);
             appendEditEnvelopeModuleReturn(h, i, s, lines, fileNodes, state);
-            const otherSyms = collectOtherSymbolsInFile(fileNodes, node.id, null, shownPointers, qTerms, qStems, true, 10);
+            const coveredRanges = [{ start: meta.effStart, end: meta.effEnd }, ...(meta.attachedSameFileSpans ?? [])];
+            const otherSyms = collectOtherSymbolsInFile(fileNodes, node.id, null, shownPointers, qTerms, qStems, true, 10, coveredRanges);
             if (otherSyms.length > 0 && !h.code.includes(`// other symbols in ${s.path}:`)) {
                 const footer = `\n// other symbols in ${s.path}: ${otherSyms.join(", ")}`;
                 h.code += footer;
@@ -2150,11 +2171,17 @@ export function ask(dir, query, opts = {}) {
             result.note = result.note ? `${outcome.fallthroughNote}\n${result.note}` : outcome.fallthroughNote;
         }
     }
+    result.rawTopPointer = result.hits[0]?.pointer ?? null;
+    result.rawTopScore = result.hits[0]?.score ?? 0;
+    const topWasSeen = Boolean(result.rawTopPointer && opts.seenPointers?.has(result.rawTopPointer));
     if (opts.seenPointers && result.hits.length > 0) {
         const filtered = result.hits.filter((h) => !opts.seenPointers.has(h.pointer));
         result.hits = (filtered.length > 0 ? filtered : result.hits).slice(0, limit);
     }
     if (opts.source) {
+        const effectiveOpts = topWasSeen && (result.hits[0]?.score ?? 0) < 0.86
+            ? { ...opts, maxHitsToInline: 0 }
+            : opts;
         const allHits = result.ranking
             ? [
                 ...result.hits,
@@ -2163,7 +2190,7 @@ export function ask(dir, query, opts = {}) {
                 ...result.ranking.baseline.map((entry) => entry.hit),
             ]
             : result.hits;
-        result.usedSourceBytes = inlineSource(root, [...new Set(allHits)], corpus.graph, opts.full ?? false, query, opts);
+        result.usedSourceBytes = inlineSource(root, [...new Set(allHits)], corpus.graph, opts.full ?? false, query, effectiveOpts);
     }
     if (opts.seenPointers && !opts.source) {
         for (const h of result.hits)

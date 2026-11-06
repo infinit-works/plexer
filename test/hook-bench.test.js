@@ -4,8 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { namedIdentifiers, pinnedHits, pointerCovers, resolveNamedDefinitions } from "../src/claude/pin.js";
-import { isSyntheticOrMetaPrompt } from "../src/claude/hooks.js";
-import { relevantRetrieval } from "../src/claude/format.js";
+import { detectPromptIntent, isSyntheticOrMetaPrompt } from "../src/claude/hooks.js";
+import { formatRetrieval, relevantRetrieval } from "../src/claude/format.js";
 import { parseInjection, needCoverage } from "../bench/needcov.js";
 import { readsFromBash, hitsFromResult, goldRanges } from "../bench/replay.js";
 
@@ -61,6 +61,51 @@ describe("pin: named-definition pinning", () => {
         assert.equal(pointerCovers("f.js:L10-L50", "f.js:L20-L30"), true);
         assert.equal(pointerCovers("f.js:L20-L30", "f.js:L10-L50"), false);
         assert.equal(pointerCovers("f.js:L10-L50", "g.js:L20-L30"), false);
+    });
+
+    it("resolves receiver-qualified and exported overloaded definitions and suppresses un-inlined call sites", () => {
+        const overloadGraph = {
+            nodes: [
+                { id: "src/Graph.luau#insert", name: "insert", kind: "function", path: "src/Graph.luau", span: "L10-L20", signature: "local function insert(n)", exported: false },
+                { id: "src/Store.luau#insert", name: "insert", kind: "function", path: "src/Store.luau", span: "L30-L50", signature: "function Store.insert(p, v)", exported: true },
+            ],
+        };
+        const qualPins = resolveNamedDefinitions(overloadGraph, "Use `Store.insert(proxy, v)` to mutate", { hintFiles: ["src/Graph.luau", "src/Store.luau"] });
+        assert.deepEqual(qualPins.map((p) => p.node.id), ["src/Store.luau#insert"]);
+
+        const exportPins = resolveNamedDefinitions(overloadGraph, "Helpers (`insert`) on store", { hintFiles: ["src/Graph.luau", "src/Store.luau"] });
+        assert.deepEqual(exportPins.map((p) => p.node.id), ["src/Store.luau#insert"]);
+
+        assert.deepEqual(detectPromptIntent("Implement custom CA cert in DesktopNetworkClient used by DesktopDownloadManager"), {
+            editEnvelope: true,
+            wantsCallSites: false,
+        });
+        assert.deepEqual(detectPromptIntent("Who calls hasPermission and where is it used across the codebase?"), {
+            editEnvelope: false,
+            wantsCallSites: true,
+        });
+
+        const formatted = formatRetrieval({
+            isEditPrompt: false,
+            hits: [
+                {
+                    kind: "symbol",
+                    title: "hasPermission · function",
+                    pointer: "src/Auth.luau:L10-L20",
+                    code: "L10: function Auth.hasPermission() end",
+                    wantsCallSites: false,
+                    callSites: ["callerA (src/A.luau:L1-L5) → L3: Auth.hasPermission()"],
+                },
+                {
+                    kind: "symbol",
+                    title: "other · function",
+                    pointer: "src/B.luau:L1-L10",
+                    wantsCallSites: true,
+                    callSites: ["callerB (src/C.luau:L1-L5) → L2: other()"],
+                },
+            ],
+        });
+        assert.ok(!formatted.includes("call sites ("), "non-caller Q&A hits and un-inlined pointer hits should not emit call sites blocks");
     });
 });
 

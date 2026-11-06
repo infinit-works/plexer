@@ -239,9 +239,9 @@ function cleanPromptBoilerplate(raw) {
 
 export function detectPromptIntent(prompt) {
     const raw = String(prompt ?? '');
-    const wantsCallSites = /\b(callers?|who\s+calls|direct\s+callers|second-hop\s+callers?|blast\s+radius|who\s+uses|used\s+by|where\s+is\b[\s\S]{0,40}\b(?:called|used|invoked)|which\s+(?:functions|modules|cli\s+commands|handlers)\b[\s\S]{0,60}\b(?:call|invoke))\b/i.test(raw);
     const editEnvelope = /\b(implement|add|extend|replace|update|rewrite|centralize|expose|forward|support)\b/i.test(raw) &&
         !/\bAnswer concisely with exact\b/i.test(raw);
+    const wantsCallSites = !editEnvelope && /\b(callers?|who\s+calls|direct\s+callers|second-hop\s+callers?|blast\s+radius|who\s+uses|used\s+by|where\s+is\b[\s\S]{0,40}\b(?:called|used|invoked)|which\s+(?:functions|modules|cli\s+commands|handlers)\b[\s\S]{0,60}\b(?:call|invoke))\b/i.test(raw);
     return { wantsCallSites, editEnvelope };
 }
 
@@ -726,7 +726,7 @@ export function distillPromptQueries(root, contextDir, prompt) {
 export const HOOK_BUDGETS = {
     qaSingleHitBytes: 3600,
     qaMultiHitBytes: 3800,
-    qaMergedBytes: 9000,
+    qaMergedBytes: 6800,
     qaMaxInlined: 5,
     editSingleHitBytes: 1450,
     editMultiHitBytes: 1150,
@@ -736,8 +736,85 @@ export const HOOK_BUDGETS = {
     multiQueryInline: 1,
     pinBytes: 5350,
     pinMax: 3,
-    editTotalBytes: 5500,
+    editTotalBytes: 4800,
 };
+function isPinCoveredByRankedHits(p, rankedHits) {
+    if (!p.a || !p.b || p.code?.includes('// delegator in '))
+        return false;
+    const pFile = (p.pointer ?? '').split(':')[0];
+    const pBytes = Buffer.byteLength(p.code ?? '', 'utf8');
+    return rankedHits.some((h) => h.code &&
+        ((h.pointer === p.pointer && Buffer.byteLength(h.code, 'utf8') >= pBytes) ||
+            (!h.code.includes('omitted)') &&
+                !h.code.includes('excerpt of') &&
+                (h.pointer ?? '').split(':')[0] === pFile &&
+                h.code.includes(`L${p.a}:`) &&
+                h.code.includes(`L${p.b}:`))));
+}
+function inheritRankedHitEnrichments(p, rankedHits) {
+    for (const h of rankedHits) {
+        if (!pointersOverlap(p.pointer, h.pointer))
+            continue;
+        if (h.related && !p.related)
+            p.related = h.related;
+        if (h.callSites && !p.callSites) {
+            p.callSites = h.callSites;
+            p.wantsCallSites = h.wantsCallSites;
+        }
+        if (h.otherSymbols && !p.otherSymbols)
+            p.otherSymbols = h.otherSymbols;
+    }
+}
+function trimRestHitCodeToBudget(rest, pins, rawPins) {
+    for (const h of rest) {
+        if (h.code && pins.filter((p) => pointerCovers(h.pointer, p.pointer)).reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0) >= 1200) {
+            delete h.code;
+        }
+    }
+    let totalCodeBytes = pins.reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0);
+    const maxTotalBytes = HOOK_BUDGETS.editTotalBytes ?? 4600;
+    const maxRestInlined = pins.length >= 2 ? 2 : 3;
+    let restInlined = 0;
+    const matchingPin = (h) => h.code ? rawPins.find((p) => p.a && p.b && (h.pointer ?? '').split(':')[0] === (p.pointer ?? '').split(':')[0] && h.code.includes(`L${p.a}:`) && h.code.includes(`L${p.b}:`)) : null;
+    for (const pass of [true, false]) {
+        for (const h of rest) {
+            const mp = matchingPin(h);
+            if (!h.code || Boolean(mp) !== pass)
+                continue;
+            if (restInlined >= maxRestInlined) {
+                delete h.code;
+                continue;
+            }
+            const hb = Buffer.byteLength(h.code, 'utf8');
+            if (totalCodeBytes + hb <= maxTotalBytes) {
+                totalCodeBytes += hb;
+                restInlined++;
+                continue;
+            }
+            const fallbackCode = mp?.code ?? (h.code.includes('\n\n// ') ? h.code.slice(0, h.code.indexOf('\n\n// ')) : null);
+            const fb = fallbackCode ? Buffer.byteLength(fallbackCode, 'utf8') : Infinity;
+            if (fallbackCode && totalCodeBytes + fb <= maxTotalBytes) {
+                h.code = fallbackCode;
+                totalCodeBytes += fb;
+                restInlined++;
+            }
+            else if (mp?.code && h.code.includes('\n\n// ')) {
+                const primary = h.code.slice(0, h.code.indexOf('\n\n// '));
+                const pb = Buffer.byteLength(primary, 'utf8');
+                if (totalCodeBytes + pb <= maxTotalBytes) {
+                    h.code = primary;
+                    totalCodeBytes += pb;
+                    restInlined++;
+                    continue;
+                }
+                delete h.code;
+            }
+            else {
+                delete h.code;
+            }
+        }
+    }
+}
 /**
  * Turn-0 retrieval for a prompt: definitions the prompt names as code are pinned first
  * (see `pin.js`), then ranked retrieval fills in the rest, minus anything a pin covers.
@@ -758,23 +835,9 @@ export function queryPromptContext(dir, prompt) {
             hintFiles,
         }) : [];
         for (const p of rawPins) {
-            const pFile = (p.pointer ?? '').split(':')[0];
-            // Skip if an already-inlined ranked hit literally contains this pin's full contiguous body.
-            if (p.a && p.b && !p.code?.includes('// delegator in ') && rankedHits.some((h) => h.code && !h.code.includes('omitted)') && !h.code.includes('excerpt of') && (h.pointer ?? '').split(':')[0] === pFile && h.code.includes(`L${p.a}:`) && h.code.includes(`L${p.b}:`)))
+            if (isPinCoveredByRankedHits(p, rankedHits))
                 continue;
-            // Inherit structural enrichments (`related`, `callSites`, `otherSymbols`) from any overlapping ranked hit.
-            for (const h of rankedHits) {
-                if (!pointersOverlap(p.pointer, h.pointer))
-                    continue;
-                if (h.related && !p.related)
-                    p.related = h.related;
-                if (h.callSites && !p.callSites) {
-                    p.callSites = h.callSites;
-                    p.wantsCallSites = h.wantsCallSites;
-                }
-                if (h.otherSymbols && !p.otherSymbols)
-                    p.otherSymbols = h.otherSymbols;
-            }
+            inheritRankedHitEnrichments(p, rankedHits);
             pins.push(p);
         }
     }
@@ -784,44 +847,7 @@ export function queryPromptContext(dir, prompt) {
     if (!pins.length)
         return res;
     const rest = (res?.hits ?? []).filter((h) => !pins.some((p) => pointerCovers(p.pointer, h.pointer)));
-    for (const h of rest) {
-        if (h.code && pins.filter((p) => pointerCovers(h.pointer, p.pointer)).reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0) >= 1200) {
-            delete h.code;
-        }
-    }
-    let totalCodeBytes = pins.reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0);
-    const maxTotalBytes = HOOK_BUDGETS.editTotalBytes ?? 4600;
-    const matchingPin = (h) => h.code ? rawPins.find((p) => p.a && p.b && (h.pointer ?? '').split(':')[0] === (p.pointer ?? '').split(':')[0] && h.code.includes(`L${p.a}:`) && h.code.includes(`L${p.b}:`)) : null;
-    for (const pass of [true, false]) {
-        for (const h of rest) {
-            const mp = matchingPin(h);
-            if (!h.code || Boolean(mp) !== pass)
-                continue;
-            const hb = Buffer.byteLength(h.code, 'utf8');
-            if (totalCodeBytes + hb > maxTotalBytes) {
-                if (mp?.code) {
-                    const mb = Buffer.byteLength(mp.code, 'utf8');
-                    if (totalCodeBytes + mb <= maxTotalBytes) {
-                        h.code = mp.code;
-                        totalCodeBytes += mb;
-                        continue;
-                    }
-                }
-                if (h.code.includes('\n\n// ')) {
-                    const primary = h.code.slice(0, h.code.indexOf('\n\n// '));
-                    const pb = Buffer.byteLength(primary, 'utf8');
-                    if (totalCodeBytes + pb <= maxTotalBytes) {
-                        h.code = primary;
-                        totalCodeBytes += pb;
-                        continue;
-                    }
-                }
-                delete h.code;
-                continue;
-            }
-            totalCodeBytes += hb;
-        }
-    }
+    trimRestHitCodeToBudget(rest, pins, rawPins);
     const keptRest = (pins.length >= 3 && !rest.some((h) => h.code)) ? [] : rest;
     return {
         ...(res ?? { query: prompt, mode: 'lexical', isEditPrompt: isEdit }),
@@ -1169,7 +1195,7 @@ function searchPromptContext(dir, prompt) {
             query: queries.join(' ; '),
             mode: 'lexical',
             hits: topHits,
-            allFiles: [...new Set([...topHits.map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean), ...multiQueryFiles])],
+            allFiles: [...new Set([...topHits.filter((h) => h.code || !h.title?.includes(' · type')).map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean), ...multiQueryFiles])],
             isEditPrompt: intent.editEnvelope,
             coverage: Math.max(...results.map((r) => r?.coverage ?? 0)),
             coverageStrong: Math.max(...results.map((r) => r?.coverageStrong ?? 0)),

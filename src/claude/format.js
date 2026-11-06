@@ -108,8 +108,8 @@ function retrievalBody(hits, isEditPrompt = false) {
             b += `\n    ${snip}`;
         if (h.related?.length && (isEditPrompt ? Boolean(h.code) || i < 2 : (h.code || i < 2)))
             b += `\n    related: ${h.related.slice(0, 6).join(', ')}`;
-        if (h.callSites?.length && (i === 0 || h.wantsCallSites)) {
-            const maxCs = h.wantsCallSites ? 26 : (isEditPrompt ? 3 : 5);
+        if (h.code && h.callSites?.length && (h.wantsCallSites || (isEditPrompt && i === 0 && h.callSites.length <= 2))) {
+            const maxCs = h.wantsCallSites ? 26 : 2;
             b += `\n    call sites (${h.callSites.length}):`;
             for (const cs of h.callSites.slice(0, maxCs))
                 b += `\n      ← ${cs}`;
