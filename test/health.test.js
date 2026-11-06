@@ -1009,7 +1009,7 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
                     `export function runServer(): number {\n  console.log("debug srv ${i}");\n  return ${i * 10};\n}\n`,
                 );
                 execFileSync("git", ["add", "."], { cwd: tmp });
-                execFileSync("git", ["commit", "-q", "-m", `co-change ${i}`], { cwd: tmp });
+                execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "-m", `co-change ${i}`], { cwd: tmp });
             }
 
             // Add a type-only cycle between peerA.ts and peerB.ts (must NOT trigger circular_deps)
@@ -1231,6 +1231,31 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             const merged = mergeReviewBatches(batchDir, { similarity: 0.7 });
             assert.equal(merged.findings.length, 1, "near-duplicate findings across batches must be merged via similarity");
             assert.equal(merged.findings[0].related_files.length, 2, "merged finding unions related_files");
+
+            // Regression checks: Luau top-level GetService after helper function & security_traps eslint-disable non-suppression
+            mkdirSync(join(tmp, "src", "LuauFix"), { recursive: true });
+            const luauFixPath = join(tmp, "src", "LuauFix", "ServiceAfterFn.luau");
+            const luauOriginal = [
+                "local function helper()",
+                "    return 1",
+                "end",
+                "local Players = game:GetService(\"Players\")",
+                "return helper",
+                "",
+            ].join("\n");
+            writeFileSync(luauFixPath, luauOriginal, "utf8");
+            px.health(tmp, { action: "autofix", fixer: "luau-hoist-getservice", dryRun: false });
+            const luauAfter = readFileSync(luauFixPath, "utf8");
+            assert.ok(
+                luauAfter.includes('local Players = game:GetService("Players")'),
+                "runAutofix must not delete top-level game:GetService placed after a local function in .luau",
+            );
+
+            assert.equal(
+                hasInlineSuppression(["// eslint-disable-next-line", "eval(userInput);"], 2, "security_traps"),
+                false,
+                "generic eslint-disable-next-line must not suppress security_traps",
+            );
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }

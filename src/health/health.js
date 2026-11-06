@@ -53,6 +53,7 @@ import { computeScoreSnapshot, emitScorecardBadge } from "./scoring.js";
 import { runSourceChecks } from "./source-checks.js";
 import {
     appendScoreHistory,
+    computeIssueFingerprints,
     detectGitContext,
     emptyHealthConfig,
     generateCommitLogPrBody,
@@ -107,6 +108,23 @@ function countScoredFiles(graph, zoneMap) {
     return count;
 }
 
+function scaleScopedPotentials(graph, zoneMap, fileFilter, potentials) {
+    let totalScoredCount = 0;
+    let scopedScoredCount = 0;
+    for (const n of graph.nodes) {
+        if (n.kind === "file" && SCORED_ZONES.has(zoneMap.get(n.path) || "production")) {
+            totalScoredCount += 1;
+            if (fileFilter(n.path)) scopedScoredCount += 1;
+        }
+    }
+    if (totalScoredCount > 0) {
+        const ratio = scopedScoredCount / totalScoredCount;
+        for (const k of Object.keys(potentials)) {
+            if (potentials[k] > 0) potentials[k] = Math.max(1, Math.round(potentials[k] * ratio));
+        }
+    }
+}
+
 /**
  * Run all enabled mechanical detectors over `graph` and `rootDir`.
  */
@@ -139,6 +157,16 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
           )
         : null;
 
+    const fileFilter =
+        inPrefixes?.length || diffFileSet
+            ? (rel) => {
+                  const f = (rel || "").replace(/\\/g, "/");
+                  if (inPrefixes?.length && !inPrefixes.some((p) => f === p || f.startsWith(`${p}/`))) return false;
+                  if (diffFileSet && !diffFileSet.has(rel)) return false;
+                  return true;
+              }
+            : null;
+
     const allIssues = [];
     const potentials = {};
 
@@ -152,11 +180,14 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
         rootDir,
         contextDir: opts.contextDir || null,
         plan: opts.plan || null,
+        fileFilter,
     });
     allIssues.push(...graphRes.issues);
     Object.assign(potentials, graphRes.potentials);
 
-    const srcRes = runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories);
+    if (fileFilter) scaleScopedPotentials(graph, zoneMap, fileFilter, potentials);
+
+    const srcRes = runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, fileFilter);
     allIssues.push(...srcRes.issues);
     Object.assign(potentials, srcRes.potentials);
 
@@ -170,19 +201,11 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
             const f = (iss.file || "").replace(/\\/g, "/");
             if (!inPrefixes.some((p) => f === p || f.startsWith(`${p}/`))) return false;
         }
-        if (diffFileSet) {
-            if (!diffFileSet.has(iss.file)) return false;
-        }
+        if (diffFileSet && !diffFileSet.has(iss.file)) return false;
         return true;
     });
 
-    return {
-        issues: filteredIssues,
-        potentials,
-        zoneMap,
-        ignoreRules,
-        readLines,
-    };
+    return { issues: filteredIssues, potentials, zoneMap, ignoreRules, readLines };
 }
 
 /**
@@ -780,6 +803,20 @@ function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config
     return base;
 }
 
+function enrichSuppressionFingerprints(state, config, res) {
+    if (res.status !== "suppressed") return;
+    const fpSet = new Set(res.fingerprints || []);
+    for (const id of res.suppressed_ids || []) {
+        const iss = state.issues?.[id];
+        if (iss) {
+            for (const fp of computeIssueFingerprints(iss.detector, iss.identifier, iss.summary)) fpSet.add(fp);
+        }
+    }
+    const allFps = [...fpSet];
+    res.fingerprints = allFps;
+    if (config.suppressions?.[res.pattern]) config.suppressions[res.pattern].fingerprints = allFps;
+}
+
 function handleHealthToolAction(
     action,
     root,
@@ -807,11 +844,7 @@ function handleHealthToolAction(
             saveLivingPlan(contextDir, plan);
             if (!opts.noBadge) emitScorecardBadge(contextDir, scores, state);
         }
-        return {
-            action: "autofix",
-            ...afRes,
-            scores,
-        };
+        return { action: "autofix", ...afRes, scores };
     }
     if (action === "move") {
         return { action: "move", ...moveFileOrDir(root, graph, opts.src, opts.dst, { dryRun: opts.dryRun }) };
@@ -840,15 +873,13 @@ function handleHealthToolAction(
         ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, false);
         return {
             action: "viz",
-            ...generateHealthTreemapHtml(contextDir, graph, state, zoneMap, readLines, {
-                ...opts,
-                rootDir: root,
-            }),
+            ...generateHealthTreemapHtml(contextDir, graph, state, zoneMap, readLines, { ...opts, rootDir: root }),
         };
     }
     if (action === "suppress") {
         const pattern = opts.pattern || (opts.patterns && opts.patterns[0]) || "";
         const res = suppressIssues(state, config, plan, pattern, opts);
+        enrichSuppressionFingerprints(state, config, res);
         const scores = computeScoreSnapshot(state);
         if (res.status === "suppressed") {
             appendScoreHistory(state, scores, "suppress");

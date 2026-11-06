@@ -41,6 +41,28 @@ function readQuantifierAt(pattern, idx) {
     return null;
 }
 
+function hasOverlappingBranches(branches) {
+    if (branches.length < 2) return false;
+    if (new Set(branches).size < branches.length) return true;
+    const leadingLiterals = new Set();
+    for (const raw of branches) {
+        const b = raw.replace(/^(?:\(\?:|\(\?!|\(\?=|\(\?<[!=]|\(\?<[^>]+>|\()+/, "");
+        if (!b) return true;
+        if (b[0] === "." || b[0] === "[") return true;
+        if (b[0] === "\\") {
+            const esc = b[1] ?? "";
+            if (/[dDwWsSpP]/.test(esc)) return true;
+            if (leadingLiterals.has(esc)) return true;
+            leadingLiterals.add(esc);
+            continue;
+        }
+        const ch = b[0];
+        if (leadingLiterals.has(ch)) return true;
+        leadingLiterals.add(ch);
+    }
+    return false;
+}
+
 /**
  * Scan `pattern` for nested repeating quantifiers (e.g. `(a+)+`, `([a-z]*)*`,
  * `(a|b+)+`) or excessive adjacent wildcards that cause exponential NFA states.
@@ -89,13 +111,7 @@ export function hasCatastrophicBacktrackingRisk(pattern) {
                     const nonEmpty = popped.branches
                         .map((b) => b.replace(/^(?:\?:|\?!|\?=|\?<[!=]|\?<[^>]+>)/, "").trim())
                         .filter(Boolean);
-                    if (nonEmpty.length >= 2 && new Set(nonEmpty).size < nonEmpty.length) {
-                        return true;
-                    }
-                    const leadingLiterals = nonEmpty
-                        .map((b) => (/^[A-Za-z0-9]/.test(b) ? b[0] : null))
-                        .filter(Boolean);
-                    if (leadingLiterals.length >= 2 && new Set(leadingLiterals).size < leadingLiterals.length) {
+                    if (hasOverlappingBranches(nonEmpty)) {
                         return true;
                     }
                     if (groupStack.length > 0) {

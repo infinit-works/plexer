@@ -136,16 +136,8 @@ export async function ensureFreshGraph(root, opts = {}) {
         const outDir = contextDirFor(dir, opts.contextDir);
         let seededFrom;
         if (!existsSync(wiringPath(outDir))) {
-            // One case has a graph to work with even though this checkout has none: a git
-            // worktree, whose parent checkout's `plexer/` git could not check out. Copy it
-            // in and carry on — the drift below is then exactly the diff between the two
-            // checkouts, and repairing it is what makes the copied graph honest here.
             const seed = await seedUnderLock(dir, outDir, opts.contextDir);
             seededFrom = seed.from;
-            // Still nothing (not a worktree, parent never built, or a concurrent seed we
-            // lost the race for and which we now re-check for): if `dir` is a recognized
-            // project/git root, bootstrap a full Tier-1 graph (including INDEX.md and
-            // .gitignore) under the sync lock so cold repos work on the first query/hook.
             if (!existsSync(wiringPath(outDir))) {
                 if (opts.autoBuild !== false && isAutoBuildableRepo(dir)) {
                     const lockCache = join(outDir, CACHE_DIR);
@@ -153,7 +145,7 @@ export async function ensureFreshGraph(root, opts = {}) {
                         const unhook = releaseOnSignal(lockCache);
                         try {
                             if (!existsSync(wiringPath(outDir))) {
-                                await buildGraph(dir, { contextDir: opts.contextDir });
+                                await buildGraph(dir, { contextDir: opts.contextDir, _lockHeld: true });
                             }
                             invalidateGraphCaches(outDir);
                             return { refreshed: true, note: `indexed repo into ${outDir}` };
@@ -170,15 +162,9 @@ export async function ensureFreshGraph(root, opts = {}) {
             }
         }
         const seedNote = seededFrom ? `copied the graph from the main checkout (${seededFrom})` : undefined;
-        // null = no fingerprint at all: a graph built before this mechanism existed,
-        // or by a different extractor build. Rebuild once — that lays the fingerprint
-        // down, so it costs exactly one build, not one per query.
         const drift = probeDrift(dir, outDir);
         if (drift && isClean(drift))
             return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
-        // On the default layout this is `<root>/plexer/.cache/.sync.lock`, the very file
-        // the Claude Code hooks lock — so this refresh and the background sync can
-        // never rebuild at the same time.
         const lockCache = join(outDir, CACHE_DIR);
         if (!(await waitForLock(lockCache))) {
             const busy = "a graph rebuild is already in flight — answering from the current graph";
@@ -190,27 +176,19 @@ export async function ensureFreshGraph(root, opts = {}) {
         }
         const unhook = releaseOnSignal(lockCache);
         try {
-            // We may have queued behind another process's rebuild for up to LOCK_WAIT_MS,
-            // and that rebuild very likely fixed the same drift we saw. Re-probe rather
-            // than rebuild on the strength of a stale observation: without this, four
-            // parallel MCP tool calls on one edited file produce four full rebuilds, three
-            // of them pure waste, and the last tool call pays for all of it. A null drift
-            // means "no fingerprint" and still has to build.
             const now = drift ? probeDrift(dir, outDir) : null;
             if (now && isClean(now)) {
                 invalidateGraphCaches(outDir);
                 return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
             }
-            // Tier-1 only: no summarizer, so no LLM call and no network, ever. And
-            // `graphOnly`: write the graph, the ask sidecar and the fingerprint, nothing
-            // else. The markdown projections under `plexer/` stay the `Stop` hook's job —
-            // a query has no business rewriting the repo's `.gitignore` or churning every
-            // card's mtime, and skipping them is most of what keeps this cheap.
-            // A `--only-dir` build recorded its whitelist in the fingerprint; re-apply it
-            // here so an auto-rebuild keeps the same limited file set instead of silently
-            // widening to the whole tree.
-            const onlyDirs = readFingerprint(outDir)?.onlyDirs;
-            await buildGraph(dir, { contextDir: opts.contextDir, graphOnly: true, onlyDirs });
+            const fp = readFingerprint(outDir);
+            await buildGraph(dir, {
+                contextDir: opts.contextDir,
+                graphOnly: true,
+                onlyDirs: fp?.onlyDirs,
+                extensions: fp?.extensions,
+                _lockHeld: true,
+            });
             invalidateGraphCaches(outDir);
             return { refreshed: true, drift: drift ?? undefined, note: seedNote };
         }
@@ -220,7 +198,6 @@ export async function ensureFreshGraph(root, opts = {}) {
         }
     }
     catch (err) {
-        // Answering from a slightly stale graph beats failing the query.
         return { refreshed: false, note: `graph refresh skipped: ${err instanceof Error ? err.message : String(err)}` };
     }
 }

@@ -75,6 +75,7 @@ export interface BuildGraphOptions {
     reuse?: boolean;
     onlyDirs?: string[];
     cards?: boolean;
+    graphOnly?: boolean;
     onProgress?: (event: BuildProgressEvent) => void;
 }
 
@@ -123,6 +124,9 @@ export interface AskOptions {
     fileComplement?: boolean;
     fileTopLock?: boolean;
     includeRankingMetadata?: boolean;
+    seenPointers?: Set<string>;
+    maxSourceBytes?: number;
+    maxHitsToInline?: number;
 }
 
 export interface AskHit {
@@ -144,7 +148,7 @@ export interface AskResult {
     coverageStrong?: number;
     scopes?: {
         federated: string[];
-        alsoMatched: Array<{ scope: string; topScore: number }>;
+        alsoMatched: Array<{ scope: string; bestId?: string; topScore?: number }>;
     };
     note?: string;
 }
@@ -216,7 +220,7 @@ export interface GrepGroup {
     inDegree: number;
     hits: GrepLineHit[];
     omittedHits: number;
-    contextBlocks?: Array<Array<{ line: number; text: string; isMatch: boolean }>>;
+    contextBlocks?: Array<{ start: number; end: number; lines: Array<{ line: number; text: string; isMatch: boolean }> }>;
 }
 
 export interface GrepResult {
@@ -234,7 +238,7 @@ export interface GrepResult {
 
 export interface EdgeWalkHit {
     id: string;
-    node?: GraphNode;
+    node?: GraphNode | null;
     relation: EdgeRelation;
     depth: number;
     via?: GraphNode | string;
@@ -259,6 +263,7 @@ export interface RepoMapOptions {
     hubsPerDir?: number;
     hotspots?: number;
     churn?: boolean;
+    since?: string;
     includeCoupling?: boolean;
     gitHistory?: Record<string, unknown>;
 }
@@ -297,7 +302,7 @@ export interface RepoMapResult {
     }>;
     hotspots: RepoMapHub[];
     dropped: number;
-    churnHotspots?: Array<{ file: string; commits: number }>;
+    churnHotspots?: Array<{ path: string; commits: number; churnCommits: number; churnScore: number; inDegree: number; score: number }>;
     coupling?: Array<{ a: string; b: string; weight: number }>;
 }
 
@@ -458,7 +463,7 @@ export function formatGrepResult(result: GrepResult): string;
 export function runGrepCommand(pattern: string, dir: string, opts?: GrepOptions & { globalDir?: string; json?: boolean }): void;
 export function resolveSymbol(graph: WiringGraph, query: string, opts?: { in?: string }): GraphNode[];
 export function edgeWalk(graph: WiringGraph, start: GraphNode, direction?: "in" | "out", maxDepth?: number): EdgeWalkHit[];
-export function runCallersCommand(query: string, dir: string, opts?: CallersOptions & { globalDir?: string; json?: boolean }): void;
+export function runCallersCommand(query: string, dir: string, opts?: CallersOptions & { globalDir?: string; json?: boolean }): Promise<void>;
 export function buildRepoMap(graph: WiringGraph, opts?: RepoMapOptions): RepoMapResult;
 export function formatRepoMap(map: RepoMapResult): string;
 export function blastRadius(
@@ -473,6 +478,7 @@ export function blastRadiusIn(
     changed: BlastChangedFile[],
     basis?: string,
     depth?: number,
+    opts?: { rootDir?: string; layerRules?: unknown[]; gitHistory?: Record<string, unknown>; includeHistory?: boolean; since?: string },
 ): BlastResult;
 export function textReport(blast: BlastResult): string;
 export function markdownReport(blast: BlastResult, opts?: { root?: string }): string;

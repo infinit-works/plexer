@@ -277,7 +277,14 @@ function skippedPath(path, includes) {
 }
 function walkFilesystem(dir, includes) {
     const out = [];
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    let entries;
+    try {
+        entries = readdirSync(dir, { withFileTypes: true });
+    }
+    catch {
+        return out;
+    }
+    for (const entry of entries) {
         const full = join(dir, entry.name);
         if (entry.isDirectory()) {
             if (shouldSkipDir(entry.name, includes))

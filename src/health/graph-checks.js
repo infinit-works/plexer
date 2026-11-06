@@ -316,15 +316,33 @@ function checkDeadSymbolsAndWrappersInFile(fNode, lines, fileSymbols, importers,
 }
 
 function checkFacadeModuleInFile(fNode, lines, fileSymbols, issues) {
-    if (lines.length < 6 || isEntrypointPath(fNode.path)) return;
-    const nonEmpty = lines
+    if (isEntrypointPath(fNode.path)) return;
+    const rawNonEmpty = lines
         .map((l) => l.trim())
         .filter((l) => l && !l.startsWith("//") && !l.startsWith("#") && !l.startsWith("--"));
+    if (rawNonEmpty.length < 2) return;
+
+    const nonEmpty = [];
+    for (let i = 0; i < rawNonEmpty.length; i++) {
+        let cur = rawNonEmpty[i];
+        if (/^export\s+(?:type\s+)?\{[^}]*$/.test(cur)) {
+            while (i + 1 < rawNonEmpty.length && !cur.includes("}")) {
+                i += 1;
+                cur += ` ${rawNonEmpty[i]}`;
+            }
+            if (!/\bfrom\s+["']/.test(cur) && i + 1 < rawNonEmpty.length && /^from\s+["']/.test(rawNonEmpty[i + 1])) {
+                i += 1;
+                cur += ` ${rawNonEmpty[i]}`;
+            }
+        }
+        nonEmpty.push(cur);
+    }
+
     const reexportCount = nonEmpty.filter((l) =>
-        /^(export\s+\*|export\s+\{.*\}\s+from|from\s+\S+\s+import|__all__\s*=)/.test(l),
+        /^(export\s+\*|export\s+(?:type\s+)?\{.*\}\s+from|from\s+\S+\s+import|__all__\s*=)/.test(l),
     ).length;
     if (
-        nonEmpty.length >= 4 &&
+        nonEmpty.length >= 1 &&
         reexportCount / nonEmpty.length >= 0.7 &&
         fileSymbols.filter((s) => s.kind === "function" || s.kind === "class").length === 0
     ) {

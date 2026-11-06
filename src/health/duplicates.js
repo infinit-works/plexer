@@ -60,14 +60,17 @@ const STOP_KEYWORDS = new Set([
     "this",
 ]);
 
-function stripCommentsAndNormalize(lines) {
+function stripCommentsAndNormalize(lines, relPath = "") {
+    const isDashComment = /\.(?:luau|lua|sql)$/i.test(relPath);
+    const isHashComment = /\.(?:py|pyi|sh|bash|zsh|rb|pl|r|ya?ml|toml)$/i.test(relPath);
+    const isSlashComment = !isDashComment && !isHashComment;
     const cleaned = [];
     for (const raw of lines) {
-        const trimmed = raw
-            .replace(/\/\/.*$/, "")
-            .replace(/--.*$/, "")
-            .replace(/#.*$/, "")
-            .trim();
+        let line = raw.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, '"$STR"');
+        if (isSlashComment) line = line.replace(/\/\/.*$/, "");
+        if (isDashComment) line = line.replace(/--.*$/, "");
+        if (isHashComment) line = line.replace(/#.*$/, "");
+        const trimmed = line.trim();
         if (!trimmed) continue;
         cleaned.push(trimmed);
     }
@@ -143,7 +146,10 @@ function collectDuplicateCandidates(graph, readLines, zoneMap, ignoreRules) {
         if (hasInlineSuppression(fileLines, range.start, "duplicates")) continue;
 
         const bodyLines = fileLines.slice(range.start - 1, range.end);
-        const innerLines = stripCommentsAndNormalize(bodyLines.length > 2 ? bodyLines.slice(1) : bodyLines);
+        const innerLines = stripCommentsAndNormalize(
+            bodyLines.length > 2 ? bodyLines.slice(1) : bodyLines,
+            node.path,
+        );
         if (innerLines.length < MIN_DUP_LINES - 2) continue;
 
         const tokens = normalizeStructuralTokens(innerLines);

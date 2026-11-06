@@ -77,7 +77,10 @@ const STATIC_FILES = {
     "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
 };
 function sendJson(res, status, body) {
-    res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+    res.writeHead(status, {
+        "content-type": "application/json; charset=utf-8",
+        "cross-origin-resource-policy": "same-origin",
+    });
     res.end(JSON.stringify(body));
 }
 function listen(server, port) {
@@ -164,6 +167,15 @@ function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot) {
 }
 
 function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients) {
+    const hostHeader = String(req.headers?.host ?? "").trim();
+    if (hostHeader && !/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(hostHeader)) {
+        sendJson(res, 403, { error: "forbidden Host header" });
+        return;
+    }
+    if (req.headers?.["sec-fetch-site"] === "cross-site") {
+        sendJson(res, 403, { error: "cross-site requests are forbidden" });
+        return;
+    }
     const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
     const path = parsedUrl.pathname;
     const asset = STATIC_FILES[path];
@@ -224,14 +236,15 @@ export async function startVizServer(opts) {
     catch { /* use resolved repoRoot */ }
     const sseClients = new Set();
     const server = createServer((req, res) => handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients));
-    let port = opts.port;
+    const basePort = Number.isInteger(opts?.port) && opts.port > 0 ? opts.port : 4400;
+    let port = basePort;
     let bound = false;
     for (let i = 0; i < PORT_ATTEMPTS && !bound; i++) {
-        port = opts.port + i;
+        port = basePort + i;
         bound = await listen(server, port);
     }
     if (!bound) {
-        throw new Error(`no free port in ${opts.port}–${opts.port + PORT_ATTEMPTS - 1}`);
+        throw new Error(`no free port in ${basePort}–${basePort + PORT_ATTEMPTS - 1}`);
     }
     const watchers = [];
     let debounce;
@@ -254,6 +267,7 @@ export async function startVizServer(opts) {
     }
     return {
         url: `http://127.0.0.1:${port}`,
+        port,
         close() {
             clearTimeout(debounce);
             for (const w of watchers)

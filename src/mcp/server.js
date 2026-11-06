@@ -17,10 +17,12 @@ function reply(id, result) {
 function replyError(id, code, message) {
     send({ jsonrpc: '2.0', id, error: { code, message } });
 }
-function advertised(_root, _dirOverride) {
+function advertised() {
     return TOOLS;
 }
 export function startMcpServer(root = process.cwd(), dirOverride, version = readCurrentVersion(import.meta.url)) {
+    let pendingCalls = 0;
+    let stdinEnded = false;
     const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
     rl.on('line', (line) => {
         const text = line.trim();
@@ -34,53 +36,74 @@ export function startMcpServer(root = process.cwd(), dirOverride, version = read
             replyError(null, -32700, 'parse error');
             return;
         }
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+            replyError(null, -32600, 'invalid request');
+            return;
+        }
         const { id, method, params } = msg;
         const isNotification = id === undefined;
-        switch (method) {
-            case 'initialize': {
-                const hasTools = advertised(root, dirOverride).length > 0;
-                reply(id, {
-                    protocolVersion: params?.protocolVersion ?? '2024-11-05',
-                    capabilities: { tools: {} },
-                    serverInfo: { name: 'plexer', version },
-                    ...(hasTools ? { instructions: mcpInstructions() } : {}),
-                });
-                return;
-            }
-            case 'notifications/initialized':
-            case 'notifications/cancelled':
-                return;
-            case 'ping':
-                if (!isNotification)
-                    reply(id, {});
-                return;
-            case 'tools/list': {
-                if (isNotification)
+        try {
+            switch (method) {
+                case 'initialize': {
+                    const hasTools = advertised().length > 0;
+                    reply(id, {
+                        protocolVersion: params?.protocolVersion ?? '2024-11-05',
+                        capabilities: { tools: {} },
+                        serverInfo: { name: 'plexer', version },
+                        ...(hasTools ? { instructions: mcpInstructions() } : {}),
+                    });
                     return;
-                reply(id, {
-                    tools: advertised(root, dirOverride).map((t) => ({
-                        name: t.name,
-                        description: t.description,
-                        inputSchema: t.inputSchema,
-                        ...(t.annotations ? { annotations: t.annotations } : {}),
-                    })),
-                });
-                return;
-            }
-            case 'tools/call': {
-                if (isNotification)
+                }
+                case 'notifications/initialized':
+                case 'notifications/cancelled':
                     return;
-                const name = String(params?.name ?? '');
-                const args = (params?.arguments ?? {});
-                callTool(root, name, args, dirOverride).then((r) => {
-                    reply(id, { content: [{ type: 'text', text: r.text }], isError: r.isError });
-                }, (err) => replyError(id, -32603, err instanceof Error ? err.message : String(err)));
-                return;
+                case 'ping':
+                    if (!isNotification)
+                        reply(id, {});
+                    return;
+                case 'tools/list': {
+                    if (isNotification)
+                        return;
+                    reply(id, {
+                        tools: advertised().map((t) => ({
+                            name: t.name,
+                            description: t.description,
+                            inputSchema: t.inputSchema,
+                            ...(t.annotations ? { annotations: t.annotations } : {}),
+                        })),
+                    });
+                    return;
+                }
+                case 'tools/call': {
+                    if (isNotification)
+                        return;
+                    const name = String(params?.name ?? '');
+                    const args = (params?.arguments ?? {});
+                    pendingCalls += 1;
+                    callTool(root, name, args, dirOverride)
+                        .then((r) => {
+                            reply(id, { content: [{ type: 'text', text: r.text }], isError: r.isError });
+                        }, (err) => replyError(id, -32603, err instanceof Error ? err.message : String(err)))
+                        .finally(() => {
+                            pendingCalls -= 1;
+                            if (stdinEnded && pendingCalls === 0)
+                                process.exit(0);
+                        });
+                    return;
+                }
+                default:
+                    if (!isNotification)
+                        replyError(id, -32601, `method not found: ${method}`);
             }
-            default:
-                if (!isNotification)
-                    replyError(id, -32601, `method not found: ${method}`);
+        }
+        catch (err) {
+            if (!isNotification)
+                replyError(id ?? null, -32603, err instanceof Error ? err.message : String(err));
         }
     });
-    process.stdin.on('end', () => process.exit(0));
+    process.stdin.on('end', () => {
+        stdinEnded = true;
+        if (pendingCalls === 0)
+            process.exit(0);
+    });
 }

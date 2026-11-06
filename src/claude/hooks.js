@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { join, basename, isAbsolute } from 'node:path';
+import { join, basename, isAbsolute, resolve, relative } from 'node:path';
 import { ask as runAsk } from '../ask/ask.js';
 import { stemToken, tokenize } from '../ask/index-file.js';
 import { formatBlastRadius, relevantRetrieval, formatOrientation } from './format.js';
@@ -9,6 +9,8 @@ import {
     patchStats,
     readStats,
     acquireLock,
+    updateLockPid,
+    releaseLock,
     readSession,
     writeSession,
     resolveContextDir,
@@ -68,8 +70,13 @@ export function isSyntheticOrMetaPrompt(raw) {
 }
 
 export function underPlexer(dir, file) {
-    const rel = file.startsWith(dir) ? file.slice(dir.length) : file;
-    return rel.replace(/^[/\\]+/, '').replace(/\\/g, '/').startsWith('plexer/');
+    const absDir = resolve(dir);
+    const absFile = resolve(absDir, file);
+    const ctxDir = resolveContextDir(absDir);
+    const relCtx = relative(ctxDir, absFile).replace(/\\/g, '/');
+    if (relCtx === '' || (!relCtx.startsWith('..') && !isAbsolute(relCtx))) return true;
+    const relDefault = relative(join(absDir, 'plexer'), absFile).replace(/\\/g, '/');
+    return relDefault === '' || (!relDefault.startsWith('..') && !isAbsolute(relDefault));
 }
 
 function emit(eventName, additionalContext) {
@@ -1156,9 +1163,10 @@ function searchPromptContext(dir, prompt) {
         };
     }
     catch (err) {
-        const fallback = null;
-        void err;
-        return fallback;
+        if (process.env.PLEXER_DEBUG) {
+            console.error(`[plexer] prompt hook: searchPromptContext failed (${err?.message ?? err})`);
+        }
+        return null;
     }
 }
 
@@ -1221,8 +1229,21 @@ export function handleStop(_input, dir) {
     const stats = readStats(dir);
     if (stats?.dirty && acquireLock(dir)) {
         patchStats(dir, { syncing: true });
-        const child = spawn(process.execPath, [syncRun, dir], { detached: true, stdio: 'ignore', windowsHide: true });
-        child.unref();
+        try {
+            const child = spawn(process.execPath, [syncRun, dir], { detached: true, stdio: 'ignore', windowsHide: true });
+            child.on('error', () => {
+                patchStats(dir, { syncing: false });
+                releaseLock(dir);
+            });
+            if (typeof child.pid === 'number') {
+                updateLockPid(dir, child.pid);
+            }
+            child.unref();
+        }
+        catch {
+            patchStats(dir, { syncing: false });
+            releaseLock(dir);
+        }
     }
 }
 

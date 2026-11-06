@@ -18,12 +18,14 @@
  * degrade safely: no fingerprint → "unknown, rebuild"; no parse cache → the
  * rebuild is just cold.
  */
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { CACHE_DIR } from "../context/node-file.js";
+import { shouldSkipDir } from "../ingest/fs.js";
 import { contentHash } from "../util/id.js";
+import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
-import { readJson, writeJsonAtomic } from "../util/state.js";
+import { readJson, readWalkConfig, writeJsonAtomic } from "../util/state.js";
 import { extractorStamp, pruneSidecars } from "./extract-cache.js";
 import { listSourceStats } from "./source-files.js";
 export const FINGERPRINT_PREFIX = "fingerprint";
@@ -50,10 +52,63 @@ export function readFingerprint(outDir) {
         return null; // different extractor — re-extract, don't trust these prints
     return f;
 }
+export function collectWalkedDirs(rootDir, outDir) {
+    const absRoot = resolve(rootDir);
+    const absOut = outDir ? resolve(outDir) : null;
+    const includeDirs = readWalkConfig(absRoot, outDir).includeDirs;
+    const dirSet = new Set(["."]);
+    const walk = (absDir) => {
+        let items;
+        try {
+            items = readdirSync(absDir, { withFileTypes: true });
+        }
+        catch {
+            return;
+        }
+        for (const item of items) {
+            if (!item.isDirectory())
+                continue;
+            if (shouldSkipDir(item.name, includeDirs))
+                continue;
+            const full = join(absDir, item.name);
+            if (absOut && full === absOut)
+                continue;
+            const rel = relPosix(absRoot, full);
+            if (rel && rel !== "." && !rel.startsWith("..")) {
+                dirSet.add(rel);
+                walk(full);
+            }
+        }
+    };
+    walk(absRoot);
+    return dirSet;
+}
+export function snapshotDirMtimes(rootDir, outDir) {
+    const absRoot = resolve(rootDir);
+    const dirs = {};
+    for (const relDir of collectWalkedDirs(absRoot, outDir)) {
+        try {
+            dirs[relDir] = statSync(relDir === "." ? absRoot : join(absRoot, relDir)).mtimeMs;
+        }
+        catch {
+            /* ignore unreadable dir */
+        }
+    }
+    const gitIdx = join(absRoot, ".git", "index");
+    if (existsSync(gitIdx)) {
+        try {
+            dirs[".git/index"] = statSync(gitIdx).mtimeMs;
+        }
+        catch {
+            /* ignore */
+        }
+    }
+    return dirs;
+}
 /** Project the extraction cache's entries into the probe sidecar. Best-effort:
  * the graph is already on disk when this runs, so a failed write costs the next
  * probe its fast path and nothing more. */
-export function writeFingerprint(outDir, entries, onlyDirs, rootDir) {
+export function writeFingerprint(outDir, entries, onlyDirs, rootDir, extensions, preWalkDirMtimes) {
     const files = {};
     const dirSet = new Set(["."]);
     for (const [rel, e] of Object.entries(entries)) {
@@ -64,9 +119,28 @@ export function writeFingerprint(outDir, entries, onlyDirs, rootDir) {
             d = dirname(d);
         }
     }
-    const dirs = {};
-    if (rootDir) {
+    let dirs = {};
+    if (preWalkDirMtimes && typeof preWalkDirMtimes === "object") {
+        dirs = { ...preWalkDirMtimes };
+        if (rootDir) {
+            const absRoot = resolve(rootDir);
+            for (const relDir of dirSet) {
+                if (relDir in dirs)
+                    continue;
+                try {
+                    dirs[relDir] = statSync(relDir === "." ? absRoot : join(absRoot, relDir)).mtimeMs;
+                }
+                catch {
+                    /* ignore unreadable dir */
+                }
+            }
+        }
+    }
+    else if (rootDir) {
         const absRoot = resolve(rootDir);
+        for (const relDir of collectWalkedDirs(absRoot, outDir)) {
+            dirSet.add(relDir);
+        }
         for (const relDir of dirSet) {
             try {
                 dirs[relDir] = statSync(relDir === "." ? absRoot : join(absRoot, relDir)).mtimeMs;
@@ -91,6 +165,8 @@ export function writeFingerprint(outDir, entries, onlyDirs, rootDir) {
             record.dirs = dirs;
         if (onlyDirs && onlyDirs.length > 0)
             record.onlyDirs = onlyDirs;
+        if (extensions && extensions.length > 0)
+            record.extensions = extensions;
         writeJsonAtomic(fingerprintPath(outDir), record, true);
         pruneSidecars(join(outDir, CACHE_DIR), FINGERPRINT_PREFIX);
         return true;
@@ -187,7 +263,8 @@ export function probeDrift(root, outDir) {
     const drift = { changed: [], added: [], removed: [] };
     const seen = new Set();
     const onlyDirs = fp.onlyDirs && fp.onlyDirs.length > 0 ? new Set(fp.onlyDirs) : undefined;
-    for (const f of listSourceStats(root, outDir, undefined, onlyDirs)) {
+    const extensions = Array.isArray(fp.extensions) && fp.extensions.length > 0 ? fp.extensions : undefined;
+    for (const f of listSourceStats(root, outDir, undefined, onlyDirs, extensions)) {
         seen.add(f.rel);
         const print = fp.files[f.rel];
         if (!print) {

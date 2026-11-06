@@ -643,7 +643,7 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             assert.ok(mapRes.dirs.length > 0);
 
             execFileSync("git", ["add", "."], { cwd: tmp });
-            execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: tmp });
+            execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"], { cwd: tmp });
             writeFileSync(
                 join(tmp, "src", "order.ts"),
                 [
@@ -884,7 +884,7 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             execFileSync("git", ["config", "user.name", "Alice Dev"], { cwd: pkgA });
             execFileSync("git", ["config", "user.email", "12345+alicedev@users.noreply.github.com"], { cwd: pkgA });
             execFileSync("git", ["add", "."], { cwd: pkgA });
-            execFileSync("git", ["commit", "-q", "-m", "alice commit"], { cwd: pkgA });
+            execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "alice commit"], { cwd: pkgA });
             const ownersAll = ownersFor(pkgA, ["src/onlyA/a.ts"]);
             assert.equal(ownersAll.length, 1);
             const ownersExcludedByEmail = ownersFor(pkgA, ["src/onlyA/a.ts"], {
@@ -1505,7 +1505,7 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
                     `// companion test for view.ts by stem\nexport function testRenderView() { return ${i}; }\n`,
                 );
                 execFileSync("git", ["add", "."], { cwd: tmp });
-                execFileSync("git", ["commit", "-q", "-m", `sync view and rpc ${i}`], { cwd: tmp });
+                execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "-m", `sync view and rpc ${i}`], { cwd: tmp });
             }
 
             // Now modify ONLY src/client/view.ts and add an illegal import to src/server/rpc.ts to test layer_rules
@@ -1586,6 +1586,22 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             );
             const mapViaSdk = px.map(tmp, { churn: true });
             assert.ok(mapViaSdk.churnHotspots?.length > 0, "px.map({ churn: true }) populates churnHotspots");
+
+            // 6. readSpans path traversal guard & upsertSection orphan <!-- plexer:start --> preservation
+            const { readSpans } = await import("../src/ask/ask.js");
+            const traversalRes = readSpans(tmp, ["../../../etc/hosts:L1-L5"]);
+            assert.equal(traversalRes.blocks.length, 1);
+            assert.ok(traversalRes.blocks[0].error, "readSpans must return an error block for path traversal outside rootDir");
+            assert.equal(traversalRes.blocks[0].lines, undefined, "readSpans must not read lines outside rootDir");
+
+            const { upsertSection } = await import("../src/hosts/sections.js");
+            const orphanMd = join(tmp, "ORPHAN_AGENTS.md");
+            writeFileSync(orphanMd, "# Project Header\n<!-- plexer:start -->\n## User Custom Rules\nKeep this section safe.\n", "utf8");
+            upsertSection(orphanMd, "plexer body v1");
+            upsertSection(orphanMd, "plexer body v2");
+            const afterOrphan = readFileSync(orphanMd, "utf8");
+            assert.ok(afterOrphan.includes("plexer body v2"), "upsertSection updates fenced body");
+            assert.ok(afterOrphan.includes("## User Custom Rules\nKeep this section safe."), "upsertSection preserves user text after orphan start marker across consecutive runs");
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }

@@ -22,6 +22,7 @@ export function git(root, args) {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         maxBuffer: 64 * 1024 * 1024,
+        timeout: 30_000,
     });
     if (res.error || res.status !== 0 || typeof res.stdout !== "string")
         return null;
@@ -69,7 +70,7 @@ export function changedFiles(root, base) {
 }
 /** Both git passes for one range: name-status (statuses, renames) then hunks. */
 function diffFiles(dir, range) {
-    const status = git(dir, ["diff", "--name-status", "--find-renames", "-z", "--end-of-options", ...range, "--"]);
+    const status = git(dir, ["diff", "--relative", "--name-status", "--find-renames", "-z", "--end-of-options", ...range, "--"]);
     if (status === null)
         return null;
     const files = parseNameStatus(status);
@@ -77,6 +78,7 @@ function diffFiles(dir, range) {
         return files;
     const patch = git(dir, [
         "diff",
+        "--relative",
         "--unified=0",
         "--no-color",
         "--no-ext-diff",
@@ -189,6 +191,6 @@ function pushLine(hunk, line, withinFile) {
 }
 /** `b/src/x.ts` → `src/x.ts`, minus any trailing tab-separated timestamp. */
 function stripPrefix(raw) {
-    const untabbed = raw.split("\t")[0];
+    const untabbed = raw.split("\t")[0].replace(/^"(.*)"$/, "$1");
     return untabbed.replace(/^[abciwo]\//, "");
 }

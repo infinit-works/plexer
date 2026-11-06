@@ -12,14 +12,30 @@ export function skillTemplate() {
     return cachedSkill;
 }
 
-function shim(entryFile, call, bakedDir) {
+function shim(entryFile, call, bakedDir, dedupGlobalHooks = false) {
+    const dedupBlock = dedupGlobalHooks
+        ? `const globalClaudeHelpers = path.join(os.homedir(), '.claude', 'helpers') + path.sep;
+if (__filename.startsWith(globalClaudeHelpers)) {
+  const proj = path.resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+  if (proj !== path.resolve(os.homedir())) {
+    const localShim = path.join(proj, '.claude', 'helpers', 'plexer-hooks.cjs');
+    const localSettings = path.join(proj, '.claude', 'settings.json');
+    try {
+      if (fs.existsSync(localShim) && fs.existsSync(localSettings) && fs.readFileSync(localSettings, 'utf8').includes('plexer-hooks.cjs')) {
+        process.exit(0);
+      }
+    } catch {}
+  }
+}
+`
+        : '';
     return `#!/usr/bin/env node
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { pathToFileURL } = require('url');
 const BAKED = ${JSON.stringify(bakedDir)};
-
+${dedupBlock}
 function entry(name) {
   const home = os.homedir();
   let binClaudeDir = null;
@@ -52,4 +68,4 @@ import(pathToFileURL(entry(${JSON.stringify(entryFile)})).href).then((m) => ${ca
 `;
 }
 export function statuslineShim(bakedDir) { return shim('statusline.js', 'm.main()', bakedDir); }
-export function hooksShim(bakedDir) { return shim('hooks.js', 'm.main(process.argv[2])', bakedDir); }
+export function hooksShim(bakedDir) { return shim('hooks.js', 'm.main(process.argv[2])', bakedDir, true); }

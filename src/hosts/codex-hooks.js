@@ -1,7 +1,7 @@
 /**
  * Active-layer install for CLI agents that read user-level hooks.json with
- * PostToolUse semantics. Writes the shared hook shim and one PostToolUse
- * entry that runs post-edit + background sync after every file edit.
+ * SessionStart, UserPromptSubmit, PostToolUse, and Stop semantics. Writes the
+ * shared hook shim and wires SessionStart, UserPromptSubmit, PostToolUse, and Stop.
  */
 import { join } from 'node:path';
 import { hooksShim } from '../claude/shim-template.js';

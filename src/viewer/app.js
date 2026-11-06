@@ -3474,7 +3474,7 @@ function renderContextEdgeSection(title, edges, endpointKey) {
       return `<div class="insp-edge-item" data-jump-id="${escapeHtml(otherId)}"><div class="insp-edge-top"><span class="insp-edge-name">${escapeHtml(other)}</span><span class="insp-edge-rel">${escapeHtml(e.relation)}</span></div>${desc}</div>`;
     })
     .join("");
-  return `<div><div class="insp-section-title">${title} (${edges.length})</div><div class="insp-edge-list">${items}</div></div>`;
+  return `<div><div class="insp-section-title">${escapeHtml(title)} (${edges.length})</div><div class="insp-edge-list">${items}</div></div>`;
 }
 
 function buildWiringInspectorSections(wNode) {

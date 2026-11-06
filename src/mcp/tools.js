@@ -3,7 +3,7 @@
  * `callTool` never throws — hosts get soft errors as isError content.
  */
 import { existsSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { ask, formatAsk, skeleton, formatSkeleton, readSpans, formatReadSpans } from '../ask/ask.js';
 import { checkGraph, formatGraphCheckReport } from '../graph/check.js';
 import { loadGraphCached } from '../graph/load.js';
@@ -262,6 +262,15 @@ function parseMaxDirs(args) {
     return typeof args.max_dirs === 'number' && Number.isFinite(args.max_dirs) && args.max_dirs > 0 ? args.max_dirs : undefined;
 }
 
+function parsePositiveLimit(raw, fallback) {
+    if (raw === undefined || raw === null)
+        return { limit: fallback };
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1)
+        return { error: 'limit must be a positive integer' };
+    return { limit: Math.min(n, 100) };
+}
+
 function parseQueriesList(raw) {
     const list = Array.isArray(raw) ? raw : raw !== undefined && raw !== null ? [raw] : [];
     return list
@@ -336,7 +345,7 @@ function runBlastOnRepo(root, dirOverride, args) {
     if (!diff) {
         return { text: `could not read a diff in ${root} — is this a git repository?`, isError: true };
     }
-    const report = blastRadiusIn(w, contextDir, diff.files, diff.basis, parsedDepth.depth);
+    const report = blastRadiusIn(w, contextDir, diff.files, diff.basis, parsedDepth.depth, { rootDir: root });
     const fmt = args.format === 'markdown' || args.format === 'mermaid' ? args.format : 'text';
     if (fmt === 'mermaid') {
         return { text: mermaidDiagram(report) ?? '%% no dependents to draw', isError: false };
@@ -349,8 +358,8 @@ function workspaceFindAll(root, dirOverride, args) {
     const patterns = parsePatternList(args.pattern);
     if (patterns.length === 0)
         return { text: 'plexer_find_all requires a pattern', isError: true };
-    const contextLines = typeof args.context === 'number'
-        ? args.context
+    const contextLines = typeof args.context === 'number' && Number.isFinite(args.context)
+        ? Math.max(0, Math.min(50, Math.trunc(args.context)))
         : args.source === false
             ? 0
             : args.full === true
@@ -394,7 +403,10 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
             const queries = parseQueriesList(args.query ?? args.queries);
             if (queries.length === 0)
                 return { text: 'plexer_find_code requires a query', isError: true };
-            const limit = typeof args.limit === 'number' ? args.limit : queries.length > 1 ? 3 : 5;
+            const parsedLimit = parsePositiveLimit(args.limit, queries.length > 1 ? 3 : 5);
+            if (parsedLimit.error)
+                return { text: parsedLimit.error, isError: true };
+            const { limit } = parsedLimit;
             const blocks = queries.map((q) => {
                 const r = federateAsk(root, dirOverride, q, { limit, source: true, full: args.full === true, in: optIn(args) });
                 return formatAsk(r).trimEnd();
@@ -442,7 +454,7 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
         case 'plexer_find_all':
             return workspaceFindAll(root, dirOverride, args);
         case 'plexer_repo_map':
-            return { text: federateMap(root, dirOverride, { maxDirs: parseMaxDirs(args) }), isError: false };
+            return { text: federateMap(root, dirOverride, { maxDirs: parseMaxDirs(args), churn: args.churn === true }), isError: false };
         case 'plexer_blast':
             return workspaceBlast(root, dirOverride, args);
         case 'plexer_health': {
@@ -452,19 +464,29 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
                 : loadWorkspaceGraphs(root, dirOverride).loaded.map((l) => l.child);
             if (children.length === 0)
                 return { text: NO_GRAPH, isError: true };
+            const isJson = args.format === 'json';
+            const repos = {};
             const chunks = [];
             for (const child of children) {
                 const childPath = typeof child === 'string' ? child : child.path;
                 const childName = typeof child === 'string' ? child : (child.name ?? child.path);
-                const res = singleHealth(join(root, childPath), args, dirOverride);
+                const res = singleHealth(join(root, childPath), args, undefined);
                 if (res.isError && res.text !== NO_GRAPH)
                     return res;
                 if (!res.isError) {
-                    chunks.push(`=== ${childName} ===\n${res.text.trimEnd()}`);
+                    if (isJson) {
+                        repos[childName] = JSON.parse(res.text);
+                    }
+                    else {
+                        chunks.push(`=== ${childName} ===\n${res.text.trimEnd()}`);
+                    }
                 }
             }
-            if (chunks.length === 0)
+            if (isJson ? Object.keys(repos).length === 0 : chunks.length === 0)
                 return { text: NO_GRAPH, isError: true };
+            if (isJson) {
+                return { text: `${JSON.stringify({ workspace: true, repos }, null, 2)}\n`, isError: false };
+            }
             return { text: `${chunks.join('\n\n')}\n`, isError: false };
         }
         case 'plexer_check_freshness': {
@@ -521,18 +543,28 @@ function resolveMcpRoot(root, args, dirOverride) {
     return candidate;
 }
 
+function isInsideRoot(base, target) {
+    if (!base)
+        return false;
+    const rel = relative(resolve(base), resolve(target));
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 export async function callTool(root, name, args, dirOverride) {
     if (!isCanonicalMcpTool(name)) {
         return { text: `unknown tool: ${name}`, isError: true };
     }
     try {
         const targetRoot = resolveMcpRoot(root, args, dirOverride);
+        const startupRoot = resolve(root);
+        const agyRoot = readAgyLastRepo();
+        const isTrustedRoot = isInsideRoot(startupRoot, targetRoot) || isInsideRoot(agyRoot, targetRoot);
         const ws = readWorkspace(targetRoot, dirOverride);
         let note = null;
         if (!NO_REFRESH_TOOLS.has(name)) {
             const r = ws
                 ? await ensureFreshChildren(targetRoot, ws.children, { contextDir: dirOverride })
-                : await ensureFreshGraph(targetRoot, { contextDir: dirOverride });
+                : await ensureFreshGraph(targetRoot, { contextDir: dirOverride, autoBuild: isTrustedRoot });
             note = refreshNote(r);
         }
         const fed = ws ? await callWorkspaceTool(targetRoot, dirOverride, name, args) : null;
@@ -548,7 +580,10 @@ function singleFindCode(root, args, dirOverride) {
     const queries = parseQueriesList(args.query ?? args.queries);
     if (queries.length === 0)
         return { text: 'plexer_find_code requires a query', isError: true };
-    const limit = typeof args.limit === 'number' ? args.limit : queries.length > 1 ? 3 : 5;
+    const parsedLimit = parsePositiveLimit(args.limit, queries.length > 1 ? 3 : 5);
+    if (parsedLimit.error)
+        return { text: parsedLimit.error, isError: true };
+    const { limit } = parsedLimit;
     const seenPointers = queries.length > 1 ? new Set() : undefined;
     const blocks = queries.map((q) => {
         const maxHitsToInline = queries.length > 1 ? 1 : undefined;
@@ -607,8 +642,8 @@ function singleFindAll(root, args, dirOverride) {
     const w = loadGraphCached(contextDirFor(root, dirOverride));
     if (!w)
         return { text: NO_GRAPH, isError: true };
-    const contextLines = typeof args.context === 'number'
-        ? args.context
+    const contextLines = typeof args.context === 'number' && Number.isFinite(args.context)
+        ? Math.max(0, Math.min(50, Math.trunc(args.context)))
         : args.source === false
             ? 0
             : args.full === true
@@ -743,7 +778,7 @@ async function callSingleTool(root, name, args, dirOverride) {
                 return { text: NO_GRAPH, isError: true };
             const map = buildRepoMap(w, {
                 maxDirs: parseMaxDirs(args),
-                gitHistory: args.churn === true ? analyzeGitHistory(root) : undefined,
+                gitHistory: args.churn === true ? analyzeGitHistory(root, contextDirFor(root, dirOverride)) : undefined,
             });
             return { text: formatRepoMap(map), isError: false };
         }

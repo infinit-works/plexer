@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import { readSourceFile } from "./source.js";
 
 export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -153,15 +154,37 @@ export function referenceLines(path, span, needles, read, opts = {}) {
 /** Read each file once via `readSourceFile` (UTF-8 / UTF-16LE aware), returning split lines or null. */
 export function fileReader(root) {
     const cache = new Map();
+    const absRoot = root !== undefined ? resolve(root) : null;
+    let realRoot = absRoot;
+    if (absRoot) {
+        try {
+            realRoot = realpathSync(absRoot);
+        }
+        catch {
+            /* keep absRoot fallback */
+        }
+    }
     return (path) => {
-        if (root === undefined)
+        if (!absRoot || !realRoot || typeof path !== "string" || !path)
             return null;
         const hit = cache.get(path);
         if (hit !== undefined)
             return hit;
         let lines = null;
         try {
-            const raw = readSourceFile(join(root, path));
+            const absFile = resolve(absRoot, path);
+            const rel = relative(absRoot, absFile);
+            if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+                cache.set(path, null);
+                return null;
+            }
+            const realFile = realpathSync(absFile);
+            const realRel = relative(realRoot, realFile);
+            if (!realRel || realRel.startsWith("..") || isAbsolute(realRel)) {
+                cache.set(path, null);
+                return null;
+            }
+            const raw = readSourceFile(realFile);
             lines = raw !== null ? raw.split(/\r?\n/) : null;
         }
         catch {

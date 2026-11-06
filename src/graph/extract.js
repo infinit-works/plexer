@@ -915,23 +915,29 @@ function tsCallImportSpecifier(node) {
     const frag = firstArg.namedChildren.find((c) => c.type === "string_fragment");
     return frag?.text ?? firstArg.text.replace(/^['"]|['"]$/g, "");
 }
+function unwrapCallExpression(node) {
+    if (!node)
+        return null;
+    if (node.type === "call_expression")
+        return node;
+    if (node.type === "await_expression") {
+        const inner = node.namedChildren[0];
+        if (inner?.type === "call_expression")
+            return inner;
+    }
+    return null;
+}
 function isRequireDeclarator(node) {
     if (node.type !== "variable_declarator")
         return false;
-    const value = node.childForFieldName("value");
-    if (value?.type !== "call_expression")
-        return false;
-    const fn = value.childForFieldName("function");
-    return fn?.type === "identifier" && fn.text === "require" && Boolean(tsCallImportSpecifier(value));
+    const call = unwrapCallExpression(node.childForFieldName("value"));
+    return Boolean(call && tsCallImportSpecifier(call));
 }
 function collectTsRequireBindings(node, out) {
-    const value = node.childForFieldName("value");
-    if (value?.type !== "call_expression")
+    const call = unwrapCallExpression(node.childForFieldName("value"));
+    if (!call)
         return;
-    const fn = value.childForFieldName("function");
-    if (fn?.type !== "identifier" || fn.text !== "require")
-        return;
-    const specifier = tsCallImportSpecifier(value);
+    const specifier = tsCallImportSpecifier(call);
     if (!specifier)
         return;
     const nameNode = node.childForFieldName("name");

@@ -20,7 +20,7 @@
  *      contribution is deleted, not truncated to `{}` or a blank document —
  *      an orphan file is the very residue this exists to remove.
  */
-import { readFileSync, writeFileSync, existsSync, lstatSync, rmSync, rmdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, lstatSync, rmSync, rmdirSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { HOSTS } from './registry.js';
@@ -32,7 +32,7 @@ import { claudeGlobalTargets } from './claude-global.js';
 import { claudeTargets } from '../claude/init.js';
 import { isPlexerAllowEntry, isPlexerFooterRegex, isPlexerStatusline } from '../claude/settings-merge.js';
 import { dirExists, isPlexerEntry, readJsonObject } from './config-write.js';
-import { resolveGitExcludePath } from '../util/state.js';
+import { resolveContextDir, resolveGitExcludePath } from '../util/state.js';
 // ---------------------------------------------------------------------------
 // primitive operations
 // ---------------------------------------------------------------------------
@@ -46,6 +46,15 @@ function removeFile(path, apply) {
             return 'absent';
     }
     catch { /* parent dir absent */ }
+    if (path.endsWith('SKILL.md')) {
+        try {
+            if (lstatSync(dirname(dirname(path))).isSymbolicLink())
+                return 'absent';
+        }
+        catch { /* grandparent dir absent */ }
+        if (existsSync(join(dirname(path), 'package.json')) || existsSync(join(dirname(path), '.git')))
+            return 'absent';
+    }
     if (!existsSync(path))
         return 'absent';
     if (apply) {
@@ -305,6 +314,25 @@ function removeDir(path, apply) {
     }
     return 'deleted';
 }
+function removePlexerCacheDir(cache, apply) {
+    if (!dirExists(cache))
+        return 'absent';
+    const isPlexerCache =
+        existsSync(join(cache, '.graph')) ||
+        existsSync(join(cache, '.cache')) ||
+        existsSync(join(cache, 'INDEX.md')) ||
+        (() => {
+            try {
+                return readdirSync(cache).length === 0;
+            }
+            catch {
+                return false;
+            }
+        })();
+    if (!isPlexerCache)
+        return 'absent';
+    return removeDir(cache, apply);
+}
 function collectKeptRetractPaths(repo, home, exclude, targetSets) {
     /**
      * Paths a *kept* host also writes, which must survive even though some other,
@@ -445,12 +473,12 @@ function targets(repo, opts) {
     // 5. The graph cache and the ignore entries that admit it. Last, so a failure
     //    here can't strand the wiring half-retracted.
     if (opts.cache !== false) {
-        const cache = join(repo, 'plexer');
+        const cache = resolveContextDir(repo);
         const gitignore = join(repo, '.gitignore');
         const gitExclude = resolveGitExcludePath(repo);
         const ignore = join(repo, '.ignore');
         const cacheTargets = [
-            { hostId: 'graph', path: cache, what: 'local graph cache', scope: 'repo', run: (a) => removeDir(cache, a) },
+            { hostId: 'graph', path: cache, what: 'local graph cache', scope: 'repo', run: (a) => removePlexerCacheDir(cache, a) },
             { hostId: 'graph', path: gitignore, what: 'plexer/ ignore entry', scope: 'repo', run: (a) => stripIgnoreEntries(gitignore, [/^\/?plexer\/?$/], a) },
             { hostId: 'graph', path: ignore, what: 'plexer/ search re-admit entries', scope: 'repo', run: (a) => stripIgnoreEntries(ignore, [/^!?plexer\/?$/, /^plexer\/\.(cache|graph)\/?$/], a) },
         ];

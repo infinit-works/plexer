@@ -1,6 +1,6 @@
 import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, realpathSync, unlinkSync, writeSync } from 'node:fs';
 import { join, dirname, basename, isAbsolute, resolve } from 'node:path';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { relevantRetrieval } from '../claude/format.js';
 import {
     MIN_PROMPT_CHARS,
@@ -13,8 +13,8 @@ import {
 } from '../claude/hooks.js';
 import { ensureFreshGraph } from '../graph/refresh.js';
 import { hasAncestorRepoOrIndex, hasPlexerIndex, isAutoBuildableRepo, isBoundaryDir } from '../graph/root.js';
-import { agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo, resolveContextDir, readJson, writeJsonAtomic } from '../util/state.js';
-export { agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo };
+import { agyTempDir, agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo, resolveContextDir, readJson, writeJsonAtomic } from '../util/state.js';
+export { agyTempDir, agyLastRepoPath, readAgyLastRepo, writeAgyLastRepo };
 
 const STALE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -49,7 +49,7 @@ function normalizePromptKey(text) {
 
 function pruneStaleAgySessions() {
     try {
-        const dir = tmpdir();
+        const dir = agyTempDir();
         const now = Date.now();
         for (const name of readdirSync(dir)) {
             if (!name.startsWith('plexer-agy-') || !name.endsWith('.json') || name === 'plexer-agy-last-repo.json')
@@ -68,7 +68,7 @@ function pruneStaleAgySessions() {
 
 export function agySessionPath(sessionId) {
     const safeId = String(sessionId || 'default').replace(/[^a-zA-Z0-9._-]/g, '_');
-    return join(tmpdir(), `plexer-agy-${safeId}.json`);
+    return join(agyTempDir(), `plexer-agy-${safeId}.json`);
 }
 
 export function readAgySession(sessionId) {
@@ -223,22 +223,25 @@ export function parseAgyTranscript(transcriptPath, sessionState) {
         finally {
             closeSync(fd);
         }
-        const chunk = buf.toString('utf8', 0, bytesRead);
-        const lastNewline = chunk.lastIndexOf('\n');
+        const rawSlice = buf.subarray(0, bytesRead);
+        const lastNlByte = rawSlice.lastIndexOf(0x0a);
         let processable = '';
-        if (lastNewline !== -1) {
-            processable = chunk.slice(0, lastNewline + 1);
+        let consumedBytes = 0;
+        if (lastNlByte !== -1) {
+            consumedBytes = lastNlByte + 1;
+            processable = rawSlice.subarray(0, consumedBytes).toString('utf8');
         }
         else {
+            const chunk = rawSlice.toString('utf8');
             try {
                 JSON.parse(chunk.trim());
                 processable = chunk;
+                consumedBytes = bytesRead;
             }
             catch {
                 return sessionState;
             }
         }
-        const consumedBytes = Buffer.byteLength(processable, 'utf8');
         sessionState.transcriptOffset = offset + consumedBytes;
         sessionState.transcriptSize = size;
 

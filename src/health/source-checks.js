@@ -528,7 +528,7 @@ function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
     for (const pat of SECRET_TOKEN_PATTERNS) {
         if (
             pat.re.test(trimmed) &&
-            !trimmed.includes("re:") &&
+            !/\bre\s*:\s*\//.test(trimmed) &&
             !trimmed.includes("RegExp") &&
             !hasInlineSuppression(lines, lineNum, "security_traps")
         ) {
@@ -1130,7 +1130,7 @@ function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarge
 /**
  * Run all source & AST checks (`catches`, `types`, `traps`, `slop`, `security`).
  */
-export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories) {
+export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, fileFilter = null) {
     const issues = [];
     const potentials = {
         silent_catches: 0,
@@ -1154,6 +1154,16 @@ export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledC
         wantSlop: enabledCategories.has("slop"),
         wantSecurity: enabledCategories.has("security"),
     };
+
+    if (
+        !enabled.wantCatches &&
+        !enabled.wantTypes &&
+        !enabled.wantTraps &&
+        !enabled.wantSlop &&
+        !enabled.wantSecurity
+    ) {
+        return { issues, potentials };
+    }
 
     const fileNodes = graph.nodes.filter((n) => n.kind === "file");
     const symbolsByFile = new Map();
@@ -1184,6 +1194,7 @@ export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledC
         const relPath = fNode.path;
         const zone = zoneMap.get(relPath) || "production";
         if (!SCORED_ZONES.has(zone)) continue;
+        if (fileFilter && !fileFilter(relPath)) continue;
 
         const lines = readLines(relPath);
         if (!lines || lines.length === 0) continue;
@@ -1194,7 +1205,11 @@ export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledC
 
     const scoredFileCount = Math.max(
         1,
-        fileNodes.filter((f) => SCORED_ZONES.has(zoneMap.get(f.path) || "production")).length,
+        fileNodes.filter(
+            (f) =>
+                SCORED_ZONES.has(zoneMap.get(f.path) || "production") &&
+                (!fileFilter || fileFilter(f.path)),
+        ).length,
     );
     for (const k of Object.keys(potentials)) {
         if (potentials[k] === 0) potentials[k] = scoredFileCount;

@@ -290,6 +290,10 @@ program
         await refreshBefore(dir, opts);
         const askGlobalDir = program.opts().dir;
         const limitOpt = opts.limit !== undefined ? Number(opts.limit) : undefined;
+        if (limitOpt !== undefined && (!Number.isInteger(limitOpt) || limitOpt < 1)) {
+            console.error(`✗ invalid --limit "${opts.limit}" — expected a positive integer`);
+            process.exit(1);
+        }
         const useSource = opts.full ? true : opts.source !== false;
         if (readWorkspace(dir, askGlobalDir)) {
             try {
@@ -479,7 +483,9 @@ program
         console.log(`plexer viz → ${srv.url}  (ctrl-c to stop)`);
         if (opts.open) {
             const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-            spawn(opener, [srv.url], { stdio: "ignore", detached: true, shell: process.platform === "win32" }).unref();
+            const child = spawn(opener, [srv.url], { stdio: "ignore", detached: true, shell: process.platform === "win32" });
+            child.on("error", () => {});
+            child.unref();
         }
     });
 
@@ -643,9 +649,17 @@ program
         const dir = queryRoot(dirArg);
         await refreshBefore(dir, opts);
         const globalOpts = program.opts();
+        let parsedContext;
+        if (opts.context !== undefined) {
+            parsedContext = Number(opts.context);
+            if (!Number.isInteger(parsedContext) || parsedContext < 0) {
+                console.error(`✗ invalid --context "${opts.context}" — expected a non-negative integer`);
+                process.exit(1);
+            }
+        }
         const contextLines =
-            opts.context !== undefined
-                ? Number(opts.context)
+            parsedContext !== undefined
+                ? parsedContext
                 : opts.source === false
                     ? 0
                     : opts.full
@@ -706,7 +720,12 @@ program
         }
         await refreshBefore(dir, opts);
         if (readWorkspace(root, globalOpts.dir)) {
-            runWorkspaceMap(root, globalOpts.dir, { maxDirs: maxDirsW, json: opts.json });
+            runWorkspaceMap(root, globalOpts.dir, {
+                maxDirs: maxDirsW,
+                json: Boolean(opts.json),
+                churn: Boolean(opts.churn),
+                since: opts.since,
+            });
             return;
         }
         const { formatRepoMap } = await import("../src/graph/map.js");

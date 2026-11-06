@@ -50,6 +50,12 @@ export function upsertSection(filePath, body) {
         writeFileSync(filePath, next.join(eol));
         return { action: 'replaced' };
     }
+    if (s !== -1 && e === -1) {
+        const block = fencedBlock(body, eol);
+        const next = [...lines.slice(0, s), ...block.split(eol), ...lines.slice(s + 1)];
+        writeFileSync(filePath, next.join(eol));
+        return { action: 'replaced' };
+    }
     const block = fencedBlock(body, eol);
     const doubleEol = eol + eol;
     const sep = text.endsWith(doubleEol) ? '' : text.endsWith(eol) ? eol : doubleEol;

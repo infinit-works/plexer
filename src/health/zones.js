@@ -4,86 +4,31 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { globToRegExp } from "../util/paths.js";
 
-export const VALID_ZONES = new Set([
-    "production",
-    "script",
-    "test",
-    "config",
-    "generated",
-    "vendor",
-]);
-
+export const VALID_ZONES = new Set(["production", "script", "test", "config", "generated", "vendor"]);
 export const SCORED_ZONES = new Set(["production", "script"]);
 
 const VENDOR_SEGMENTS = new Set([
-    "node_modules",
-    "vendor",
-    "third_party",
-    "third-party",
-    "external",
-    "packages",
-    "wallypackages",
-    "serverpackages",
-    "devpackages",
-    "robloxpackages",
-    "roblox_packages",
-    "luau_packages",
-    "_index",
+    "node_modules", "vendor", "third_party", "third-party", "external", "packages",
+    "wallypackages", "serverpackages", "devpackages", "robloxpackages", "roblox_packages", "luau_packages", "_index",
 ]);
 
 const GENERATED_SEGMENTS = new Set([
-    "dist",
-    "build",
-    "out",
-    "coverage",
-    ".next",
-    ".nuxt",
-    "generated",
-    "__generated__",
-    "proto_gen",
+    "dist", "build", "out", "coverage", ".next", ".nuxt", "generated", "__generated__", "proto_gen",
 ]);
 
 const TEST_SEGMENTS = new Set([
-    "test",
-    "tests",
-    "__tests__",
-    "spec",
-    "specs",
-    "bench",
-    "benchmarks",
-    "fixtures",
-    "__fixtures__",
-    "testdata",
-    "mocks",
-    "__mocks__",
+    "test", "tests", "__tests__", "spec", "specs", "bench", "benchmarks",
+    "fixtures", "__fixtures__", "testdata", "mocks", "__mocks__",
 ]);
 
-const SCRIPT_SEGMENTS = new Set([
-    "scripts",
-    "script",
-    "tools",
-    "dev",
-    "bin",
-    "ci",
-]);
+const SCRIPT_SEGMENTS = new Set(["scripts", "script", "tools", "dev", "bin", "ci"]);
 
 const CONFIG_BASENAMES = new Set([
-    "default.project.json",
-    "sourcemap.json",
-    "wally.toml",
-    "wally.lock",
-    "rokit.toml",
-    "aftman.toml",
-    "selene.toml",
-    "stylua.toml",
-    "package.json",
-    "package-lock.json",
-    "tsconfig.json",
-    "jsconfig.json",
-    "pyproject.toml",
-    "setup.py",
-    "conftest.py",
+    "default.project.json", "sourcemap.json", "wally.toml", "wally.lock", "rokit.toml", "aftman.toml",
+    "selene.toml", "stylua.toml", "package.json", "package-lock.json", "tsconfig.json", "jsconfig.json",
+    "pyproject.toml", "setup.py", "conftest.py",
 ]);
 
 /**
@@ -189,29 +134,6 @@ export function isSupportOrBenchFile(relPath) {
     );
 }
 
-function globToRegExp(glob) {
-    let re = "^";
-    for (let i = 0; i < glob.length; i++) {
-        const ch = glob[i];
-        if (ch === "*") {
-            if (glob[i + 1] === "*") {
-                re += ".*";
-                i++;
-            } else {
-                re += "[^/]*";
-            }
-        } else if (ch === "?") {
-            re += "[^/]";
-        } else if ("+()^$.{}|[]\\".includes(ch)) {
-            re += `\\${ch}`;
-        } else {
-            re += ch;
-        }
-    }
-    re += "$";
-    return new RegExp(re);
-}
-
 function isPathIgnoredByRules(rules, relPath, detectorOrCategory = null) {
     const norm = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
     const cat = detectorOrCategory ? String(detectorOrCategory).toLowerCase() : null;
@@ -277,8 +199,7 @@ export function loadIgnoreRules(rootDir, configExcludes = []) {
     };
 }
 
-const INLINE_SUPPRESS_RE =
-    /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore|#\s*noqa\b|\/\/\s*eslint-disable\b|@ts-expect-error\b|--\s*selene:\s*allow)/i;
+const INLINE_SUPPRESS_RE = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore|--\s*selene:\s*allow)/i;
 
 /**
  * Check if `lineNum` (1-based) or its preceding line has an inline suppression directive.
@@ -286,29 +207,24 @@ const INLINE_SUPPRESS_RE =
 export function hasInlineSuppression(lines, lineNum, detectorName = "") {
     if (!Array.isArray(lines) || lineNum < 1) return false;
     const candidates = [lines[lineNum - 1], lineNum >= 2 ? lines[lineNum - 2] : null];
-    for (const line of candidates) {
+    const detLower = String(detectorName || "").toLowerCase();
+    for (let candIdx = 0; candIdx < candidates.length; candIdx++) {
+        const line = candidates[candIdx];
         if (typeof line !== "string") continue;
+        if (candIdx === 1 && !/^\s*(?:\/\/|--|#|\/\*)/.test(line)) continue;
         if (!INLINE_SUPPRESS_RE.test(line)) continue;
-        const specificMatch =
-            /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)\s*\[([^\]]+)\]/i.exec(
-                line,
-            );
-        if (specificMatch && detectorName) {
-            const tokens = specificMatch[1]
-                .split(",")
-                .map((s) => s.trim().toLowerCase())
-                .filter(Boolean);
-            if (
-                tokens.length > 0 &&
-                !tokens.some(
-                    (t) =>
-                        t === "all" ||
-                        detectorName.toLowerCase().includes(t) ||
-                        t.includes(detectorName.toLowerCase()),
-                )
-            ) {
-                continue;
-            }
+        if (
+            /--\s*selene:\s*allow/i.test(line) &&
+            !/(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)/i.test(line) &&
+            detLower &&
+            detLower !== "luau_quality" &&
+            detLower !== "language_traps"
+        ) continue;
+        const specificMatch = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)\s*\[([^\]]+)\]/i.exec(line);
+        if (specificMatch && detLower) {
+            const tokens = specificMatch[1].split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+            const detParts = detLower.split("_");
+            if (tokens.length > 0 && !tokens.some((t) => t === "all" || t === detLower || detParts.includes(t))) continue;
         }
         return true;
     }

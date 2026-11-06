@@ -98,7 +98,7 @@ and `plexer health move` to verify blast radius and update all callers cleanly.
 Use `plexer health plan` / `plexer health plan reorder` to reorder priorities or cluster related
 issues (`plexer health plan cluster create <name>`). When subjective review is surfaced by `next`,
 run `plexer health review --prepare`, evaluate dimensions blindly against
-`plexer/.health/review_packet_blind.json`, and import with `plexer health review --import`.
+`plexer/.health/review_packet_blind.json`, and import with `plexer health review --import <file>`.
 Rescan periodically with `plexer health scan`. Follow the scan output's agent instructions.
 ```
 

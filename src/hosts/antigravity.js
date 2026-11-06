@@ -1,5 +1,5 @@
-import { lstatSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { skillTemplate } from './skill-template.js';
 import { hooksShim } from '../claude/shim-template.js';
 import { claudeDistDir } from '../claude/paths.js';
@@ -59,11 +59,16 @@ function desiredPlexerHooksBlock(shim) {
 
 function isSkillSymlink(sDir) {
     try {
-        return lstatSync(sDir).isSymbolicLink();
+        if (lstatSync(dirname(sDir)).isSymbolicLink())
+            return true;
     }
-    catch {
-        return false;
+    catch { /* parent dir absent */ }
+    try {
+        if (lstatSync(sDir).isSymbolicLink())
+            return true;
     }
+    catch { /* sDir absent */ }
+    return existsSync(join(sDir, 'package.json')) || existsSync(join(sDir, '.git'));
 }
 
 export function installAntigravitySkill(home, opts = {}) {

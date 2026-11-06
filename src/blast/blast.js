@@ -63,11 +63,14 @@ function blastRadiusFromDir(dir, rawOpts) {
     if (!diff)
         throw new Error(`could not read a diff in ${root} — is this a git repository?`);
     const parsedDepth = parseWalkDepth(dirOpts.depth, 2);
-    const depth = Number.isNaN(parsedDepth) ? 2 : parsedDepth;
-    return blastRadiusIn(loaded, contextDir, diff.files, diff.basis, depth, {
+    if (Number.isNaN(parsedDepth))
+        throw new RangeError("depth must be a positive integer or 'all'");
+    return blastRadiusIn(loaded, contextDir, diff.files, diff.basis, parsedDepth, {
         rootDir: root,
         layerRules: dirOpts.layerRules ?? dirOpts.layer_rules,
         gitHistory: dirOpts.gitHistory,
+        includeHistory: dirOpts.includeHistory,
+        since: dirOpts.since,
     });
 }
 function indexBlastGraphNodes(graph) {
@@ -170,14 +173,17 @@ function collectBlastSeedsAndImpacts(graph, changed, depth) {
 export function blastRadius(graph, changed, basis = "working tree", opts = { depth: 2 }) {
     if (typeof graph === "string")
         return blastRadiusFromDir(graph, changed);
-    const { seeds, unindexed, deleted, seedNodes, merged } = collectBlastSeedsAndImpacts(graph, changed, opts?.depth ?? 2);
+    const parsedDepth = parseWalkDepth(opts?.depth, 2);
+    if (Number.isNaN(parsedDepth))
+        throw new RangeError("depth must be a positive integer or 'all'");
+    const { seeds, unindexed, deleted, seedNodes, merged } = collectBlastSeedsAndImpacts(graph, changed, parsedDepth);
     const impacted = [...merged.values()].map((m) => m.hit);
     const origins = new Map([...merged].map(([id, m]) => [id, m.from]));
     const index = opts.modules ?? emptyIndex();
     const grouped = groupByModule(impacted, changed, origins, index);
     const res = {
         basis,
-        depth: opts.depth,
+        depth: parsedDepth,
         changed,
         unindexed,
         deleted,
@@ -440,13 +446,21 @@ function collectLayerViolations(graph, changed, rules) {
 
 /** Convenience wrapper: build the module index from a context dir. */
 export function blastRadiusIn(graph, contextDir, changed, basis, depth, opts = {}) {
-    const res = blastRadius(graph, changed, basis, { depth, modules: moduleIndex(contextDir) });
+    const parsedDepth = parseWalkDepth(depth, 2);
+    if (Number.isNaN(parsedDepth))
+        throw new RangeError("depth must be a positive integer or 'all'");
+    const res = blastRadius(graph, changed, basis, { depth: parsedDepth, modules: moduleIndex(contextDir) });
     const hotspots = collectBlastHealthHotspots(contextDir, changed, res.impacted);
     if (hotspots.length > 0) {
         res.healthHotspots = hotspots;
     }
     const rootDir = opts.rootDir ?? (contextDir ? dirname(resolve(contextDir)) : null);
-    const history = opts.gitHistory ?? (rootDir && existsSync(rootDir) ? analyzeGitHistory(rootDir, contextDir) : null);
+    const history = opts.includeHistory === false
+        ? null
+        : (opts.gitHistory ??
+            (rootDir && existsSync(rootDir)
+                ? analyzeGitHistory(rootDir, contextDir, opts.since ? { since: opts.since } : undefined)
+                : null));
     if (history) {
         const coChanges = untouchedCoChanges(history, changed.map((c) => c.path), graph);
         if (coChanges.length > 0) {

@@ -2333,8 +2333,10 @@ function parseReadSpanSpec(spec) {
     const mRange = /^(.*?):L?(\d+)(?:-L?(\d+))?$/.exec(trimmed);
     if (mRange && mRange[1]) {
         const rawPath = mRange[1].replace(/\\/g, "/").replace(/^\/+/, "");
-        const start = Math.max(1, Number(mRange[2]));
-        const end = mRange[3] !== undefined ? Math.max(start, Number(mRange[3])) : start + 30;
+        const rawStart = Math.max(1, Number(mRange[2]));
+        const rawEnd = mRange[3] !== undefined ? Math.max(1, Number(mRange[3])) : rawStart + 30;
+        const start = Math.min(rawStart, rawEnd);
+        const end = Math.max(rawStart, rawEnd);
         return { raw: trimmed, file: rawPath, start, end, hasExplicitRange: true, symbol: null };
     }
     const mSym = /^(.*?):([A-Za-z_][A-Za-z0-9_.:#]*)$/.exec(trimmed);

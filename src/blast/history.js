@@ -165,6 +165,9 @@ export function analyzeGitHistory(root, contextDir = null, opts = {}) {
     const minCoCommits = opts.minCoCommits ?? DEFAULT_MIN_CO_COMMITS;
     const minRatio = opts.minRatio ?? DEFAULT_MIN_COUPLING_RATIO;
     const since = opts.since ?? DEFAULT_SINCE;
+    if (typeof since !== "string" || !since.trim() || since.startsWith("-") || /[\0\r\n]/.test(since)) {
+        throw new Error(`Invalid --since value: "${since}"`);
+    }
     const now = opts.now ?? Date.now();
 
     const headRaw = git(absRoot, ["rev-parse", "--verify", "--quiet", "HEAD"]);
@@ -183,7 +186,10 @@ export function analyzeGitHistory(root, contextDir = null, opts = {}) {
         "-n",
         String(maxCommits),
         "--format=\x01%H\x02%aI",
+        "--relative",
         "--name-only",
+        "--end-of-options",
+        "--",
     ]);
 
     if (!out) {

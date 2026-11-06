@@ -9,6 +9,7 @@ import { join, dirname, isAbsolute, resolve } from "node:path";
 const LOCK_STALE_MS = 300000;
 const SESSION_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCK_FILE = ".sync.lock";
+let atomicSeq = 0;
 
 export function emptyStats() {
     return {
@@ -60,7 +61,7 @@ export function readJson(p) {
  */
 export function writeJsonAtomic(p, value, compact = false) {
     mkdirSync(dirname(p), { recursive: true });
-    const tmp = `${p}.${process.pid}.tmp`;
+    const tmp = `${p}.${process.pid}.${++atomicSeq}.tmp`;
     try {
         writeFileSync(tmp, compact ? JSON.stringify(value) : JSON.stringify(value, null, 2));
         renameSync(tmp, p);
@@ -295,8 +296,12 @@ export function acquireLock(d) {
     return acquireLockIn(cacheDir(d));
 }
 
-export function releaseLock(d) {
-    releaseLockIn(cacheDir(d));
+export function updateLockPid(d, pid = process.pid) {
+    updateLockPidIn(cacheDir(d), pid);
+}
+
+export function releaseLock(d, expectedPid = process.pid) {
+    releaseLockIn(cacheDir(d), expectedPid);
 }
 
 function pidAlive(pid) {
@@ -322,43 +327,66 @@ export function acquireLockIn(cache) {
     catch (e) {
         if (e?.code !== "EEXIST")
             throw e;
-        let stale;
+        let stale = false;
         try {
             const st = statSync(p);
             const age = Date.now() - st.mtimeMs;
             const holder = readJson(p);
-            stale = age >= LOCK_STALE_MS || (holder && typeof holder.pid === "number" && !pidAlive(holder.pid));
+            if (holder && typeof holder.pid === "number") {
+                stale = !pidAlive(holder.pid);
+            }
+            else {
+                stale = age >= LOCK_STALE_MS;
+            }
         }
         catch {
             stale = true;
         }
         if (!stale)
             return false;
+        const tmp = `${p}.${process.pid}.${++atomicSeq}.tmp`;
         try {
-            rmSync(p);
-        }
-        catch { /* another process reclaimed it */ }
-        try {
-            writeFileSync(p, payload, { flag: "wx" });
+            writeFileSync(tmp, payload);
+            renameSync(tmp, p);
             return true;
         }
-        catch (e2) {
-            if (e2?.code === "EEXIST")
-                return false;
-            throw e2;
+        catch {
+            try {
+                rmSync(tmp, { force: true });
+            }
+            catch { /* ignore */ }
+            return false;
         }
     }
 }
 
-export function releaseLockIn(cache) {
+export function updateLockPidIn(cache, pid = process.pid) {
+    writeJsonAtomic(join(cache, LOCK_FILE), { pid, at: new Date().toISOString() }, true);
+}
+
+export function releaseLockIn(cache, expectedPid = process.pid) {
     try {
-        rmSync(join(cache, LOCK_FILE));
+        const p = join(cache, LOCK_FILE);
+        const holder = readJson(p);
+        if (!holder || typeof holder.pid !== "number" || holder.pid === expectedPid) {
+            rmSync(p);
+        }
     }
     catch { /* already gone */ }
 }
 
+export function agyTempDir() {
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const dir = join(tmpdir(), `plexer-agy-${uid}`);
+    try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    catch { /* best-effort */ }
+    return dir;
+}
+
 export function agyLastRepoPath() {
-    return join(tmpdir(), "plexer-agy-last-repo.json");
+    return join(agyTempDir(), "plexer-agy-last-repo.json");
 }
 
 export function readAgyLastRepo() {

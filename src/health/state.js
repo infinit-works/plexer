@@ -4,6 +4,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { copyFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 import {
@@ -51,8 +52,15 @@ export function emptyHealthConfig() {
 }
 
 export function loadHealthConfig(contextDir) {
-    const raw = readJson(configFilePath(contextDir));
-    if (!raw || typeof raw !== "object") return emptyHealthConfig();
+    const p = configFilePath(contextDir);
+    if (!existsSync(p)) return emptyHealthConfig();
+    const raw = readJson(p);
+    if (!raw || typeof raw !== "object") {
+        try {
+            copyFileSync(p, `${p}.corrupt`);
+        } catch {}
+        return emptyHealthConfig();
+    }
     return {
         ...emptyHealthConfig(),
         ...raw,
@@ -102,8 +110,15 @@ export function emptyHealthState() {
 }
 
 export function loadHealthState(contextDir) {
-    const raw = readJson(stateFilePath(contextDir));
-    if (!raw || typeof raw !== "object") return emptyHealthState();
+    const p = stateFilePath(contextDir);
+    if (!existsSync(p)) return emptyHealthState();
+    const raw = readJson(p);
+    if (!raw || typeof raw !== "object") {
+        try {
+            copyFileSync(p, `${p}.corrupt`);
+        } catch {}
+        return emptyHealthState();
+    }
     return {
         ...emptyHealthState(),
         ...raw,
@@ -177,8 +192,15 @@ export function emptyLivingPlan() {
 }
 
 export function loadLivingPlan(contextDir) {
-    const raw = readJson(planFilePath(contextDir));
-    if (!raw || typeof raw !== "object") return emptyLivingPlan();
+    const p = planFilePath(contextDir);
+    if (!existsSync(p)) return emptyLivingPlan();
+    const raw = readJson(p);
+    if (!raw || typeof raw !== "object") {
+        try {
+            copyFileSync(p, `${p}.corrupt`);
+        } catch {}
+        return emptyLivingPlan();
+    }
     const base = emptyLivingPlan();
     return {
         ...base,
@@ -250,6 +272,26 @@ function markStaleSubjectiveAssessments(nextSubjective, nextIssues, changedIds, 
 export const SUSPECT_DROP_THRESHOLD = 3;
 
 /**
+ * Compute both exact and line-normalized 12-char SHA-1 fingerprints for an issue.
+ */
+export function computeIssueFingerprints(detector, identifier, summary) {
+    const det = String(detector || "");
+    const idStr = String(identifier || "");
+    const sumStr = String(summary || "");
+    const exact = createHash("sha1")
+        .update(`${det}::${idStr}::${sumStr}`)
+        .digest("hex")
+        .slice(0, 12);
+    const normId = idStr.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
+    const normSum = sumStr.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
+    const norm = createHash("sha1")
+        .update(`${det}::${normId}::${normSum}`)
+        .digest("hex")
+        .slice(0, 12);
+    return exact === norm ? [exact] : [exact, norm];
+}
+
+/**
  * Check whether an issue or issue ID matches any configured suppression pattern or fingerprint.
  * Supports `*` wildcards (e.g. `detector::*::rule` matching `detector::path/to/file.js::rule`).
  */
@@ -274,13 +316,10 @@ export function isSuppressedByPatterns(issueOrId, suppressions) {
                 )
               : [];
 
-    let issueFp = null;
-    if (isObj && detector && (identifier || issueOrId.summary)) {
-        issueFp = createHash("sha1")
-            .update(`${detector}::${identifier || ""}::${issueOrId.summary || ""}`)
-            .digest("hex")
-            .slice(0, 12);
-    }
+    const issueFps =
+        isObj && detector && (identifier || issueOrId.summary)
+            ? computeIssueFingerprints(detector, identifier, issueOrId.summary)
+            : [];
 
     for (const entry of entries) {
         if (!entry) continue;
@@ -292,8 +331,17 @@ export function isSuppressedByPatterns(issueOrId, suppressions) {
         const substrRe = wildcardToRegExp(pat.includes("*") ? pat : `*${pat}*`);
         if (substrRe.test(id)) return true;
         if (!pat.includes("::") && (substrRe.test(file) || substrRe.test(identifier))) return true;
-        if (issueFp && Array.isArray(entry.fingerprints) && entry.fingerprints.includes(issueFp)) {
+        if (
+            issueFps.length > 0 &&
+            Array.isArray(entry.fingerprints) &&
+            issueFps.some((fp) => entry.fingerprints.includes(fp))
+        ) {
             return true;
+        }
+        if (Array.isArray(entry.fingerprints) && pat.includes("::")) {
+            const normPat = pat.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
+            const normId = id.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
+            if (normPat && normPat === normId) return true;
         }
     }
     return false;
@@ -385,7 +433,7 @@ function reconcileUnseenScanIssues(
             prev.status === "open" ||
             prev.status === "deferred" ||
             prev.status === "triaged_out" ||
-            (prev.status === "wontfix" && !prev.suppressed)
+            prev.status === "wontfix"
         ) {
             if (suspectDetectors.has(prev.detector)) {
                 nextIssues[id] = {
@@ -398,6 +446,7 @@ function reconcileUnseenScanIssues(
                 nextIssues[id] = {
                     ...prev,
                     status: "auto_resolved",
+                    suppressed: false,
                     suspect_hold: false,
                     verified: true,
                     verified_at_scan: scanNum,

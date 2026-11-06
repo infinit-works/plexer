@@ -45,6 +45,7 @@ export class Plexer {
             reuse: opts.reuse,
             onlyDirs: opts.onlyDirs,
             cards: opts.cards,
+            graphOnly: opts.graphOnly,
             onProgress: opts.onProgress,
         });
     }
