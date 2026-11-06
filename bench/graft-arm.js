@@ -150,19 +150,23 @@ for (const fam of ["opus", "sonnet"]) costByFam[fam] = fitFamily(rows.filter((r)
 function estimate(f, t0) {
     let wall = 0;
     let cum = 0;
+    let unc = 0;
+    let cost = 0;
     for (const fam of ["opus", "sonnet"]) {
         const tc = TURN_MODEL[fam];
         const turns = Math.max(0, dot(tc, [1, 1 - f.needCov, 1 - f.locCov, f.isEdit ? 1 : 0]));
         const p = predict(costByFam[fam], turns, t0);
         wall += p.wallMs;
         cum += p.cumIn;
+        unc += p.uncIn;
+        cost += p.cost;
     }
-    return { wall, cum };
+    return { wall, cum, unc, cost };
 }
 
 const arms = ["plexer", "graft-hook", "graft-push"];
-const tot = Object.fromEntries(arms.map((a) => [a, { t0: 0, need: 0, loc: 0, rec: 0, wall: 0, cum: 0, n: 0 }]));
-console.log("Task | arm        |  T0tok | GoldRec | Need | Loc  | EstWall(o+s) | EstCum(o+s)");
+const tot = Object.fromEntries(arms.map((a) => [a, { t0: 0, need: 0, loc: 0, rec: 0, wall: 0, cum: 0, unc: 0, cost: 0, n: 0 }]));
+console.log("Task | arm        |  T0tok | GoldRec | Need | Loc  | EstWall(o+s) | EstUnc(o+s) | EstCost(o+s) | EstCum(o+s)");
 for (const t of tasks()) {
     const g = loadGraphCached(resolveContextDir(t.plexerDir));
     const ask = queryPromptContext(t.plexerDir, t.prompt);
@@ -194,19 +198,21 @@ for (const t of tasks()) {
         T.rec += rec;
         T.wall += est.wall;
         T.cum += est.cum;
+        T.unc += est.unc;
+        T.cost += est.cost;
         T.n++;
         console.log(
             `${t.id.padEnd(4)} | ${arm.padEnd(10)} | ${String(t0).padStart(6)} | ${(rec * 100).toFixed(0).padStart(6)}% | ${(nc.needCov * 100).toFixed(0).padStart(3)}% | ${(nc.locCov * 100).toFixed(0).padStart(3)}% | ` +
-                `${(est.wall / 1000).toFixed(1).padStart(10)}s | ${(est.cum / 1000).toFixed(0).padStart(9)}k`
+                `${(est.wall / 1000).toFixed(1).padStart(10)}s | ${(est.unc / 1000).toFixed(1).padStart(10)}k | ${(est.cost / 1000).toFixed(1).padStart(11)}k | ${(est.cum / 1000).toFixed(0).padStart(9)}k`
         );
     }
 }
-console.log("\nTOTALS (mean per task; EstWall/EstCum summed over opus+sonnet per task)");
+console.log("\nTOTALS (mean per task; EstWall/EstUncached/EstCost/EstCum summed over opus+sonnet per task)");
 for (const arm of arms) {
     const T = tot[arm];
     if (!T.n) continue;
     console.log(
         `${arm.padEnd(10)} T0=${Math.round(T.t0 / T.n)} tok | GoldRec=${((T.rec / T.n) * 100).toFixed(1)}% | NeedCov=${((T.need / T.n) * 100).toFixed(1)}% | ` +
-            `LocCov=${((T.loc / T.n) * 100).toFixed(1)}% | EstWall=${(T.wall / T.n / 1000).toFixed(1)}s | EstCum=${(T.cum / T.n / 1000).toFixed(0)}k`
+            `LocCov=${((T.loc / T.n) * 100).toFixed(1)}% | EstWall=${(T.wall / T.n / 1000).toFixed(1)}s | EstUncached=${(T.unc / T.n / 1000).toFixed(1)}k | EstCost=${(T.cost / T.n / 1000).toFixed(1)}k | EstCum=${(T.cum / T.n / 1000).toFixed(0)}k`
     );
 }

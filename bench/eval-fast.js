@@ -186,8 +186,8 @@ function predictLive() {
         }
         const err = (set) => set.reduce((a, r) => a + Math.abs(Math.max(0, dot(tc, turnX(feat(r)))) - r.turns), 0) / Math.max(1, set.length);
         const hold = P.filter((r) => HOLDOUT.has(r.id));
-        let est = { turns: 0, wallMs: 0, cumIn: 0 };
-        let live = { turns: 0, wallMs: 0, cumIn: 0 };
+        let est = { turns: 0, wallMs: 0, cumIn: 0, uncIn: 0, cost: 0 };
+        let live = { turns: 0, wallMs: 0, cumIn: 0, uncIn: 0, cost: 0 };
         for (const r of P) {
             const f = feat(r);
             const turns = Math.max(0, dot(tc, turnX(f)));
@@ -195,24 +195,32 @@ function predictLive() {
             est.turns += turns;
             est.wallMs += p.wallMs;
             est.cumIn += p.cumIn;
+            est.uncIn += p.uncIn;
+            est.cost += p.cost;
             live.turns += r.turns;
             live.wallMs += r.ms;
             live.cumIn += r.cum;
+            live.uncIn += r.unc;
+            live.cost += r.cost;
         }
         const C = R.filter((r) => r.arm === "cold");
         const coldMs = C.reduce((a, r) => a + r.ms, 0);
         const coldCum = C.reduce((a, r) => a + r.cum, 0);
-        if (process.argv.includes("--coef")) console.log(`${family} cum coef ${JSON.stringify(cost.cum.c.map((v) => +v.toFixed(3)))}`);
+        const coldUnc = C.reduce((a, r) => a + r.unc, 0);
+        const coldCost = C.reduce((a, r) => a + r.cost, 0);
+        if (process.argv.includes("--coef")) console.log(`${family} cum coef ${JSON.stringify(cost.cum.c.map((v) => +v.toFixed(3)))} unc coef ${JSON.stringify(cost.unc.c.map((v) => +v.toFixed(3)))}`);
         console.log(
             `${family.padEnd(6)} turn-model [${tc.map((v) => v.toFixed(2)).join(", ")}] MAE train=${err(train).toFixed(2)} holdout=${err(hold).toFixed(2)} | ` +
-                `wall R²=${cost.wall.r2.toFixed(2)} cum R²=${cost.cum.r2.toFixed(2)}`
+                `wall R²=${cost.wall.r2.toFixed(2)} cum R²=${cost.cum.r2.toFixed(2)} unc R²=${cost.unc.r2.toFixed(2)}`
         );
         console.log(
             `       plexer EstTurns=${est.turns.toFixed(1)} (live-at-record ${live.turns}) | EstWall=${(est.wallMs / 1000).toFixed(1)}s ` +
                 `(live ${(live.wallMs / 1000).toFixed(1)}s, cold ${(coldMs / 1000).toFixed(1)}s → ${pct(coldMs, est.wallMs)}) | ` +
+                `EstUncached=${(est.uncIn / 1000).toFixed(0)}k (live ${(live.uncIn / 1000).toFixed(0)}k, cold ${(coldUnc / 1000).toFixed(0)}k → ${pct(coldUnc, est.uncIn)}) | ` +
+                `EstCost=${(est.cost / 1000).toFixed(0)}k (live ${(live.cost / 1000).toFixed(0)}k, cold ${(coldCost / 1000).toFixed(0)}k → ${pct(coldCost, est.cost)}) | ` +
                 `EstCum=${(est.cumIn / 1000).toFixed(0)}k (live ${(live.cumIn / 1000).toFixed(0)}k, cold ${(coldCum / 1000).toFixed(0)}k → ${pct(coldCum, est.cumIn)})`
         );
-        summary.push({ family, est, coldMs, coldCum });
+        summary.push({ family, est, coldMs, coldCum, coldUnc, coldCost });
     }
     if (CALIBRATE) {
         writeFileSync(TURN_MODEL_PATH, JSON.stringify({ calibrated: new Date().toISOString(), features: "[1, 1-needCov, 1-locCov, isEdit]", ...TURN_MODEL }, null, 1) + "\n");
@@ -221,9 +229,15 @@ function predictLive() {
     if (summary.length) {
         const w = summary.reduce((a, s) => a + s.est.wallMs, 0);
         const cw = summary.reduce((a, s) => a + s.coldMs, 0);
+        const u = summary.reduce((a, s) => a + s.est.uncIn, 0);
+        const cu = summary.reduce((a, s) => a + s.coldUnc, 0);
+        const k = summary.reduce((a, s) => a + s.est.cost, 0);
+        const ck = summary.reduce((a, s) => a + s.coldCost, 0);
         const c = summary.reduce((a, s) => a + s.est.cumIn, 0);
         const cc = summary.reduce((a, s) => a + s.coldCum, 0);
-        console.log(`SCORE  EstWall vs cold ${pct(cw, w)} | EstCum vs cold ${pct(cc, c)}  (lower is better; gate: must not regress)`);
+        console.log(
+            `SCORE  EstWall vs cold ${pct(cw, w)} | EstUncached vs cold ${pct(cu, u)} | EstCost vs cold ${pct(ck, k)} | EstCum vs cold ${pct(cc, c)}  (lower is better; gate: must not regress)`
+        );
     }
 }
 

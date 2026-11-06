@@ -10,6 +10,8 @@
  *   wall_ms  ≈ w0 + w1·turns + w2·outTok          (model latency is mostly decode time)
  *   outTok   ≈ o0 + o1·turns
  *   cumIn    ≈ c0 + c1·(turns+1) + c2·(turns+1)·t0Tok   (Turn-0 tokens are re-billed every turn)
+ *   uncIn    ≈ u0 + u1·turns + t0Tok              (tokens written to prompt cache once per session)
+ *   cost     ≈ 1.25·uncIn + 0.1·(cumIn - uncIn) + 5·outTok (Anthropic cache-aware API cost units)
  *
  * Usage: node bench/cost-model.js   — prints coefficients, R², leave-one-out MAPE.
  */
@@ -63,13 +65,19 @@ export function fitStats(X, y) {
     return { c, r2: 1 - ssr / sst, looMape: ape / y.length };
 }
 
+const WARM_PREFIX_TOKENS = {
+    opus: 6583,
+    sonnet: 6710,
+};
+
 /**
- * Load per-task live rows: {family, suite, id, arm, turns, calls, out, ms, apiMs, cum, final}.
+ * Load per-task live rows: {family, suite, id, arm, turns, calls, out, ms, apiMs, cum, final, unc, cost}.
  * `t0Tok` is filled in later by the caller (it is an offline quantity).
  */
 export function loadRows(benchDir = import.meta.dirname) {
     const rows = [];
     for (const [family, files] of Object.entries(RESULT_FILES)) {
+        const warmPrefix = WARM_PREFIX_TOKENS[family] ?? 6600;
         for (const f of files) {
             const p = resolve(benchDir, f);
             if (!existsSync(p)) continue;
@@ -78,6 +86,9 @@ export function loadRows(benchDir = import.meta.dirname) {
                 for (const arm of ["cold", "plexer"]) {
                     const x = t[arm];
                     if (!x) continue;
+                    const unc = Math.max(0, x.finalContextTokens - warmPrefix + 2 * (x.turns + 1));
+                    const cacheRead = Math.max(0, x.cumulativeInputTokens - unc);
+                    const cost = 1.25 * unc + 0.1 * cacheRead + 5 * x.totalModelOutputTokens;
                     rows.push({
                         family,
                         suite: f.includes("swebench") ? "S" : "T",
@@ -89,6 +100,8 @@ export function loadRows(benchDir = import.meta.dirname) {
                         ms: x.totalMs,
                         cum: x.cumulativeInputTokens,
                         final: x.finalContextTokens,
+                        unc,
+                        cost,
                         score: x.score,
                     });
                 }
@@ -98,7 +111,7 @@ export function loadRows(benchDir = import.meta.dirname) {
     return rows;
 }
 
-/** Fit the three cost equations for one family. `t0Of(row)` supplies Turn-0 tokens. */
+/** Fit the cost equations for one family. `t0Of(row)` supplies Turn-0 tokens. */
 export function fitFamily(rows, t0Of = () => 0) {
     const wall = fitStats(rows.map((r) => [1, r.turns, r.out]), rows.map((r) => r.ms));
     const out = fitStats(rows.map((r) => [1, r.turns]), rows.map((r) => r.out));
@@ -107,16 +120,27 @@ export function fitFamily(rows, t0Of = () => 0) {
         rows.map((r) => r.cum - (r.turns + 1) * t0Of(r))
     );
     const cum = { ...baseCum, c: [baseCum.c[0], baseCum.c[1], 1] };
-    return { wall, out, cum, n: rows.length };
+    const baseUnc = fitStats(
+        rows.map((r) => [1, r.turns]),
+        rows.map((r) => r.unc - t0Of(r))
+    );
+    const unc = { ...baseUnc, c: [baseUnc.c[0], baseUnc.c[1], 1] };
+    return { wall, out, cum, unc, n: rows.length };
 }
 
-/** Predict {wallMs, outTok, cumIn} for a given turn count and Turn-0 token load. */
+/** Predict {wallMs, outTok, cumIn, uncIn, cost} for a given turn count and Turn-0 token load. */
 export function predict(model, turns, t0Tok) {
     const outTok = Math.max(0, dot(model.out.c, [1, turns]));
+    const cumIn = Math.max(0, dot(model.cum.c, [1, turns + 1, (turns + 1) * t0Tok]));
+    const uncIn = Math.max(0, dot(model.unc.c, [1, turns, t0Tok]));
+    const cacheRead = Math.max(0, cumIn - uncIn);
+    const cost = 1.25 * uncIn + 0.1 * cacheRead + 5 * outTok;
     return {
         outTok,
         wallMs: Math.max(0, dot(model.wall.c, [1, turns, outTok])),
-        cumIn: Math.max(0, dot(model.cum.c, [1, turns + 1, (turns + 1) * t0Tok])),
+        cumIn,
+        uncIn,
+        cost,
     };
 }
 
@@ -131,5 +155,6 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename
         console.log(`  wall_ms ~ 1, turns, outTok      ${f(m.wall)}`);
         console.log(`  outTok  ~ 1, turns              ${f(m.out)}`);
         console.log(`  cumIn   ~ 1, turns+1, (t+1)·t0  ${f(m.cum)}   (t0=0 here; eval-fast refits with offline t0)`);
+        console.log(`  uncIn   ~ 1, turns, t0          ${f(m.unc)}   (t0=0 here; eval-fast refits with offline t0)`);
     }
 }

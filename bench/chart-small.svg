@@ -120,24 +120,24 @@
   <line x1="404.0" y1="414" x2="404.0" y2="534" class="grid"/>
   <line x1="492.0" y1="414" x2="492.0" y2="534" class="grid"/>
   <line x1="580.0" y1="414" x2="580.0" y2="534" class="grid"/>
-  <text x="32" y="428" class="font row-label">Live 3-Arm Tool Output</text>
-  <text x="32" y="441" class="font row-sub">T4, T5, T9 + S1–S8 across 4 models</text>
-  <rect x="228" y="416" width="243.1" height="9.5" rx="2" class="bar-plexer"/>
-  <text x="477.1" y="424.5" class="font val-plexer">572.8k (884 calls)</text>
-  <rect x="228" y="427.5" width="331.4" height="9" rx="2" class="bar-trail"/>
-  <text x="565.4" y="435.5" class="font val-other">780.9k (1,112 calls)</text>
-  <rect x="228" y="438.5" width="352.0" height="9" rx="2" class="bar-cold"/>
-  <text x="586.0" y="446.5" class="font val-other">829.5k (1,168 calls)</text>
+  <text x="32" y="428" class="font row-label">Live 3-Arm Uncached Input</text>
+  <text x="32" y="441" class="font row-sub">input + cache_creation (33 shared tasks)</text>
+  <rect x="228" y="416" width="246.1" height="9.5" rx="2" class="bar-plexer"/>
+  <text x="480.1" y="424.5" class="font val-plexer">1.43M tok (397 calls)</text>
+  <rect x="228" y="427.5" width="352.0" height="9" rx="2" class="bar-trail"/>
+  <text x="586.0" y="435.5" class="font val-other">2.05M tok (543 calls)</text>
+  <rect x="228" y="438.5" width="313.4" height="9" rx="2" class="bar-cold"/>
+  <text x="547.4" y="446.5" class="font val-other">1.82M tok (585 calls)</text>
   <rect x="740" y="422" width="108" height="20" rx="10" class="badge-bg"/>
-  <text x="794" y="435.5" text-anchor="middle" class="font badge-txt">-26.6% vs trail</text>
+  <text x="794" y="435.5" text-anchor="middle" class="font badge-txt">-30.1% vs trail</text>
   <text x="32" y="470" class="font row-label">Live 3-Arm Cum. Input</text>
-  <text x="32" y="483" class="font row-sub">Score: plexer 339/352 vs. 337</text>
+  <text x="32" y="483" class="font row-sub">T4, T5, T9 + S1–S8 across 4 models</text>
   <rect x="228" y="458" width="257.5" height="9.5" rx="2" class="bar-plexer"/>
-  <text x="491.5" y="466.5" class="font val-plexer">39.92M tok</text>
+  <text x="491.5" y="466.5" class="font val-plexer">39.92M tok (572.8k tool out)</text>
   <rect x="228" y="469.5" width="352.0" height="9" rx="2" class="bar-trail"/>
-  <text x="586.0" y="477.5" class="font val-other">54.56M tok</text>
+  <text x="586.0" y="477.5" class="font val-other">54.56M tok (780.9k tool out)</text>
   <rect x="228" y="480.5" width="330.8" height="9" rx="2" class="bar-cold"/>
-  <text x="564.8" y="488.5" class="font val-other">51.27M tok</text>
+  <text x="564.8" y="488.5" class="font val-other">51.27M tok (829.5k tool out)</text>
   <rect x="740" y="464" width="108" height="20" rx="10" class="badge-bg"/>
   <text x="794" y="477.5" text-anchor="middle" class="font badge-txt">-26.8% vs trail</text>
   <text x="32" y="512" class="font row-label">Retrieval Recall@1</text>

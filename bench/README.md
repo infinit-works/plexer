@@ -7,13 +7,13 @@ This directory contains the multi-model benchmark suite for `plexer`:
 - **Antigravity A/B Runner:** [`bench/run-agy-ab.js`](run-agy-ab.js) runs headless Google Antigravity (`agy -p`) evaluations on `argon-low` (`gemini-4-argon-low --effort low`) and `argon-medium` (`gemini-4-argon-medium --effort medium`).
 - **Claude Code A/B Runner:** [`bench/run-claude-ab.js`](run-claude-ab.js) runs headless Claude Code (`claude -p --effort medium`) evaluations on `claude-sonnet-5-5` and `claude-opus-5-5` across `T1`–`T12`.
 - **SWE-bench A/B Runner:** [`bench/run-swebench-ab.js`](run-swebench-ab.js) runs `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`) across all 4 models, supporting both patch/symbol grading and Docker verification (`SWEBENCH_DOCKER=1`).
-- **Offline Fast Evaluator:** [`bench/eval-fast.js`](eval-fast.js) evaluates all 20 tasks (`T1`–`T12` + `S1`–`S8`) offline in ~4.8s at `$0` API cost. It measures Turn-0 BPE token budgets, file and symbol recall, needed-line coverage (`NeedCov` / `LocCov`), and predicted wall time and cumulative input (`EstWall`, `EstCum`).
+- **Offline Fast Evaluator:** [`bench/eval-fast.js`](eval-fast.js) evaluates all 20 tasks (`T1`–`T12` + `S1`–`S8`) offline in ~4.6s at `$0` API cost. It measures Turn-0 BPE token budgets, file and symbol recall, needed-line coverage (`NeedCov` / `LocCov`), and predicted wall time, uncached input, cache-aware cost, and cumulative input (`EstWall`, `EstUncached`, `EstCost`, `EstCum`).
 - **Transcript Span Miner:** [`bench/replay.js`](replay.js) and [`bench/needed-spans.json`](needed-spans.json) extract ranged file reads, whole-file reads, grep hits, and gold patch hunks across all 20 tasks into a ground-truth fixture.
 - **Coverage Metrics:** [`bench/needcov.js`](needcov.js) computes `needCov` (weighted share of needed lines inlined at Turn 0), `locCov` (share of needed symbols pointed to or inlined), and `fileCov`.
-- **Empirical Cost Model:** [`bench/cost-model.js`](cost-model.js) and [`bench/turn-model.json`](turn-model.json) fit per-family cost equations (`wall_ms ~ 1 + turns + outTok`, `outTok ~ 1 + turns`, `cumIn - (turns + 1)·t0 ~ 1 + (turns + 1)`) with leave-one-out cross-validation (`R² = 0.83–0.94`).
+- **Empirical Cost Model:** [`bench/cost-model.js`](cost-model.js) and [`bench/turn-model.json`](turn-model.json) fit per-family cost equations (`wall_ms ~ 1 + turns + outTok`, `outTok ~ 1 + turns`, `uncIn ~ 1 + turns + t0`, `cumIn - (turns + 1)·t0 ~ 1 + (turns + 1)`) and cache-aware cost (`1.25·uncIn + 0.1·cacheRead + 5·outTok`) with leave-one-out cross-validation (`R² = 0.83–0.94`).
 - **Offline Trail-Code Comparison:** [`bench/graft-arm.js`](graft-arm.js) compares `plexer` offline against `@trailhq/trail-code@0.25.0` (`graft-hook` and `graft-push`) across `T4`, `T5`, `T9`, and `S1`–`S8`.
 - **Live 3-Arm Trail-Code Runner:** [`bench/trail-live-helper.js`](trail-live-helper.js) wires `@trailhq/trail-code@0.25.0` (`trail init`, `trail _hook`, `PreInvocation` `systemMessage` caching, and deduplicated `PostToolUse` hooks) in isolated worktrees alongside `cold` and `plexer`.
-- **Trail-Comparable Metrics:** [`bench/trail-table.js`](trail-table.js) computes per-task means (tool calls, uncached input tokens `input + cache_creation`, cache-aware cost, and latency) alongside cumulative input tokens and search wall time.
+- **Trail-Comparable Metrics:** [`bench/trail-table.js`](trail-table.js) computes per-task means (tool calls, raw & warm-cache uncached input tokens `input + cache_creation`, post-Turn-1 exploration uncached tokens, cache-aware cost, and 3-arm `cold` vs `trail` vs `plexer` comparisons) alongside cumulative input tokens and search wall time.
 - **Worktree Fixture Builder:** [`bench/ensure-base.js`](ensure-base.js) populates `/tmp/plexer-ab-base/{clean,indexed}` and `/tmp/plexer-swebench-base/{clean,indexed}`.
 - **Interactive Evaluation Viewer:** [`bench/skill-review.html`](skill-review.html) renders a self-contained `/skill-creator` evaluation viewer for all paired A/B runs.
 - **Benchmark SVG Generator:** [`bench/chart.js`](chart.js) generates [`bench/chart-small.svg`](chart-small.svg) and [`bench/chart.svg`](chart.svg) with automatic light/dark theme support.
@@ -233,22 +233,27 @@ node bench/run-swebench-ab.js opus 4 both all
 
 ### Trail-Comparable Metric Table (`node bench/trail-table.js`)
 
-Trail-Code (`@trailhq/trail-code`) reports per-task means on read-only Q&A prompts (`--max-turns 10`) by pre-running `ask "<question>" --source` and prepending the output to the prompt. It tracks **uncached input tokens** (`input_tokens + cache_creation_input_tokens`) and **cache-aware cost** (`1·input + 1.25·cache_write + 0.1·cache_read + 5·output`). [`bench/trail-table.js`](trail-table.js) computes those same metrics alongside cumulative input tokens and search wall time across our Claude Code sessions:
+Trail-Code (`@trailhq/trail-code`) reports per-task means on read-only Q&A prompts (`--max-turns 10`) by pre-running `ask "<question>" --source` and prepending the output to the prompt. It tracks **uncached input tokens** (`input_tokens + cache_creation_input_tokens`) and **cache-aware cost** (`1·input + 1.25·cache_write + 0.1·cache_read + 5·output`). Across Claude Code sessions, $\text{UncachedInputTokens} = \text{FinalContextTokens} - \text{Turn1CacheRead} + 2T$. [`bench/trail-table.js`](trail-table.js) computes raw uncached input, **warm-cache uncached input** (normalizing out cold-start worktree system prompt / `SKILL.md` cache-miss noise), **post-Turn-1 exploration uncached tokens** (new tokens written to cache after Turn 1 via file reads and greps), cumulative input tokens, cache-aware cost, and direct 3-arm (`cold` vs. `trail` vs. `plexer`) comparisons:
 
 ```bash
 node bench/trail-table.js --suite qa
 node bench/trail-table.js --suite all
 node bench/trail-table.js --suite swe
+node bench/trail-table.js --suite 3arm
 ```
 
-| Model & Suite (Per-Task Mean) | Tool Calls (`cold` → `plexer`) | Uncached Input Tok (`cold` → `plexer`) | Cumulative Input Tok (`cold` → `plexer`) | Cache-Aware Cost (`cold` → `plexer`) | Search Time (`cold` → `plexer`) | Total Latency (`cold` → `plexer`) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Opus 5.5 — Q&A (`T1`–`T8`)** | 5.8 → **1.4 (-76%)** | 12,608 → **8,412 (-33%)** | 86,533 → **31,790 (-63%)** | 35,377 → **21,579 (-39%)** | 13.4s → **2.7s (-80%)** | 29.5s → **19.4s (-34%)** |
-| **Sonnet 5.5 — Q&A (`T1`–`T8`)** | 4.8 → **1.3 (-74%)** | 9,655 → **6,747 (-30%)** | 46,218 → **24,648 (-47%)** | 24,615 → **16,343 (-34%)** | 4.6s → **1.8s (-62%)** | 14.8s → **12.8s (-14%)** |
-| **Opus 5.5 — All (`T1`–`T12`)** | 6.8 → **2.3 (-65%)** | 13,111 → **8,940 (-32%)** | 107,313 → **47,521 (-56%)** | 40,034 → **24,961 (-38%)** | 20.7s → **7.8s (-63%)** | 34.9s → **21.8s (-38%)** |
-| **Sonnet 5.5 — All (`T1`–`T12`)** | 6.3 → **2.1 (-67%)** | 9,950 → **6,510 (-35%)** | 54,530 → **34,545 (-37%)** | 26,953 → **17,953 (-33%)** | 8.1s → **5.2s (-36%)** | 16.8s → **15.4s (-8%)** |
-| **Opus 5.5 — SWE-bench (`S1`–`S8`)** | 4.9 → **4.3 (-13%)** | 11,751 → **10,111 (-14%)** | 80,703 → **77,954 (-3%)** | 36,189 → **32,808 (-9%)** | 24.1s → **19.4s (-20%)** | 35.9s → **28.7s (-20%)** |
-| **Sonnet 5.5 — SWE-bench (`S1`–`S8`)** | 8.1 → **3.6 (-55%)** | 10,653 → **9,713 (-9%)** | 79,626 → **55,584 (-30%)** | 33,577 → **25,315 (-25%)** | 15.0s → **10.2s (-32%)** | 21.1s → **17.7s (-16%)** |
+| Model & Suite (Per-Task Mean) | Tool Calls (`cold` → `plexer`) | Uncached Input (`cold` → `plexer`) | Warm-Cache Uncached (`cold` → `plexer`) | Post-Turn-1 Uncached (`cold` → `plexer`) | Cumulative Input (`cold` → `plexer`) | Cache-Aware Cost (`cold` → `plexer`) | Search Time (`cold` → `plexer`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Opus 5.5 — Q&A (`T1`–`T8`)** | 5.8 → **1.4 (-76%)** | 12,608 → **8,412 (-33%)** | 11,331 → **6,665 (-41%)** | 10,031 → **2,193 (-78%)** | 86,533 → **31,790 (-63%)** | 35,377 → **21,579 (-39%)** | 13.4s → **2.7s (-80%)** |
+| **Sonnet 5.5 — Q&A (`T1`–`T8`)** | 4.8 → **1.3 (-74%)** | 9,655 → **6,747 (-30%)** | 8,377 → **5,786 (-31%)** | 7,235 → **1,572 (-78%)** | 46,218 → **24,648 (-47%)** | 24,615 → **16,343 (-34%)** | 4.6s → **1.8s (-62%)** |
+| **Opus 5.5 — All (`T1`–`T12`)** | 6.8 → **2.3 (-65%)** | 13,111 → **8,940 (-32%)** | 12,260 → **7,633 (-38%)** | 10,879 → **3,053 (-72%)** | 107,313 → **47,521 (-56%)** | 40,034 → **24,961 (-38%)** | 20.7s → **7.8s (-63%)** |
+| **Sonnet 5.5 — All (`T1`–`T12`)** | 6.3 → **2.1 (-67%)** | 9,950 → **6,510 (-35%)** | 9,098 → **5,870 (-35%)** | 7,853 → **1,943 (-75%)** | 54,530 → **34,545 (-37%)** | 26,953 → **17,953 (-33%)** | 8.1s → **5.2s (-36%)** |
+| **Opus 5.5 — SWE-bench (`S1`–`S8`)** | 4.9 → **4.3 (-13%)** | 11,751 → **10,111 (-14%)** | 10,829 → **9,144 (-16%)** | 8,608 → **6,170 (-28%)** | 80,703 → **77,954 (-3%)** | 36,189 → **32,808 (-9%)** | 24.1s → **19.4s (-20%)** |
+| **Sonnet 5.5 — SWE-bench (`S1`–`S8`)** | 8.1 → **3.6 (-55%)** | 10,653 → **9,713 (-9%)** | 9,688 → **8,766 (-10%)** | 7,722 → **5,692 (-26%)** | 79,626 → **55,584 (-30%)** | 33,577 → **25,315 (-25%)** | 15.0s → **10.2s (-32%)** |
+
+#### 3-Arm Uncached Input & Cumulative Token Totals (`node bench/trail-table.js --suite 3arm`)
+
+Across all 33 shared 3-arm tasks (`T4, T5, T9, S1–S8` on `argon-medium`, `opus`, and `sonnet`), `plexer` cuts **Uncached Input Tokens (`input + cache_creation`) by `-21.5%` vs. `cold` (`1,821k → 1,430k`)** and **`-30.1%` vs. `trail` (`2,045k → 1,430k`)**, while reducing **Cumulative Input Tokens by `-37.3%` vs. `trail` (`16.73M → 10.49M`)** and **Tool Calls by `-26.9%` vs. `trail` (`543 → 397`)**.
 
 ### Offline Head-to-Head vs. `@trailhq/trail-code@0.25.0` (`node bench/graft-arm.js`)
 
@@ -258,18 +263,18 @@ node bench/trail-table.js --suite swe
 node bench/graft-arm.js
 ```
 
-| Arm (`T4`, `T5`, `T9`, `S1`–`S8` Mean) | Turn-0 Tokens | Gold File Recall | `NeedCov` (Inlined Lines) | `LocCov` (Located Symbols) | Predicted Wall (`EstWall`) | Predicted CumInput (`EstCum`) |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`plexer` (`11/11` task wins)** | **2,613 tok** | **100.0%** | **28.7%** | **49.8%** | **41.0s** | **125k** |
-| `graft-hook` (`ask --json -n 3`) | 135 tok | 41.6% | 0.0% | 4.5% | 49.1s | 140k |
-| `graft-push` (`ask --source`) | 5,741 tok | 60.6% | 3.9% | 8.3% | 48.2s | 191k |
+| Arm (`T4`, `T5`, `T9`, `S1`–`S8` Mean) | Turn-0 Tokens | Gold File Recall | `NeedCov` (Inlined Lines) | `LocCov` (Located Symbols) | Predicted Wall (`EstWall`) | Predicted Uncached (`EstUncached`) | Predicted Cost (`EstCost`) | Predicted CumInput (`EstCum`) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`plexer` (`11/11` task wins)** | **2,469 tok** | **100.0%** | **29.6%** | **50.0%** | **40.7s** | **21.1k** | **55.5k** | **123k** |
+| `graft-hook` (`ask --json -n 3`) | 135 tok | 41.6% | 0.0% | 4.5% | 49.1s | 16.5k | 58.8k | 140k |
+| `graft-push` (`ask --source`) | 5,741 tok | 60.6% | 3.9% | 8.3% | 48.2s | 29.9k | 76.1k | 191k |
 
 ### 3-Tier Offline Optimization Suite (`node bench/eval-fast.js`)
 
 [`bench/eval-fast.js`](eval-fast.js) evaluates retrieval ranking, named-definition pinning (`src/claude/pin.js`), and hook budgets in under 5s at `$0` API cost:
 1. **Transcript-mined ground truth (`bench/replay.js` → `bench/needed-spans.json`):** Captures every line range and symbol that `cold` agents read or grepped across all 20 tasks, plus SWE-bench gold patch hunks.
 2. **Coverage metrics (`bench/needcov.js`):** Computes `NeedCov` (weighted share of needed lines inlined with `L<n>:` numbers at Turn 0) and `LocCov` (share of needed symbols pointed to or inlined at Turn 0), with separate holdout reporting (`T4`, `T8`, `T12`).
-3. **Live-calibrated cost model (`bench/cost-model.js` & `bench/turn-model.json`):** Uses per-family linear models fit on the 80 recorded live runs (`wall R² = 0.92` on Opus, `cum R² = 0.90–0.92` with `1.0 × (turns + 1) × t0Tok` Turn-0 re-billing).
+3. **Live-calibrated cost model (`bench/cost-model.js` & `bench/turn-model.json`):** Uses per-family linear models fit on the 80 recorded live runs (`wall R² = 0.92` on Opus, `cum R² = 0.90–0.92` with `1.0 × (turns + 1) × t0Tok` Turn-0 re-billing), achieving **`100.0%` File Recall**, **`84.6%` `TokCov`**, **`-28.4%` `EstWall`**, **`-11.7%` `EstUncached`**, **`-25.1%` `EstCost`**, and **`-35.1%` `EstCum`** vs. `cold`.
 
 ```bash
 node bench/eval-fast.js
@@ -281,7 +286,7 @@ node bench/eval-fast.js --quiet --set editMergedBytes=3200
 
 ## 4. Engine & Retrieval Benchmark (`npm run bench`)
 
-[`bench/run.js`](run.js) benchmarks the `plexer` engine across 6 repositories (`plexer`, `kohls-admin`, `flux`, `sert`, `building-tools`, and `z`, totaling **14,197 symbols** and **29,020 graph edges** at pinned benchmark commits) and **24 natural-language intent queries**:
+[`bench/run.js`](run.js) benchmarks the `plexer` engine across 6 repositories (`plexer`, `kohls-admin`, `flux`, `sert`, `building-tools`, and `z`, totaling **14,214 symbols** and **29,061 graph edges** at pinned benchmark commits) and **24 natural-language intent queries**:
 
 ```bash
 npm run bench
@@ -295,9 +300,9 @@ node bench/run.js --json
 
 | Repository | Graph Size (Nodes / Edges) | `wiring.json` | `check` | `ask --source` Latency & Tokens (vs Raw Files) | `callers` (`d=2`) | `skeleton` | `map` |
 | :--- | ---: | ---: | ---: | :--- | ---: | ---: | ---: |
-| **`plexer`** (JS/TS) | 1,655 / 5,343 | 1,353 KB | 30.0ms | **13.5ms** / 1,367 tok (**-91%** vs 15,477 raw) | **0.13ms** | **0.13ms** | 0.05ms |
-| **`kohls-admin`** (Luau) | 2,508 / 4,137 | 1,568 KB | 39.3ms | **10.4ms** / 1,280 tok (**-88%** vs 10,566 raw) | **0.85ms** | **0.04ms** | 0.01ms |
-| **`flux`** (Luau) | 1,524 / 2,210 | 808 KB | 17.7ms | **5.1ms** / 1,448 tok (**-94%** vs 26,234 raw) | **0.33ms** | **0.10ms** | 0.01ms |
-| **`sert`** (Luau + Py) | 2,926 / 6,127 | 1,906 KB | 36.3ms | **10.7ms** / 1,186 tok (**-89%** vs 10,757 raw) | **1.56ms** | **0.04ms** | 0.01ms |
-| **`building-tools`** (Luau) | 1,970 / 4,778 | 1,413 KB | 39.1ms | **7.1ms** / 1,445 tok (**-73%** vs 5,306 raw) | **0.70ms** | **0.02ms** | 0.01ms |
-| **`z`** (Luau + Rust + Py) | 3,614 / 6,425 | 2,438 KB | 47.1ms | **24.0ms** / 1,376 tok (**-93%** vs 20,675 raw) | **0.37ms** | **0.05ms** | 0.03ms |
+| **`plexer`** (JS/TS) | 1,672 / 5,384 | 1,364 KB | 35.7ms | **13.0ms** / 1,367 tok (**-91%** vs 15,477 raw) | **0.15ms** | **0.12ms** | 0.04ms |
+| **`kohls-admin`** (Luau) | 2,508 / 4,137 | 1,568 KB | 35.6ms | **9.2ms** / 1,280 tok (**-88%** vs 10,566 raw) | **0.62ms** | **0.03ms** | 0.01ms |
+| **`flux`** (Luau) | 1,524 / 2,210 | 808 KB | 20.8ms | **5.4ms** / 1,448 tok (**-94%** vs 26,234 raw) | **0.60ms** | **0.10ms** | 0.01ms |
+| **`sert`** (Luau + Py) | 2,926 / 6,127 | 1,906 KB | 34.9ms | **14.0ms** / 1,239 tok (**-88%** vs 10,757 raw) | **1.26ms** | **0.04ms** | 0.01ms |
+| **`building-tools`** (Luau) | 1,970 / 4,778 | 1,413 KB | 27.3ms | **6.4ms** / 1,445 tok (**-73%** vs 5,306 raw) | **0.47ms** | **0.02ms** | 0.01ms |
+| **`z`** (Luau + Rust + Py) | 3,614 / 6,425 | 2,438 KB | 39.7ms | **20.6ms** / 1,376 tok (**-93%** vs 20,675 raw) | **0.37ms** | **0.05ms** | 0.03ms |

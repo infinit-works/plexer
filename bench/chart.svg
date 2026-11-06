@@ -144,34 +144,34 @@
   <line x1="412.0" y1="582" x2="412.0" y2="740" class="grid"/>
   <line x1="500.0" y1="582" x2="500.0" y2="740" class="grid"/>
   <line x1="588.0" y1="582" x2="588.0" y2="740" class="grid"/>
-  <text x="32" y="596" class="font row-label">Live 3-Arm Tool Output</text>
-  <text x="32" y="609" class="font row-sub">T4, T5, T9 + S1–S8 across 4 models</text>
-  <rect x="236" y="584" width="243.1" height="9.5" rx="2" class="bar-plexer"/>
-  <text x="485.1" y="592.5" class="font val-plexer">572.8k tok (884 calls · 5,697s)</text>
-  <rect x="236" y="595.5" width="331.4" height="9" rx="2" class="bar-trail"/>
-  <text x="573.4" y="603.5" class="font val-other">780.9k tok (1,112 calls)</text>
-  <rect x="236" y="606.5" width="352.0" height="9" rx="2" class="bar-cold"/>
-  <text x="594.0" y="614.5" class="font val-other">829.5k tok (1,168 calls)</text>
+  <text x="32" y="596" class="font row-label">Live 3-Arm Uncached Input</text>
+  <text x="32" y="609" class="font row-sub">input + cache_creation (33 shared tasks)</text>
+  <rect x="236" y="584" width="246.1" height="9.5" rx="2" class="bar-plexer"/>
+  <text x="488.1" y="592.5" class="font val-plexer">1.43M tok (397 calls · -78% post-T1)</text>
+  <rect x="236" y="595.5" width="352.0" height="9" rx="2" class="bar-trail"/>
+  <text x="594.0" y="603.5" class="font val-other">2.05M tok (543 calls)</text>
+  <rect x="236" y="606.5" width="313.4" height="9" rx="2" class="bar-cold"/>
+  <text x="555.4" y="614.5" class="font val-other">1.82M tok (585 calls)</text>
   <rect x="776" y="590" width="108" height="20" rx="10" class="badge-bg"/>
-  <text x="830" y="603.5" text-anchor="middle" class="font badge-txt">-26.6% vs trail</text>
+  <text x="830" y="603.5" text-anchor="middle" class="font badge-txt">-30.1% vs trail</text>
   <text x="32" y="638" class="font row-label">Live 3-Arm Cum. Input</text>
   <text x="32" y="651" class="font row-sub">Total input tokens across 44 sessions/arm</text>
   <rect x="236" y="626" width="257.5" height="9.5" rx="2" class="bar-plexer"/>
-  <text x="499.5" y="634.5" class="font val-plexer">39.92M tok (339/352 score)</text>
+  <text x="499.5" y="634.5" class="font val-plexer">39.92M tok (572.8k tool out)</text>
   <rect x="236" y="637.5" width="352.0" height="9" rx="2" class="bar-trail"/>
-  <text x="594.0" y="645.5" class="font val-other">54.56M tok (337/352 score)</text>
+  <text x="594.0" y="645.5" class="font val-other">54.56M tok (780.9k tool out)</text>
   <rect x="236" y="648.5" width="330.8" height="9" rx="2" class="bar-cold"/>
-  <text x="572.8" y="656.5" class="font val-other">51.27M tok (337/352 score)</text>
+  <text x="572.8" y="656.5" class="font val-other">51.27M tok (829.5k tool out)</text>
   <rect x="776" y="632" width="108" height="20" rx="10" class="badge-bg"/>
   <text x="830" y="645.5" text-anchor="middle" class="font badge-txt">-26.8% vs trail</text>
   <text x="32" y="680" class="font row-label">Turn-0 Gold File Recall</text>
   <text x="32" y="693" class="font row-sub">11 shared tasks (T4, T5, T9, S1–S8)</text>
   <rect x="236" y="668" width="352.0" height="9.5" rx="2" class="bar-plexer"/>
-  <text x="594.0" y="676.5" class="font val-plexer">100.0% (Need 28.7% · Loc 49.8%)</text>
+  <text x="594.0" y="676.5" class="font val-plexer">100.0% (Need 29.6% · Loc 50.0% · 2,469 tok)</text>
   <rect x="236" y="679.5" width="213.3" height="9" rx="2" class="bar-trail"/>
-  <text x="455.3" y="687.5" class="font val-other">60.6% graft-push (NeedCov 3.9%)</text>
+  <text x="455.3" y="687.5" class="font val-other">60.6% graft-push (NeedCov 3.9% · 5,741 tok)</text>
   <rect x="236" y="690.5" width="146.4" height="9" rx="2" class="bar-cold"/>
-  <text x="388.4" y="698.5" class="font val-other">41.6% graft-hook (NeedCov 0.0%)</text>
+  <text x="388.4" y="698.5" class="font val-other">41.6% graft-hook (NeedCov 0.0% · 135 tok)</text>
   <rect x="776" y="674" width="108" height="20" rx="10" class="badge-bg"/>
   <text x="830" y="687.5" text-anchor="middle" class="font badge-txt">11/11 task wins</text>
   <text x="32" y="722" class="font row-label">Engine Retrieval Recall@1</text>
@@ -183,13 +183,13 @@
   <rect x="776" y="716" width="108" height="20" rx="10" class="badge-bg"/>
   <text x="830" y="729.5" text-anchor="middle" class="font badge-txt">100% Recall@1</text>
   <rect x="16" y="762" width="888" height="202" rx="8" class="card"/>
-  <text x="32" y="784" class="font sec-title">4. Engine Source Compaction (ask --source Tokens vs. Raw Target Files · 14,197 Nodes / 29,020 Edges)</text>
+  <text x="32" y="784" class="font sec-title">4. Engine Source Compaction (ask --source Tokens vs. Raw Target Files · 14,214 Nodes / 29,061 Edges)</text>
   <line x1="324.0" y1="792" x2="324.0" y2="954" class="grid"/>
   <line x1="412.0" y1="792" x2="412.0" y2="954" class="grid"/>
   <line x1="500.0" y1="792" x2="500.0" y2="954" class="grid"/>
   <line x1="588.0" y1="792" x2="588.0" y2="954" class="grid"/>
   <text x="32" y="805" class="font row-label">flux &amp; z</text>
-  <text x="32" y="818" class="font row-sub">ask --source: 5.1ms (flux) · 24.0ms (z)</text>
+  <text x="32" y="818" class="font row-sub">ask --source: 5.4ms (flux) · 20.6ms (z)</text>
   <rect x="236" y="795" width="21.2" height="11" rx="2.5" class="bar-plexer"/>
   <text x="263.2" y="804" class="font val-plexer">1,448 tok (flux) · 1,376 tok (z)</text>
   <rect x="236" y="809" width="352.0" height="10" rx="2.5" class="bar-cold"/>
@@ -197,15 +197,15 @@
   <rect x="776" y="797" width="108" height="20" rx="10" class="badge-bg"/>
   <text x="830" y="810.5" text-anchor="middle" class="font badge-txt">-94% / -93% tok</text>
   <text x="32" y="845" class="font row-label">plexer &amp; sert</text>
-  <text x="32" y="858" class="font row-sub">ask --source: 13.5ms (plexer) · 10.7ms (sert)</text>
-  <rect x="236" y="835" width="34.3" height="11" rx="2.5" class="bar-plexer"/>
-  <text x="276.3" y="844" class="font val-plexer">1,367 tok (plexer) · 1,186 tok (sert)</text>
+  <text x="32" y="858" class="font row-sub">ask --source: 13.0ms (plexer) · 14.0ms (sert)</text>
+  <rect x="236" y="835" width="35.0" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="277.0" y="844" class="font val-plexer">1,367 tok (plexer) · 1,239 tok (sert)</text>
   <rect x="236" y="849" width="352.0" height="10" rx="2.5" class="bar-cold"/>
   <text x="594.0" y="857.5" class="font val-other">15.5k raw (plexer) · 10.8k (sert)</text>
   <rect x="776" y="837" width="108" height="20" rx="10" class="badge-bg"/>
-  <text x="830" y="850.5" text-anchor="middle" class="font badge-txt">-91% / -89% tok</text>
+  <text x="830" y="850.5" text-anchor="middle" class="font badge-txt">-91% / -88% tok</text>
   <text x="32" y="885" class="font row-label">kohls-admin &amp; building-tools</text>
-  <text x="32" y="898" class="font row-sub">ask --source: 10.4ms (ka) · 7.1ms (btools)</text>
+  <text x="32" y="898" class="font row-sub">ask --source: 9.2ms (ka) · 6.4ms (btools)</text>
   <rect x="236" y="875" width="60.4" height="11" rx="2.5" class="bar-plexer"/>
   <text x="302.4" y="884" class="font val-plexer">1,280 tok (ka) · 1,445 tok (btools)</text>
   <rect x="236" y="889" width="352.0" height="10" rx="2.5" class="bar-cold"/>
@@ -214,10 +214,10 @@
   <text x="830" y="890.5" text-anchor="middle" class="font badge-txt">-88% / -73% tok</text>
   <text x="32" y="925" class="font row-label">Turn-0 Offline Readiness</text>
   <text x="32" y="938" class="font row-sub">20-task eval-fast.js (T1–T12 + S1–S8)</text>
-  <rect x="236" y="915" width="233.0" height="11" rx="2.5" class="bar-plexer"/>
-  <text x="475.0" y="924" class="font val-plexer">100% file recall · 83.4% TokCov · -33.8% EstCum</text>
+  <rect x="236" y="915" width="228.4" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="470.4" y="924" class="font val-plexer">100% file recall · 84.6% TokCov · -35.1% EstCum · -25.1% EstCost</text>
   <rect x="236" y="929" width="352.0" height="10" rx="2.5" class="bar-cold"/>
-  <text x="594.0" y="937.5" class="font val-other">Cold baseline (100% EstCum)</text>
+  <text x="594.0" y="937.5" class="font val-other">Cold baseline (100% EstCum / EstCost)</text>
   <rect x="776" y="917" width="108" height="20" rx="10" class="badge-bg"/>
-  <text x="830" y="930.5" text-anchor="middle" class="font badge-txt">-28.1% EstWall</text>
+  <text x="830" y="930.5" text-anchor="middle" class="font badge-txt">-28.4% EstWall</text>
 </svg>
