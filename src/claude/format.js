@@ -93,12 +93,14 @@ export function formatBlastRadius(w, filePath, cap = 8, dir) {
 }
 function retrievalBody(hits, isEditPrompt = false) {
     let ranked = 0;
+    const seenSymbolFiles = new Set();
     const blocks = hits.map((h, n) => {
         // Pinned hits are numbered but don't consume the ranked hits' "top result" slots
         // (which earn the related / call-site lines below).
         const i = h.pinned ? Infinity : ranked++;
         const num = n + 1;
         const ptr = (h.pointer ?? '').split(',')[0].trim();
+        const fileKey = ptr.split(':')[0];
         const snip = (h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
         const redundant = isRedundantSnippet(snip, h.code);
         let b = ` ${num}. ${h.title}: ${ptr}`;
@@ -112,8 +114,11 @@ function retrievalBody(hits, isEditPrompt = false) {
             for (const cs of h.callSites.slice(0, maxCs))
                 b += `\n      ← ${cs}`;
         }
-        if (h.otherSymbols && !h.code && i < 3)
+        if (h.otherSymbols && !h.code && i < 3 && (!fileKey || !seenSymbolFiles.has(fileKey))) {
+            if (fileKey)
+                seenSymbolFiles.add(fileKey);
             b += `\n    symbols: ${h.otherSymbols.split(', ').slice(0, 6).join(', ')}`;
+        }
         if (h.code)
             b += `\n\`\`\`\n${h.code}\n\`\`\``;
         return b;

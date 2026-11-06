@@ -52,7 +52,7 @@ export function isTestPath(path) {
     return /(?:^|\/)(?:__tests__|tests?|testdata|specs?|bench|benchmarks?|fixtures?|__mocks__|mocks?)\/|\.(?:test|spec|bench|mock)\.[a-z0-9]+$|_(?:test|spec|bench|mock)\.(?:go|py|rb|rs|luau|lua|ts|js|tsx|jsx|mjs|cjs)$|(?:^|\/)(?:test_[^/]+|mock_[^/]+|conftest)\.(?:py|go|rb|rs|luau|lua|ts|js)$/i.test(path || "");
 }
 export function isGeneratedPath(path) {
-    return /\.pb\.(?:go|ts|js|cc|h)$|_pb2(?:_grpc)?\.py$|\.(?:generated|gen)\.[a-z0-9]+$|(?:\b|^)(?:generated|__generated__)\//i.test(path || "");
+    return /\.pb\.(?:go|ts|js|cc|h)$|_pb2(?:_grpc)?\.py$|(?:^|\/|\.)(?:generated|__generated__|gen)\.[a-z0-9]+$|(?:\b|^)(?:generated|__generated__)\//i.test(path || "");
 }
 const TEST_RANK_PENALTY = 0.35;
 const GENERATED_RANK_PENALTY = 0.25;
@@ -205,6 +205,22 @@ function fallthroughNoteFor(subject) {
     return (`structural index: no entries for '${subject}' — showing lexical matches; ` +
         `for precise edges try plexer callers '${subject}', or plexer grep '${subject}' for every reference (loosen the pattern if it returns nothing)`);
 }
+function structuralAdjacency(graph, outgoing) {
+    const prop = outgoing ? "_structAdjOut" : "_structAdjIn";
+    if (graph[prop])
+        return graph[prop];
+    const rels = new Set(outgoing ? OUTGOING_RELS : INCOMING_RELS);
+    const adj = new Map();
+    for (const e of graph.edges) {
+        if (!rels.has(e.relation))
+            continue;
+        const anchor = outgoing ? e.source : e.target;
+        const other = outgoing ? e.target : e.source;
+        pushMap(adj, anchor, { other, relation: e.relation });
+    }
+    Object.defineProperty(graph, prop, { value: adj, enumerable: false, configurable: true });
+    return adj;
+}
 function structural(query, graph, limit, inPrefix) {
     const wantsIn = INCOMING.test(query);
     const wantsOut = OUTGOING.test(query);
@@ -215,29 +231,26 @@ function structural(query, graph, limit, inPrefix) {
     const { nodes: subjects, tried } = findSubjectNodes(query, graph, inPrefix);
     if (subjects.length === 0)
         return { fallthroughNote: fallthroughNoteFor(tried) };
-    const ids = new Set(subjects.map((n) => n.id));
     const byId = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
     const outgoing = wantsOut && !wantsIn; // "what does X call / import" — else default to callers
-    const rels = new Set(outgoing ? OUTGOING_RELS : INCOMING_RELS);
+    const adj = structuralAdjacency(graph, outgoing);
     const hits = [];
     const seen = new Set();
-    for (const e of graph.edges) {
-        if (!rels.has(e.relation))
-            continue;
-        const anchor = outgoing ? e.source : e.target;
-        const other = outgoing ? e.target : e.source;
-        if (!ids.has(anchor) || seen.has(other + e.relation))
-            continue;
-        seen.add(other + e.relation);
-        const node = byId.get(other);
-        hits.push({
-            kind: outgoing ? "callee" : "caller",
-            title: node ? node.name : other, // unresolved import target → raw module string
-            pointer: node ? `${node.path}:${node.span}` : other,
-            snippet: node?.summary?.split("\n")[0].trim() || node?.signature || "",
-            relation: e.relation,
-            score: 1,
-        });
+    for (const s of subjects) {
+        for (const { other, relation } of adj.get(s.id) ?? []) {
+            if (seen.has(other + relation))
+                continue;
+            seen.add(other + relation);
+            const node = byId.get(other);
+            hits.push({
+                kind: outgoing ? "callee" : "caller",
+                title: node ? node.name : other, // unresolved import target → raw module string
+                pointer: node ? `${node.path}:${node.span}` : other,
+                snippet: node?.summary?.split("\n")[0].trim() || node?.signature || "",
+                relation,
+                score: 1,
+            });
+        }
     }
     // Subject resolved but the graph has no indexed edges for it — same "loud,
     // never a bare empty" contract as `plexer callers`/`callees` — fall through
@@ -345,6 +358,14 @@ function buildSymbolDocRecord(n, hydratedById, rawDocById) {
     const fileStemLower = extDotIdx >= 0 ? baseNameLower.slice(0, extDotIdx) : baseNameLower;
     const ownerLower = n.owner ? n.owner.toLowerCase() : "";
     const singleWordMethod = Boolean(ownerLower && !n.name.includes("_") && !/[A-Z]/.test(n.name.slice(1)));
+    let spanLines = 1;
+    if (n.span) {
+        const dash = n.span.indexOf("-");
+        const a = Number(n.span.slice(n.span[0] === "L" ? 1 : 0, dash >= 0 ? dash : undefined));
+        const b = dash >= 0 ? Number(n.span.slice(dash + (n.span[dash + 1] === "L" ? 2 : 1))) : a;
+        if (b >= a && a > 0)
+            spanLines = b - a + 1;
+    }
     const hd = hydratedById?.get(n.id);
     if (hd) {
         return {
@@ -356,6 +377,7 @@ function buildSymbolDocRecord(n, hydratedById, rawDocById) {
             pathStems: hd.pathStems,
             bodyStems: hd.bodyStems,
             bodyLen: hd.bodyLen,
+            spanLines,
             baseNameLower,
             fileStemLower,
             ownerLower,
@@ -375,6 +397,7 @@ function buildSymbolDocRecord(n, hydratedById, rawDocById) {
         pathStems: stemCounts(path),
         bodyStems: stemCounts(body),
         bodyLen: bagLen(body),
+        spanLines,
         baseNameLower,
         fileStemLower,
         ownerLower,
@@ -428,18 +451,22 @@ function prepareLexicalSymbolDocs(corpus, graph, inPrefix) {
 }
 function applyLexicalCompoundBoosts(n, nameScore, pathScore, matchedInName, matchedInPath, matchedCount, baseNameLower, ownerLower, qState) {
     let exactCompoundName = false;
-    const { qLen, query, rawIdentifiers, rawFileNames } = qState;
+    const { qLen, query, rawIdentifiers, identLikeWords, rawFileNames } = qState;
     if (nameScore > 0 && n.kind !== "file") {
-        if (matchedInName >= 2)
-            nameScore *= 1 + 0.35 * Math.min(3, matchedInName - 1);
+        if (matchedInName >= 2) {
+            const corroborated = qLen < 5 || matchedCount > matchedInName || matchedInPath > 0 || matchedInName >= 3;
+            nameScore *= 1 + (corroborated ? 0.35 : 0.12) * Math.min(3, matchedInName - 1);
+        }
         if (rawIdentifiers.size > 0) {
             const sepIdx = Math.max(n.name.lastIndexOf("#"), n.name.lastIndexOf("."));
             const bare = (sepIdx >= 0 ? n.name.slice(sepIdx + 1) : n.name).toLowerCase();
             const qual = ownerLower ? `${ownerLower}.${bare}` : "";
             if ((bare.length >= 4 && rawIdentifiers.has(bare)) || (qual && rawIdentifiers.has(qual))) {
                 const isQualMatch = Boolean(qual && rawIdentifiers.has(qual));
-                const isExactFullName = isQualMatch || matchedInName >= 2 || (tokenize(bare).length === 1 && (qLen <= 3 || matchedCount * 2 >= qLen));
-                nameScore *= isQualMatch ? 1.85 : isExactFullName ? 1.65 : 1.25;
+                const isSingleTokenBare = tokenize(bare).length === 1;
+                const isCodeIdent = !isSingleTokenBare || Boolean(identLikeWords?.has(bare));
+                const isExactFullName = isQualMatch || matchedInName >= 2 || (isSingleTokenBare && isCodeIdent && (qLen <= 3 || matchedCount * 2 >= qLen));
+                nameScore *= isQualMatch ? 1.85 : isExactFullName ? 1.65 : isCodeIdent ? 1.25 : 1.08;
                 if (isExactFullName)
                     exactCompoundName = true;
                 if (matchedInName >= 3 && bare.endsWith("error"))
@@ -458,10 +485,17 @@ function applyLexicalCompoundBoosts(n, nameScore, pathScore, matchedInName, matc
             else if (rawIdentifiers.size > 0) {
                 const dotIdx = baseNameLower.indexOf(".");
                 const fileStem = dotIdx >= 0 ? baseNameLower.slice(0, dotIdx) : baseNameLower;
-                if (fileStem.length >= 4 && rawIdentifiers.has(fileStem)) {
-                    const isPrimaryModule = (n.kind !== "file" && n.name.toLowerCase() === fileStem) || (n.kind === "file" && matchedInPath === 1 && matchedCount >= 3 && !/[a-z][A-Z]|[._]/.test(query));
+                const fileStemRoot = stemToken(fileStem);
+                const hasFileStemInQuery = (fileStem.length >= 4 && rawIdentifiers.has(fileStem)) ||
+                    (fileStem.length >= 3 && fileStemRoot.length >= 3 && qState.qStems?.includes(fileStemRoot));
+                if (hasFileStemInQuery) {
+                    const bareLower = n.name.toLowerCase();
+                    const isPrimaryModule = (n.kind !== "file" && (bareLower === fileStem || (fileStemRoot.length >= 4 && stemToken(bareLower) === fileStemRoot))) ||
+                        (n.kind === "file" && matchedInPath >= 1 && matchedCount >= 3 && !/[a-z][A-Z]|[._]/.test(query));
                     pathScore *= isPrimaryModule ? 2.1 : 1.25;
-                    if (fileStem.length >= 5 && isPrimaryModule && matchedCount >= 3)
+                    if (isPrimaryModule && n.kind === "file")
+                        nameScore *= 1.5;
+                    if (fileStem.length >= 4 && isPrimaryModule && matchedCount >= 3)
                         exactCompoundName = true;
                 }
             }
@@ -475,9 +509,10 @@ function scoreLexicalSymbolDocs(docs, ctx) {
     const k1 = 1.2;
     const b = 0.75;
     const out = new Map();
-    for (const { n, name, path, body, nameStems, pathStems, bodyStems, bodyLen: dBodyLen, baseNameLower, fileStemLower, ownerLower, singleWordMethod } of docs) {
-        const effBodyLen = n.kind === "file" ? Math.min(dBodyLen * 0.35, 420) : Math.max(dBodyLen, avgBodyLen * 0.65);
+    for (const { n, name, path, body, nameStems, pathStems, bodyStems, bodyLen: dBodyLen, spanLines, baseNameLower, fileStemLower, ownerLower, singleWordMethod } of docs) {
+        const effBodyLen = n.kind === "file" ? Math.min(dBodyLen * 0.35, 420) : Math.max(dBodyLen, avgBodyLen * 0.65, (spanLines ?? 1) * 3.5);
         const norm = k1 * (1 - b + b * effBodyLen * invAvgDl);
+        const isIndexFile = /^(?:init|index|mod)$/.test(fileStemLower);
         let nameScore = 0;
         let pathScore = 0;
         let bodyScore = 0;
@@ -499,7 +534,8 @@ function scoreLexicalSymbolDocs(docs, ctx) {
             const bTf = fastTermCount(body, bodyStems, t, alt, stem);
             if (nTf === 0 && pTf === 0 && bTf === 0)
                 continue;
-            const dirOnlyMatch = pTf > 0 && nTf === 0 && bTf === 0 && !fileStemLower.includes(t) && (!stem || !fileStemLower.includes(stem));
+            const inFileStem = isIndexFile || fileStemLower.includes(t) || (stem && fileStemLower.includes(stem)) || (fileStemLower === "prop" && t.startsWith("prop"));
+            const dirOnlyMatch = pTf > 0 && nTf === 0 && bTf === 0 && !inFileStem;
             matchedCount += dirOnlyMatch ? 0.45 : 1;
             matchedIdf += wIdf * (dirOnlyMatch ? 0.45 : 1);
             if (nTf > 0) {
@@ -507,9 +543,9 @@ function scoreLexicalSymbolDocs(docs, ctx) {
                 nameScore += Math.min(1, nTf) * 3 * wIdf;
             }
             if (pTf > 0) {
-                if (!dirOnlyMatch)
+                if (inFileStem)
                     matchedInPath++;
-                pathScore += Math.min(1, pTf) * (dirOnlyMatch ? 0.55 : nTf > 0 ? 1.1 : 2) * wIdf;
+                pathScore += Math.min(1, pTf) * (dirOnlyMatch ? 0.55 : !inFileStem && nTf === 0 ? 0.85 : nTf > 0 ? 1.1 : 2) * wIdf;
             }
             if (bTf > 0)
                 bodyScore += wIdf * ((bTf * (k1 + 1)) / (bTf + norm));
@@ -883,6 +919,16 @@ function buildLexicalRankingContext(query, corpus, graphRank, inPrefix, fileFirs
         ...(query.toLowerCase().match(/[a-z0-9_]+/g) ?? []).filter((w) => w.length >= 4),
         ...(query.toLowerCase().match(/[a-z0-9_]+(?:\.[a-z0-9_]+)+/g) ?? []),
     ]);
+    const identLikeWords = new Set();
+    for (const m of query.matchAll(/`([^`\n]+)`/g)) {
+        for (const w of m[1].toLowerCase().match(/[a-z0-9_.]+/g) ?? [])
+            identLikeWords.add(w);
+    }
+    for (const m of query.matchAll(/\b[A-Za-z0-9_.:]+\b/g)) {
+        const tok = m[0];
+        if (/[a-z][A-Z]|^[A-Z][a-z0-9]+|[0-9_.:]/.test(tok))
+            identLikeWords.add(tok.toLowerCase());
+    }
     const rawFileNames = new Set(query.toLowerCase().match(/\b[a-z0-9_-]+\.(?:py|go|js|ts|tsx|jsx|luau|rs)\b/g) ?? []);
     const graph = corpus.graph;
     const wantsTests = /\b(tests?|specs?|coverage|assert(?:ion)?s?|fixtures?|mocks?)\b/i.test(query);
@@ -920,7 +966,7 @@ function buildLexicalRankingContext(query, corpus, graphRank, inPrefix, fileFirs
             return s.length >= 4 ? s : "";
         }),
         qIdfs, totalQueryIdf: qIdfs.reduce((a, w) => a + w, 0) || 1,
-        rawIdentifiers, rawFileNames,
+        rawIdentifiers, identLikeWords, rawFileNames,
     };
     const toFileCandidate = (id, n, lexicalScore, graphScore, rankFactor, baselineScore) => {
         const rawLexical = rawLexicalById.get(id) ?? 0;
@@ -1575,7 +1621,9 @@ function inlinePrimaryHitSpan(h, hitIdx, hits, state) {
         state.inlinedHitCount++;
         return;
     }
-    const helperReserve = state.inlinedHitCount > 0 ? Math.min(950, Math.floor(maxTotalBytes * 0.28)) : 0;
+    const helperReserve = state.inlinedHitCount > 0
+        ? (isMultiQuery && maxHitsToInline >= 2 && state.inlinedHitCount === 1 ? 250 : Math.min(950, Math.floor(maxTotalBytes * 0.28)))
+        : 0;
     const effectiveBudget = maxTotalBytes - helperReserve;
     if ((state.inlinedHitCount > 0 || isMultiQuery) && state.totalInlinedBytes + Buffer.byteLength(code, "utf8") > effectiveBudget) {
         if (isMultiQuery && state.inlinedHitCount === 0)
@@ -1731,8 +1779,8 @@ function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms,
         else if (!cand.fromGraph && hSpanLen > 18)
             hScore -= 12.0;
     }
-    else if (cand.isCallee && cand.hop === 1 && hSpanLen <= 12) {
-        hScore += 6.5;
+    else if (cand.isCallee && cand.hop === 1 && (hSpanLen <= 12 || (cand.node.name === node.name && hSpanLen <= 28))) {
+        hScore += cand.node.name === node.name ? 11.5 : 6.5;
     }
     if ((cand.isSameFile || cand.node.name.length >= 4 || (cand.isCallee && hSpanLen <= 12)) && cand.fromGraph && cand.isCallee && cand.hop === 1) {
         const fileStem = basename(s.path).replace(/\.[a-z0-9]+$/i, "").toLowerCase();
@@ -1753,7 +1801,7 @@ function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms,
     }
     const bodySlice = candLines.slice(Math.max(0, cs.start - 1), Math.min(candLines.length, cs.end)).join(" ");
     if (/\b(?:[A-Z0-9_]*(?:LIMIT|MAX|MIN|PASS|PASSES|GUARD|BOUND|SIZE|TIMEOUT|RETRY|COUNT|CAP|THRESHOLD)[A-Z0-9_]*)\b/.test(bodySlice))
-        hScore += 2.5;
+        hScore += hSpanLen <= 14 ? 7.5 : 2.5;
     const helperText = `${cand.node.owner ?? ""} ${cand.node.name} ${cand.node.summary ?? ""} ${bodySlice}`;
     for (const tok of new Set(tokenize(helperText))) {
         if (qTerms.has(tok)) {
@@ -1814,8 +1862,14 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
     let hitHelperBytes = 0;
     const helperBlocks = [];
     const nestedRanges = [];
+    const attachedSameFileSpans = [];
     let hIdx = 0;
-    for (let sIdx = 0; sIdx < scoredHelpers.length && hIdx < maxHelpers; sIdx++) {
+    for (
+        let sIdx = 0;
+        sIdx < scoredHelpers.length &&
+        (hIdx < maxHelpers || (hIdx === maxHelpers && !editEnvelope && scoredHelpers[sIdx]?.hSpanLen <= 12 && scoredHelpers[sIdx]?.isSameFile && scoredHelpers[sIdx]?.hScore >= 16));
+        sIdx++
+    ) {
         const hCand = scoredHelpers[sIdx];
         if (hCand.hScore < 3.5 || shownPointers.has(hCand.ptr))
             continue;
@@ -1851,8 +1905,11 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
         state.totalInlinedBytes += bLen;
         hitHelperBytes += bLen;
         hIdx++;
-        if (hCand.isSameFile && hCand.cs.start > effStart && hCand.cs.end <= effEnd)
-            nestedRanges.push({ start: hCand.cs.start, end: hCand.cs.end });
+        if (hCand.isSameFile) {
+            attachedSameFileSpans.push({ start: hCand.cs.start, end: hCand.cs.end });
+            if (hCand.cs.start > effStart && hCand.cs.end <= effEnd)
+                nestedRanges.push({ start: hCand.cs.start, end: hCand.cs.end });
+        }
     }
     let baseCode = h.code;
     if (nestedRanges.length > 0 && !full) {
@@ -1863,10 +1920,17 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
     if (helperBlocks.length > 0) {
         const helperJoined = helperBlocks.join("\n\n");
         const helperCodeNoComments = helperJoined.split("\n").map((l) => l.replace(/(?:--|\s\/\/).*$/, "")).join("\n");
+        const attachedFullHelperText = attachedSameFileSpans
+            .map((sp) => lines.slice(Math.max(0, sp.start - 1), Math.min(lines.length, sp.end)).join("\n"))
+            .join("\n");
         let combined = `${baseCode}\n\n${helperJoined}`;
         const fileConsts = getFileConstantsList(s.path, lines, constsByPath);
         const extraConsts = fileConsts
-            .filter((c) => !combined.includes(`L${c.lineNo}:`) && new RegExp(`\\b${c.name}\\b`).test(helperCodeNoComments))
+            .filter((c) => !combined.includes(`L${c.lineNo}:`) && (
+                new RegExp(`\\b${c.name}\\b`).test(helperCodeNoComments) ||
+                (/(?:LIMIT|MAX|MIN|PASS|PASSES|GUARD|BOUND|SIZE|TIMEOUT|RETRY|COUNT|CAP|THRESHOLD)/.test(c.name) &&
+                    new RegExp(`\\b${c.name}\\b`).test(attachedFullHelperText))
+            ))
             .map((c) => `L${c.lineNo}: ${c.text}`);
         if (extraConsts.length > 0)
             combined = `${extraConsts.join("\n")}\n${combined}`;

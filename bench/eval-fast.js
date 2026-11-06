@@ -53,17 +53,17 @@ const T_ORACLE = {
     },
     T5: {
         files: ["src/graph/refresh.js", "bin/plexer.js", "src/mcp/server.js"],
-        tokens: ["isWorktreeFresh", "ensureFreshGraph", "checkFresh"],
+        tokens: ["probeDrift", "ensureFreshGraph", "refreshBefore", "callTool"],
         expectedTurns: 2,
     },
     T6: {
         files: ["src/Shared/Auth.luau"],
-        tokens: ["hasPermission", "hasAccess", "CreatorId", "default", "banasync", "targetothers", "settings", "serverlogs"],
+        tokens: ["hasPermission", "hasAccess", "creatorId", "default", "banasync", "targetothers", "settings", "serverlogs"],
         expectedTurns: 1,
     },
     T7: {
         files: ["src/init.luau", "src/Clock.luau", "src/Motion.luau"],
-        tokens: ["_onFrame", "RunService", "_defer", "_schedule", "_onRender", "_onStep"],
+        tokens: ["RunService", "setFrame", "runFrame", "frameHook", "onRender", "onStep"],
         expectedTurns: 2,
     },
     T8: {

@@ -143,7 +143,8 @@ const PROMPT_BOILERPLATE_NOISE = new Set([
     'entries', 'part', 'parts', 'step', 'steps', 'plan', 'system', 'code', 'state',
     'check', 'checks', 'checking', 'checked', 'evaluate', 'evaluates', 'detect', 'detects',
     'expose', 'exposes', 'them', 'their', 'they', 'defined', 'define', 'defines',
-    'invoke', 'invokes', 'invoked',
+    'invoke', 'invokes', 'invoked', 'numeric', 'trigger',
+    'triggers', 'offending', 'exceeded', 'symbols',
 ]);
 
 function buildCorpusVocab(outDir) {
@@ -323,13 +324,16 @@ function extractCamelAndCompoundPhrases(cleaned, compoundSymbols) {
             const bi = `${w1}${w2}`;
             const fwdStem = `${stemToken(w1)}${stemToken(w2)}`;
             const revStem = `${stemToken(w2)}${stemToken(w1)}`;
+            const nextIsNeg = w3 === 'not' || w3 === 'never';
             const fwdSym = fwdStem.length >= 8 ? compoundSymbols.get(fwdStem) : undefined;
-            if ((bi.length >= 8 && compoundSymbols.has(bi)) || fwdSym?.includes('.') || (revStem.length >= 7 && compoundSymbols.has(revStem))) {
-                const sym = compoundSymbols.get(bi) ?? (fwdSym?.includes('.') ? fwdSym : undefined) ?? compoundSymbols.get(revStem);
-                camelOrCodePhrases.push(sym);
-                camelOrCode.add(w1);
-                camelOrCode.add(w2);
-                continue;
+            if ((bi.length >= 8 && compoundSymbols.has(bi)) || fwdSym?.includes('.') || (!nextIsNeg && revStem.length >= 7 && compoundSymbols.has(revStem))) {
+                const sym = compoundSymbols.get(bi) ?? (fwdSym?.includes('.') ? fwdSym : undefined) ?? (!nextIsNeg ? compoundSymbols.get(revStem) : undefined);
+                if (sym) {
+                    camelOrCodePhrases.push(sym);
+                    camelOrCode.add(w1);
+                    camelOrCode.add(w2);
+                    continue;
+                }
             }
             const verbRoots = w2.endsWith('ing') && w2.length > 5
                 ? [w2.slice(0, -3), `${w2.slice(0, -3)}e`]
@@ -396,6 +400,9 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
     const rawCompounds = [...new Set([...backtickPhrases, ...camelOrCodePhrases])];
     const { compounds, exactSingleCompounds } = selectTopCompounds(vocab, rawCompounds, maxCompounds);
     const rawToks = tokenize(cleaned);
+    const tokCounts = new Map();
+    for (const t of rawToks)
+        tokCounts.set(t, (tokCounts.get(t) ?? 0) + 1);
     const allToks = [...new Set(rawToks)].filter((t) => !PROMPT_BOILERPLATE_NOISE.has(t) && t.length >= 3);
     const scored = [];
     for (const t of allToks) {
@@ -413,7 +420,7 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
         const symDf = nameStems.get(s) ?? df;
         const idf = (inSymExact || inSymStem)
             ? Math.log(1 + nDocs / Math.max(2, symDf))
-            : Math.min(3.0, df > 0 ? Math.log(1 + nDocs / Math.max(3, df)) : 0.5);
+            : Math.min(3.5, df > 0 ? Math.log(1 + nDocs / Math.max(3, df)) : 0.5);
         let fieldMult = 1.0;
         if (inSymExact && inPath)
             fieldMult = 5.2;
@@ -425,8 +432,11 @@ function distillSegment(vocab, text, maxWords = 10, maxCompounds = 4) {
             fieldMult = 3.2;
         else if (inPath)
             fieldMult = 2.2;
+        else if (df >= 1 && df <= Math.max(10, Math.floor(nDocs * 0.015)))
+            fieldMult = 2.4;
         const codeMult = isBt ? 3.0 : isCode ? 2.5 : 1.0;
-        scored.push({ t, score: idf * fieldMult * codeMult });
+        const tfMult = 1 + 0.35 * Math.min(2, (tokCounts.get(t) ?? 1) - 1);
+        scored.push({ t, score: idf * fieldMult * codeMult * tfMult });
     }
     if (scored.length === 0 && compounds.length === 0)
         return cleaned;
@@ -826,14 +836,15 @@ function mergeMultiQueryHits(results, editEnvelope) {
     const pushMergedHit = (h, rank, maxPerFile = 2) => {
         if (!h || mergedSeen.has(h.pointer))
             return false;
-        if (rank > 0 && h.title && mergedSymbolTitles.has(h.title))
-            return false;
         const fileKey = (h.pointer || '').split(':')[0];
+        const titleKey = `${fileKey}:${h.title ?? ''}`;
+        if (rank > 0 && h.title && mergedSymbolTitles.has(titleKey))
+            return false;
         if (editEnvelope && fileKey && (mergedFileCounts.get(fileKey) ?? 0) >= maxPerFile && mergedHits.length < 4)
             return false;
         mergedSeen.add(h.pointer);
         if (h.title)
-            mergedSymbolTitles.add(h.title);
+            mergedSymbolTitles.add(titleKey);
         if (fileKey)
             mergedFileCounts.set(fileKey, (mergedFileCounts.get(fileKey) ?? 0) + 1);
         mergedHits.push(h);
@@ -1127,7 +1138,9 @@ function searchPromptContext(dir, prompt) {
                     maxHitsToInline: (qIdx === 0 && !intent.editEnvelope && intent.wantsCallSites) ? 2 : HOOK_BUDGETS.multiQueryInline,
                     maxSourceBytes: intent.editEnvelope
                         ? HOOK_BUDGETS.editMultiHitBytes
-                        : (qIdx > 0 && intent.wantsCallSites ? 2800 : HOOK_BUDGETS.qaMultiHitBytes),
+                        : (qIdx === 0 && intent.wantsCallSites
+                            ? HOOK_BUDGETS.qaMultiHitBytes + 1100
+                            : (qIdx > 0 && intent.wantsCallSites ? 2800 : HOOK_BUDGETS.qaMultiHitBytes)),
                     wantsCallSites: intent.wantsCallSites,
                     editEnvelope: intent.editEnvelope,
                     includeRankingMetadata: false,

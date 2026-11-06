@@ -106,7 +106,7 @@ const GOLD_QUERIES = [
     {
         repo: "plexer",
         query: "how are dotted or colon-qualified symbol names matched to graph nodes",
-        goldPath: "src/graph/traverse.js",
+        goldPath: "src/util/id.js",
     },
     // kohls-admin (Luau)
     {

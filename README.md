@@ -3,7 +3,7 @@
 An offline structural code graph and call-chain indexer for AI coding agents. It indexes symbols, call edges, imports, and exact line spans into a local `plexer/` directory using WASM Tree-sitter so agents can resolve definitions, callers, and blast radius in a single turn.
 
 - **Fewer tokens and tool calls:** Cuts tool output tokens by 59–73% (`48W/0L`) and tool calls by 45–67% across 80+ paired evaluations ([see benchmarks](#benchmarks)).
-- **Fast local search:** Hits 100.0% Recall@1 and 1.000 MRR in 7–19ms on natural-language queries across 17,551 symbols and 32,566 edges (`73–96%` smaller than raw files).
+- **Fast local search:** Hits 100.0% Recall@1 and 1.000 MRR in 5–24ms on natural-language queries across 6 repositories (`73–94%` smaller than raw files).
 - **25 languages:** Parses TypeScript/JS, Python, Go, Rust, Java, C/C++, C#, Kotlin, Swift, Ruby, PHP, and more out of the box, including full Luau and Roblox project support.
 - **12 AI coding hosts:** One command configures skills, hooks, and MCP tools for Claude Code, Google Antigravity, OpenAI Codex, Cursor, Gemini CLI, Windsurf, GitHub Copilot, Aider, Kiro, OpenCode, Grok CLI, and Amp.
 - **Web graph explorer:** Serves a 60fps HTML5 Canvas viewer for inspecting architecture, health hotspots, and diff blast radius (`plexer viz`).
@@ -108,13 +108,17 @@ Rescan periodically with `plexer health scan`. Follow the scan output's agent in
 
 Evaluated on **Gemini 3.8 Flash**, **Gemini 4 Argon** (`low` and `medium`), **Claude Sonnet 5.5**, and **Claude Opus 5.5**. Full per-model tables, per-task breakdowns (`T1`–`T12`, `S1`–`S8`), and reproduction scripts are in [`bench/README.md`](bench/README.md).
 
+<p align="center">
+  <img src="bench/chart-small.svg" alt="plexer Benchmark Summary: 12-Task Suite, SWE-bench Pro V2, and 3-Arm Comparison vs. trail-code and Cold Baseline" width="100%" />
+</p>
+
 | Evaluation Suite | Correctness | Tool Calls | Tool Output Tokens | Cumulative Input Tokens | Search Wall Time |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **12-Task Suite (`T1`–`T12`, 48 pairs)** | 380/384 → **384/384 (100%)** | 449 → **198 (-55.9%)** | 626.4k → **234.4k (-62.6%, `48W/0L`)** | 9.41M → **3.91M (-58.5%)** | 2,780s → **1,826s (-34.3%)** |
 | **`SWE-bench_Pro` V2 (`S1`–`S8`, 32 pairs)** | 238/256 → **239/256** | 616 → **438 (-28.9%)** | 573.0k → **402.3k (-29.8%)** | 20.30M → **14.29M (-29.6%)** | 6,085s → **4,906s (-19.4%)** |
 | **Live 3-Arm vs. `trail` (`T4,T5,T9` + `S1`–`S8`)** | **`plexer` 339/352** (`trail` 337, `cold` 337) | **884** (`trail` 1,112, `cold` 1,168) | **572.8k** (`trail` 780.9k, `cold` 829.5k) | **39.92M** (`trail` 54.56M, `cold` 51.27M) | **5,697s** (`trail` 7,158s, `cold` 6,568s) |
 
-- **Retrieval and latency (`npm run bench`):** Hits **100.0% Recall@1 (24/24)** and **1.000 MRR** across 6 repos (17,551 symbols, 32,566 edges) compared to `@trailhq/trail-code@0.25.0` (`20.8% Recall@1` overall, `62.5%` on non-Luau repos). Queries finish in **7–19ms** for `ask --source` and **<2ms** for `callers`, `skeleton`, and `map`.
+- **Retrieval and latency (`npm run bench`):** Hits **100.0% Recall@1 (24/24)** and **1.000 MRR** across 6 repos (14,197 symbols, 29,020 edges at pinned benchmark commits) compared to `@trailhq/trail-code@0.25.0` (`20.8% Recall@1` overall, `62.5%` on non-Luau repos). Queries finish in **5–24ms** for `ask --source` and **<2ms** for `callers`, `skeleton`, and `map`.
 
 ---
 

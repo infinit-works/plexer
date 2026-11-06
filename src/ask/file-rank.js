@@ -152,13 +152,20 @@ function scoreBoundedFileGroup(file, members, queryWeights) {
     const pooledRepLexical = baselineRepresentative
         ? clamp01(baselineRepresentative.lexical + (1 - clamp01(baselineRepresentative.lexical)) * repResidual)
         : 0;
+    const repGraph = baselineRepresentative
+        ? (baselineRepresentative.kind === "file"
+            ? Math.max(clamp01(baselineRepresentative.graph), clamp01(lexicalAnchor?.graph ?? 0))
+            : clamp01(baselineRepresentative.graph))
+        : 0;
     const pooledRepScore = baselineRepresentative
         ? clamp01(baselineRepresentative.rankFactor) *
-            (pooledRepLexical + graphScale * clamp01(baselineRepresentative.graph) + coverageBonus)
+            (pooledRepLexical + graphScale * repGraph + coverageBonus)
         : 0;
-    const pooledWins = Boolean(lexicalAnchor && pooledAnchorScore > pooledRepScore);
+    const baselineFloor = baselineRepresentative?.baselineScore ?? 0;
+    const effectiveRepScore = Math.max(pooledRepScore, baselineFloor);
+    const pooledWins = Boolean(lexicalAnchor && pooledAnchorScore > effectiveRepScore);
     const representative = pooledWins ? lexicalAnchor : baselineRepresentative;
-    const score = pooledWins ? pooledAnchorScore : pooledRepScore;
+    const score = pooledWins ? pooledAnchorScore : effectiveRepScore;
     const representativeReason = pooledWins
         ? "pooled-anchor"
         : representative.kind === "file"

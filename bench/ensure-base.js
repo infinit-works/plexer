@@ -19,11 +19,11 @@ const BENCH_REPOS_DIR = process.env.PLEXER_BENCH_REPOS_DIR || join(homedir(), "P
 
 const REPOS = [
     { name: "plexer", src: resolve(import.meta.dirname, ".."), ref: "0362ee2" },
-    { name: "kohls-admin", src: join(BENCH_REPOS_DIR, "kohls-admin") },
-    { name: "flux", src: join(BENCH_REPOS_DIR, "flux") },
-    { name: "sert", src: join(BENCH_REPOS_DIR, "sert") },
-    { name: "building-tools", src: join(BENCH_REPOS_DIR, "building-tools") },
-    { name: "z", src: join(BENCH_REPOS_DIR, "z") },
+    { name: "kohls-admin", src: join(BENCH_REPOS_DIR, "kohls-admin"), ref: "a8b4b465" },
+    { name: "flux", src: join(BENCH_REPOS_DIR, "flux"), ref: "75090db" },
+    { name: "sert", src: join(BENCH_REPOS_DIR, "sert"), ref: "0a928ab" },
+    { name: "building-tools", src: join(BENCH_REPOS_DIR, "building-tools"), ref: "d910e7b" },
+    { name: "z", src: join(BENCH_REPOS_DIR, "z"), ref: "dc76d03" },
 ];
 
 const STRIP = [
@@ -46,12 +46,6 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
         if (onlyRepos && !onlyRepos.has(r.name)) continue;
         const cleanDir = join(AB_BASE_DIR, "clean", r.name);
         const idxDir = join(AB_BASE_DIR, "indexed", r.name);
-        if (existsSync(join(idxDir, "plexer", ".cache", "wiring.json")) && existsSync(cleanDir)) {
-            continue;
-        }
-        rmSync(cleanDir, { recursive: true, force: true });
-        rmSync(idxDir, { recursive: true, force: true });
-        mkdirSync(cleanDir, { recursive: true });
         let ref = "HEAD";
         if (r.ref) {
             try {
@@ -59,6 +53,14 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
                 ref = r.ref;
             } catch {}
         }
+        const pinStampPath = join(idxDir, "plexer", ".pinned_ref");
+        const currentPin = existsSync(pinStampPath) ? readFileSync(pinStampPath, "utf8").trim() : "";
+        if (existsSync(join(idxDir, "plexer", ".graph", "wiring.json")) && existsSync(cleanDir) && currentPin === ref) {
+            continue;
+        }
+        rmSync(cleanDir, { recursive: true, force: true });
+        rmSync(idxDir, { recursive: true, force: true });
+        mkdirSync(cleanDir, { recursive: true });
         execFileSync("bash", ["-c", `git -C "${r.src}" archive ${ref} | tar -x -C "${cleanDir}"`]);
         for (const s of STRIP) {
             rmSync(join(cleanDir, s), { recursive: true, force: true });
@@ -76,7 +78,11 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
         }
         execFileSync("git", ["init", "-q"], { cwd: cleanDir });
         execFileSync("git", ["add", "-A"], { cwd: cleanDir });
-        execFileSync("git", ["commit", "-qm", "init", "--no-verify"], { cwd: cleanDir });
+        execFileSync(
+            "git",
+            ["-c", "commit.gpgsign=false", "-c", "user.name=plexer-bench", "-c", "user.email=bench@plexer.invalid", "commit", "-qm", "init", "--no-verify"],
+            { cwd: cleanDir }
+        );
 
         mkdirSync(join(AB_BASE_DIR, "indexed"), { recursive: true });
         execFileSync("cp", ["-a", cleanDir, idxDir]);
@@ -86,6 +92,7 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
         process.env.PLEXER_NO_IGNORE = "1";
         try {
             await buildGraph(idxDir, { graphOnly: false });
+            writeFileSync(pinStampPath, `${ref}\n`, "utf8");
         } finally {
             if (prevNoGitignore === undefined) delete process.env.PLEXER_NO_GITIGNORE;
             else process.env.PLEXER_NO_GITIGNORE = prevNoGitignore;
@@ -113,7 +120,7 @@ export async function ensureSwebenchBaseRepos(onlyIds = null) {
             });
             execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: cleanDir });
         }
-        if (!existsSync(join(indexedDir, "plexer", ".cache", "wiring.json"))) {
+        if (!existsSync(join(indexedDir, "plexer", ".graph", "wiring.json"))) {
             rmSync(indexedDir, { recursive: true, force: true });
             mkdirSync(join(SWEBENCH_BASE_DIR, "indexed"), { recursive: true });
             cpSync(cleanDir, indexedDir, { recursive: true });

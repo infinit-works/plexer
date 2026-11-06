@@ -16,7 +16,12 @@ This directory contains the multi-model benchmark suite for `plexer`:
 - **Trail-Comparable Metrics:** [`bench/trail-table.js`](trail-table.js) computes per-task means (tool calls, uncached input tokens `input + cache_creation`, cache-aware cost, and latency) alongside cumulative input tokens and search wall time.
 - **Worktree Fixture Builder:** [`bench/ensure-base.js`](ensure-base.js) populates `/tmp/plexer-ab-base/{clean,indexed}` and `/tmp/plexer-swebench-base/{clean,indexed}`.
 - **Interactive Evaluation Viewer:** [`bench/skill-review.html`](skill-review.html) renders a self-contained `/skill-creator` evaluation viewer for all paired A/B runs.
+- **Benchmark SVG Generator:** [`bench/chart.js`](chart.js) generates [`bench/chart-small.svg`](chart-small.svg) and [`bench/chart.svg`](chart.svg) with automatic light/dark theme support.
 - **Engine & Retrieval Benchmark:** [`bench/run.js`](run.js) runs the deterministic engine and retrieval benchmark across 6 repositories and 24 natural-language intent queries (`npm run bench`).
+
+<p align="center">
+  <img src="chart.svg" alt="plexer Multi-Suite Benchmark Breakdown" width="100%" />
+</p>
 
 ---
 
@@ -255,9 +260,9 @@ node bench/graft-arm.js
 
 | Arm (`T4`, `T5`, `T9`, `S1`–`S8` Mean) | Turn-0 Tokens | Gold File Recall | `NeedCov` (Inlined Lines) | `LocCov` (Located Symbols) | Predicted Wall (`EstWall`) | Predicted CumInput (`EstCum`) |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`plexer` (`11/11` task wins)** | **2,570 tok** | **100.0%** | **28.4%** | **46.9%** | **41.2s** | **126k** |
-| `graft-hook` (`ask --json -n 3`) | 141 tok | 44.7% | 0.0% | 5.6% | 49.0s | 139k |
-| `graft-push` (`ask --source`) | 6,006 tok | 66.7% | 4.0% | 8.5% | 48.1s | 193k |
+| **`plexer` (`11/11` task wins)** | **2,613 tok** | **100.0%** | **28.7%** | **49.8%** | **41.0s** | **125k** |
+| `graft-hook` (`ask --json -n 3`) | 135 tok | 41.6% | 0.0% | 4.5% | 49.1s | 140k |
+| `graft-push` (`ask --source`) | 5,741 tok | 60.6% | 3.9% | 8.3% | 48.2s | 191k |
 
 ### 3-Tier Offline Optimization Suite (`node bench/eval-fast.js`)
 
@@ -276,7 +281,7 @@ node bench/eval-fast.js --quiet --set editMergedBytes=3200
 
 ## 4. Engine & Retrieval Benchmark (`npm run bench`)
 
-[`bench/run.js`](run.js) benchmarks the `plexer` engine across 6 repositories (`plexer`, `kohls-admin`, `flux`, `sert`, `building-tools`, and `z`, totaling **17,551 symbols** and **32,566 graph edges**) and **24 natural-language intent queries**:
+[`bench/run.js`](run.js) benchmarks the `plexer` engine across 6 repositories (`plexer`, `kohls-admin`, `flux`, `sert`, `building-tools`, and `z`, totaling **14,197 symbols** and **29,020 graph edges** at pinned benchmark commits) and **24 natural-language intent queries**:
 
 ```bash
 npm run bench
@@ -290,9 +295,9 @@ node bench/run.js --json
 
 | Repository | Graph Size (Nodes / Edges) | `wiring.json` | `check` | `ask --source` Latency & Tokens (vs Raw Files) | `callers` (`d=2`) | `skeleton` | `map` |
 | :--- | ---: | ---: | ---: | :--- | ---: | ---: | ---: |
-| **`plexer`** (JS/TS) | 1,156 / 3,580 | 910 KB | 21.6ms | **9.1ms** / 1,390 tok (**-85%** vs 9,296 raw) | **0.09ms** | **0.08ms** | 0.04ms |
-| **`kohls-admin`** (Luau) | 6,213 / 8,557 | 3,818 KB | 110.7ms | **15.6ms** / 1,059 tok (**-75%** vs 4,190 raw) | **1.65ms** | **0.03ms** | 0.02ms |
-| **`flux`** (Luau) | 1,107 / 1,894 | 631 KB | 17.1ms | **17.2ms** / 1,310 tok (**-96%** vs 30,646 raw) | **0.23ms** | **0.10ms** | 0.01ms |
-| **`sert`** (Luau + Py) | 3,204 / 6,760 | 2,171 KB | 41.9ms | **12.4ms** / 1,337 tok (**-90%** vs 13,478 raw) | **1.59ms** | **0.03ms** | 0.01ms |
-| **`building-tools`** (Luau) | 1,810 / 4,551 | 1,322 KB | 27.7ms | **7.1ms** / 1,445 tok (**-73%** vs 5,306 raw) | **0.53ms** | **0.01ms** | 0.01ms |
-| **`z`** (Luau + Rust + Py) | 4,061 / 7,224 | 2,737 KB | 61.5ms | **18.7ms** / 1,524 tok (**-91%** vs 16,418 raw) | **0.46ms** | **0.05ms** | 0.03ms |
+| **`plexer`** (JS/TS) | 1,655 / 5,343 | 1,353 KB | 30.0ms | **13.5ms** / 1,367 tok (**-91%** vs 15,477 raw) | **0.13ms** | **0.13ms** | 0.05ms |
+| **`kohls-admin`** (Luau) | 2,508 / 4,137 | 1,568 KB | 39.3ms | **10.4ms** / 1,280 tok (**-88%** vs 10,566 raw) | **0.85ms** | **0.04ms** | 0.01ms |
+| **`flux`** (Luau) | 1,524 / 2,210 | 808 KB | 17.7ms | **5.1ms** / 1,448 tok (**-94%** vs 26,234 raw) | **0.33ms** | **0.10ms** | 0.01ms |
+| **`sert`** (Luau + Py) | 2,926 / 6,127 | 1,906 KB | 36.3ms | **10.7ms** / 1,186 tok (**-89%** vs 10,757 raw) | **1.56ms** | **0.04ms** | 0.01ms |
+| **`building-tools`** (Luau) | 1,970 / 4,778 | 1,413 KB | 39.1ms | **7.1ms** / 1,445 tok (**-73%** vs 5,306 raw) | **0.70ms** | **0.02ms** | 0.01ms |
+| **`z`** (Luau + Rust + Py) | 3,614 / 6,425 | 2,438 KB | 47.1ms | **24.0ms** / 1,376 tok (**-93%** vs 20,675 raw) | **0.37ms** | **0.05ms** | 0.03ms |

@@ -4,6 +4,27 @@ const emptyTopology = () => ({
     ids: new Set(),
     adjacency: new Map(),
 });
+function parseLineSpan(span) {
+    if (!span)
+        return null;
+    const m = /^L?(\d+)(?:-L?(\d+))?$/.exec(span);
+    if (!m)
+        return null;
+    const a = Number(m[1]);
+    const b = m[2] !== undefined ? Number(m[2]) : a;
+    return [a, b];
+}
+function isContainedSymbolEdge(nodeById, srcId, tgtId) {
+    const u = nodeById.get(srcId);
+    const v = nodeById.get(tgtId);
+    if (!u || !v || u.kind === "file" || v.kind === "file" || !u.path || u.path !== v.path)
+        return false;
+    const su = u._parsedSpan ?? (u._parsedSpan = parseLineSpan(u.span));
+    const sv = v._parsedSpan ?? (v._parsedSpan = parseLineSpan(v.span));
+    if (!su || !sv)
+        return false;
+    return (su[0] <= sv[0] && su[1] >= sv[1]) || (sv[0] <= su[0] && sv[1] >= su[1]);
+}
 function attachCsr(topology) {
     if (topology._csr)
         return topology._csr;
@@ -46,6 +67,7 @@ function attachCsr(topology) {
  * Edges crossing partitions are excluded, exactly like applying a nodeFilter
  * for each partition independently. Returning `undefined` omits a node. */
 export function preparePageRankPartitions(graph, partitionOfId) {
+    const nodeById = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
     const partitionById = new Map();
     const mutable = new Map();
     for (const node of graph.nodes) {
@@ -65,6 +87,8 @@ export function preparePageRankPartitions(graph, partitionOfId) {
         const partition = partitionById.get(edge.source);
         if (partition === undefined || partitionById.get(edge.target) !== partition)
             continue;
+        if (isContainedSymbolEdge(nodeById, edge.source, edge.target))
+            continue;
         const topology = mutable.get(partition);
         pushMap(topology.adjacency, edge.source, edge.target);
         pushMap(topology.adjacency, edge.target, edge.source);
@@ -76,6 +100,7 @@ export function preparePageRankPartitions(graph, partitionOfId) {
 export function preparePageRankTopology(graph, nodeFilter) {
     if (!nodeFilter && graph._csrTopology)
         return graph._csrTopology;
+    const nodeById = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
     const ids = new Set(graph.nodes.map((node) => node.id).filter((id) => !nodeFilter || nodeFilter(id)));
     if (ids.size === 0)
         return emptyTopology();
@@ -84,6 +109,8 @@ export function preparePageRankTopology(graph, nodeFilter) {
         if (!WALK_RELATIONS.has(edge.relation))
             continue;
         if (!ids.has(edge.source) || !ids.has(edge.target))
+            continue;
+        if (isContainedSymbolEdge(nodeById, edge.source, edge.target))
             continue;
         pushMap(adjacency, edge.source, edge.target);
         pushMap(adjacency, edge.target, edge.source);
@@ -172,9 +199,14 @@ export function personalizedPageRankPrepared(topology, seeds, opts = {}) {
             for (let k = 0; k < sLen; k++)
                 next[seedIdx[k]] += dm * seedWeight[k];
         }
+        let l1Delta = 0;
+        for (let u = 0; u < n; u++)
+            l1Delta += Math.abs(next[u] - rank[u]);
         const tmp = rank;
         rank = next;
         next = tmp;
+        if (l1Delta < 1e-6)
+            break;
     }
     let max = 0;
     for (let u = 0; u < n; u++) {

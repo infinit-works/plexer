@@ -94,6 +94,8 @@ const COMPOUND_STEMS = new Map([
     ["bitwidths", ["bit", "width"]],
     ["cframe", ["coordin", "fram"]],
     ["mtime", ["modify", "tim"]],
+    ["prop", ["property"]],
+    ["props", ["property"]],
 ]);
 /** Build a stem → max-term-frequency map from a token count map. */
 export function stemCounts(tokenMap) {

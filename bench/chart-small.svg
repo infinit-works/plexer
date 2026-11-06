@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 560" width="100%">
+  <style>
+    svg { color-scheme: light dark; }
+    .font { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-variant-numeric: tabular-nums; }
+    .mono { font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .bg { fill: #ffffff; }
+    .card { fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1; }
+    .track { fill: #f1f5f9; }
+    .divider { stroke: #e2e8f0; stroke-width: 1; }
+    .grid { stroke: #cbd5e1; stroke-width: 0.75; stroke-dasharray: 2,3; }
+    .title { fill: #0f172a; font-size: 16px; font-weight: 700; }
+    .subtitle { fill: #64748b; font-size: 11.5px; font-weight: 400; }
+    .sec-title { fill: #0f172a; font-size: 12.5px; font-weight: 700; }
+    .sec-sub { fill: #64748b; font-size: 10.5px; font-weight: 500; }
+    .row-label { fill: #0f172a; font-size: 11.5px; font-weight: 600; }
+    .row-sub { fill: #64748b; font-size: 10px; font-weight: 400; }
+    .val-plexer { fill: #0f172a; font-size: 10.5px; font-weight: 700; }
+    .val-other { fill: #64748b; font-size: 10px; font-weight: 500; }
+    .badge-bg { fill: #ecfdf5; stroke: #10b981; stroke-width: 0.8; stroke-opacity: 0.55; }
+    .badge-txt { fill: #047857; font-size: 10px; font-weight: 700; }
+    .bar-plexer { fill: #059669; }
+    .bar-trail { fill: #3b82f6; }
+    .bar-cold { fill: #94a3b8; }
+    .legend-txt { fill: #334155; font-size: 11px; font-weight: 600; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .card { fill: #161b22; stroke: #30363d; }
+      .track { fill: #21262d; }
+      .divider { stroke: #30363d; }
+      .grid { stroke: #30363d; }
+      .title { fill: #f0f6fc; }
+      .subtitle { fill: #8b949e; }
+      .sec-title { fill: #f0f6fc; }
+      .sec-sub { fill: #8b949e; }
+      .row-label { fill: #f0f6fc; }
+      .row-sub { fill: #8b949e; }
+      .val-plexer { fill: #f0f6fc; }
+      .val-other { fill: #8b949e; }
+      .badge-bg { fill: #064e3b; stroke: #34d399; stroke-opacity: 0.5; }
+      .badge-txt { fill: #6ee7b7; }
+      .bar-plexer { fill: #10b981; }
+      .bar-trail { fill: #60a5fa; }
+      .bar-cold { fill: #64748b; }
+      .legend-txt { fill: #c9d1d9; }
+    }
+  </style>
+  <rect width="880" height="560" rx="10" class="bg"/>
+  <text x="24" y="30" class="font title">plexer Benchmark Summary</text>
+  <text x="24" y="48" class="font subtitle">80 paired A/B evaluations (Gemini 4 Argon, Claude Opus 5.5, Claude Sonnet 5.5) + 3-arm live &amp; retrieval suites</text>
+  <rect x="520" y="23" width="10" height="10" rx="2.5" class="bar-plexer"/>
+  <text x="535" y="32" class="font legend-txt">plexer</text>
+  <rect x="582" y="23" width="10" height="10" rx="2.5" class="bar-trail"/>
+  <text x="597" y="32" class="font legend-txt">trail (@trailhq/trail-code)</text>
+  <rect x="754" y="23" width="10" height="10" rx="2.5" class="bar-cold"/>
+  <text x="769" y="32" class="font legend-txt">cold baseline</text>
+  <rect x="16" y="62" width="848" height="184" rx="8" class="card"/>
+  <text x="32" y="84" class="font sec-title">12-Task Engineering Suite (T1–T12 · 48 Task-Model Pairs · 384/384 Correctness)</text>
+  <text x="794" y="84" text-anchor="middle" class="font sec-sub">plexer vs. cold</text>
+  <line x1="316.0" y1="92" x2="316.0" y2="236" class="grid"/>
+  <line x1="404.0" y1="92" x2="404.0" y2="236" class="grid"/>
+  <line x1="492.0" y1="92" x2="492.0" y2="236" class="grid"/>
+  <line x1="580.0" y1="92" x2="580.0" y2="236" class="grid"/>
+  <text x="32" y="107" class="font row-label">Tool Output Tokens</text>
+  <text x="32" y="120" class="font row-sub">Read / grep / CLI stdout volume</text>
+  <rect x="228" y="97" width="131.7" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="365.7" y="106" class="font val-plexer">234.4k tok</text>
+  <rect x="228" y="111" width="352.0" height="10" rx="2.5" class="bar-cold"/>
+  <text x="586.0" y="119.5" class="font val-other">626.4k tok</text>
+  <rect x="740" y="99" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="112.5" text-anchor="middle" class="font badge-txt">-62.6% (48W/0L)</text>
+  <text x="32" y="143" class="font row-label">Cumulative Input Tokens</text>
+  <text x="32" y="156" class="font row-sub">Total prompt + cached tokens billed</text>
+  <rect x="228" y="133" width="146.3" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="380.3" y="142" class="font val-plexer">3.91M tok</text>
+  <rect x="228" y="147" width="352.0" height="10" rx="2.5" class="bar-cold"/>
+  <text x="586.0" y="155.5" class="font val-other">9.41M tok</text>
+  <rect x="740" y="135" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="148.5" text-anchor="middle" class="font badge-txt">-58.5% input</text>
+  <text x="32" y="179" class="font row-label">Total Tool Calls</text>
+  <text x="32" y="192" class="font row-sub">File reads, greps, and edits</text>
+  <rect x="228" y="169" width="155.2" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="389.2" y="178" class="font val-plexer">198 calls</text>
+  <rect x="228" y="183" width="352.0" height="10" rx="2.5" class="bar-cold"/>
+  <text x="586.0" y="191.5" class="font val-other">449 calls</text>
+  <rect x="740" y="171" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="184.5" text-anchor="middle" class="font badge-txt">-55.9% calls</text>
+  <text x="32" y="215" class="font row-label">Search Wall Time</text>
+  <text x="32" y="228" class="font row-sub">Time to localize targets before edit</text>
+  <rect x="228" y="205" width="231.2" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="465.2" y="214" class="font val-plexer">1,826s</text>
+  <rect x="228" y="219" width="352.0" height="10" rx="2.5" class="bar-cold"/>
+  <text x="586.0" y="227.5" class="font val-other">2,780s</text>
+  <rect x="740" y="207" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="220.5" text-anchor="middle" class="font badge-txt">-34.3% faster</text>
+  <rect x="16" y="258" width="848" height="114" rx="8" class="card"/>
+  <text x="32" y="280" class="font sec-title">ScaleAI/SWE-bench_Pro V2 (S1–S8 · 32 Pairs · Python, Go, JavaScript, TypeScript)</text>
+  <line x1="316.0" y1="288" x2="316.0" y2="362" class="grid"/>
+  <line x1="404.0" y1="288" x2="404.0" y2="362" class="grid"/>
+  <line x1="492.0" y1="288" x2="492.0" y2="362" class="grid"/>
+  <line x1="580.0" y1="288" x2="580.0" y2="362" class="grid"/>
+  <text x="32" y="303" class="font row-label">Tool Output Tokens</text>
+  <text x="32" y="316" class="font row-sub">qutebrowser, flipt, NodeBB, tutanota</text>
+  <rect x="228" y="293" width="247.1" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="481.1" y="302" class="font val-plexer">402.3k tok</text>
+  <rect x="228" y="307" width="352.0" height="10" rx="2.5" class="bar-cold"/>
+  <text x="586.0" y="315.5" class="font val-other">573.0k tok</text>
+  <rect x="740" y="295" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="308.5" text-anchor="middle" class="font badge-txt">-29.8% tok</text>
+  <text x="32" y="339" class="font row-label">Cumulative Input &amp; Calls</text>
+  <text x="32" y="352" class="font row-sub">438 vs. 616 calls (-28.9%)</text>
+  <rect x="228" y="329" width="247.8" height="11" rx="2.5" class="bar-plexer"/>
+  <text x="481.8" y="338" class="font val-plexer">14.29M (438 calls)</text>
+  <rect x="228" y="343" width="352.0" height="10" rx="2.5" class="bar-cold"/>
+  <text x="586.0" y="351.5" class="font val-other">20.30M (616 calls)</text>
+  <rect x="740" y="331" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="344.5" text-anchor="middle" class="font badge-txt">-29.6% input</text>
+  <rect x="16" y="384" width="848" height="160" rx="8" class="card"/>
+  <text x="32" y="406" class="font sec-title">3-Arm Comparison vs. @trailhq/trail-code@0.25.0 &amp; Cold Baseline</text>
+  <line x1="316.0" y1="414" x2="316.0" y2="534" class="grid"/>
+  <line x1="404.0" y1="414" x2="404.0" y2="534" class="grid"/>
+  <line x1="492.0" y1="414" x2="492.0" y2="534" class="grid"/>
+  <line x1="580.0" y1="414" x2="580.0" y2="534" class="grid"/>
+  <text x="32" y="428" class="font row-label">Live 3-Arm Tool Output</text>
+  <text x="32" y="441" class="font row-sub">T4, T5, T9 + S1–S8 across 4 models</text>
+  <rect x="228" y="416" width="243.1" height="9.5" rx="2" class="bar-plexer"/>
+  <text x="477.1" y="424.5" class="font val-plexer">572.8k (884 calls)</text>
+  <rect x="228" y="427.5" width="331.4" height="9" rx="2" class="bar-trail"/>
+  <text x="565.4" y="435.5" class="font val-other">780.9k (1,112 calls)</text>
+  <rect x="228" y="438.5" width="352.0" height="9" rx="2" class="bar-cold"/>
+  <text x="586.0" y="446.5" class="font val-other">829.5k (1,168 calls)</text>
+  <rect x="740" y="422" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="435.5" text-anchor="middle" class="font badge-txt">-26.6% vs trail</text>
+  <text x="32" y="470" class="font row-label">Live 3-Arm Cum. Input</text>
+  <text x="32" y="483" class="font row-sub">Score: plexer 339/352 vs. 337</text>
+  <rect x="228" y="458" width="257.5" height="9.5" rx="2" class="bar-plexer"/>
+  <text x="491.5" y="466.5" class="font val-plexer">39.92M tok</text>
+  <rect x="228" y="469.5" width="352.0" height="9" rx="2" class="bar-trail"/>
+  <text x="586.0" y="477.5" class="font val-other">54.56M tok</text>
+  <rect x="228" y="480.5" width="330.8" height="9" rx="2" class="bar-cold"/>
+  <text x="564.8" y="488.5" class="font val-other">51.27M tok</text>
+  <rect x="740" y="464" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="477.5" text-anchor="middle" class="font badge-txt">-26.8% vs trail</text>
+  <text x="32" y="512" class="font row-label">Retrieval Recall@1</text>
+  <text x="32" y="525" class="font row-sub">24 queries across 6 repos (5–24ms)</text>
+  <rect x="228" y="500" width="352.0" height="9.5" rx="2" class="bar-plexer"/>
+  <text x="586.0" y="508.5" class="font val-plexer">100.0% (24/24 · 1.000 MRR)</text>
+  <rect x="228" y="511.5" width="73.2" height="9" rx="2" class="bar-trail"/>
+  <text x="307.2" y="519.5" class="font val-other">20.8% all repos (62.5% non-Luau)</text>
+  <rect x="740" y="506" width="108" height="20" rx="10" class="badge-bg"/>
+  <text x="794" y="519.5" text-anchor="middle" class="font badge-txt">24/24 Recall@1</text>
+</svg>
