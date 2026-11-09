@@ -48,9 +48,12 @@ function levenshtein(a, b) {
 }
 
 const SECRET_TOKEN_PATTERNS = [
+    { label: "Anthropic API secret key", re: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/ },
     { label: "OpenAI/API secret key", re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/ },
     { label: "GitHub personal access token", re: /\bgh[pousr]_[A-Za-z0-9]{30,}\b/ },
-    { label: "AWS access key ID", re: /\bAKIA[0-9A-Z]{16}\b/ },
+    { label: "AWS access key ID", re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/ },
+    { label: "Stripe live secret key", re: /\b(?:sk|rk)_live_[0-9A-Za-z]{20,}\b/ },
+    { label: "Slack access token", re: /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/ },
     { label: "PEM private key block", re: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/ },
 ];
 
@@ -553,7 +556,7 @@ function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
     }
 
     const secretVarMatch =
-        /\b(api_?key|secret_?key|access_?token|private_?key|password|passwd|auth_?token)\s*[:=]\s*["']([^"']{8,})["']/i.exec(
+        /\b([A-Za-z0-9_]*(?:api_?key|secret_?access_?key|secret_?key|client_?secret|access_?token|private_?key|password|passwd|auth_?token))\s*[:=]\s*["']([^"']{8,})["']/i.exec(
             trimmed,
         );
     if (
@@ -643,7 +646,9 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
         /\b(?:console\.(?:log|info|debug|warn|error)|logger\.(?:info|debug|warning|error)|logging\.(?:info|debug|warning|error)|print)\s*\(/.test(
             trimmed,
         ) &&
-        /\b(?:password|passwd|secret_key|api_key|access_token|private_key|bearer_token)\b/i.test(trimmed) &&
+        /\b[A-Za-z0-9_]*(?:password|passwd|secret_?access_?key|secret_?key|client_?secret|api_?key|access_?token|private_?key|bearer_?token)\b/i.test(
+            trimmed,
+        ) &&
         !trimmed.includes("REDACTED") &&
         !trimmed.includes("***") &&
         !hasInlineSuppression(lines, lineNum, "security_traps")

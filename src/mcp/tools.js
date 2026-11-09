@@ -569,6 +569,9 @@ export async function callTool(root, name, args, dirOverride) {
         const startupRoot = resolve(root);
         const agyRoot = readAgyLastRepo();
         const isTrustedRoot = isInsideRoot(startupRoot, targetRoot) || isInsideRoot(agyRoot, targetRoot);
+        if (!isTrustedRoot && !hasPlexerIndex(targetRoot)) {
+            return { text: NO_GRAPH, isError: true };
+        }
         const ws = readWorkspace(targetRoot, dirOverride);
         let note = null;
         if (!NO_REFRESH_TOOLS.has(name)) {

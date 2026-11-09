@@ -524,13 +524,15 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             );
 
             const fakePrefix = "gh" + "p_";
+            const fakeAwsSecret = "wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY";
             writeFileSync(
                 join(tmp, "src", "consumer_pkg", "web.ts"),
                 [
                     "async function computeScores(scores: number[]) {",
                     "    const sorted = scores.sort();",
                     `    const apiToken = '${fakePrefix}1234567890abcdefghijklmnopqrstuvwxyzABCD';`,
-                    "    console.log('auth password:', apiToken);",
+                    `    const aws_secret_access_key = '${fakeAwsSecret}';`,
+                    "    console.log('auth password:', apiToken, aws_secret_access_key);",
                     "    return sorted[0];",
                     "    const deadAfterReturn = 99;",
                     "}",
@@ -598,6 +600,10 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             assert.ok(
                 secFindings.some((i) => i.id.includes("hardcoded_secret")),
                 "should detect hardcoded ghp_ token",
+            );
+            assert.ok(
+                secFindings.some((i) => i.id.includes("secret_var_aws_secret_access_key")),
+                "should detect prefixed aws_secret_access_key assignment",
             );
             assert.ok(
                 secFindings.some((i) => i.id.includes("sensitive_log")),

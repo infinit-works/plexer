@@ -300,7 +300,9 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
             assert.ok(Array.isArray(codeGraph?.nodes) && codeGraph.nodes.length > 0);
             assert.deepEqual(contextGraph.nodes, []);
 
-            // Viz live server (/api/source excerpt + L-prefixed span + path-jail guard)
+            // Viz live server (/api/source excerpt + L-prefixed span + path-jail & indexed-file guard)
+            writeFileSync(join(tmp, ".env"), "AWS_SECRET_ACCESS_KEY=super_secret_value\n", "utf8");
+            writeFileSync(join(tmp, "unindexed.txt"), "not in wiring.json\n", "utf8");
             const { startVizServer } = await import("../src/viz/serve.js");
             const srv = await startVizServer({
                 root: tmp,
@@ -312,6 +314,9 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
             try {
                 const srcRes = await fetch(`${srv.url}/api/source?path=src/Shared/Validate.luau&span=3-8`);
                 assert.equal(srcRes.status, 200);
+                assert.equal(srcRes.headers.get("cross-origin-resource-policy"), "same-origin");
+                assert.equal(srcRes.headers.get("x-content-type-options"), "nosniff");
+                assert.equal(srcRes.headers.get("x-frame-options"), "DENY");
                 const srcJson = await srcRes.json();
                 assert.equal(srcJson.startLine, 3);
                 assert.ok(srcJson.lines.some((l) => l.text.includes("Validate.check")));
@@ -325,6 +330,30 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
 
                 const forbidden = await fetch(`${srv.url}/api/source?path=../../etc/passwd`);
                 assert.equal(forbidden.status, 403);
+
+                const dotEnvForbidden = await fetch(`${srv.url}/api/source?path=.env`);
+                assert.equal(dotEnvForbidden.status, 403);
+
+                const gitConfigForbidden = await fetch(`${srv.url}/api/source?path=.git/config`);
+                assert.equal(gitConfigForbidden.status, 403);
+
+                const unindexedForbidden = await fetch(`${srv.url}/api/source?path=unindexed.txt`);
+                assert.equal(unindexedForbidden.status, 403);
+
+                const crossOrigin = await fetch(`${srv.url}/api/source?path=src/Shared/Validate.luau`, {
+                    headers: { Origin: "http://evil.example.com" },
+                });
+                assert.equal(crossOrigin.status, 403);
+
+                const crossSite = await fetch(`${srv.url}/api/source?path=src/Shared/Validate.luau`, {
+                    headers: { "Sec-Fetch-Site": "cross-site" },
+                });
+                assert.equal(crossSite.status, 403);
+
+                const postMethod = await fetch(`${srv.url}/api/source?path=src/Shared/Validate.luau`, {
+                    method: "POST",
+                });
+                assert.equal(postMethod.status, 405);
             } finally {
                 await srv.close();
             }
@@ -1587,12 +1616,19 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             const mapViaSdk = px.map(tmp, { churn: true });
             assert.ok(mapViaSdk.churnHotspots?.length > 0, "px.map({ churn: true }) populates churnHotspots");
 
-            // 6. readSpans path traversal guard & upsertSection orphan <!-- plexer:start --> preservation
+            // 6. readSpans path traversal / dot-path guard & upsertSection orphan <!-- plexer:start --> preservation
             const { readSpans } = await import("../src/ask/ask.js");
-            const traversalRes = readSpans(tmp, ["../../../etc/hosts:L1-L5"]);
-            assert.equal(traversalRes.blocks.length, 1);
-            assert.ok(traversalRes.blocks[0].error, "readSpans must return an error block for path traversal outside rootDir");
-            assert.equal(traversalRes.blocks[0].lines, undefined, "readSpans must not read lines outside rootDir");
+            const traversalRes = readSpans(tmp, ["../../../etc/hosts:L1-L5", ".env:L1-L5", ".git/config:L1-L5"]);
+            assert.equal(traversalRes.blocks.length, 3);
+            for (const blk of traversalRes.blocks) {
+                assert.ok(blk.error, "readSpans must return an error block for path traversal or dot/sensitive paths");
+                assert.equal(blk.lines, undefined, "readSpans must not read lines from restricted paths");
+            }
+            const untrustedMcpRead = await callTool(join(tmp, "src"), "plexer_read", {
+                dir: "/etc",
+                spans: "hosts:L1-L5",
+            });
+            assert.equal(untrustedMcpRead.isError, true, "MCP plexer_read must reject unindexed untrusted roots");
 
             const { upsertSection } = await import("../src/hosts/sections.js");
             const orphanMd = join(tmp, "ORPHAN_AGENTS.md");

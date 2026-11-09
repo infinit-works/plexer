@@ -21,7 +21,7 @@ import { combineComparableScopes, rankScopesAndFuse, } from "./fuse.js";
 import { rankFilesBounded, } from "./file-rank.js";
 import { fileFirstRoundRobin, roundRobinQueues } from "./file-selection.js";
 import { personalizedPageRank, personalizedPageRankPrepared, preparePageRankPartitions, } from "./graphrank.js";
-import { fileReader, needlesForName, parseSpan, plural, referenceLines, spanRange, spanStart, wordRe } from "../util/span.js";
+import { fileReader, isSensitiveOrDotPath, needlesForName, parseSpan, plural, referenceLines, spanRange, spanStart, wordRe } from "../util/span.js";
 import { bagLen, counts, loadAskIndexCached, loadGraphCached, stemCounts, stemToken, tokenize } from "./index-file.js";
 /** Max source lines to inline per hit when `--full` is enabled. */
 const MAX_SPAN_LINES = 80;
@@ -2459,8 +2459,6 @@ export function readSpans(dir, spanSpecs, opts = {}) {
         const normalizedQuery = fileQuery.startsWith(rootPrefix)
             ? fileQuery.slice(rootPrefix.length)
             : fileQuery;
-        if (read(normalizedQuery))
-            return normalizedQuery;
         const suffix = `/${normalizedQuery}`;
         const matches = indexedPaths.filter((p) => p === normalizedQuery || p.endsWith(suffix));
         if (matches.length === 1)
@@ -2470,6 +2468,8 @@ export function readSpans(dir, spanSpecs, opts = {}) {
         const ciMatches = indexedPaths.filter((p) => p.toLowerCase() === lower || p.toLowerCase().endsWith(lowerSuffix));
         if (ciMatches.length === 1)
             return ciMatches[0];
+        if (read(normalizedQuery))
+            return normalizedQuery;
         return matches[0] ?? ciMatches[0] ?? normalizedQuery;
     };
     const blocks = [];
@@ -2480,6 +2480,10 @@ export function readSpans(dir, spanSpecs, opts = {}) {
             continue;
         }
         const resolvedFile = resolvePath(parsed.file);
+        if (!resolvedFile.startsWith("..") && isSensitiveOrDotPath(resolvedFile)) {
+            blocks.push({ spec: rawSpec, file: resolvedFile, error: `cannot read sensitive or hidden path "${resolvedFile}"` });
+            continue;
+        }
         const lines = read(resolvedFile);
         if (!lines) {
             blocks.push({ spec: rawSpec, file: resolvedFile, error: `cannot read "${resolvedFile}"` });

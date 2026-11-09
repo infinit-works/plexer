@@ -151,6 +151,21 @@ export function referenceLines(path, span, needles, read, opts = {}) {
     });
 }
 
+const SENSITIVE_BASENAME_RE = /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)$|\.(?:pem|key|p12|pfx)$/i;
+
+/** True when a repo-relative path contains a dot-prefixed segment (`.git`, `.env`, `.aws`) or private key file. */
+export function isSensitiveOrDotPath(relPath) {
+    const norm = String(relPath ?? "").replace(/\\/g, "/").replace(/^\.\//, "");
+    if (!norm)
+        return true;
+    const parts = norm.split("/").filter(Boolean);
+    if (parts.length === 0)
+        return true;
+    if (parts.some((seg) => seg.startsWith(".")))
+        return true;
+    return SENSITIVE_BASENAME_RE.test(parts[parts.length - 1]);
+}
+
 /** Read each file once via `readSourceFile` (UTF-8 / UTF-16LE aware), returning split lines or null. */
 export function fileReader(root) {
     const cache = new Map();
@@ -174,13 +189,13 @@ export function fileReader(root) {
         try {
             const absFile = resolve(absRoot, path);
             const rel = relative(absRoot, absFile);
-            if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+            if (!rel || rel.startsWith("..") || isAbsolute(rel) || isSensitiveOrDotPath(rel)) {
                 cache.set(path, null);
                 return null;
             }
             const realFile = realpathSync(absFile);
             const realRel = relative(realRoot, realFile);
-            if (!realRel || realRel.startsWith("..") || isAbsolute(realRel)) {
+            if (!realRel || realRel.startsWith("..") || isAbsolute(realRel) || isSensitiveOrDotPath(realRel)) {
                 cache.set(path, null);
                 return null;
             }

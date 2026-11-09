@@ -12,11 +12,13 @@
  */
 import { createServer } from "node:http";
 import { readFileSync, existsSync, realpathSync, statSync, watch } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { loadGraphCached } from "../graph/load.js";
 import { computeScoreSnapshot } from "../health/scoring.js";
 import { loadHealthState, stateFilePath } from "../health/state.js";
+import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
+import { isSensitiveOrDotPath } from "../util/span.js";
 
 export function buildVizHealthPayload(contextDir) {
     if (!contextDir || !existsSync(stateFilePath(contextDir))) return null;
@@ -70,6 +72,13 @@ export function buildVizHealthPayload(contextDir) {
 }
 const PORT_ATTEMPTS = 10;
 const WATCH_DEBOUNCE_MS = 300;
+const LOOPBACK_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
+const LOOPBACK_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
+const SECURITY_HEADERS = {
+    "cross-origin-resource-policy": "same-origin",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+};
 const STATIC_FILES = {
     "/": { file: "index.html", type: "text/html; charset=utf-8" },
     "/index.html": { file: "index.html", type: "text/html; charset=utf-8" },
@@ -79,7 +88,8 @@ const STATIC_FILES = {
 function sendJson(res, status, body) {
     res.writeHead(status, {
         "content-type": "application/json; charset=utf-8",
-        "cross-origin-resource-policy": "same-origin",
+        "cache-control": "no-store",
+        ...SECURITY_HEADERS,
     });
     res.end(JSON.stringify(body));
 }
@@ -100,7 +110,7 @@ function listen(server, port) {
         server.listen(port, "127.0.0.1", onListening);
     });
 }
-function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot) {
+function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot, contextDir) {
     const relPath = (parsedUrl.searchParams.get("path") ?? "").trim();
     const spanParam = (parsedUrl.searchParams.get("span") ?? "").trim();
     const full = parsedUrl.searchParams.get("full") === "1";
@@ -109,9 +119,14 @@ function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot) {
         return;
     }
     const absFile = resolve(repoRoot, relPath);
-    const relCheck = relative(repoRoot, absFile);
-    if (!relCheck || relCheck.startsWith("..") || isAbsolute(relCheck)) {
-        sendJson(res, 403, { error: "path outside repository root" });
+    const relCheck = relPosix(repoRoot, absFile);
+    if (!relCheck || relCheck.startsWith("..") || isAbsolute(relCheck) || isSensitiveOrDotPath(relCheck)) {
+        sendJson(res, 403, { error: "path outside repository root or restricted" });
+        return;
+    }
+    const graph = contextDir ? loadGraphCached(contextDir) : null;
+    if (!graph?.nodes?.some((n) => n.path === relCheck)) {
+        sendJson(res, 403, { error: "file is not indexed in the codebase graph" });
         return;
     }
     try {
@@ -120,9 +135,9 @@ function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot) {
             return;
         }
         const realFile = realpathSync(absFile);
-        const realRel = relative(realRepoRoot, realFile);
-        if (!realRel || realRel.startsWith("..") || isAbsolute(realRel)) {
-            sendJson(res, 403, { error: "path outside repository root" });
+        const realRel = relPosix(realRepoRoot, realFile);
+        if (!realRel || realRel.startsWith("..") || isAbsolute(realRel) || isSensitiveOrDotPath(realRel)) {
+            sendJson(res, 403, { error: "path outside repository root or restricted" });
             return;
         }
         const raw = readSourceFile(realFile);
@@ -151,7 +166,7 @@ function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot) {
             lines.push({ n: ln, text: allLines[ln - 1] ?? "" });
         }
         sendJson(res, 200, {
-            path: relPath,
+            path: relCheck,
             span: spanParam || `${startLine}-${cappedEnd}`,
             startLine,
             endLine: cappedEnd,
@@ -168,12 +183,21 @@ function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot) {
 
 function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients) {
     const hostHeader = String(req.headers?.host ?? "").trim();
-    if (hostHeader && !/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(hostHeader)) {
+    if (!hostHeader || !LOOPBACK_HOST_RE.test(hostHeader)) {
         sendJson(res, 403, { error: "forbidden Host header" });
         return;
     }
-    if (req.headers?.["sec-fetch-site"] === "cross-site") {
+    const originHeader = String(req.headers?.origin ?? "").trim();
+    if (
+        req.headers?.["sec-fetch-site"] === "cross-site" ||
+        (originHeader && !LOOPBACK_ORIGIN_RE.test(originHeader))
+    ) {
         sendJson(res, 403, { error: "cross-site requests are forbidden" });
+        return;
+    }
+    const method = String(req.method ?? "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") {
+        sendJson(res, 405, { error: "method not allowed" });
         return;
     }
     const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -182,11 +206,11 @@ function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients
     if (asset) {
         const file = join(opts.viewerDir, asset.file);
         if (!existsSync(file)) {
-            res.writeHead(404, { "content-type": "text/plain" });
+            res.writeHead(404, { "content-type": "text/plain", ...SECURITY_HEADERS });
             res.end("viewer bundle missing — run the package build");
             return;
         }
-        res.writeHead(200, { "content-type": asset.type });
+        res.writeHead(200, { "content-type": asset.type, ...SECURITY_HEADERS });
         res.end(readFileSync(file));
         return;
     }
@@ -204,7 +228,7 @@ function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients
         return;
     }
     if (path === "/api/source") {
-        handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot);
+        handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot, opts.contextDir);
         return;
     }
     if (path === "/api/health") {
@@ -217,13 +241,14 @@ function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients
             "content-type": "text/event-stream",
             "cache-control": "no-cache",
             connection: "keep-alive",
+            ...SECURITY_HEADERS,
         });
         res.write(": connected\n\n");
         sseClients.add(res);
         req.on("close", () => sseClients.delete(res));
         return;
     }
-    res.writeHead(404, { "content-type": "text/plain" });
+    res.writeHead(404, { "content-type": "text/plain", ...SECURITY_HEADERS });
     res.end("not found");
 }
 
