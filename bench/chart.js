@@ -3,7 +3,7 @@
  * Renders self-contained, dual-theme (light/dark) SVG benchmark charts using the
  * visual grammar, Oklch color system, and layout geometry of
  * https://github.com/kohltastrophe/luau-reactivity-benchmark:
- *   - `bench/chart-small.svg` — hero overall geomean + headline suite rows for `README.md`
+ *   - `bench/chart-small.svg` (+ `assets/chart-small.svg`) — hero overall geomean + headline suite rows for `README.md`
  *   - `bench/chart.svg`       — full multi-suite & per-model breakdown for `bench/README.md`
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -107,14 +107,14 @@ const COLORS = Object.fromEntries(ARMS.map((arm, i) => [arm, rainbow(ARMS.length
 
 const PKG_VERSION = (() => {
     try {
-        return JSON.parse(readFileSync(resolve(import.meta.dirname, "../package.json"), "utf8")).version || "1.1.0";
+        return JSON.parse(readFileSync(resolve(import.meta.dirname, "../package.json"), "utf8")).version || "1.1.1";
     } catch {
-        return "1.1.0";
+        return "1.1.1";
     }
 })();
 
 const ARM_META = {
-    plexer: { scope: "@plexer/", name: "cli", ver: PKG_VERSION, link: "https://github.com/infinit-works/plexer" },
+    plexer: { scope: "@plexer/", name: "cli", ver: PKG_VERSION, link: "https://www.npmjs.com/package/@plexer/cli" },
     trail: { scope: "@trailhq/", name: "trail-code", ver: "0.29.0", link: "https://www.npmjs.com/package/@trailhq/trail-code" },
     cold: { scope: null, name: "cold baseline", ver: "no index", link: null },
 };
@@ -880,7 +880,13 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename
     mkdirSync(outDir, { recursive: true });
     const smallPath = resolve(outDir, "chart-small.svg");
     const fullPath = resolve(outDir, "chart.svg");
-    writeFileSync(smallPath, renderChart(false, benchDir), "utf8");
+    const smallSvg = renderChart(false, benchDir);
+    writeFileSync(smallPath, smallSvg, "utf8");
     writeFileSync(fullPath, renderChart(true, benchDir), "utf8");
+    if (outDir === resolve(import.meta.dirname)) {
+        const assetsDir = resolve(import.meta.dirname, "../assets");
+        mkdirSync(assetsDir, { recursive: true });
+        writeFileSync(resolve(assetsDir, "chart-small.svg"), smallSvg, "utf8");
+    }
     console.log(`Wrote ${smallPath} and ${fullPath}`);
 }
