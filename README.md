@@ -2,8 +2,8 @@
 
 An offline structural code graph and call-chain indexer for AI coding agents. It indexes symbols, call edges, imports, and exact line spans into a local `plexer/` directory using WASM Tree-sitter so agents can resolve definitions, callers, and blast radius in a single turn.
 
-- **Fewer tokens and tool calls:** Cuts tool output tokens by 59–73% (`48W/0L`) and tool calls by 45–67% across 80+ paired evaluations ([see benchmarks](#benchmarks)).
-- **Fast local search:** Hits 100.0% Recall@1 and 1.000 MRR in 5–24ms on natural-language queries across 6 repositories (`73–94%` smaller than raw files).
+- **Fewer tokens and tool calls:** Cuts tool output tokens by 50–73% (`59W/1L` on `T1`–`T12`) and tool calls by 43–67% across 140 paired and 3-arm evaluations ([see benchmarks](#benchmarks)).
+- **Fast local search:** Hits 100.0% Recall@1 and 1.000 MRR in 7–21ms on natural-language queries across 6 repositories (`75–96%` smaller than raw files).
 - **25 languages:** Parses TypeScript/JS, Python, Go, Rust, Java, C/C++, C#, Kotlin, Swift, Ruby, PHP, and more out of the box, including full Luau and Roblox project support.
 - **12 AI coding hosts:** One command configures skills, hooks, and MCP tools for Claude Code, Google Antigravity, OpenAI Codex, Cursor, Gemini CLI, Windsurf, GitHub Copilot, Aider, Kiro, OpenCode, Grok CLI, and Amp.
 - **Web graph explorer:** Serves a 60fps HTML5 Canvas viewer for inspecting architecture, health hotspots, and diff blast radius (`plexer viz`).
@@ -106,20 +106,21 @@ Rescan periodically with `plexer health scan`. Follow the scan output's agent in
 
 ## Benchmarks
 
-Evaluated on **Gemini 3.8 Flash**, **Gemini 4 Argon** (`low` and `medium`), **Claude Sonnet 5.5**, and **Claude Opus 5.5**. Full per-model tables, per-task breakdowns (`T1`–`T12`, `S1`–`S8`), and reproduction scripts are in [`bench/README.md`](bench/README.md).
+Evaluated on **Gemini 4 Carbon** (`medium`), **Gemini 4 Argon** (`low` and `medium`), **Gemini 3.8 Flash** (`medium`), **Claude Sonnet 5.5**, and **Claude Opus 5.5** across **28 tasks (`T1`–`T12`, `S1`–`S8`, `L1`–`L8`)** and **11 repositories** up to **1,350+ files** (**140 paired and 3-arm evaluations**). Full per-model tables, per-task breakdowns (`T1`–`T12`, `S1`–`S8`, `L1`–`L8`), repo-size scaling tables, and reproduction scripts are in [`bench/README.md`](bench/README.md).
 
 <p align="center">
   <img src="bench/chart-small.svg" alt="plexer Benchmark Summary: 12-Task Suite, SWE-bench Pro V2, and 3-Arm Comparison vs. trail-code and Cold Baseline" width="100%" />
 </p>
 
-| Evaluation Suite | Correctness | Tool Calls | Tool Output Tokens | Uncached Input (`in + cw`) | Cumulative Input Tokens | Search Wall Time |
+| Evaluation Suite | Correctness / Resolved | Tool Calls | Tool Output Tokens | Uncached Input (`in + cw`) | Cumulative Input Tokens | Search Wall Time |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **12-Task Suite (`T1`–`T12`, 48 pairs)** | 380/384 → **384/384 (100%)** | 449 → **198 (-55.9%)** | 626.4k → **234.4k (-62.6%, `48W/0L`)** | 1.56M → **1.10M (-29.3%)** | 9.41M → **3.91M (-58.5%)** | 2,780s → **1,826s (-34.3%)** |
-| **`SWE-bench_Pro` V2 (`S1`–`S8`, 32 pairs)** | 238/256 → **239/256** | 616 → **438 (-28.9%)** | 573.0k → **402.3k (-29.8%)** | 2.38M → **1.89M (-20.4%)** | 20.30M → **14.29M (-29.6%)** | 6,085s → **4,906s (-19.4%)** |
-| **Live 3-Arm vs. `trail` (`T4,T5,T9` + `S1`–`S8`)** | **`plexer` 339/352** (`trail` 337, `cold` 337) | **884** (`trail` 1,112, `cold` 1,168) | **572.8k** (`trail` 780.9k, `cold` 829.5k) | **1.43M** (`trail` 2.05M **-30.1%**, `cold` 1.82M **-21.5%**) | **39.92M** (`trail` 54.56M, `cold` 51.27M) | **5,697s** (`trail` 7,158s, `cold` 6,568s) |
+| **12-Task Suite (`T1`–`T12`, 60 pairs)** | 476/480 → **478/480 (99.6%)** | 737 → **358 (-51.4%)** | 959.5k → **396.8k (-58.6%, `59W/1L`)** | 2.54M → **1.83M (-27.9%)** | 17.95M → **9.00M (-49.8%)** | 5,101s → **4,173s (-18.2%)** |
+| **`SWE-bench_Pro` V2 (`S1`–`S8`, 40 pairs)** | 302/320 → **303/320** (`100%` file recall) | 1,075 → **745 (-30.7%)** | 971.4k → **627.8k (-35.4%, `36W/4L`)** | 3.79M → **2.54M (-33.0%)** | 41.63M → **26.98M (-35.2%)** | 11,495s → **8,967s (-22.0%)** |
+| **Large-Repo Suite (`L1`–`L8`, 40 3-arm)** | 316/320 → **320/320 (40/40 resolved)** | 395 → **252 (-36.2%)** | 287.2k → **134.5k (-53.2%)** | 2.00M → **1.54M (-23.1%)** | 6.22M → **3.66M (-41.2%)** | 1,705s → **1,331s (-21.9%)** |
+| **Live 3-Arm vs. `trail` (`111 tasks/arm`)** | **`plexer` 864/888** (`trail` 874/888, `cold` 858/888) | **1,501 (-31.8%)** (`trail` 1,887, `cold` 2,202) | **919.0k (-29.0% vs `trail`)** (`trail` 1.29M, `cold` 1.65M) | **6.82M (-28.6%)** (`trail` 8.38M **-12.4%**, `cold` 9.56M) | **51.75M (-37.4%)** (`trail` 71.85M, `cold` 82.61M) | **11,741s (-19.2%)** (`trail` 14,504s, `cold` 14,524s) |
 
-- **Uncached input tokens & warm-cache Q&A (`node bench/trail-table.js`):** Across Claude Code Q&A tasks (`T1`–`T8`), `plexer` cuts warm-cache uncached input tokens (`input + cache_creation`) by **-41% on Opus 5.5 (`11,331 → 6,665`)** and **-31% on Sonnet 5.5 (`8,377 → 5,786`)**, while cutting post-Turn-1 exploration uncached tokens by **-78% on both Opus (`10,031 → 2,193`) and Sonnet (`7,235 → 1,572`)**.
-- **Retrieval and latency (`npm run bench`):** Hits **100.0% Recall@1 (24/24)** and **1.000 MRR** across 6 repos (14,214 symbols, 29,061 edges at pinned benchmark commits) compared to `@trailhq/trail-code@0.25.0` (`20.8% Recall@1` overall, `62.5%` on non-Luau repos). Queries finish in **5–21ms** for `ask --source` and **<2ms** for `callers`, `skeleton`, and `map`.
+- **Uncached input tokens, warm-cache Q&A, and repo-size scaling (`node bench/trail-table.js`):** Across Q&A tasks (`T1`–`T8`), `plexer` cuts warm-cache uncached input tokens (`input + cache_creation`) by **-42% on Gemini 4 Carbon (`35,144 → 20,279`)**, **-41% on Opus 5.5 (`11,331 → 6,665`)**, and **-31% on Sonnet 5.5 (`8,377 → 5,786`)**. Post-Turn-1 exploration uncached tokens drop by **-53% on Carbon (`42,976 → 20,036`)** and **-78% on both Opus (`10,031 → 2,193`) and Sonnet (`7,235 → 1,572`)**. Across all 111 shared 3-arm tasks (`T4, T5, T9`, `S1`–`S8`, and `L1`–`L8` across 5 models), native `trail` (`@trailhq/trail-code@0.29.0`) cuts raw uncached input by `-12.4%` (`9,564k → 8,380k`), post-Turn-1 exploration uncached tokens by `-14.4%` (`6,896k → 5,900k`), net context growth by `-16.9%` (`3,873k → 3,218k`), cumulative input by `-13.0%` (`82.61M → 71.85M`), and tool calls by `-14.3%` (`2,202 → 1,887`). `plexer` cuts them by **`-28.6%` (`6,824k`)**, **`-38.1%` (`4,268k`)**, **`-35.2%` (`2,508k`)**, **`-37.4%` (`51.75M`)**, and **`-31.8%` (`1,501` calls)** while hitting **`100.0%` gold file recall (`111/111`)** across `Small (<250 files)`, `Medium (350–750 files)`, and `Large (700–1350+ files)` repositories.
+- **Retrieval and latency (`npm run bench`):** Hits **100.0% Recall@1 (24/24)** and **1.000 MRR** across 6 repos (14,475 symbols, 29,088 edges at pinned benchmark commits) compared to `@trailhq/trail-code@0.25.0` (`16.7% Recall@1` overall, `50.0%` on shared non-Luau repos). Queries finish in **6.8–20.6ms** for `ask --source` and **<2ms** for `callers`, `skeleton`, and `map`.
 
 ---
 
