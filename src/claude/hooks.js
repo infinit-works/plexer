@@ -2,9 +2,11 @@ import { readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join, basename, isAbsolute, resolve, relative } from 'node:path';
 import { ask as runAsk } from '../ask/ask.js';
-import { stemToken, tokenize } from '../ask/index-file.js';
+import { loadAskIndexCached, recordNodeCompoundVocab, stemToken, tokenize } from '../ask/index-file.js';
 import { formatBlastRadius, relevantRetrieval, formatOrientation } from './format.js';
-import { loadAskIndexCached, loadGraphCached } from '../graph/load.js';
+import { loadGraphCached } from '../context/graph-store.js';
+import { scopeOf, scopesOfGraph } from '../context/scopes.js';
+import { contextDirFor } from '../util/paths.js';
 import {
     patchStats,
     readStats,
@@ -13,7 +15,6 @@ import {
     releaseLock,
     readSession,
     writeSession,
-    resolveContextDir,
     readStdin,
     projectDir,
     writeAgyLastRepo,
@@ -21,7 +22,6 @@ import {
 import { claudeScriptPath } from './paths.js';
 import { ensureFreshGraph } from '../graph/refresh.js';
 import { isAutoBuildableRepo, nearestPlexerRoot } from '../graph/root.js';
-import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
 import { federateAsk, readWorkspace } from '../graph/workspace.js';
 import { pinnedHits, pointerCovers, pointersOverlap } from './pin.js';
 
@@ -30,16 +30,22 @@ import { pinnedHits, pointerCovers, pointersOverlap } from './pin.js';
  * them reliably with so few terms. */
 export const MIN_PROMPT_CHARS = 12;
 
-export const LEADING_SLASH_COMMANDS_RE = /^(?:\/(?:plan|grill-me|review|simplify|commit|pr|revise-rules|learn|skill-creator|token-telemetry|auto-compact|goal|boost|compact|schedule|browser|plugin|automation|teamwork-preview|agy-customizations|antigravity-guide|doctor|clear|help|init|status|cost)\b\s*)+/i;
+export const LEADING_SLASH_COMMANDS_RE = /^(?:\/(?!tmp\b|app\b|var\b|opt\b|etc\b|usr\b|bin\b|home\b|root\b|srv\b|mnt\b|private\b|Users\b)[a-z][a-z0-9_-]*(?=\s|$)\s*)+/i;
+export const READ_ONLY_SLASH_RE = /^(?:\/[a-z][a-z0-9_-]*\s+)*\/(?:plan|grill-me|review)\b/i;
 
 export function stripLeadingSlashCommands(text) {
     return String(text ?? '').trim().replace(LEADING_SLASH_COMMANDS_RE, '').trim();
 }
 
+const CODE_SIGNAL_RE = /`[^`\n]+`|[A-Za-z0-9_/-]+\.(?:py|go|js|ts|tsx|jsx|mjs|cjs|luau|lua|rs|c|cc|cpp|h|hpp|java|rb|php|cs|swift|kt|scala|sh|json|toml|yaml|yml|md)\b|[a-z][A-Z]|[A-Za-z0-9]+_[A-Za-z0-9]+/;
+const META_OPERATIONAL_RE = /^(?:(?:tested|done|ok|okay|yes|yep|sure|thanks|thank\s+you|great|nice|awesome|perfect|please|now|good|lgtm|can\s+you|could\s+you|would\s+you|let'?s)[,.\s]+)*(?:commit|push|deploy|stage|merge|ship|run\s+(?:(?:all\s+)?(?:the\s+)?)?(?:unit\s+|integration\s+)?tests?(?:\s+suite)?|go\s+ahead|proceed|looks\s+good|continue)\b/i;
+const META_PROJECT_STATUS_RE = /^(?:what(?:'s|\s+is|\s+are)\s+(?:the\s+)?(?:current\s+)?(?:status|progress|state)\s+(?:of|on)\s+(?:the|this|our)\s+(?:project|repo|repository|task|work|plan|sprint)\b|where\s+are\s+we\s+(?:on|with|at)\s+(?:this|the|our)\s+(?:task|project|work|plan|feature|pr|branch)\b|how\s+is\s+(?:the|this|our)\s+(?:project|task|work)\s+(?:going|progressing|coming\s+along)\b)/i;
+const META_PHILOSOPHY_RE = /^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:explain|describe|summarize|tell\s+me(?:\s+about)?|walk\s+me\s+through|what\s+is)\s+(?:the\s+)?(?:high[- ]level\s+|overall\s+|core\s+|general\s+)?(?:philosophy|vision|motivation|purpose|goals?|rationale|design\s+philosophy|guiding\s+principles?)\s+(?:behind|of|for)\s+(?:this|the|our)\s+(?:project|repo|repository|tool|library|system)\b/i;
+
 /**
  * True when a hook prompt payload is a synthetic harness notification, subagent/peer
- * message, interrupt marker, slash-only command, or short operational git/deploy/approval
- * reply with no code identifiers or file paths.
+ * message, interrupt marker, slash-only command, or pure operational/status/meta
+ * prompt with no code identifiers or file paths.
  */
 export function isSyntheticOrMetaPrompt(raw) {
     const t = String(raw ?? '').trim();
@@ -58,12 +64,8 @@ export function isSyntheticOrMetaPrompt(raw) {
     const stripped = stripLeadingSlashCommands(t);
     if (stripped.length < MIN_PROMPT_CHARS)
         return true;
-    const hasCodeSignal = /`[^`\n]+`|[A-Za-z0-9_/-]+\.(?:py|go|js|ts|tsx|jsx|mjs|cjs|luau|lua|rs|c|cc|cpp|h|hpp|java|rb|php|cs|swift|kt|scala|sh|json|toml|yaml|yml|md)\b|[a-z][A-Z]|[A-Za-z0-9]+_[A-Za-z0-9]+/.test(stripped);
-    if (
-        !hasCodeSignal &&
-        stripped.length < 80 &&
-        /^(?:(?:tested|done|ok|okay|yes|yep|sure|thanks|great|nice|please|now|good|lgtm)[,.\s]+)*(?:commit|push|deploy|stage|merge|ship|run\s+(?:the\s+)?tests?|go\s+ahead|proceed|looks\s+good)\b/i.test(stripped)
-    ) {
+    const hasCodeSignal = CODE_SIGNAL_RE.test(stripped);
+    if (!hasCodeSignal && (META_OPERATIONAL_RE.test(stripped) || META_PROJECT_STATUS_RE.test(stripped) || META_PHILOSOPHY_RE.test(stripped))) {
         return true;
     }
     return false;
@@ -72,7 +74,7 @@ export function isSyntheticOrMetaPrompt(raw) {
 export function underPlexer(dir, file) {
     const absDir = resolve(dir);
     const absFile = resolve(absDir, file);
-    const ctxDir = resolveContextDir(absDir);
+    const ctxDir = contextDirFor(absDir);
     const relCtx = relative(ctxDir, absFile).replace(/\\/g, '/');
     if (relCtx === '' || (!relCtx.startsWith('..') && !isAbsolute(relCtx))) return true;
     const relDefault = relative(join(absDir, 'plexer'), absFile).replace(/\\/g, '/');
@@ -102,14 +104,14 @@ export function recordFileEdit(dir, file) {
     const prev = readStats(dir);
     const nextStale = Math.max(1, (prev?.staleCount ?? 0) + 1);
     patchStats(dir, { dirty: true, staleCount: nextStale, lastFile: basename(file) });
-    const w = loadGraphCached(resolveContextDir(dir));
+    const w = loadGraphCached(contextDirFor(dir));
     return w ? formatBlastRadius(w, file, 8, dir) : null;
 }
 
 export function readOrientation(dir, budgetBytes = 1200) {
     let formatted = null;
     try {
-        const idx = readFileSync(join(resolveContextDir(dir), 'INDEX.md'), 'utf8');
+        const idx = readFileSync(join(contextDirFor(dir), 'INDEX.md'), 'utf8');
         formatted = formatOrientation(idx, budgetBytes);
     }
     catch {
@@ -119,7 +121,7 @@ export function readOrientation(dir, budgetBytes = 1200) {
 }
 
 const PROMPT_BOILERPLATE_NOISE = new Set([
-    'directory', 'concisely', 'exact', 'citations', 'line', 'lines',
+    'plexer', 'directory', 'concisely', 'exact', 'citations', 'line', 'lines',
     'investigate', 'answer', 'developer', 'notices', 'refactor', 'refactoring',
     'currently', 'implement', 'extend', 'support', 'preserve', 'existing',
     'verify', 'passes', 'pass', 'test', 'tests', 'suite', 'important', 'edit',
@@ -145,62 +147,90 @@ const PROMPT_BOILERPLATE_NOISE = new Set([
     'expose', 'exposes', 'them', 'their', 'they', 'defined', 'define', 'defines',
     'invoke', 'invokes', 'invoked', 'numeric', 'trigger',
     'triggers', 'offending', 'exceeded', 'symbols',
+    'lazy', 'small', 'large', 'medium', 'improve', 'issues', 'usage', 'spent',
+    'correctness', 'possible', 'afterwards', 'progress', 'grill', 'philosophy',
+    'traditional', 'differs', 'approach', 'everything', 'anything',
 ]);
 
-function buildCorpusVocab(outDir) {
+const corpusVocabCache = new Map();
+
+function deriveVocabFromHydrated(vh) {
+    const nameTokens = new Set();
+    const validNameStems = new Set();
+    for (const t of vh.nameTokens) {
+        if (t.length >= 3 && !PROMPT_BOILERPLATE_NOISE.has(t)) {
+            nameTokens.add(t);
+            validNameStems.add(stemToken(t));
+        }
+    }
+    const nameStems = new Map();
+    for (const [s, c] of vh.nameStems) {
+        if (validNameStems.has(s))
+            nameStems.set(s, c);
+    }
+    const pathTokens = new Set();
+    for (const t of vh.pathTokens) {
+        if (t.length >= 3 && !PROMPT_BOILERPLATE_NOISE.has(t))
+            pathTokens.add(t);
+    }
+    return {
+        dfMap: vh.dfMap,
+        stemDf: vh.stemDf,
+        nameTokens,
+        nameStems,
+        pathTokens,
+        compoundSymbols: vh.compoundSymbols,
+        nDocs: vh.nDocs,
+    };
+}
+
+export function buildCorpusVocab(outDir) {
     const idx = loadAskIndexCached(outDir);
+    const cached = corpusVocabCache.get(outDir);
+    if (idx?.vocabHydrated) {
+        if (cached && cached.fromHydrated && cached.idxRef === idx)
+            return cached.vocab;
+        const vocab = deriveVocabFromHydrated(idx.vocabHydrated);
+        corpusVocabCache.set(outDir, { idxRef: idx, graphRef: null, fromHydrated: true, vocab });
+        return vocab;
+    }
     const graph = loadGraphCached(outDir);
-    if (!idx && !graph)
+    if (!idx && !graph) {
+        corpusVocabCache.delete(outDir);
         return null;
+    }
+    if (cached && !cached.fromHydrated && cached.idxRef === idx && cached.graphRef === graph)
+        return cached.vocab;
     const dfMap = idx ? new Map(idx.df) : new Map();
     const stemDf = new Map();
-    for (const [tok, c] of dfMap) {
-        const s = stemToken(tok);
-        stemDf.set(s, (stemDf.get(s) ?? 0) + c);
-    }
+    const buildDfFromGraph = !idx && Boolean(graph);
     const nameTokens = new Set();
     const nameStems = new Map();
     const pathTokens = new Set();
     const compoundSymbols = new Map();
     if (graph) {
         for (const n of graph.nodes) {
-            if (n.path) {
-                const base = basename(n.path).replace(/\.[a-z0-9]+$/i, '');
-                if (base.length >= 6)
-                    compoundSymbols.set(base.toLowerCase(), base);
+            if (buildDfFromGraph) {
+                const docToks = new Set([
+                    ...tokenize(n.name ?? ''),
+                    ...tokenize(n.path ?? ''),
+                    ...tokenize(`${n.signature ?? ''} ${n.summary ?? ''} ${n.body_text ?? ''}`),
+                ]);
+                const docStems = new Set();
+                for (const t of docToks) {
+                    dfMap.set(t, (dfMap.get(t) ?? 0) + 1);
+                    docStems.add(stemToken(t));
+                }
+                for (const s of docStems)
+                    stemDf.set(s, (stemDf.get(s) ?? 0) + 1);
             }
+            recordNodeCompoundVocab(n, compoundSymbols);
             for (const t of tokenize(n.path ?? '')) {
                 if (t.length >= 3 && !PROMPT_BOILERPLATE_NOISE.has(t))
                     pathTokens.add(t);
             }
             if (n.kind === 'file')
                 continue;
-            if (n.name) {
-                const bare = n.name.split(/[.:#]/).pop() ?? '';
-                const bareToks = tokenize(bare);
-                if (bare.length >= 6 && (!bare.includes('_') || bareToks.length >= 3 || bareToks.some((t) => t.length >= 7))) {
-                    compoundSymbols.set(bare.toLowerCase(), bare);
-                    const flat = bare.replace(/^_+/, '').replaceAll('_', '').toLowerCase();
-                    if (flat.length >= 6 && !compoundSymbols.has(flat))
-                        compoundSymbols.set(flat, bare);
-                    const strippedPrefix = bare.replace(/^(?:_?(?:on|handle|is)_|(?:on|handle|is|get)(?=[A-Z]))/, '');
-                    const flatStripped = strippedPrefix.replaceAll('_', '').toLowerCase();
-                    if (flatStripped.length >= 6 && !compoundSymbols.has(flatStripped))
-                        compoundSymbols.set(flatStripped, bare);
-                }
-                if (
-                    n.owner &&
-                    !bare.includes('_') &&
-                    !/[A-Z]/.test(bare.slice(1)) &&
-                    n.owner !== 'Command' &&
-                    !/^(?:module|exports|window|global|self|this)$/i.test(n.owner) &&
-                    !n.owner.startsWith('Socket')
-                ) {
-                    const qualKey = `${stemToken(n.owner.toLowerCase())}${stemToken(bare.toLowerCase())}`;
-                    if (qualKey.length >= 8 && !compoundSymbols.has(qualKey))
-                        compoundSymbols.set(qualKey, `${n.owner}.${bare}`);
-                }
-            }
             const seenStems = new Set();
             for (const t of tokenize(n.name ?? '')) {
                 if (t.length < 3 || PROMPT_BOILERPLATE_NOISE.has(t))
@@ -214,12 +244,28 @@ function buildCorpusVocab(outDir) {
             }
         }
     }
+    if (!buildDfFromGraph && idx?.docs) {
+        for (const d of idx.docs) {
+            const docStems = new Set();
+            for (const [t] of d.name ?? [])
+                docStems.add(stemToken(t));
+            for (const [t] of d.path ?? [])
+                docStems.add(stemToken(t));
+            for (const [t] of d.body ?? [])
+                docStems.add(stemToken(t));
+            for (const s of docStems)
+                stemDf.set(s, (stemDf.get(s) ?? 0) + 1);
+        }
+    }
     const nDocs = idx?.docCount || graph?.nodes?.length || 100;
-    return { dfMap, stemDf, nameTokens, nameStems, pathTokens, compoundSymbols, nDocs };
+    const vocab = { dfMap, stemDf, nameTokens, nameStems, pathTokens, compoundSymbols, nDocs };
+    corpusVocabCache.set(outDir, { idxRef: idx, graphRef: graph, fromHydrated: false, vocab });
+    return vocab;
 }
 
-function cleanPromptBoilerplate(raw) {
-    return String(raw ?? '')
+export function cleanPromptBoilerplate(raw) {
+    const preStripped = stripLeadingSlashCommands(String(raw ?? ''));
+    const body = preStripped
         .replace(/^Working directory:.*$/gm, '')
         .replace(/^A code repository is available in.*$/gm, '')
         .replace(/^Your task is to implement the changes.*$/gm, '')
@@ -233,14 +279,42 @@ function cleanPromptBoilerplate(raw) {
         .replace(/\b0[\s-]byte\b/gi, 'zero_size')
         .replace(/\/tmp\/[A-Za-z0-9._-]+\/(?:(?:clean|indexed)\/)?[A-Za-z0-9._-]+\/(?=[A-Za-z0-9_])/g, '')
         .replace(/`\/(?:tmp|app|workspace|home)\/[A-Za-z0-9._/-]*`/g, '')
-        .replace(/\/app\/(?=[A-Za-z0-9_])/g, '')
-        .trim();
+        .replace(/\/app\/(?=[A-Za-z0-9_])/g, '');
+    return stripLeadingSlashCommands(body);
 }
 
-export function detectPromptIntent(prompt) {
+const EDIT_VERB_RE = /\b(implement|add|extend|replace|update|rewrite|centralize|expose|forward|support)\b/i;
+
+function hasActionableEditIntent(raw, forceReadOnly = false) {
+    if (forceReadOnly || READ_ONLY_SLASH_RE.test(raw.trim()) || /\bAnswer concisely with exact\b/i.test(raw))
+        return false;
+    const cleaned = stripLeadingSlashCommands(raw)
+        .replace(/\b(?:do\s+not|don't|dont|never|without|not\s+to)\s+(?:[a-z]+\s+){0,2}(?:implement|add|extend|replace|update|rewrite|centralize|expose|forward|support)\b/gi, '')
+        .trim();
+    if (!EDIT_VERB_RE.test(cleaned))
+        return false;
+    const isInterrogativeLead = /^(?:how|why|what|where|when|which|who|is|are|does|do|can\s+you\s+(?:explain|tell|show|walk))\b/i.test(cleaned);
+    if (!isInterrogativeLead && !cleaned.endsWith('?'))
+        return true;
+    if (isInterrogativeLead && cleaned.endsWith('?') && !CODE_SIGNAL_RE.test(cleaned))
+        return false;
+    const clauses = cleaned
+        .split(/[?;\n]+|,\s*(?=(?:and|or|but|so|if|before|after|then|without|instead)\b)|\b(?:and\s+(?:how|whether|should|could|would|can|might|what)|so\s+(?:we|i|you)\s+(?:can|could)|if\s+(?:we|i|you)\b)/i)
+        .map((c) => c.trim())
+        .filter(Boolean);
+    if (isInterrogativeLead && clauses.length >= 1 && !EDIT_VERB_RE.test(clauses[0])) {
+        const trailingEditClauses = clauses.slice(1).filter((c) => EDIT_VERB_RE.test(c));
+        return trailingEditClauses.some((c) => CODE_SIGNAL_RE.test(c) && !/^(?:and\s+|or\s+)?(?:how|whether|should|could|would|might|what\s+would)\b/i.test(c));
+    }
+    if (/^(?:how\s+(?:does|do|is|are|did|can\s+we|could\s+we|should\s+we|would\s+we)|does\b|do\b|is\b|are\b|why\b|what\b|where\b|who\b|which\b)/i.test(cleaned) && cleaned.endsWith('?')) {
+        return false;
+    }
+    return true;
+}
+
+export function detectPromptIntent(prompt, opts = {}) {
     const raw = String(prompt ?? '');
-    const editEnvelope = /\b(implement|add|extend|replace|update|rewrite|centralize|expose|forward|support)\b/i.test(raw) &&
-        !/\bAnswer concisely with exact\b/i.test(raw);
+    const editEnvelope = hasActionableEditIntent(raw, Boolean(opts.forceReadOnly));
     const wantsCallSites = !editEnvelope && /\b(callers?|who\s+calls|direct\s+callers|second-hop\s+callers?|blast\s+radius|who\s+uses|used\s+by|where\s+is\b[\s\S]{0,40}\b(?:called|used|invoked)|which\s+(?:functions|modules|cli\s+commands|handlers)\b[\s\S]{0,60}\b(?:call|invoke))\b/i.test(raw);
     return { wantsCallSites, editEnvelope };
 }
@@ -248,8 +322,6 @@ export function detectPromptIntent(prompt) {
 function extractBacktickPhrases(cleaned) {
     const backtickPhrases = [];
     const backticked = new Set();
-    if (!PROMPT_BOILERPLATE_NOISE.has('plexer'))
-        PROMPT_BOILERPLATE_NOISE.add('plexer');
     for (const m of cleaned.matchAll(/`([^`\n]{2,80})`/g)) {
         const inner = m[1].trim().replace(/^\/app\//, '');
         if (/^(?:\/tmp\/|\/home\/|\/var\/)/i.test(inner))
@@ -507,9 +579,13 @@ function distillMultiFileReqQueries(vocab, outDir, cleaned, uniqueFiles, ifaceTy
         usedIdx.add(p.idx);
     }
     const queries = [];
+    const sharedCoreMatch = cleaned.slice(0, 320).match(/`([A-Za-z_][A-Za-z0-9_]{2,18})`/g);
+    const sharedHint = sharedCoreMatch
+        ? sharedCoreMatch.map((x) => x.slice(1, -1)).filter((x) => !x.includes('/') && !x.includes('.')).slice(0, 2).join(' ')
+        : '';
     for (const fRel of targetFiles) {
         const matchedClause = assigned.get(fRel) ?? '';
-        const sub = distillSegment(vocab, `\`${fRel}\` ${matchedClause}`, 5, 2);
+        const sub = distillSegment(vocab, `\`${fRel}\` ${matchedClause} ${sharedHint}`, 6, 2);
         if (sub && !queries.includes(sub))
             queries.push(sub);
     }
@@ -688,7 +764,7 @@ export function distillPromptQueries(root, contextDir, prompt) {
     const rawToks = tokenize(cleaned);
     if (rawToks.length <= 16)
         return [cleaned || prompt];
-    const outDir = contextDir ?? resolveContextDir(root);
+    const outDir = contextDir ?? contextDirFor(root);
     const vocab = buildCorpusVocab(outDir);
     if (!vocab)
         return [cleaned];
@@ -698,16 +774,19 @@ export function distillPromptQueries(root, contextDir, prompt) {
     const parts = cleaned.split(/\n(?=\s*\d+\.\s+)/).map((s) => s.trim()).filter(Boolean);
     if (parts.length >= 2) {
         const hasNumberedHeader = /^\d+\.\s/.test(parts[0]);
-        const leadWords = hasNumberedHeader ? '' : distillSegment(vocab, parts[0], 2, 1);
-        const subItems = (hasNumberedHeader ? parts : parts.slice(1)).slice(0, 3);
+        const headerNoAlongside = (parts[0] ?? '').replace(/\balongside\b[^)\n]*/gi, '');
+        const leadWords = hasNumberedHeader ? '' : distillSegment(vocab, headerNoAlongside, 2, 1);
+        const rawSubItems = hasNumberedHeader ? parts : parts.slice(1);
+        const subItems = rawSubItems.slice(0, rawSubItems.length >= 4 ? 4 : 3);
         return subItems.map((item, idx) => {
             const sub = distillSegment(vocab, item, 7, 3);
             if (!leadWords || (idx > 0 && /`[A-Za-z0-9_]+\/[A-Za-z0-9_/-]*`/.test(item)))
                 return sub;
             const subToks = new Set(sub.split(/\s+/).filter(Boolean));
+            const hasSubCompound = /[a-z][A-Z]|[A-Za-z0-9]_[A-Za-z0-9]/.test(sub);
             const leadExtra = leadWords
                 .split(/\s+/)
-                .filter((w) => w && !subToks.has(w))
+                .filter((w) => w && !subToks.has(w) && !(hasSubCompound && /[a-z][A-Z]|[A-Za-z0-9]_[A-Za-z0-9]/.test(w)) && (idx === 0 || !/^(?:insert|remove|move)$/.test(w)))
                 .join(' ');
             return leadExtra ? `${sub} ${leadExtra}`.trim() : sub;
         });
@@ -728,28 +807,58 @@ export const HOOK_BUDGETS = {
     qaMultiHitBytes: 3800,
     qaMergedBytes: 6800,
     qaMaxInlined: 5,
-    editSingleHitBytes: 1450,
-    editMultiHitBytes: 1150,
-    editMergedBytes: 3800,
+    editSingleHitBytes: 2400,
+    editMultiHitBytes: 1850,
+    editMergedBytes: 4200,
     editMaxInlined: 3,
     singleQueryInline: 3,
     multiQueryInline: 1,
     pinBytes: 5350,
     pinMax: 3,
-    editTotalBytes: 4800,
+    editTotalBytes: 4950,
 };
-function isPinCoveredByRankedHits(p, rankedHits) {
-    if (!p.a || !p.b || p.code?.includes('// delegator in '))
-        return false;
+function findCoveringRankedHit(p, rankedHits) {
+    if (!p.a || !p.b || p.code?.includes('// delegator in ') || p.code?.includes('// caller in ') || p.code?.includes('// constructor in '))
+        return null;
     const pFile = (p.pointer ?? '').split(':')[0];
     const pBytes = Buffer.byteLength(p.code ?? '', 'utf8');
-    return rankedHits.some((h) => h.code &&
+    return rankedHits.find((h) => h.code &&
         ((h.pointer === p.pointer && Buffer.byteLength(h.code, 'utf8') >= pBytes) ||
             (!h.code.includes('omitted)') &&
                 !h.code.includes('excerpt of') &&
                 (h.pointer ?? '').split(':')[0] === pFile &&
-                h.code.includes(`L${p.a}:`) &&
-                h.code.includes(`L${p.b}:`))));
+                ((h.code.includes(`L${p.a}:`) && h.code.includes(`L${p.b}:`)) ||
+                    pointerCovers(h.pointer, p.pointer))))) ?? null;
+}
+function isPinCoveredByRankedHits(p, rankedHits) {
+    const covering = findCoveringRankedHit(p, rankedHits);
+    if (!covering)
+        return false;
+    covering.pinned = true;
+    if (covering.title && !covering.title.includes('(named in prompt)'))
+        covering.title = `${covering.title} (named in prompt)`;
+    return true;
+}
+function inlinedLineNumbers(code) {
+    const nums = new Set();
+    for (const m of String(code ?? '').matchAll(/^L(\d+):/gm))
+        nums.add(Number(m[1]));
+    return nums;
+}
+function hasDuplicateInlinedSpan(h, p) {
+    if (!h.code || !p.code || !pointersOverlap(p.pointer, h.pointer))
+        return false;
+    const hLines = inlinedLineNumbers(h.code);
+    const pLines = inlinedLineNumbers(p.code);
+    if (!hLines.size || !pLines.size)
+        return false;
+    let shared = 0;
+    for (const ln of pLines) {
+        if (hLines.has(ln))
+            shared++;
+    }
+    const minSize = Math.min(hLines.size, pLines.size);
+    return shared >= 4 || (minSize > 0 && shared / minSize >= 0.5);
 }
 function inheritRankedHitEnrichments(p, rankedHits) {
     for (const h of rankedHits) {
@@ -767,17 +876,26 @@ function inheritRankedHitEnrichments(p, rankedHits) {
 }
 function trimRestHitCodeToBudget(rest, pins, rawPins) {
     for (const h of rest) {
-        if (h.code && pins.filter((p) => pointerCovers(h.pointer, p.pointer)).reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0) >= 1200) {
+        if (h.pinned || !h.code)
+            continue;
+        const coveredPinBytes = pins
+            .filter((p) => pointerCovers(h.pointer, p.pointer))
+            .reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0);
+        if (coveredPinBytes >= 1200 || pins.some((p) => hasDuplicateInlinedSpan(h, p))) {
             delete h.code;
         }
     }
-    let totalCodeBytes = pins.reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0);
+    const pinnedRestCount = rest.filter((h) => h.pinned).length;
+    let totalCodeBytes = pins.reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0) +
+        rest.filter((h) => h.pinned && h.code).reduce((a, h) => a + Buffer.byteLength(h.code, 'utf8'), 0);
     const maxTotalBytes = HOOK_BUDGETS.editTotalBytes ?? 4600;
-    const maxRestInlined = pins.length >= 2 ? 2 : 3;
+    const maxRestInlined = (pins.length + pinnedRestCount) >= 2 ? 2 : 3;
     let restInlined = 0;
     const matchingPin = (h) => h.code ? rawPins.find((p) => p.a && p.b && (h.pointer ?? '').split(':')[0] === (p.pointer ?? '').split(':')[0] && h.code.includes(`L${p.a}:`) && h.code.includes(`L${p.b}:`)) : null;
     for (const pass of [true, false]) {
         for (const h of rest) {
+            if (h.pinned)
+                continue;
             const mp = matchingPin(h);
             if (!h.code || Boolean(mp) !== pass)
                 continue;
@@ -791,9 +909,13 @@ function trimRestHitCodeToBudget(rest, pins, rawPins) {
                 restInlined++;
                 continue;
             }
-            const fallbackCode = mp?.code ?? (h.code.includes('\n\n// ') ? h.code.slice(0, h.code.indexOf('\n\n// ')) : null);
+            let partialHelpersCode = !mp?.code && h.code.includes('\n\n// ') ? h.code : null;
+            while (partialHelpersCode && partialHelpersCode.includes('\n\n// ') && totalCodeBytes + Buffer.byteLength(partialHelpersCode, 'utf8') > maxTotalBytes + 450) {
+                partialHelpersCode = partialHelpersCode.slice(0, partialHelpersCode.lastIndexOf('\n\n// '));
+            }
+            const fallbackCode = mp?.code ?? partialHelpersCode ?? (h.code.includes('\n\n// ') ? h.code.slice(0, h.code.indexOf('\n\n// ')) : null);
             const fb = fallbackCode ? Buffer.byteLength(fallbackCode, 'utf8') : Infinity;
-            if (fallbackCode && totalCodeBytes + fb <= maxTotalBytes) {
+            if (fallbackCode && totalCodeBytes + fb <= maxTotalBytes + (partialHelpersCode?.includes('\n\n// ') ? 450 : 0)) {
                 h.code = fallbackCode;
                 totalCodeBytes += fb;
                 restInlined++;
@@ -810,6 +932,25 @@ function trimRestHitCodeToBudget(rest, pins, rawPins) {
                 delete h.code;
             }
             else {
+                const room = maxTotalBytes + 450 - totalCodeBytes;
+                if (room >= 450 && h.code) {
+                    const lines = h.code.split('\n');
+                    const kept = [];
+                    let used = 0;
+                    for (const l of lines) {
+                        const lb = Buffer.byteLength(l, 'utf8') + 1;
+                        if (used + lb > room)
+                            break;
+                        kept.push(l);
+                        used += lb;
+                    }
+                    if (kept.length >= 6) {
+                        h.code = kept.join('\n');
+                        totalCodeBytes += used;
+                        restInlined++;
+                        continue;
+                    }
+                }
                 delete h.code;
             }
         }
@@ -819,14 +960,14 @@ function trimRestHitCodeToBudget(rest, pins, rawPins) {
  * Turn-0 retrieval for a prompt: definitions the prompt names as code are pinned first
  * (see `pin.js`), then ranked retrieval fills in the rest, minus anything a pin covers.
  */
-export function queryPromptContext(dir, prompt) {
-    const res = searchPromptContext(dir, prompt);
-    const isEdit = res?.isEditPrompt ?? detectPromptIntent(prompt).editEnvelope;
+export function queryPromptContext(dir, prompt, opts = {}) {
+    const res = searchPromptContext(dir, prompt, opts);
+    const isEdit = res?.isEditPrompt ?? detectPromptIntent(prompt, opts).editEnvelope;
     let pins = [];
     let rawPins = [];
     try {
         const root = nearestPlexerRoot(dir)?.root ?? dir;
-        const graph = loadGraphCached(resolveContextDir(root));
+        const graph = loadGraphCached(contextDirFor(root));
         const rankedHits = res?.hits ?? [];
         const hintFiles = res?.allFiles ?? [...new Set(rankedHits.map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean))];
         rawPins = (isEdit && HOOK_BUDGETS.pinMax > 0) ? pinnedHits(root, graph, prompt, {
@@ -848,7 +989,10 @@ export function queryPromptContext(dir, prompt) {
         return res;
     const rest = (res?.hits ?? []).filter((h) => !pins.some((p) => pointerCovers(p.pointer, h.pointer)));
     trimRestHitCodeToBudget(rest, pins, rawPins);
-    const keptRest = (pins.length >= 3 && !rest.some((h) => h.code)) ? [] : rest;
+    const pinnedRestCount = rest.filter((h) => h.pinned).length;
+    const pinnedFiles = new Set([...pins, ...rest.filter((h) => h.pinned)].map((p) => (p.pointer ?? '').split(':')[0]).filter(Boolean));
+    const novelRest = rest.filter((h) => h.pinned || !pinnedFiles.has((h.pointer ?? '').split(':')[0]));
+    const keptRest = ((pins.length + pinnedRestCount) >= 3 && !rest.some((h) => !h.pinned && h.code)) ? novelRest.slice(0, 2 + pinnedRestCount) : rest;
     return {
         ...(res ?? { query: prompt, mode: 'lexical', isEditPrompt: isEdit }),
         hits: [...pins, ...keptRest],
@@ -877,7 +1021,9 @@ function mergeMultiQueryHits(results, editEnvelope) {
         return true;
     };
     for (const r of results) {
-        pushMergedHit(r?.hits?.[0], 0, 1);
+        if (!pushMergedHit(r?.hits?.[0], 0, 1) && editEnvelope) {
+            pushMergedHit(r?.hits?.[1], 1, 1);
+        }
     }
     for (const r of results) {
         const h0 = r?.hits?.[0];
@@ -1060,10 +1206,10 @@ function reclaimPrevHitHelpersForCandidate(mergedHits, idx, h, inlinedBytes, max
 
 function enforceMergedHitsBudget(mergedHits, intent, queryCount) {
     const maxMergedBytes = intent.editEnvelope
-        ? (queryCount >= 4 ? Math.max(HOOK_BUDGETS.editMergedBytes, 3800) : HOOK_BUDGETS.editMergedBytes)
-        : HOOK_BUDGETS.qaMergedBytes;
+        ? (queryCount >= 3 ? Math.max(HOOK_BUDGETS.editMergedBytes, 4800) : HOOK_BUDGETS.editMergedBytes)
+        : (intent.wantsCallSites ? Math.min(HOOK_BUDGETS.qaMergedBytes, 6400) : HOOK_BUDGETS.qaMergedBytes);
     const maxInlinedHits = intent.editEnvelope
-        ? Math.max(HOOK_BUDGETS.editMaxInlined, queryCount >= 4 ? 4 : 0)
+        ? Math.max(HOOK_BUDGETS.editMaxInlined, queryCount >= 3 ? 4 : 0)
         : HOOK_BUDGETS.qaMaxInlined;
     let inlinedBytes = 0;
     let inlinedCount = 0;
@@ -1123,83 +1269,106 @@ function enforceMergedHitsBudget(mergedHits, intent, queryCount) {
     }
 }
 
-function searchPromptContext(dir, prompt) {
-    const root = nearestPlexerRoot(dir)?.root ?? dir;
-    const scopeHint = lastFileScopeHint(root, readStats(root)?.lastFile);
-    const contextDir = process.env.PLEXER_DIR ? resolveContextDir(root) : undefined;
-    try {
-        const intent = detectPromptIntent(prompt);
-        const queries = distillPromptQueries(root, contextDir, prompt);
-        if (readWorkspace(root, contextDir)) {
-            return federateAsk(root, contextDir, queries[0], {
+function runScopedPromptQueries(root, contextDir, queries, intent, scope) {
+    if (readWorkspace(root, contextDir)) {
+        return federateAsk(root, contextDir, queries[0], {
+            limit: 3,
+            source: true,
+            in: scope ?? undefined,
+        });
+    }
+    if (queries.length === 1) {
+        const singleRes = runAsk(root, queries[0], {
+            limit: 3,
+            source: true,
+            maxHitsToInline: HOOK_BUDGETS.singleQueryInline,
+            maxSourceBytes: intent.editEnvelope ? HOOK_BUDGETS.editSingleHitBytes : HOOK_BUDGETS.qaSingleHitBytes,
+            wantsCallSites: intent.wantsCallSites,
+            editEnvelope: intent.editEnvelope,
+            includeRankingMetadata: false,
+            contextDir,
+            in: scope ?? undefined,
+        });
+        if (singleRes)
+            singleRes.isEditPrompt = intent.editEnvelope;
+        return singleRes;
+    }
+    const seen = new Set();
+    const results = [];
+    for (let qIdx = 0; qIdx < queries.length; qIdx++) {
+        const q = queries[qIdx];
+        results.push(
+            runAsk(root, q, {
                 limit: 3,
                 source: true,
-                in: scopeHint ?? undefined,
-            });
-        }
-        if (queries.length === 1) {
-            const singleRes = runAsk(root, queries[0], {
-                limit: 3,
-                source: true,
-                maxHitsToInline: HOOK_BUDGETS.singleQueryInline,
-                maxSourceBytes: intent.editEnvelope ? HOOK_BUDGETS.editSingleHitBytes : HOOK_BUDGETS.qaSingleHitBytes,
+                subQueryIndex: qIdx,
+                maxHitsToInline: (qIdx === 0 && !intent.editEnvelope && intent.wantsCallSites) ? 2 : HOOK_BUDGETS.multiQueryInline,
+                maxSourceBytes: intent.editEnvelope
+                    ? HOOK_BUDGETS.editMultiHitBytes
+                    : (qIdx === 0 && intent.wantsCallSites
+                        ? HOOK_BUDGETS.qaMultiHitBytes + 1100
+                        : (qIdx > 0 && intent.wantsCallSites ? 2600 : HOOK_BUDGETS.qaMultiHitBytes)),
                 wantsCallSites: intent.wantsCallSites,
                 editEnvelope: intent.editEnvelope,
                 includeRankingMetadata: false,
+                seenPointers: seen,
                 contextDir,
-                in: scopeHint ?? undefined,
-            });
-            if (singleRes)
-                singleRes.isEditPrompt = intent.editEnvelope;
-            return singleRes;
-        }
-        const seen = new Set();
-        const results = [];
-        for (let qIdx = 0; qIdx < queries.length; qIdx++) {
-            const q = queries[qIdx];
-            results.push(
-                runAsk(root, q, {
-                    limit: 3,
-                    source: true,
-                    maxHitsToInline: (qIdx === 0 && !intent.editEnvelope && intent.wantsCallSites) ? 2 : HOOK_BUDGETS.multiQueryInline,
-                    maxSourceBytes: intent.editEnvelope
-                        ? HOOK_BUDGETS.editMultiHitBytes
-                        : (qIdx === 0 && intent.wantsCallSites
-                            ? HOOK_BUDGETS.qaMultiHitBytes + 1100
-                            : (qIdx > 0 && intent.wantsCallSites ? 2800 : HOOK_BUDGETS.qaMultiHitBytes)),
-                    wantsCallSites: intent.wantsCallSites,
-                    editEnvelope: intent.editEnvelope,
-                    includeRankingMetadata: false,
-                    seenPointers: seen,
-                    contextDir,
-                    in: scopeHint ?? undefined,
-                })
-            );
-        }
-        const mergedHits = mergeMultiQueryHits(results, intent.editEnvelope);
-        enforceMergedHitsBudget(mergedHits, intent, queries.length);
-        const topHits = mergedHits.slice(0, 4);
-        const fileQueryCount = new Map();
-        for (const r of results) {
-            const seenInQ = new Set();
-            for (const h of r?.hits ?? []) {
-                const f = (h.pointer ?? '').split(':')[0];
-                if (f && !seenInQ.has(f)) {
-                    seenInQ.add(f);
-                    fileQueryCount.set(f, (fileQueryCount.get(f) ?? 0) + 1);
-                }
+                in: scope ?? undefined,
+            })
+        );
+    }
+    const mergedHits = mergeMultiQueryHits(results, intent.editEnvelope);
+    enforceMergedHitsBudget(mergedHits, intent, queries.length);
+    const topHits = mergedHits.slice(0, queries.length >= 4 ? 5 : 4);
+    const fileQueryCount = new Map();
+    for (const r of results) {
+        const seenInQ = new Set();
+        for (const h of r?.hits ?? []) {
+            const f = (h.pointer ?? '').split(':')[0];
+            if (f && !seenInQ.has(f)) {
+                seenInQ.add(f);
+                fileQueryCount.set(f, (fileQueryCount.get(f) ?? 0) + 1);
             }
         }
-        const multiQueryFiles = [...fileQueryCount.entries()].filter(([, c]) => c >= 2).map(([f]) => f);
-        return {
-            query: queries.join(' ; '),
-            mode: 'lexical',
-            hits: topHits,
-            allFiles: [...new Set([...topHits.filter((h) => h.code || !h.title?.includes(' · type')).map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean), ...multiQueryFiles])],
-            isEditPrompt: intent.editEnvelope,
-            coverage: Math.max(...results.map((r) => r?.coverage ?? 0)),
-            coverageStrong: Math.max(...results.map((r) => r?.coverageStrong ?? 0)),
-        };
+    }
+    const multiQueryFiles = [...fileQueryCount.entries()].filter(([, c]) => c >= 2).map(([f]) => f);
+    return {
+        query: queries.join(' ; '),
+        mode: 'lexical',
+        hits: topHits,
+        allFiles: [...new Set([...topHits.filter((h) => h.code || !h.title?.includes(' · type')).map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean), ...multiQueryFiles])],
+        isEditPrompt: intent.editEnvelope,
+        coverage: Math.max(...results.map((r) => r?.coverage ?? 0)),
+        coverageStrong: Math.max(...results.map((r) => r?.coverageStrong ?? 0)),
+    };
+}
+
+function isUnscopedStronger(scoped, unscoped) {
+    if (!unscoped?.hits?.length)
+        return false;
+    if (!scoped?.hits?.length)
+        return true;
+    const uStrong = unscoped.coverageStrong ?? 0;
+    const sStrong = scoped.coverageStrong ?? 0;
+    if (uStrong !== sStrong)
+        return uStrong > sStrong;
+    return (unscoped.coverage ?? 0) > (scoped.coverage ?? 0);
+}
+
+function searchPromptContext(dir, prompt, opts = {}) {
+    const root = nearestPlexerRoot(dir)?.root ?? dir;
+    const scopeHint = lastFileScopeHint(root, readStats(root)?.lastFile);
+    const contextDir = process.env.PLEXER_DIR ? contextDirFor(root) : undefined;
+    try {
+        const intent = detectPromptIntent(prompt, opts);
+        const queries = distillPromptQueries(root, contextDir, prompt);
+        const scopedRes = runScopedPromptQueries(root, contextDir, queries, intent, scopeHint);
+        if (scopeHint && (!scopedRes?.hits?.length || (scopedRes.coverageStrong ?? 0) < 0.25)) {
+            const unscopedRes = runScopedPromptQueries(root, contextDir, queries, intent, null);
+            if (isUnscopedStronger(scopedRes, unscopedRes))
+                return unscopedRes;
+        }
+        return scopedRes;
     }
     catch (err) {
         if (process.env.PLEXER_DEBUG) {
@@ -1216,17 +1385,21 @@ export function handlePostEdit(input, dir) {
         return;
     const id = input?.session_id || 'default';
     const s = readSession(dir, id);
-    const base = basename(editedFile || '');
+    const absEdited = editedFile ? (isAbsolute(editedFile) ? editedFile : join(dir, editedFile)) : '';
+    const relEdited = absEdited
+        ? (relative(resolve(dir), resolve(absEdited)).replace(/\\/g, '/') || basename(absEdited))
+        : '';
     if (!Array.isArray(s.emittedBlastFiles))
         s.emittedBlastFiles = [];
-    const alreadyInTurn0 = (s.injectedPointers ?? []).some((p) =>
-        String(p).split(':')[0] === base || String(p).split(':')[0].endsWith(`/${base}`),
-    );
-    if (base && (s.emittedBlastFiles.includes(base) || alreadyInTurn0)) {
+    const alreadyInTurn0 = Boolean(relEdited) && (s.injectedPointers ?? []).some((p) => {
+        const pFile = String(p).split(':')[0].replace(/\\/g, '/');
+        return pFile === relEdited || relEdited.endsWith(`/${pFile}`);
+    });
+    if (relEdited && (s.emittedBlastFiles.includes(relEdited) || alreadyInTurn0)) {
         return;
     }
-    if (base) {
-        s.emittedBlastFiles.push(base);
+    if (relEdited) {
+        s.emittedBlastFiles.push(relEdited);
         writeSession(dir, id, s);
     }
     emit('PostToolUse', br);
@@ -1236,7 +1409,7 @@ export function lastFileScopeHint(dir, lastFile) {
     if (!lastFile)
         return null;
     try {
-        const w = loadGraphCached(resolveContextDir(dir));
+        const w = loadGraphCached(contextDirFor(dir));
         if (!w)
             return null;
         const scopes = scopesOfGraph(w);
@@ -1289,24 +1462,23 @@ export function handleStop(_input, dir) {
 export async function main(event) {
     const input = readStdin();
     if (event === 'agy-pre-invocation' || event === 'agy-post-edit' || event === 'agy-stop') {
-        const agyHooksPath = ['..', 'hosts', 'antigravity-hooks.js'].join('/');
-        const agyMod = await import(agyHooksPath);
-        await agyMod['dispatchAgyEvent'](event, input);
+        const agyHooksUrl = new URL(['..', 'hosts', 'antigravity-hooks.js'].join('/'), import.meta.url).href;
+        const agyMod = await import(agyHooksUrl);
+        await agyMod.dispatchAgyEvent(event, input);
         return;
     }
-
     const rawDir = projectDir(input);
     const dir = nearestPlexerRoot(rawDir)?.root ?? rawDir;
     if (process.env.PLEXER_DISABLE_HOOKS === '1') {
         return;
     }
-    if (!existsSync(resolveContextDir(dir)) && (event === 'session-start' || event === 'prompt') && isAutoBuildableRepo(dir)) {
+    if (!existsSync(contextDirFor(dir)) && (event === 'session-start' || event === 'prompt') && isAutoBuildableRepo(dir)) {
         try {
             await ensureFreshGraph(dir);
         }
         catch { /* best-effort auto-build */ }
     }
-    if (!existsSync(resolveContextDir(dir))) {
+    if (!existsSync(contextDirFor(dir))) {
         return;
     }
     writeAgyLastRepo(dir);
@@ -1341,7 +1513,7 @@ export async function main(event) {
         if (prompt === s.lastQuery)
             return;
         const isFollowUp = (s.injectedPointers?.length ?? 0) > 0;
-        const ask = queryPromptContext(dir, prompt);
+        const ask = queryPromptContext(dir, prompt, { forceReadOnly: READ_ONLY_SLASH_RE.test(rawPrompt) });
         if (!ask)
             return;
         s.lastQuery = prompt;

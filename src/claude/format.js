@@ -1,4 +1,4 @@
-import { basename } from 'node:path';
+import { basename, relative, resolve } from 'node:path';
 import { isRedundantSnippet } from '../ask/ask.js';
 import { HIGH_FLOOR, STRONG_FLOOR } from '../ask/fuse.js';
 const C = {
@@ -42,6 +42,20 @@ function nodeIdsInFile(w, filePath, dir) {
             norm = norm.slice(normDir.length + 1);
         }
     }
+    if (w._nodesByPath) {
+        const exactNodes = w._nodesByPath.get(norm);
+        if (exactNodes && exactNodes.length > 0)
+            return new Set(exactNodes.map((n) => n.id));
+        let bestLen = 0;
+        let bestNodes = null;
+        for (const [p, list] of w._nodesByPath) {
+            if (norm.endsWith(`/${p}`) && p.length > bestLen) {
+                bestLen = p.length;
+                bestNodes = list;
+            }
+        }
+        return bestNodes ? new Set(bestNodes.map((n) => n.id)) : new Set();
+    }
     const exact = nodes.filter((n) => n.path && n.path === norm);
     if (exact.length > 0)
         return new Set(exact.map((n) => n.id));
@@ -65,7 +79,18 @@ export function incomingEdges(w, filePath, dir) {
         return [];
     const byId = w._byId ?? new Map((w.nodes ?? []).map((n) => [n.id, n]));
     const isTestTarget = /(?:^|\/)(?:tests?|specs?|__tests__|fixtures?)\b|(?:\.|_)(?:test|spec)\.[a-z0-9]+$/i.test(filePath);
-    return (w.edges ?? []).filter((e) => {
+    const candidateEdges = [];
+    if (w._inEdges) {
+        for (const id of ids) {
+            const list = w._inEdges.get(id);
+            if (list)
+                candidateEdges.push(...list);
+        }
+    }
+    else {
+        candidateEdges.push(...(w.edges ?? []));
+    }
+    return candidateEdges.filter((e) => {
         if (!ids.has(e.target) || ids.has(e.source))
             return false;
         if (!isTestTarget) {
@@ -82,14 +107,83 @@ export function formatBlastRadius(w, filePath, cap = 8, dir) {
     if (!edges.length)
         return null;
     const byId = w._byId ?? new Map((w.nodes ?? []).map((n) => [n.id, n]));
+    const baseCounts = new Map();
+    for (const n of w.nodes ?? []) {
+        if (n.kind === 'file' && n.path) {
+            const b = basename(n.path);
+            baseCounts.set(b, (baseCounts.get(b) || 0) + 1);
+        }
+    }
+    const displayFile = (p) => {
+        const b = basename(p);
+        if ((baseCounts.get(b) || 0) <= 1)
+            return b;
+        if (dir) {
+            const rel = relative(resolve(dir), resolve(dir, p)).replace(/\\/g, '/');
+            if (rel && !rel.startsWith('..'))
+                return rel;
+        }
+        return p.replace(/\\/g, '/');
+    };
     const allItems = [...new Set(edges.map((e) => {
         const n = byId.get(e.source);
-        const label = n ? `${n.name} (${basename(n.path)})` : e.source;
+        const label = n ? `${n.name} (${displayFile(n.path)})` : e.source;
         return ` • ${e.relation} ← ${label}`;
     }))];
     const items = allItems.slice(0, cap);
     const more = allItems.length > cap ? `\n • +${allItems.length - cap} more` : '';
-    return `[plexer] blast radius for ${basename(filePath)}, who depends on it:\n${items.join('\n')}${more}`;
+    const headerTarget = dir && (baseCounts.get(basename(filePath)) || 0) > 1
+        ? (relative(resolve(dir), resolve(filePath)).replace(/\\/g, '/') || basename(filePath))
+        : basename(filePath);
+    return `[plexer] blast radius for ${headerTarget}, who depends on it:\n${items.join('\n')}${more}`;
+}
+function selectDiverseCallSites(callSites, maxCs) {
+    if (callSites.length <= maxCs)
+        return callSites;
+    const byFile = new Map();
+    for (const cs of callSites) {
+        const m = /\(([^():]+):L\d+/.exec(cs);
+        const file = m ? m[1] : cs;
+        const caller = (m ? cs.slice(0, m.index) : cs).trim();
+        let entry = byFile.get(file);
+        if (!entry) {
+            entry = { seenCallers: new Set(), primary: [], repeats: [] };
+            byFile.set(file, entry);
+        }
+        if (caller && !entry.seenCallers.has(caller)) {
+            entry.seenCallers.add(caller);
+            entry.primary.push(cs);
+        }
+        else {
+            entry.repeats.push(cs);
+        }
+    }
+    const queues = [...byFile.values()].map((e) => [...e.primary, ...e.repeats]);
+    const selected = [];
+    while (selected.length < maxCs) {
+        let progressed = false;
+        for (const q of queues) {
+            if (!q.length)
+                continue;
+            selected.push(q.shift());
+            progressed = true;
+            if (selected.length >= maxCs)
+                break;
+        }
+        if (!progressed)
+            break;
+    }
+    return selected;
+}
+function hasExplicitPathHitMatch(ask) {
+    const q = String(ask.query ?? '').toLowerCase();
+    if (!q)
+        return false;
+    const refs = q.match(/[a-z0-9_.-]+\/[a-z0-9_./-]+|[a-z0-9_-]+\.(?:py|go|js|ts|tsx|jsx|mjs|cjs|luau|lua|rs|c|cc|cpp|h|hpp|java|rb|php|cs|swift|kt|scala|sh|json|toml|yaml|yml|md)\b/g);
+    if (!refs)
+        return false;
+    const hitFiles = (ask.hits ?? []).map((h) => String(h.pointer ?? '').split(':')[0].replace(/\\/g, '/').toLowerCase()).filter(Boolean);
+    return refs.some((ref) => hitFiles.some((f) => f === ref || f.endsWith(`/${ref}`) || f.includes(ref)));
 }
 function retrievalBody(hits, isEditPrompt = false) {
     let ranked = 0;
@@ -101,33 +195,47 @@ function retrievalBody(hits, isEditPrompt = false) {
         const num = n + 1;
         const ptr = (h.pointer ?? '').split(',')[0].trim();
         const fileKey = ptr.split(':')[0];
-        const snip = (h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
-        const redundant = isRedundantSnippet(snip, h.code);
-        let b = ` ${num}. ${h.title}: ${ptr}`;
-        if (snip && !redundant && (!isEditPrompt || !h.code))
-            b += `\n    ${snip}`;
-        if (h.related?.length && (isEditPrompt ? Boolean(h.code) || i < 2 : (h.code || i < 2)))
-            b += `\n    related: ${h.related.slice(0, 6).join(', ')}`;
-        if (h.code && h.callSites?.length && (h.wantsCallSites || (isEditPrompt && i === 0 && h.callSites.length <= 2))) {
-            const maxCs = h.wantsCallSites ? 26 : 2;
-            b += `\n    call sites (${h.callSites.length}):`;
-            for (const cs of h.callSites.slice(0, maxCs))
-                b += `\n      ← ${cs}`;
+        let codeToRender = h.code;
+        if (codeToRender && codeToRender.includes('// other symbols in ')) {
+            if (fileKey && seenSymbolFiles.has(fileKey)) {
+                codeToRender = codeToRender.replace(/\n*\/\/ other symbols in [^\n]+/g, '');
+            }
+            else if (fileKey) {
+                seenSymbolFiles.add(fileKey);
+            }
         }
-        if (h.otherSymbols && !h.code && i < 3 && (!fileKey || !seenSymbolFiles.has(fileKey))) {
+        const snip = (h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
+        const redundant = isRedundantSnippet(snip, codeToRender);
+        let b = ` ${num}. ${h.title}: ${ptr}`;
+        if (snip && !redundant && (!isEditPrompt || !codeToRender))
+            b += `\n    ${snip}`;
+        if (h.related?.length && (codeToRender || i < 2))
+            b += `\n    related: ${h.related.slice(0, 6).join(', ')}`;
+        if (codeToRender && h.callSites?.length && (h.wantsCallSites || (isEditPrompt && i === 0 && h.callSites.length <= 2))) {
+            const maxCs = h.wantsCallSites ? 12 : 2;
+            const selected = selectDiverseCallSites(h.callSites, maxCs);
+            b += `\n    call sites (${h.callSites.length}):`;
+            for (const cs of selected)
+                b += `\n      ← ${cs}`;
+            if (h.callSites.length > selected.length) {
+                const symName = String(h.title ?? '').split(' · ')[0].replace(/\s*\(named in prompt\)\s*$/, '').trim() || '<sym>';
+                b += `\n      … +${h.callSites.length - selected.length} more — run \`plexer callers ${symName}\``;
+            }
+        }
+        if (h.otherSymbols && !codeToRender && i < 3 && (!fileKey || !seenSymbolFiles.has(fileKey))) {
             if (fileKey)
                 seenSymbolFiles.add(fileKey);
             b += `\n    symbols: ${h.otherSymbols.split(', ').slice(0, 6).join(', ')}`;
         }
-        if (h.code)
-            b += `\n\`\`\`\n${h.code}\n\`\`\``;
+        if (codeToRender)
+            b += `\n\`\`\`\n${codeToRender}\n\`\`\``;
         return b;
     });
     const header = hits.some((h) => h.code)
         ? (isEditPrompt
-            ? '[plexer] edit targets localized (skip repo-wide grep/find; batch remaining reads in 1 turn, then apply all edits in 1 turn):'
-            : '[plexer] retrieved context, read these spans; do not re-open the files:')
-        : '[plexer] starting points for this task: pull the code inline with `plexer ask "<what you need>" --source`, trace impact with `plexer callers <symbol>`, or search with `plexer grep "<literal>"`:';
+            ? '[plexer] edit targets localized (edit inlined `L<n>:` spans directly; batch any missing spans into 1 `plexer read` call or 1 parallel turn; never serialize 1 call/turn or read whole files):'
+            : '[plexer] retrieved context (use inlined `L<n>:` spans directly; batch any missing spans into 1 `plexer read` call or 1 parallel turn; never serialize 1 call/turn or read whole files):')
+        : '[plexer] starting points (batch any missing spans into 1 `plexer read` or `plexer callers` call or 1 parallel turn; never serialize 1 call/turn or read whole files):';
     return `${header}\n${blocks.join('\n')}`;
 }
 export function formatRetrieval(ask, cap = 5) {
@@ -165,13 +273,10 @@ export function relevantRetrieval(ask, s, cap = 4, opts = {}) {
         const strong = ask.coverageStrong ?? 0;
         const broad = ask.coverage ?? 0;
         const qLen = String(ask.query ?? '').trim().split(/\s+/).filter(Boolean).length;
-        // A single body-only word collision on a short 2–5 word conversational prompt
-        // measures broad ~0.29–0.35; only allow body-only broad >= 0.28 on multi-term
-        // Turn-1 technical queries (qLen >= 6).
+        const canTrustBroadAlone = strong > 0 || hasExplicitPathHitMatch(ask);
         const hasSubstantialMatch = strong >= STRONG_FLOOR ||
-            broad >= HIGH_FLOOR ||
             (strong >= 0.04 && broad >= 0.14) ||
-            (!isFollowUp && qLen >= 6 && broad >= 0.28);
+            (canTrustBroadAlone && (broad >= HIGH_FLOOR || (!isFollowUp && qLen >= 6 && broad >= 0.28)));
         if (!hasSubstantialMatch)
             return isFollowUp ? null : weakMatchNudge(s, strong);
     }

@@ -21,9 +21,13 @@ export interface GraphNode {
     kind: NodeKind;
     path: string;
     span: string;
+    owner?: string;
+    origin?: string;
+    chars?: number;
     exported?: boolean;
     signature?: string | null;
     summary?: string | null;
+    summary_state?: string;
     crux?: string | null;
     body_hash?: string;
     body_text?: string;
@@ -35,6 +39,7 @@ export interface GraphEdge {
     relation: EdgeRelation;
     confidence?: "extracted" | "inferred";
     line?: number;
+    typeOnly?: boolean;
 }
 
 export interface GraphScope {
@@ -49,17 +54,17 @@ export interface WiringGraph {
         version?: number;
         nodeCount?: number;
         edgeCount?: number;
-        generated_at?: string;
         root?: string;
-        files?: number;
-        nodes?: number;
-        edges?: number;
         languages: string[];
         config_hash?: string;
         scopes?: GraphScope[];
     };
     nodes: GraphNode[];
     edges: GraphEdge[];
+    _byId?: Map<string, GraphNode>;
+    _nodesByPath?: Map<string, GraphNode[]>;
+    _inEdges?: Map<string, GraphEdge[]>;
+    _outEdges?: Map<string, GraphEdge[]>;
 }
 
 export interface BuildProgressEvent {
@@ -138,6 +143,10 @@ export interface AskHit {
     code?: string;
     score?: number;
     scope?: string;
+    related?: string[];
+    callSites?: string[];
+    wantsCallSites?: boolean;
+    otherSymbols?: string;
 }
 
 export interface AskResult {
@@ -146,6 +155,9 @@ export interface AskResult {
     hits: AskHit[];
     coverage?: number;
     coverageStrong?: number;
+    rawTopPointer?: string | null;
+    rawTopScore?: number;
+    usedSourceBytes?: number;
     scopes?: {
         federated: string[];
         alsoMatched: Array<{ scope: string; bestId?: string; topScore?: number }>;
@@ -255,7 +267,7 @@ export interface CallersOptions {
 export interface CallersMatch {
     symbol: GraphNode;
     hits: EdgeWalkHit[];
-    tests?: Array<{ path: string; confidence: string; reason?: string }>;
+    tests?: Array<{ path: string; confidence: "high" | "medium" | "low"; reason?: string }>;
 }
 
 export interface RepoMapOptions {
@@ -306,13 +318,28 @@ export interface RepoMapResult {
     coupling?: Array<{ a: string; b: string; weight: number }>;
 }
 
+export type LayerRuleInput =
+    | string
+    | {
+          from?: string;
+          source?: string;
+          to?: string | string[];
+          target?: string | string[];
+          forbid?: string | string[];
+          disallow?: string | string[];
+          allowTypeOnly?: boolean;
+          allow_type_only?: boolean;
+          reason?: string | null;
+          message?: string | null;
+      };
+
 export interface BlastOptions {
     contextDir?: string;
     base?: string;
     depth?: number | "all" | string;
     includeHistory?: boolean;
     since?: string;
-    layerRules?: unknown[];
+    layerRules?: LayerRuleInput[];
     gitHistory?: Record<string, unknown>;
 }
 
@@ -369,6 +396,45 @@ export interface BlastArea {
     seedNames: string[];
 }
 
+export interface BlastCoChange {
+    file: string;
+    with?: string;
+    count?: number;
+    weight?: number;
+    confidence?: number;
+}
+
+export interface BlastTestLink {
+    sourceFile?: string;
+    testFile: string;
+    confidence: "high" | "medium" | "low";
+    reason?: string;
+}
+
+export interface BlastLayerViolation {
+    sourceFile: string;
+    targetFile: string;
+    relation: EdgeRelation;
+    ruleFrom: string;
+    ruleTo: string;
+    reason: string | null;
+}
+
+export interface BlastHealthHotspot {
+    file: string;
+    role: "changed" | "impacted";
+    count: number;
+    max_tier: string;
+    issues: Array<{
+        id: string;
+        detector: string;
+        tier?: string;
+        severity?: string;
+        span?: string | null;
+        summary?: string;
+    }>;
+}
+
 export interface BlastResult {
     basis: string;
     depth: number;
@@ -381,11 +447,11 @@ export interface BlastResult {
     testModules: BlastModuleGroup[];
     areas: BlastArea[];
     owners?: Array<{ name: string; commits: number }>;
-    coChanges?: unknown[];
-    untouchedCoChanges?: unknown[];
-    testLinks?: unknown[];
-    layerViolations?: unknown[];
-    healthHotspots?: unknown[];
+    coChanges?: BlastCoChange[];
+    untouchedCoChanges?: BlastCoChange[];
+    testLinks?: BlastTestLink[];
+    layerViolations?: BlastLayerViolation[];
+    healthHotspots?: BlastHealthHotspot[];
     reviewers?: Array<{ name: string; email?: string; commits: number; score?: number }>;
     history?: Record<string, unknown>;
 }
@@ -423,11 +489,86 @@ export interface ExportVizResult {
     tabs: VizTab[];
 }
 
+export interface HealthOptions {
+    contextDir?: string;
+    action?: string;
+    detector?: string;
+    scanPath?: string;
+    only?: string | string[];
+    skip?: string | string[];
+    count?: number;
+    readOnly?: boolean;
+    noBadge?: boolean;
+    profile?: string;
+    [key: string]: unknown;
+}
+
+export interface HealthDimensionScore {
+    score: number;
+    tier?: number;
+    open?: number;
+    checks?: number;
+    stale?: boolean;
+}
+
+export interface HealthScoreSnapshot {
+    overall: number;
+    objective: number;
+    strict: number;
+    verified: number;
+    dimensions?: Record<string, HealthDimensionScore>;
+    ignore_integrity?: {
+        suppressed?: number;
+        total?: number;
+        pct?: number;
+    };
+}
+
+export interface HealthIssueItem {
+    id: string;
+    detector: string;
+    tier?: string;
+    severity?: string;
+    confidence?: string;
+    status?: string;
+    file?: string;
+    span?: string | null;
+    identifier?: string | null;
+    summary?: string;
+}
+
+export interface HealthHeadline {
+    open_count: number;
+    target_score?: number;
+    delta_to_target?: number;
+    next_id?: string | null;
+}
+
+export interface HealthResult {
+    action: string;
+    verbose?: boolean;
+    scores?: HealthScoreSnapshot;
+    headline?: HealthHeadline;
+    queue?: {
+        items?: HealthIssueItem[];
+        all_items?: HealthIssueItem[];
+        total?: number;
+    };
+    items?: HealthIssueItem[];
+    reminders?: Array<{ type: string; message: string; priority?: number }>;
+    tree_text?: string;
+    detector?: string;
+    count?: number;
+    scan_count?: number;
+    last_scan_at?: string | null;
+}
+
 export interface PlexerConfig {
     contextDir?: string;
 }
 
 export class Plexer {
+    readonly cfg: PlexerConfig;
     constructor(config?: PlexerConfig);
     check(dir: string, opts?: CheckGraphOptions): Promise<CheckGraphResult>;
     checkGraph(dir: string, opts?: CheckGraphOptions): Promise<CheckGraphResult>;
@@ -439,7 +580,8 @@ export class Plexer {
     grep(dir: string, pattern: string, opts?: GrepOptions): GrepResult;
     callers(dir: string, symbol: string, opts?: CallersOptions): CallersMatch[];
     map(dir: string, opts?: RepoMapOptions): RepoMapResult;
-    health(dir: string, opts?: Record<string, unknown>): Record<string, unknown> | Promise<Record<string, unknown>>;
+    health(dir: string, opts?: HealthOptions): HealthResult | Promise<HealthResult>;
+    healthAsync(dir: string, opts?: HealthOptions): Promise<HealthResult>;
 }
 
 export function buildGraph(dir: string, opts?: BuildGraphOptions): Promise<BuildGraphResult>;
@@ -463,7 +605,7 @@ export function formatGrepResult(result: GrepResult): string;
 export function runGrepCommand(pattern: string, dir: string, opts?: GrepOptions & { globalDir?: string; json?: boolean }): void;
 export function resolveSymbol(graph: WiringGraph, query: string, opts?: { in?: string }): GraphNode[];
 export function edgeWalk(graph: WiringGraph, start: GraphNode, direction?: "in" | "out", maxDepth?: number): EdgeWalkHit[];
-export function runCallersCommand(query: string, dir: string, opts?: CallersOptions & { globalDir?: string; json?: boolean }): Promise<void>;
+export function runCallersCommand(query: string, dir: string, opts?: CallersOptions & { globalDir?: string; json?: boolean }): void;
 export function buildRepoMap(graph: WiringGraph, opts?: RepoMapOptions): RepoMapResult;
 export function formatRepoMap(map: RepoMapResult): string;
 export function blastRadius(
@@ -472,13 +614,29 @@ export function blastRadius(
     basis?: string,
     opts?: { depth?: number; modules?: unknown },
 ): BlastResult;
+export interface BlastInOptions {
+    basis?: string;
+    depth?: number | "all" | string;
+    rootDir?: string;
+    layerRules?: LayerRuleInput[];
+    gitHistory?: Record<string, unknown>;
+    includeHistory?: boolean;
+    since?: string;
+}
+
+export function blastRadiusIn(
+    graph: WiringGraph,
+    contextDir: string,
+    changed: BlastChangedFile[],
+    opts?: BlastInOptions,
+): BlastResult;
 export function blastRadiusIn(
     graph: WiringGraph,
     contextDir: string,
     changed: BlastChangedFile[],
     basis?: string,
-    depth?: number,
-    opts?: { rootDir?: string; layerRules?: unknown[]; gitHistory?: Record<string, unknown>; includeHistory?: boolean; since?: string },
+    depth?: number | "all" | string,
+    opts?: BlastInOptions,
 ): BlastResult;
 export function textReport(blast: BlastResult): string;
 export function markdownReport(blast: BlastResult, opts?: { root?: string }): string;
@@ -486,7 +644,8 @@ export function mermaidDiagram(blast: BlastResult): string | null;
 export function startVizServer(opts: VizServerOptions): Promise<{ url: string; port: number; close: () => Promise<void> }>;
 export function exportViz(opts: ExportVizOptions): ExportVizResult;
 export function startMcpServer(root?: string, dirOverride?: string, version?: string): void;
-export function health(dir: string, opts?: Record<string, unknown>): Record<string, unknown> | Promise<Record<string, unknown>>;
-export function formatHealthText(report: Record<string, unknown>): string;
-export function formatHealthMarkdown(report: Record<string, unknown>): string;
+export function health(dir: string, opts?: HealthOptions): HealthResult | Promise<HealthResult>;
+export function healthAsync(dir: string, opts?: HealthOptions): Promise<HealthResult>;
+export function formatHealthText(report: HealthResult): string;
+export function formatHealthMarkdown(report: HealthResult): string;
 

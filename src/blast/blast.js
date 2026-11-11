@@ -15,12 +15,12 @@
  */
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { isTestPath } from "../ask/ask.js";
 import { contextDirFor } from "../context/node-file.js";
-import { loadGraphCached } from "../graph/load.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { linkTestsForGraph } from "../graph/test-links.js";
 import { impactOfMany, parseWalkDepth } from "../graph/traverse.js";
-import { globToRegExp, parseLayerRuleEntry, pushMap, toPosixPath } from "../util/paths.js";
+import { globToRegExp, isTestPath, pushMap, toPosixPath } from "../util/paths.js";
+import { parseLayerRuleEntry } from "./layer-rules.js";
 import { readJson } from "../util/state.js";
 import { changedFiles, refExists } from "./diff.js";
 import { spanRange } from "./evidence.js";
@@ -445,7 +445,11 @@ function collectLayerViolations(graph, changed, rules) {
 }
 
 /** Convenience wrapper: build the module index from a context dir. */
-export function blastRadiusIn(graph, contextDir, changed, basis, depth, opts = {}) {
+export function blastRadiusIn(graph, contextDir, changed, basisOrOpts, depthArg, optsArg = {}) {
+    const bagMode = basisOrOpts !== null && typeof basisOrOpts === "object";
+    const opts = bagMode ? basisOrOpts : optsArg;
+    const basis = bagMode ? (opts.basis ?? "working-tree") : basisOrOpts;
+    const depth = bagMode ? opts.depth : depthArg;
     const parsedDepth = parseWalkDepth(depth, 2);
     if (Number.isNaN(parsedDepth))
         throw new RangeError("depth must be a positive integer or 'all'");

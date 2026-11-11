@@ -6,7 +6,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadGraphCached } from "../graph/load.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { buildVizHealthPayload } from "./serve.js";
 /**
  * JSON safe to drop inside a `<script>` element.
@@ -14,6 +14,7 @@ import { buildVizHealthPayload } from "./serve.js";
 function inlineJson(value) {
     return JSON.stringify(value ?? null)
         .replace(/</g, "\\u003c")
+        .replace(/>/g, "\\u003e")
         .replace(/\u2028/g, "\\u2028")
         .replace(/\u2029/g, "\\u2029");
 }
@@ -46,9 +47,11 @@ export function exportViz(opts) {
         `  codeGraph: ${inlineJson(code)}`,
         "};</script>",
     ].join("\n");
+    const safeCss = css.replace(/<\/style/gi, "<\\/style");
+    const safeJs = js.replace(/<\/script/gi, "<\\/script");
     const page = html
-        .replace(LINK_TAG, () => `<style>\n${css}\n</style>`)
-        .replace(SCRIPT_TAG, () => `${data}\n<script type="module">\n${js}\n</script>`);
+        .replace(LINK_TAG, () => `<style>\n${safeCss}\n</style>`)
+        .replace(SCRIPT_TAG, () => `${data}\n<script type="module">\n${safeJs}\n</script>`);
     mkdirSync(opts.outDir, { recursive: true });
     const file = join(opts.outDir, "index.html");
     writeFileSync(file, page);

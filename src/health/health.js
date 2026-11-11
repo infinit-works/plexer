@@ -3,8 +3,9 @@
  */
 import { resolve } from "node:path";
 import { changedFiles } from "../blast/diff.js";
+import { analyzeGitHistory } from "../blast/history.js";
 import { contextDirFor } from "../context/node-file.js";
-import { loadGraphCached } from "../graph/load.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { fileReader } from "../util/span.js";
 import { moveFileOrDir, runAutofix } from "./autofix.js";
 import { generateConcerns } from "./concerns.js";
@@ -17,8 +18,13 @@ import {
     normalizeDimensionKey,
 } from "./constants.js";
 import { detectDuplicates } from "./duplicates.js";
-import { runGraphChecks } from "./graph-checks.js";
-import { computeHeadline, computeReminders } from "./narrative.js";
+import { buildUndirectedFileAdjacency, runGraphChecks } from "./graph-checks.js";
+import {
+    computeFixerLeverage,
+    computeHeadline,
+    computeReminders,
+    computeWorkLanes,
+} from "./narrative.js";
 import {
     annotatePlanIssues,
     buildExecutionQueue,
@@ -68,7 +74,36 @@ import {
     saveLivingPlan,
 } from "./state.js";
 import { generateHealthTreemapHtml, generateHealthTreeText } from "./viz.js";
-import { SCORED_ZONES, VALID_ZONES, classifyZone, loadIgnoreRules } from "./zones.js";
+import {
+    SCORED_ZONES,
+    VALID_ZONES,
+    classifyZone,
+    createSuppressionLedger,
+    loadIgnoreRules,
+} from "./zones.js";
+
+function createTrackedLineReader(rootDir, suppressionLedger = null) {
+    const rawReader = fileReader(rootDir);
+    if (!suppressionLedger) return rawReader;
+    return (relPath) => {
+        const lines = rawReader(relPath);
+        if (lines && Array.isArray(lines) && !lines._suppressionLedger) {
+            Object.defineProperties(lines, {
+                _suppressionLedger: {
+                    value: suppressionLedger,
+                    enumerable: false,
+                    configurable: true,
+                },
+                _relPath: {
+                    value: relPath,
+                    enumerable: false,
+                    configurable: true,
+                },
+            });
+        }
+        return lines;
+    };
+}
 
 function parseCategorySet(onlyOpt, skipOpt) {
     let set = new Set(ALL_CATEGORIES);
@@ -87,12 +122,12 @@ function parseCategorySet(onlyOpt, skipOpt) {
     return set;
 }
 
-export function buildZoneMap(graph, config) {
+export function buildZoneMap(graph, config, rootDir = null) {
     const map = new Map();
     const overrides = config?.zones || {};
     for (const node of graph.nodes) {
         if (node.kind === "file") {
-            map.set(node.path, classifyZone(node.path, overrides));
+            map.set(node.path, classifyZone(node.path, overrides, rootDir));
         }
     }
     return map;
@@ -130,12 +165,20 @@ function scaleScopedPotentials(graph, zoneMap, fileFilter, potentials) {
  */
 export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
     const enabledCategories = parseCategorySet(opts.only, opts.skip);
-    const zoneMap = buildZoneMap(graph, config);
-    const ignoreRules = loadIgnoreRules(rootDir, config?.excludes || []);
-    const readLines = fileReader(rootDir);
+    const zoneMap = buildZoneMap(graph, config, rootDir);
+    const suppressionLedger = opts.suppressionLedger || createSuppressionLedger();
+    const ignoreRules = loadIgnoreRules(rootDir, config?.excludes || [], suppressionLedger);
+    const readLines = createTrackedLineReader(rootDir, suppressionLedger);
+    const gitHistory =
+        config?.gitHistory ||
+        (rootDir ? analyzeGitHistory(rootDir, opts.contextDir || null) : null);
+    if (config && gitHistory && !config.gitHistory) {
+        config.gitHistory = gitHistory;
+    }
 
-    const inPrefixes = opts.in
-        ? (Array.isArray(opts.in) ? opts.in : [opts.in]).map((p) =>
+    const rawIn = opts.in || (opts.scanPath && opts.scanPath !== "." ? opts.scanPath : null);
+    const inPrefixes = rawIn
+        ? (Array.isArray(rawIn) ? rawIn : [rawIn]).map((p) =>
               String(p).replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""),
           )
         : null;
@@ -171,7 +214,7 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
     const potentials = {};
 
     if (enabledCategories.has("duplicates")) {
-        const dupRes = detectDuplicates(graph, readLines, zoneMap, ignoreRules);
+        const dupRes = detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHistory);
         allIssues.push(...dupRes.issues);
         potentials.duplicates = dupRes.potential;
     }
@@ -201,11 +244,23 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
             const f = (iss.file || "").replace(/\\/g, "/");
             if (!inPrefixes.some((p) => f === p || f.startsWith(`${p}/`))) return false;
         }
-        if (diffFileSet && !diffFileSet.has(iss.file)) return false;
+        if (diffFileSet && !diffFileSet.has(iss.file) && !(iss.partner_file && diffFileSet.has(iss.partner_file))) {
+            return false;
+        }
         return true;
     });
 
-    return { issues: filteredIssues, potentials, zoneMap, ignoreRules, readLines };
+    return {
+        issues: filteredIssues,
+        potentials,
+        zoneMap,
+        ignoreRules,
+        readLines,
+        suppressionLedger,
+        scannedCategories: enabledCategories,
+        scannedDetectors: detectorFilter,
+        fileFilter,
+    };
 }
 
 /**
@@ -383,13 +438,13 @@ function handlePlanQueueMutationSubAction(sub, contextDir, state, plan, opts) {
     }
     if (sub === "resolve") {
         const res = resolveIssues(state, plan, opts.patterns || [], opts);
+        const scores = computeScoreSnapshot(state);
         if (res.status === "resolved") {
-            const scores = computeScoreSnapshot(state);
             appendScoreHistory(state, scores, "resolve");
             saveHealthState(contextDir, state);
             saveLivingPlan(contextDir, plan);
         }
-        return { action: "plan_resolve", ...res };
+        return { action: "plan_resolve", ...res, scores };
     }
     if (sub === "skip") {
         const res = skipIssues(state, plan, opts.patterns || [], opts);
@@ -403,15 +458,17 @@ function handlePlanQueueMutationSubAction(sub, contextDir, state, plan, opts) {
     }
     if (sub === "reopen") {
         const res = reopenIssues(state, plan, opts.patterns || []);
+        const scores = computeScoreSnapshot(state);
         saveHealthState(contextDir, state);
         saveLivingPlan(contextDir, plan);
-        return { action: "plan_reopen", ...res };
+        return { action: "plan_reopen", ...res, scores };
     }
     if (sub === "unskip") {
         const res = unskipIssues(state, plan, opts.patterns || []);
+        const scores = computeScoreSnapshot(state);
         saveHealthState(contextDir, state);
         saveLivingPlan(contextDir, plan);
-        return { action: "plan_unskip", ...res };
+        return { action: "plan_unskip", ...res, scores };
     }
     if (sub === "promote") {
         const res = promotePlanItems(
@@ -695,9 +752,16 @@ function handleHealthReviewAction(root, contextDir, graph, state, config, plan, 
 function ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, persist = false) {
     if ((state.scan_count || 0) === 0) {
         const det = runMechanicalDetectors(graph, root, config, { ...opts, contextDir, plan });
+        const gitCtx = detectGitContext(root);
         const merged = mergeScanIntoState(state, det.issues, det.potentials, plan, {
             ...opts,
+            scannedCategories: det.scannedCategories,
+            scannedDetectors: det.scannedDetectors,
+            fileFilter: det.fileFilter,
             suppressions: config.suppressions,
+            suppressionLedger: det.suppressionLedger,
+            gitHead: gitCtx.head_sha,
+            dirty: gitCtx.has_uncommitted,
         });
         Object.assign(state, merged.state);
         if (persist) {
@@ -709,44 +773,107 @@ function ensureInitialHealthScan(graph, root, contextDir, config, state, plan, o
     }
 }
 
-function runHealthScanAction(root, contextDir, graph, config, state, plan, totalProdFiles, opts) {
-    const det = runMechanicalDetectors(graph, root, config, { ...opts, contextDir, plan });
-    const isScopedQuery = Boolean(opts.diff || opts.in || opts.only || opts.skip || opts.stateless);
+function filterIssueToScanScope(iss, det) {
+    if (!iss) return false;
+    if (det.scannedDetectors && det.scannedDetectors.size > 0) {
+        if (
+            !det.scannedDetectors.has((iss.detector || "").toLowerCase()) &&
+            !det.scannedDetectors.has((iss.category || "").toLowerCase())
+        ) {
+            return false;
+        }
+    }
+    if (det.scannedCategories && det.scannedCategories.size < ALL_CATEGORIES.length) {
+        if (iss.category && !det.scannedCategories.has(iss.category.toLowerCase())) {
+            return false;
+        }
+    }
+    if (det.fileFilter) {
+        if (!det.fileFilter(iss.file) && !(iss.partner_file && det.fileFilter(iss.partner_file))) {
+            return false;
+        }
+    }
+    return true;
+}
 
-    let activeState = state;
-    let diff = null;
-
-    if (isScopedQuery) {
+function executeScanReconcile(state, det, plan, config, contextDir, gitCtx, isEphemeralQuery, isPartialScope, opts) {
+    if (isEphemeralQuery) {
         const ephemeral = mergeScanIntoState(
-            { ...state, issues: {} },
+            { ...state, issues: { ...(state.issues || {}) } },
             det.issues,
             det.potentials,
             null,
-            { ...opts, isScopedScan: true, forceResolve: true, suppressions: config.suppressions },
+            {
+                ...opts,
+                isEphemeral: true,
+                isScopedScan: true,
+                forceResolve: true,
+                scannedCategories: det.scannedCategories,
+                scannedDetectors: det.scannedDetectors,
+                fileFilter: det.fileFilter,
+                suppressions: config.suppressions,
+                suppressionLedger: det.suppressionLedger,
+                gitHead: gitCtx.head_sha,
+                dirty: gitCtx.has_uncommitted,
+            },
         );
-        activeState = ephemeral.state;
-        diff = ephemeral.diff;
-    } else {
-        const merged = mergeScanIntoState(state, det.issues, det.potentials, plan, {
-            scanPath: opts.scanPath || ".",
-            resetSubjective: opts.resetSubjective,
-            forceResolve: opts.forceResolve,
-            suppressions: config.suppressions,
-        });
-        activeState = merged.state;
-        diff = merged.diff;
-        if (config.needs_rescan) {
-            config.needs_rescan = false;
-            saveHealthConfig(contextDir, config);
+        const scopedIssues = {};
+        for (const [id, iss] of Object.entries(ephemeral.state.issues || {})) {
+            if (filterIssueToScanScope(iss, det)) scopedIssues[id] = iss;
         }
+        return {
+            activeState: { ...ephemeral.state, issues: scopedIssues },
+            diff: {
+                ...ephemeral.diff,
+                open_count: Object.values(scopedIssues).filter((i) => i.status === "open" && !i.suppressed).length,
+            },
+        };
     }
 
+    const merged = mergeScanIntoState(state, det.issues, det.potentials, plan, {
+        scanPath: opts.scanPath || ".",
+        resetSubjective: opts.resetSubjective,
+        forceResolve: opts.forceResolve,
+        isScopedScan: isPartialScope,
+        scannedCategories: det.scannedCategories,
+        scannedDetectors: det.scannedDetectors,
+        fileFilter: det.fileFilter,
+        suppressions: config.suppressions,
+        suppressionLedger: det.suppressionLedger,
+        gitHead: gitCtx.head_sha,
+        dirty: gitCtx.has_uncommitted,
+    });
+    if (!isPartialScope && config.needs_rescan) {
+        config.needs_rescan = false;
+        saveHealthConfig(contextDir, config);
+    }
+    return { activeState: merged.state, diff: merged.diff };
+}
+
+function runHealthScanAction(root, contextDir, graph, config, state, plan, totalProdFiles, opts) {
+    const det = runMechanicalDetectors(graph, root, config, { ...opts, contextDir, plan });
+    const isEphemeralQuery = Boolean(opts.diff || opts.stateless);
+    const isPartialScope = Boolean(
+        opts.in || opts.only || opts.skip || opts.detector || (opts.scanPath && opts.scanPath !== "."),
+    );
+    const isScopedQuery = isEphemeralQuery || isPartialScope;
+    const gitCtx = detectGitContext(root);
+
+    const { activeState, diff } = executeScanReconcile(
+        state,
+        det,
+        plan,
+        config,
+        contextDir,
+        gitCtx,
+        isEphemeralQuery,
+        isPartialScope,
+        opts,
+    );
+
     const scores = computeScoreSnapshot(activeState);
-    if (!isScopedQuery) {
+    if (!isEphemeralQuery && !diff?.noop) {
         appendScoreHistory(activeState, scores, "scan");
-        saveHealthState(contextDir, activeState);
-        saveLivingPlan(contextDir, plan);
-        if (!opts.noBadge) emitScorecardBadge(contextDir, scores, activeState);
     }
 
     const maxItems = opts.max === "all" ? 9999 : Number(opts.max) || 10;
@@ -758,9 +885,17 @@ function runHealthScanAction(root, contextDir, graph, config, state, plan, total
         totalProdFiles,
     });
     const headline = computeHeadline(activeState, scores, plan, config);
-    const reminders = computeReminders(activeState, scores, plan, config, "scan", totalProdFiles);
+    const reminders = computeReminders(activeState, scores, plan, config, "scan", totalProdFiles, {
+        persistReminders: !isEphemeralQuery && !opts.readOnly,
+    });
 
-    return {
+    if (!isEphemeralQuery) {
+        saveHealthState(contextDir, activeState);
+        saveLivingPlan(contextDir, plan);
+        if (!opts.noBadge) emitScorecardBadge(contextDir, scores, activeState);
+    }
+
+    const scanResult = {
         action: "scan",
         scoped: isScopedQuery,
         scores,
@@ -769,9 +904,15 @@ function runHealthScanAction(root, contextDir, graph, config, state, plan, total
         queue,
         reminders,
         review_coverage: detectReviewCoverage(activeState, totalProdFiles),
-        findings: queue.all_items.slice(0, maxItems),
-        showWorkflowGuide: !isScopedQuery && opts.profile !== "ci",
+        showWorkflowGuide: !isScopedQuery && opts.profile !== "ci" && (activeState.scan_count || 1) <= 1,
     };
+    Object.defineProperty(scanResult, "findings", {
+        value: queue.all_items.slice(0, maxItems),
+        enumerable: false,
+        configurable: true,
+        writable: true,
+    });
+    return scanResult;
 }
 
 function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config, state, plan, totalProdFiles, opts) {
@@ -787,17 +928,37 @@ function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config
         includeSkipped: opts.includeSkipped,
         totalProdFiles,
     });
+    const zoneMap = buildZoneMap(graph, config, root);
+    const fileAdj = buildUndirectedFileAdjacency(graph, zoneMap);
+    const lanes = computeWorkLanes(queue.all_items || [], fileAdj, opts);
+    queue.fixer_leverage = lanes.fixer_leverage || computeFixerLeverage(queue.all_items || []);
+    if (opts.lanes) {
+        queue.lanes = lanes;
+    }
+
+    const shouldPersistReminders = action === "next" && !opts.readOnly;
+    const reminders = computeReminders(state, scores, plan, config, action, totalProdFiles, {
+        laneCount: lanes.lane_count,
+        persistReminders: shouldPersistReminders,
+    });
+    if (shouldPersistReminders) {
+        saveHealthState(contextDir, state);
+    }
+
     const base = {
         action,
+        verbose: Boolean(opts.verbose),
         scores,
         headline: computeHeadline(state, scores, plan, config),
         queue,
-        reminders: computeReminders(state, scores, plan, config, action, totalProdFiles),
+        ...(opts.lanes || action === "status" ? { lanes, work_lanes: lanes } : {}),
+        reminders,
     };
     if (action === "status") {
         base.review_coverage = detectReviewCoverage(state, totalProdFiles);
         base.scan_count = state.scan_count;
         base.last_scan_at = state.last_scan_at;
+        base.ignore_integrity = scores.ignore_integrity;
         base.history = state.history || [];
     }
     return base;
@@ -815,6 +976,32 @@ function enrichSuppressionFingerprints(state, config, res) {
     const allFps = [...fpSet];
     res.fingerprints = allFps;
     if (config.suppressions?.[res.pattern]) config.suppressions[res.pattern].fingerprints = allFps;
+}
+
+function runSuppressOrResolveAction(action, contextDir, config, state, plan, totalProdFiles, opts) {
+    if (action === "suppress") {
+        const pattern = opts.pattern || (opts.patterns && opts.patterns[0]) || "";
+        const res = suppressIssues(state, config, plan, pattern, opts);
+        enrichSuppressionFingerprints(state, config, res);
+        const scores = computeScoreSnapshot(state);
+        const reminders = computeReminders(state, scores, plan, config, "suppress", totalProdFiles);
+        if (res.status === "suppressed") {
+            appendScoreHistory(state, scores, "suppress");
+            saveHealthConfig(contextDir, config);
+            saveHealthState(contextDir, state);
+            saveLivingPlan(contextDir, plan);
+        }
+        return { action: "suppress", ...res, scores, reminders };
+    }
+    const res = resolveIssues(state, plan, opts.patterns || [], opts);
+    const scores = computeScoreSnapshot(state);
+    const reminders = computeReminders(state, scores, plan, config, "resolve", totalProdFiles);
+    if (res.status === "resolved") {
+        appendScoreHistory(state, scores, "resolve");
+        saveHealthState(contextDir, state);
+        saveLivingPlan(contextDir, plan);
+    }
+    return { action: "resolve", ...res, scores, reminders };
 }
 
 function handleHealthToolAction(
@@ -847,7 +1034,16 @@ function handleHealthToolAction(
         return { action: "autofix", ...afRes, scores };
     }
     if (action === "move") {
-        return { action: "move", ...moveFileOrDir(root, graph, opts.src, opts.dst, { dryRun: opts.dryRun }) };
+        const mvRes = moveFileOrDir(root, graph, opts.src, opts.dst, {
+            dryRun: opts.dryRun,
+            state,
+            plan,
+        });
+        if (!opts.dryRun && mvRes.remapped_issues > 0) {
+            saveHealthState(contextDir, state);
+            saveLivingPlan(contextDir, plan);
+        }
+        return { action: "move", ...mvRes };
     }
     if (action === "detect") {
         const detName = opts.detector || (opts.patterns && opts.patterns[0]) || "all";
@@ -876,38 +1072,8 @@ function handleHealthToolAction(
             ...generateHealthTreemapHtml(contextDir, graph, state, zoneMap, readLines, { ...opts, rootDir: root }),
         };
     }
-    if (action === "suppress") {
-        const pattern = opts.pattern || (opts.patterns && opts.patterns[0]) || "";
-        const res = suppressIssues(state, config, plan, pattern, opts);
-        enrichSuppressionFingerprints(state, config, res);
-        const scores = computeScoreSnapshot(state);
-        if (res.status === "suppressed") {
-            appendScoreHistory(state, scores, "suppress");
-            saveHealthConfig(contextDir, config);
-            saveHealthState(contextDir, state);
-            saveLivingPlan(contextDir, plan);
-        }
-        return {
-            action: "suppress",
-            ...res,
-            scores,
-            reminders: computeReminders(state, scores, plan, config, "suppress", totalProdFiles),
-        };
-    }
-    if (action === "resolve") {
-        const res = resolveIssues(state, plan, opts.patterns || [], opts);
-        const scores = computeScoreSnapshot(state);
-        if (res.status === "resolved") {
-            appendScoreHistory(state, scores, "resolve");
-            saveHealthState(contextDir, state);
-            saveLivingPlan(contextDir, plan);
-        }
-        return {
-            action: "resolve",
-            ...res,
-            scores,
-            reminders: computeReminders(state, scores, plan, config, "resolve", totalProdFiles),
-        };
+    if (action === "suppress" || action === "resolve") {
+        return runSuppressOrResolveAction(action, contextDir, config, state, plan, totalProdFiles, opts);
     }
     return null;
 }
@@ -933,7 +1099,7 @@ export function health(dir, opts = {}) {
         throw new Error(`no graph found at ${contextDir} — run \`plexer build\` first`);
     }
 
-    const zoneMap = buildZoneMap(graph, config);
+    const zoneMap = buildZoneMap(graph, config, root);
     const totalProdFiles = countScoredFiles(graph, zoneMap);
     const readLines = fileReader(root);
 
@@ -976,5 +1142,5 @@ export function health(dir, opts = {}) {
 }
 
 export async function healthAsync(dir, opts = {}) {
-    return await health(dir, { ...opts, _allowAsync: true });
+    return await health(dir, opts);
 }

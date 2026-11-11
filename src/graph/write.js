@@ -8,9 +8,8 @@
  * timestamps, so rebuilding an unchanged repo produces a byte-identical file and
  * git diffs stay minimal.
  */
-import { GRAPH_DIR, GRAPH_FILE, readGraph, wiringPath } from "../context/node-file.js";
+import { wiringPath } from "../context/node-file.js";
 import { writeJsonAtomic } from "../util/state.js";
-export { GRAPH_DIR, GRAPH_FILE, readGraph, wiringPath };
 export function writeGraph(graph, outDir) {
     const sorted = {
         ...graph,

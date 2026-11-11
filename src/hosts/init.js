@@ -5,14 +5,12 @@
  */
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { buildGraphIfMissing } from '../claude/init.js';
 import { HOSTS, detectHosts } from './registry.js';
 import { upsertSection } from './sections.js';
 import { CLI_MCP_OPT_IN_HOSTS, registerMcpConfigs } from './mcp-config.js';
 import { installCodexHooks } from './codex-hooks.js';
 import { installAntigravitySkill } from './antigravity.js';
-import { writeOwned } from './config-write.js';
-export { buildGraphIfMissing };
+import { writeOwned } from '../util/config-write.js';
 export function runHostsInit(repo, opts = {}) {
     const home = opts.home ?? homedir();
     let selected;

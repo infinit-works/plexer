@@ -3,22 +3,24 @@ const PALETTE = [
   "#60a5fa", "#2dd4bf", "#818cf8", "#fb923c", "#94a3b8",
 ];
 
-const KIND_COLORS = {
-  file: "#5b73e8",
-  module: "#38bdf8",
-  class: "#f59e0b",
-  struct: "#fb923c",
-  interface: "#a78bfa",
-  trait: "#c084fc",
-  function: "#2dd4bf",
-  method: "#34d399",
-  type: "#818cf8",
-  enum: "#eab308",
-  constant: "#94a3b8",
-  variable: "#64748b",
-  changed: "#f59e0b",
-  affected: "#5b73e8",
-};
+const KIND_COLORS = Object.freeze(
+  Object.assign(Object.create(null), {
+    file: "#5b73e8",
+    module: "#38bdf8",
+    class: "#f59e0b",
+    struct: "#fb923c",
+    interface: "#a78bfa",
+    trait: "#c084fc",
+    function: "#2dd4bf",
+    method: "#34d399",
+    type: "#818cf8",
+    enum: "#eab308",
+    constant: "#94a3b8",
+    variable: "#64748b",
+    changed: "#f59e0b",
+    affected: "#5b73e8",
+  })
+);
 
 const state = {
   contextGraph: null,
@@ -3334,7 +3336,7 @@ function renderEvidenceSection(evidence) {
           );
         })
         .join("");
-      const moreHtml = ev.more ? `<div class="insp-evidence-more">… +${ev.more} more line(s)</div>` : "";
+      const moreHtml = ev.more ? `<div class="insp-evidence-more">… +${escapeHtml(ev.more)} more line(s)</div>` : "";
       return (
         `<div class="insp-evidence-block">` +
           `<div class="insp-evidence-header">` +
@@ -3479,7 +3481,8 @@ function renderContextEdgeSection(title, edges, endpointKey) {
 
 function buildWiringInspectorSections(wNode) {
   const sections = [];
-  const fileHealth = wNode.path ? state.health?.by_file?.[wNode.path] : null;
+  const byFile = state.health?.by_file;
+  const fileHealth = wNode.path && byFile && Object.hasOwn(byFile, wNode.path) ? byFile[wNode.path] : null;
   if (fileHealth && fileHealth.count > 0) {
     const hItems = (fileHealth.issues ?? [])
       .map(
@@ -4407,7 +4410,8 @@ function escapeHtml(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 async function loadGraphs(isReload = false) {

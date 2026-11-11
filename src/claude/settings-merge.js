@@ -1,4 +1,4 @@
-import { isPlexerEntry } from '../util/state.js';
+import { isPlexerEntry } from '../util/config-write.js';
 const SL_CMD = 'node "${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/plexer-statusline.cjs"';
 /** Stable marker for "this statusLine is Plexer's", not the full command string —
  * an older shim path or a PLEXER_DIR wrapper still names this file. */

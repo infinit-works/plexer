@@ -22,7 +22,8 @@
  * checkout or a shallow clone leaves the report exactly as it was and the comment
  * simply says nothing about people.
  */
-import { resolve } from "node:path";
+import { statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { git } from "./diff.js";
 /**
  * Recency half-life. A commit from four months ago counts half as much as one
@@ -73,6 +74,151 @@ export function githubHandle(email) {
 function isBot(name, email) {
     return /\[bot\]/i.test(name) || /\[bot\]@/i.test(email) || /^(github-actions|dependabot|renovate)(\[bot\])?$/i.test(name.trim());
 }
+const BATCH_PATHSPEC = 200;
+const MAX_BATCH_COMMITS = 4000;
+const LOCAL_IDENTITY_CACHE = new Map();
+const MAX_IDENTITY_CACHE = 128;
+
+function buildExcludedSet(exclude) {
+    const excluded = new Set();
+    for (const raw of exclude ?? []) {
+        const clean = raw.trim().toLowerCase();
+        if (!clean)
+            continue;
+        excluded.add(clean);
+        const h = githubHandle(clean);
+        if (h)
+            excluded.add(h.toLowerCase());
+    }
+    return excluded;
+}
+
+function isExcludedOwner(o, key, excluded) {
+    return excluded.has(key.toLowerCase()) ||
+        excluded.has(o.name.toLowerCase()) ||
+        (o.handle !== undefined && excluded.has(o.handle.toLowerCase())) ||
+        [...o.emails].some((e) => excluded.has(e));
+}
+
+function parseGitOwnerLog(out, wanted, now, fileCommits, seqStart = 0) {
+    let seq = seqStart;
+    let commit = null;
+    for (const line of out.split("\n")) {
+        if (line.startsWith("\x1e")) {
+            const [hash, secStr, name = "", email = ""] = line.slice(1).split("\x1f");
+            const sec = Number(secStr);
+            const at = sec * 1000;
+            commit = hash && Number.isFinite(at)
+                ? {
+                    seq: seq++,
+                    hash,
+                    at,
+                    weight: Math.pow(0.5, (now - at) / HALF_LIFE_MS),
+                    name,
+                    email,
+                    bot: isBot(name, email),
+                }
+                : null;
+            continue;
+        }
+        // A pathspec'd `git log --name-only` already lists only matching files, but
+        // the set is re-checked here so a future flag change cannot silently start
+        // crediting whoever touched an unrelated file in the same commit.
+        if (commit === null || !line || !wanted.has(line))
+            continue;
+        let list = fileCommits.get(line);
+        if (!list) {
+            list = [];
+            fileCommits.set(line, list);
+        }
+        list.push(commit);
+    }
+    return seq;
+}
+
+function collectCommitsByFile(dir, uniquePaths, now, maxCommits) {
+    const fileCommits = new Map();
+    if (uniquePaths.length === 0)
+        return { fileCommits, multiChunk: false };
+    let seq = 0;
+    let chunks = 0;
+    for (let i = 0; i < uniquePaths.length; i += BATCH_PATHSPEC) {
+        const slice = uniquePaths.slice(i, i + BATCH_PATHSPEC);
+        const out = git(dir, [
+            "log",
+            "--no-merges",
+            "--no-textconv",
+            `--since=${SINCE}`,
+            "-n",
+            String(maxCommits),
+            "--format=\x1e%H\x1f%at\x1f%aN\x1f%aE",
+            "--name-only",
+            "--",
+            ...slice,
+        ]);
+        chunks += 1;
+        if (out === null)
+            continue;
+        seq = parseGitOwnerLog(out, new Set(slice), now, fileCommits, seq);
+    }
+    return { fileCommits, multiChunk: chunks > 1 };
+}
+
+function areaCommitsFromMap(paths, fileCommits, multiChunk = false) {
+    const byHash = new Map();
+    for (const p of paths) {
+        const list = fileCommits.get(p);
+        if (!list)
+            continue;
+        for (const c of list) {
+            if (!byHash.has(c.hash))
+                byHash.set(c.hash, c);
+        }
+    }
+    if (byHash.size === 0)
+        return [];
+    const unique = [...byHash.values()].sort((a, b) => (multiChunk ? b.at - a.at || a.seq - b.seq : a.seq - b.seq));
+    return unique.length > MAX_COMMITS ? unique.slice(0, MAX_COMMITS) : unique;
+}
+
+function rankOwnersFromCommits(commits, excluded) {
+    const people = new Map();
+    for (const commit of commits) {
+        // One commit touching six files in the area is already deduplicated to one entry in `commits`.
+        if (commit.bot)
+            continue;
+        const handle = githubHandle(commit.email) ?? undefined;
+        const emailLower = commit.email.toLowerCase();
+        const key = (handle ?? commit.email).toLowerCase();
+        const prev = people.get(key);
+        if (!prev) {
+            people.set(key, {
+                name: commit.name,
+                handle,
+                commits: 1,
+                score: commit.weight,
+                last: commit.at,
+                emails: new Set([emailLower]),
+            });
+            continue;
+        }
+        prev.emails.add(emailLower);
+        prev.commits += 1;
+        prev.score += commit.weight;
+        prev.last = Math.max(prev.last, commit.at);
+    }
+    const kept = [...people].filter(([key, o]) => !isExcludedOwner(o, key, excluded)).map(([, o]) => o);
+    // The floor is a SHARE of what is left after the author is dropped, not of the
+    // whole area. On a repo where one person wrote everything, their own PR would
+    // otherwise leave every remaining contributor under the floor and report nobody.
+    const total = kept.reduce((n, o) => n + o.score, 0);
+    return kept
+        .filter((o) => total === 0 || o.score / total >= MIN_SHARE)
+        .sort((a, b) => b.score - a.score || b.commits - a.commits || a.name.localeCompare(b.name))
+        .slice(0, MAX_PER_AREA)
+        .map(({ name, handle, commits, score, last }) => ({ name, handle, commits, score, last }));
+}
+
 /**
  * The people behind `files`, best first.
  *
@@ -87,82 +233,11 @@ export function ownersFor(root, files, opts = {}) {
     if (paths.length === 0)
         return [];
     const now = opts.now ?? Date.now();
-    const out = git(resolve(root), [
-        "log",
-        "--no-merges",
-        `--since=${SINCE}`,
-        "-n",
-        String(MAX_COMMITS),
-        "--format=\x01%H\x02%aI\x02%aN\x02%aE",
-        "--name-only",
-        "--",
-        ...paths,
-    ]);
-    if (out === null)
+    const { fileCommits, multiChunk } = collectCommitsByFile(resolve(root), paths, now, MAX_COMMITS);
+    const commits = areaCommitsFromMap(paths, fileCommits, multiChunk);
+    if (commits.length === 0)
         return [];
-    const wanted = new Set(paths);
-    const people = new Map();
-    let commit = null;
-    for (const line of out.split("\n")) {
-        if (line.startsWith("\x01")) {
-            const [hash, iso, name, email] = line.slice(1).split("\x02");
-            const at = Date.parse(iso ?? "");
-            commit = Number.isFinite(at)
-                ? { hash, at, weight: Math.pow(0.5, (now - at) / HALF_LIFE_MS), name: name ?? "", email: email ?? "" }
-                : null;
-            continue;
-        }
-        // A pathspec'd `git log --name-only` already lists only matching files, but
-        // the set is re-checked here so a future flag change cannot silently start
-        // crediting whoever touched an unrelated file in the same commit.
-        if (commit === null || !wanted.has(line))
-            continue;
-        if (isBot(commit.name, commit.email))
-            continue;
-        const handle = githubHandle(commit.email) ?? undefined;
-        const key = (handle ?? commit.email).toLowerCase();
-        const prev = people.get(key);
-        if (!prev) {
-            people.set(key, {
-                name: commit.name, handle, commits: 1, score: commit.weight, last: commit.at,
-                seen: new Set([commit.hash]),
-                emails: new Set([commit.email.toLowerCase()]),
-            });
-            continue;
-        }
-        prev.emails.add(commit.email.toLowerCase());
-        // One commit touching six files in the area is one commit, not six.
-        if (prev.seen.has(commit.hash))
-            continue;
-        prev.seen.add(commit.hash);
-        prev.commits += 1;
-        prev.score += commit.weight;
-        prev.last = Math.max(prev.last, commit.at);
-    }
-    const excluded = new Set();
-    for (const raw of opts.exclude ?? []) {
-        const clean = raw.trim().toLowerCase();
-        if (!clean)
-            continue;
-        excluded.add(clean);
-        const h = githubHandle(clean);
-        if (h)
-            excluded.add(h.toLowerCase());
-    }
-    const isExcludedOwner = (o, key) => excluded.has(key.toLowerCase()) ||
-        excluded.has(o.name.toLowerCase()) ||
-        (o.handle !== undefined && excluded.has(o.handle.toLowerCase())) ||
-        [...o.emails].some((e) => excluded.has(e));
-    const kept = [...people].filter(([key, o]) => !isExcludedOwner(o, key)).map(([, o]) => o);
-    // The floor is a SHARE of what is left after the author is dropped, not of the
-    // whole area. On a repo where one person wrote everything, their own PR would
-    // otherwise leave every remaining contributor under the floor and report nobody.
-    const total = kept.reduce((n, o) => n + o.score, 0);
-    return kept
-        .filter((o) => total === 0 || o.score / total >= MIN_SHARE)
-        .sort((a, b) => b.score - a.score || b.commits - a.commits || a.name.localeCompare(b.name))
-        .slice(0, MAX_PER_AREA)
-        .map(({ name, handle, commits, score, last }) => ({ name, handle, commits, score, last }));
+    return rankOwnersFromCommits(commits, buildExcludedSet(opts.exclude));
 }
 /**
  * Everyone who authored a commit in `base...HEAD` — the people whose work this
@@ -180,7 +255,7 @@ export function ownersFor(root, files, opts = {}) {
 export function diffAuthors(root, base) {
     if (!base || base.startsWith("-"))
         return [];
-    const out = git(resolve(root), ["log", "--format=%aN%n%aE%n%(trailers:key=Co-authored-by,valueonly)", "--end-of-options", `${base}...HEAD`, "--"]);
+    const out = git(resolve(root), ["log", "--no-textconv", "--format=%aN%n%aE%n%(trailers:key=Co-authored-by,valueonly)", "--end-of-options", `${base}...HEAD`, "--"]);
     if (out === null)
         return [];
     const names = new Set();
@@ -210,16 +285,54 @@ export function diffAuthors(root, base) {
  */
 export function localIdentity(root) {
     const dir = resolve(root);
-    const out = [git(dir, ["config", "user.name"]), git(dir, ["config", "user.email"])];
-    return out.map((v) => v?.trim() ?? "").filter((v) => v !== "");
+    let configMtime = -1;
+    try {
+        configMtime = statSync(join(dir, ".git", "config")).mtimeMs;
+    } catch {
+        // Worktree `.git` pointer file or non-repo; fall back to path key
+    }
+    const cacheKey = `${dir}\0${configMtime}`;
+    const cached = LOCAL_IDENTITY_CACHE.get(cacheKey);
+    if (cached)
+        return [...cached];
+
+    const raw = git(dir, ["config", "--get-regexp", "^user\\.(name|email)$"]);
+    let userName = "";
+    let userEmail = "";
+    if (raw !== null) {
+        for (const line of raw.split("\n")) {
+            if (line.startsWith("user.name")) {
+                userName = line.slice("user.name".length).trim();
+            } else if (line.startsWith("user.email")) {
+                userEmail = line.slice("user.email".length).trim();
+            }
+        }
+    }
+    const res = [userName, userEmail].filter((v) => v !== "");
+    if (LOCAL_IDENTITY_CACHE.size >= MAX_IDENTITY_CACHE) {
+        LOCAL_IDENTITY_CACHE.clear();
+    }
+    LOCAL_IDENTITY_CACHE.set(cacheKey, res);
+    return [...res];
 }
 /**
  * Fill in `owners` on every area and module, and rank the report's `reviewers`.
  */
 export function attachOwners(root, report, opts = {}) {
+    const now = opts.now ?? Date.now();
+    const excluded = buildExcludedSet(opts.exclude);
+    const areaPaths = report.areas.map((a) => [...a.files].sort().slice(0, MAX_PATHSPEC));
+    const modPaths = report.modules.map((m) => [...m.files].sort().slice(0, MAX_PATHSPEC));
+    const uniquePaths = [...new Set([...areaPaths.flat(), ...modPaths.flat()])].sort();
+    const batchCap = Math.min(MAX_BATCH_COMMITS, Math.max(MAX_COMMITS, (areaPaths.length + modPaths.length) * MAX_COMMITS));
+    const { fileCommits, multiChunk } = collectCommitsByFile(resolve(root), uniquePaths, now, batchCap);
+
     const ranked = new Map();
-    const accumulateAreaOwners = (label, files, weight) => {
-        const owners = ownersFor(root, files, opts);
+    const accumulateAreaOwners = (label, paths, weight) => {
+        if (paths.length === 0)
+            return [];
+        const commits = areaCommitsFromMap(paths, fileCommits, multiChunk);
+        const owners = commits.length > 0 ? rankOwnersFromCommits(commits, excluded) : [];
         for (const o of owners) {
             const key = (o.handle ?? o.name).toLowerCase();
             const prev = ranked.get(key);
@@ -239,10 +352,10 @@ export function attachOwners(root, report, opts = {}) {
         }
         return owners;
     };
-    for (const area of report.areas)
-        area.owners = accumulateAreaOwners(area.label, area.files, 1);
-    for (const mod of report.modules)
-        mod.owners = accumulateAreaOwners(mod.label, mod.files, AFFECTED_WEIGHT);
+    for (let i = 0; i < report.areas.length; i++)
+        report.areas[i].owners = accumulateAreaOwners(report.areas[i].label, areaPaths[i], 1);
+    for (let i = 0; i < report.modules.length; i++)
+        report.modules[i].owners = accumulateAreaOwners(report.modules[i].label, modPaths[i], AFFECTED_WEIGHT);
     report.reviewers = [...ranked.values()]
         .sort((a, b) => b.weighted - a.weighted || b.commits - a.commits || a.name.localeCompare(b.name))
         .slice(0, MAX_REVIEWERS)

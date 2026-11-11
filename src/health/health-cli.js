@@ -4,7 +4,8 @@
  * `detect`, `zone`, `exclude`, `directives`, `config`, `prompt`).
  */
 import { existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
+import { nearestPlexerRoot } from "../graph/root.js";
 import { health, healthAsync } from "./health.js";
 import { formatHealthMarkdown, formatHealthText } from "./render.js";
 
@@ -30,13 +31,35 @@ const KNOWN_ACTIONS = new Set([
     "prompt",
 ]);
 
-function isDirArg(candidate) {
-    if (!candidate) return false;
-    try {
-        return existsSync(candidate) && statSync(candidate).isDirectory();
-    } catch {
-        return false;
+function resolveDirArg(candidate, baseDir = process.cwd()) {
+    if (!candidate) return null;
+    const baseFirst = baseDir && resolve(baseDir) !== process.cwd();
+    const candidates = baseFirst
+        ? [resolve(baseDir, candidate), resolve(candidate)]
+        : [resolve(candidate), resolve(baseDir, candidate)];
+    for (const p of candidates) {
+        try {
+            if (existsSync(p) && statSync(p).isDirectory()) return p;
+        } catch {}
     }
+    return null;
+}
+
+function isDirArg(candidate, baseDir = process.cwd()) {
+    return Boolean(resolveDirArg(candidate, baseDir));
+}
+
+function applyTargetCandidate(candidate, currentDir, callOpts) {
+    const absCand = resolveDirArg(candidate, currentDir);
+    if (!absCand) return currentDir;
+    const { root } = nearestPlexerRoot(absCand, callOpts.contextDir);
+    const repoDir = root || absCand;
+    const relSub = relative(repoDir, absCand).replace(/\\/g, "/");
+    if (relSub && !relSub.startsWith("..")) {
+        callOpts.in = callOpts.in || relSub;
+        callOpts.scanPath = relSub;
+    }
+    return repoDir;
 }
 
 function parsePositionTail(rest, allowUpDown = false) {
@@ -97,7 +120,12 @@ function parsePlanCliSubargs(args, callOpts) {
         if (cAct === "list") {
             callOpts.clusterName = null;
         } else if (cAct === "move") {
-            callOpts.patterns = rest.slice(1);
+            if (!callOpts.to && rest.length >= 3) {
+                callOpts.clusterName = rest[1];
+                callOpts.patterns = rest.slice(2);
+            } else {
+                callOpts.patterns = rest.slice(1);
+            }
         } else if (cAct === "merge") {
             callOpts.clusterName = rest[1];
             callOpts.targetCluster = rest[2];
@@ -116,8 +144,8 @@ function parsePlanCliSubargs(args, callOpts) {
         callOpts.policyAction = (rest[0] || "list").toLowerCase();
         if (rest.length > 1) callOpts.rule = rest.slice(1).join(" ");
     } else if (sub === "scan-gate" || sub === "scangate") {
-        if (rest[0] === "reset") callOpts.reset = true;
-        if (rest[0] === "skip") callOpts.skip = true;
+        if (rest[0] === "reset" || callOpts.resetGate) callOpts.reset = true;
+        if (rest[0] === "skip" || callOpts.skipGate) callOpts.skip = true;
     } else if (sub === "triage") {
         if (rest[0] && !callOpts.stagePrompt && !callOpts["stage-prompt"]) {
             callOpts.stagePrompt = rest[0];
@@ -133,31 +161,41 @@ function parseHealthCliArgs(defaultDir, positionalArgs, opts) {
     const args = [...positionalArgs];
     let action = "scan";
     let dir = defaultDir;
+    const callOpts = { ...opts, action, scanPath: opts.scanPath || opts.path || "." };
 
     if (args.length > 0 && KNOWN_ACTIONS.has(args[0].toLowerCase())) {
         action = args.shift().toLowerCase();
-    } else if (args.length > 0 && isDirArg(args[0])) {
-        dir = resolve(args.shift());
+        callOpts.action = action;
+    } else if (args.length > 0 && isDirArg(args[0], dir)) {
+        dir = applyTargetCandidate(args.shift(), dir, callOpts);
     }
 
-    if (opts.path && isDirArg(opts.path)) {
-        dir = resolve(opts.path);
+    if (opts.path && isDirArg(opts.path, dir)) {
+        dir = applyTargetCandidate(opts.path, dir, callOpts);
     }
 
-    const callOpts = { ...opts, action, scanPath: opts.path || "." };
+    if (opts.detailText !== undefined && callOpts.detail === undefined) {
+        callOpts.detail = opts.detailText;
+    } else if (opts.detailText !== undefined && action === "plan") {
+        callOpts.detail = opts.detailText;
+    }
 
     if (["scan", "next", "backlog", "status", "tree", "viz"].includes(action)) {
-        if (args.length > 0 && isDirArg(args[0])) dir = resolve(args.shift());
+        if (args.length > 0 && isDirArg(args[0], dir)) {
+            dir = applyTargetCandidate(args.shift(), dir, callOpts);
+        }
     } else if (action === "show" || action === "resolve") {
         callOpts.patterns = args;
     } else if (action === "suppress") {
         callOpts.pattern = args[0];
         callOpts.patterns = args;
     } else if (action === "detect") {
-        callOpts.detector = args[0] || "all";
-        if (args[1] && isDirArg(args[1])) dir = resolve(args[1]);
+        callOpts.detector = args[0] || opts.detector || "all";
+        if (args[1] && isDirArg(args[1], dir)) {
+            dir = applyTargetCandidate(args[1], dir, callOpts);
+        }
     } else if (action === "exclude") {
-        callOpts.target = args[0];
+        callOpts.target = args[0] || opts.target;
     } else if (action === "autofix") {
         callOpts.fixer = args[0] || "all";
     } else if (action === "move") {
@@ -165,7 +203,7 @@ function parseHealthCliArgs(defaultDir, positionalArgs, opts) {
         callOpts.dst = args[1];
     } else if (action === "zone") {
         callOpts.subAction = args[0] === "set" || args[0] === "clear" ? args[0] : "show";
-        callOpts.target = args[1];
+        callOpts.target = args[1] || opts.target;
         if (args[0] === "set") callOpts.zone = args[2];
     } else if (action === "config") {
         callOpts.subAction = args[0] === "set" || args[0] === "unset" ? args[0] : "show";
@@ -279,6 +317,19 @@ function printPlanSubcommandResult(action, result) {
             return true;
         }
         console.log(`✓ Unskipped ${result.unskipped_ids.length} finding(s): ${result.unskipped_ids.join(", ")}`);
+        return true;
+    }
+    if (result.action === "plan_reopen") {
+        if (result.status === "not_found") {
+            console.error(`✗ ${result.message}`);
+            process.exitCode = 1;
+            return true;
+        }
+        console.log(`✓ Reopened ${(result.reopened_ids || []).length} finding(s): ${(result.reopened_ids || []).join(", ")}`);
+        return true;
+    }
+    if (result.action === "plan_reset") {
+        console.log("✓ Living plan reset.");
         return true;
     }
     if (result.action === "plan_promote") {

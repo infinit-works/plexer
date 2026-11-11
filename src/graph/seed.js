@@ -34,13 +34,12 @@
  * was *cloned* rather than worktree'd behaves exactly as it did before: "run plexer
  * build first".
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ASK_INDEX_FILE } from "../ask/index-file.js";
-import { CACHE_DIR, contextDirFor, envTruthy } from "../context/node-file.js";
+import { CACHE_DIR, GRAPH_DIR, contextDirFor, envTruthy, wiringPath } from "../context/node-file.js";
 import { EXTRACT_CACHE_PREFIX } from "./extract-cache.js";
 import { FINGERPRINT_PREFIX } from "./fingerprint.js";
-import { GRAPH_DIR, wiringPath } from "./write.js";
 /** The one line a linked worktree's `.git` file carries. */
 const GITDIR_KEY = "gitdir:";
 /**
@@ -63,7 +62,7 @@ const GITDIR_KEY = "gitdir:";
 export function mainWorktreeRoot(root) {
     try {
         const dot = join(root, ".git");
-        if (statSync(dot).isDirectory())
+        if (lstatSync(dot).isSymbolicLink() || statSync(dot).isDirectory())
             return null;
         // Read the pointer without a regex. `/^gitdir:[ \t]*(.+?)[ \t]*$/m` is the
         // polynomial-ReDoS shape CodeQL flagged on `ensureSearchable` (`js/polynomial-redos`,
@@ -85,6 +84,8 @@ export function mainWorktreeRoot(root) {
             return null;
         const common = isAbsolute(rel) ? rel : resolve(gitdir, rel);
         if (basename(common) !== ".git" || !statSync(common).isDirectory())
+            return null;
+        if (realpathSync(join(common, "worktrees", basename(gitdir))) !== realpathSync(gitdir))
             return null;
         const main = dirname(common);
         if (resolve(main) === resolve(root))

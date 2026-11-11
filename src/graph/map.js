@@ -1,10 +1,11 @@
 import { plural } from "../util/span.js";
 import { languageLabelOf } from "./extract.js";
-import { computeInDegree } from "./relations.js";
-import { scopeLabel, scopeOf, scopesOfGraph } from "./scopes.js";
+import { scopeLabel, scopeOf, scopesOfGraph } from "../context/scopes.js";
+import { computeInDegree } from "../context/symbol-query.js";
 const DEFAULT_MAX_DIRS = 16;
 const DEFAULT_HUBS_PER_DIR = 3;
 const DEFAULT_HOTSPOTS = 12;
+const MAX_COUPLING_PAIRS = 15;
 /** A single group must not exceed this share of all file nodes, or it's
  * refined one path-segment deeper — see the module doc. */
 const SPLIT_THRESHOLD = 0.6;
@@ -18,11 +19,20 @@ function dirKey(path, depth) {
 /** Top `cap` nodes by inDegree (ties broken by name asc, then path asc, for
  * full determinism regardless of the input nodes' array order), dropping
  * anything with zero inbound edges — a hub with no callers isn't a hub. */
+const TEST_FILE_HUB_RE = /(?:^|\/)(?:__tests__|tests?|testdata|specs?|bench|benchmarks?|fixtures?|__mocks__|mocks?)\/|\.(?:test|spec|bench|mock)\.[a-z0-9]+$|_(?:test|spec|bench|mock)\.(?:go|py|rb|rs|luau|lua|ts|js|tsx|jsx|mjs|cjs)$|(?:^|\/)(?:test_[^/]+|mock_[^/]+|conftest)\.(?:py|go|rb|rs|luau|lua|ts|js)$/i;
 function topHubs(nodes, inDegree, cap) {
     return nodes
-        .map((n) => ({ name: n.name, kind: n.kind, path: n.path, span: n.span, inDegree: inDegree.get(n.id) ?? 0 }))
+        .map((n) => ({
+            name: n.name,
+            kind: n.kind,
+            path: n.path,
+            span: n.span,
+            inDegree: inDegree.get(n.id) ?? 0,
+            isTest: TEST_FILE_HUB_RE.test(n.path ?? ""),
+        }))
         .filter((h) => h.inDegree > 0)
-        .sort((a, b) => b.inDegree - a.inDegree || a.name.localeCompare(b.name) || a.path.localeCompare(b.path))
+        .sort((a, b) => Number(a.isTest) - Number(b.isTest) || b.inDegree - a.inDegree || a.name.localeCompare(b.name) || a.path.localeCompare(b.path))
+        .map(({ isTest: _isTest, ...rest }) => rest)
         .slice(0, cap);
 }
 /** Display labels, not tree-sitter grammars: a `scripts/` tree of `.mjs` files is
@@ -137,6 +147,69 @@ function attachChurnHotspots(result, graph, fileNodes, inDegree, hotspots, hotsp
     result.churnHotspots = churnHotspots.slice(0, hotspotsN);
 }
 
+function buildCouplingBucketMap(fileNodes) {
+    const bucketOf = new Map();
+    const total = fileNodes.length;
+    if (total === 0)
+        return bucketOf;
+    const depth1Counts = new Map();
+    for (const f of fileNodes) {
+        const k = dirKey(f.path, 1);
+        depth1Counts.set(k, (depth1Counts.get(k) ?? 0) + 1);
+    }
+    let splitSeg = null;
+    for (const [seg, count] of depth1Counts) {
+        if (count / total > SPLIT_THRESHOLD) {
+            splitSeg = seg;
+            break;
+        }
+    }
+    for (const f of fileNodes) {
+        const depth = splitSeg !== null && dirKey(f.path, 1) === splitSeg ? 2 : 1;
+        bucketOf.set(f.path, dirKey(f.path, depth));
+    }
+    if (total >= 2 && new Set(bucketOf.values()).size <= 1) {
+        for (const f of fileNodes) {
+            const slash = f.path.lastIndexOf("/");
+            bucketOf.set(f.path, slash >= 0 ? f.path.slice(0, slash) : f.path);
+        }
+        if (new Set(bucketOf.values()).size <= 1) {
+            for (const f of fileNodes)
+                bucketOf.set(f.path, f.path);
+        }
+    }
+    return bucketOf;
+}
+
+function computeStructuralCoupling(graph, fileNodes) {
+    const bucketOf = buildCouplingBucketMap(fileNodes);
+    const byId = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
+    const weights = new Map();
+    for (const e of graph.edges) {
+        if (e.relation === "contains" || e.typeOnly)
+            continue;
+        const srcPath = byId.get(e.source)?.path;
+        const tgtPath = byId.get(e.target)?.path;
+        if (!srcPath || !tgtPath || srcPath === tgtPath)
+            continue;
+        const ba = bucketOf.get(srcPath);
+        const bb = bucketOf.get(tgtPath);
+        if (!ba || !bb || ba === bb)
+            continue;
+        const a = ba < bb ? ba : bb;
+        const b = ba < bb ? bb : ba;
+        const key = `${a}\0${b}`;
+        weights.set(key, (weights.get(key) ?? 0) + 1);
+    }
+    return [...weights.entries()]
+        .map(([key, weight]) => {
+            const [a, b] = key.split("\0");
+            return { a, b, weight };
+        })
+        .sort((x, y) => y.weight - x.weight || x.a.localeCompare(y.a) || x.b.localeCompare(y.b))
+        .slice(0, MAX_COUPLING_PAIRS);
+}
+
 /**
  * Build the repo map from an already-loaded `GraphV1`. Deterministic: same
  * graph in → byte-identical `RepoMap` out (modulo insertion order, which is
@@ -153,7 +226,8 @@ export function buildRepoMap(graph, opts = {}) {
     const hubsPerDir = opts.hubsPerDir ?? DEFAULT_HUBS_PER_DIR;
     const hotspotsN = opts.hotspots ?? DEFAULT_HOTSPOTS;
     const hasChurnOpts = Boolean(opts.gitHistory);
-    const isDefault = maxDirs === DEFAULT_MAX_DIRS && hubsPerDir === DEFAULT_HUBS_PER_DIR && hotspotsN === DEFAULT_HOTSPOTS && !hasChurnOpts;
+    const hasCoupling = Boolean(opts.includeCoupling);
+    const isDefault = maxDirs === DEFAULT_MAX_DIRS && hubsPerDir === DEFAULT_HUBS_PER_DIR && hotspotsN === DEFAULT_HOTSPOTS && !hasChurnOpts && !hasCoupling;
     if (isDefault && graph._defaultRepoMap && graph._mapNodeLen === graph.nodes.length && graph._mapEdgeLen === graph.edges.length) {
         return graph._defaultRepoMap;
     }
@@ -182,10 +256,15 @@ export function buildRepoMap(graph, opts = {}) {
         for (const n of graph.nodes) {
             byScope.get(scopeOf(n.path, scopes).prefix)?.push(n);
         }
-        scopeGroups = scopes.map((s) => {
-            const computed = computeDirEntries(byScope.get(s.prefix) ?? [], inDegree, maxDirs, hubsPerDir, s.prefix);
-            return { scope: scopeLabel(s.prefix), dirs: computed.dirs, dropped: computed.dropped };
-        });
+        scopeGroups = scopes
+            .map((s) => {
+                const scopeNodes = byScope.get(s.prefix) ?? [];
+                const computed = computeDirEntries(scopeNodes, inDegree, maxDirs, hubsPerDir, s.prefix);
+                const symCount = scopeNodes.reduce((acc, n) => acc + (n.kind === "file" ? 0 : 1), 0);
+                return { scope: scopeLabel(s.prefix), dirs: computed.dirs, dropped: computed.dropped, _symCount: symCount };
+            })
+            .sort((a, b) => b._symCount - a._symCount || a.scope.localeCompare(b.scope))
+            .map(({ _symCount, ...rest }) => rest);
     }
     const allSymbols = graph.nodes.filter((n) => n.kind !== "file");
     const hotspots = topHubs(allSymbols, inDegree, hotspotsN);
@@ -203,6 +282,9 @@ export function buildRepoMap(graph, opts = {}) {
     };
     if (hasChurnOpts) {
         attachChurnHotspots(result, graph, fileNodes, inDegree, hotspots, hotspotsN, opts.gitHistory);
+    }
+    if (hasCoupling) {
+        result.coupling = computeStructuralCoupling(graph, fileNodes);
     }
     if (isDefault) {
         Object.defineProperty(graph, "_defaultRepoMap", { value: result, enumerable: false, configurable: true, writable: true });
@@ -263,6 +345,9 @@ export function formatRepoMap(map) {
     lines.push(`hotspots: ${map.hotspots.map(formatHotspot).join("  ")}`);
     if (Array.isArray(map.churnHotspots) && map.churnHotspots.length > 0) {
         lines.push(`churn hotspots: ${map.churnHotspots.map(formatChurnHotspot).join("  ")}`);
+    }
+    if (Array.isArray(map.coupling) && map.coupling.length > 0) {
+        lines.push(`coupling: ${map.coupling.map((c) => `${c.a} ↔ ${c.b} (${c.weight})`).join("  ")}`);
     }
     return lines.join("\n") + "\n";
 }

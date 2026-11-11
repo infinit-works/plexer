@@ -17,7 +17,7 @@ const MAX_HUNK_LINES = 24;
 const MAX_FILE_LINES = 200;
 /** Run git in `root`, or return null when git fails (not a repo, unknown ref). */
 export function git(root, args) {
-    const res = spawnSync("git", ["-c", "core.quotePath=false", ...args], {
+    const res = spawnSync("git", ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", ...args], {
         cwd: root,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
@@ -70,7 +70,7 @@ export function changedFiles(root, base) {
 }
 /** Both git passes for one range: name-status (statuses, renames) then hunks. */
 function diffFiles(dir, range) {
-    const status = git(dir, ["diff", "--relative", "--name-status", "--find-renames", "-z", "--end-of-options", ...range, "--"]);
+    const status = git(dir, ["diff", "--relative", "--no-ext-diff", "--no-textconv", "--name-status", "--find-renames", "-z", "--end-of-options", ...range, "--"]);
     if (status === null)
         return null;
     const files = parseNameStatus(status);
@@ -82,6 +82,7 @@ function diffFiles(dir, range) {
         "--unified=0",
         "--no-color",
         "--no-ext-diff",
+        "--no-textconv",
         "--src-prefix=a/",
         "--dst-prefix=b/",
         "--find-renames",

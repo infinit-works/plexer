@@ -4,7 +4,7 @@
  */
 import { createHash } from "node:crypto";
 import { basename, dirname } from "node:path";
-import { computeInDegree, WALK_RELATIONS } from "../graph/relations.js";
+import { computeInDegree, WALK_RELATIONS } from "../context/symbol-query.js";
 import { SCORED_ZONES } from "./zones.js";
 
 export function computeOutDegree(graph) {
@@ -27,6 +27,10 @@ const JUDGMENT_DETECTORS = new Set([
     "single_importer_files",
     "signature_variance",
     "naming_inconsistencies",
+    "hotspots",
+    "package_census",
+    "enum_bypasses",
+    "deceptive_queries",
 ]);
 
 const MIN_FILES_FOR_SYSTEMIC = 3;
@@ -94,13 +98,72 @@ function appendSystemicSmellConcerns(openIssues, dismissals, seenFp, concerns) {
     }
 }
 
+function appendSystemicPatternConcerns(byFile, dismissals, seenFp, concerns) {
+    const comboToFiles = new Map();
+    for (const [file, fileIssues] of byFile.entries()) {
+        const dets = [
+            ...new Set(
+                fileIssues.filter((i) => JUDGMENT_DETECTORS.has(i.detector)).map((i) => i.detector),
+            ),
+        ].sort();
+        if (dets.length >= 2) {
+            const key = dets.join("+");
+            let arr = comboToFiles.get(key);
+            if (!arr) {
+                arr = [];
+                comboToFiles.set(key, arr);
+            }
+            arr.push(file);
+        }
+    }
+
+    for (const [comboKey, files] of comboToFiles.entries()) {
+        if (files.length < MIN_FILES_FOR_SYSTEMIC) continue;
+        const sortedFiles = [...files].sort();
+        const detSet = comboKey.split("+");
+        const sourceIds = sortedFiles
+            .flatMap((f) =>
+                (byFile.get(f) || []).filter((i) => detSet.includes(i.detector)).map((i) => i.id),
+            )
+            .sort();
+        const fp = concernFingerprint("systemic_pattern", sortedFiles.join(","), detSet);
+        if (seenFp.has(fp) || isConcernDismissed(dismissals, fp, sourceIds)) continue;
+        seenFp.add(fp);
+
+        concerns.push({
+            fingerprint: fp,
+            type: "systemic_pattern",
+            target_dimension: "design_coherence",
+            file: sortedFiles[0],
+            affected_files: sortedFiles,
+            detectors: detSet,
+            source_issues: sourceIds,
+            summary: `${sortedFiles.length} files share the same structural pattern (${detSet.join(", ")})`,
+            evidence: [
+                `Affected files (${sortedFiles.length}): ${sortedFiles.slice(0, 8).join(", ")}`,
+                `Shared detectors: ${detSet.join(", ")}`,
+            ],
+            question: `These ${sortedFiles.length} files all exhibit (${detSet.join(", ")}). Should this be solved systemically at the architecture level rather than patched file-by-file?`,
+        });
+    }
+}
+
 /**
  * Generate synthesized structural & systemic concerns from open mechanical findings.
  * Bridges mechanical detectors to `design_coherence` and holistic subjective review.
  */
-export function generateConcerns(state) {
+export function generateConcerns(state, graph = null, zoneMap = null) {
     const dismissals = state.concern_dismissals || {};
-    const openIssues = Object.values(state.issues || {}).filter((i) => i.status === "open");
+    const openIssues = Object.values(state.issues || {}).filter((i) => {
+        if (i.status !== "open" || i.suppressed) return false;
+        if (i.file && i.file !== "repo") {
+            const z =
+                (zoneMap && typeof zoneMap.get === "function" ? zoneMap.get(i.file) : null) ||
+                i.zone;
+            if (z && !SCORED_ZONES.has(z)) return false;
+        }
+        return true;
+    });
     const byFile = new Map();
 
     for (const iss of openIssues) {
@@ -127,7 +190,7 @@ export function generateConcerns(state) {
             continue;
         }
 
-        const sourceIds = judgment.map((i) => i.id).sort();
+        const sourceIds = (judgment.length >= 2 ? judgment : fileIssues).map((i) => i.id).sort();
         const fp = concernFingerprint("file_hotspot", file, detSet);
         if (seenFp.has(fp) || isConcernDismissed(dismissals, fp, sourceIds)) continue;
         seenFp.add(fp);
@@ -146,48 +209,7 @@ export function generateConcerns(state) {
     }
 
     // 2. Cross-file detector-combination patterns (>= 3 files sharing the same >= 2 judgment detectors)
-    const comboToFiles = new Map();
-    for (const [file, fileIssues] of byFile.entries()) {
-        const dets = [...new Set(fileIssues.filter((i) => JUDGMENT_DETECTORS.has(i.detector)).map((i) => i.detector))].sort();
-        if (dets.length >= 2) {
-            const key = dets.join("+");
-            let arr = comboToFiles.get(key);
-            if (!arr) {
-                arr = [];
-                comboToFiles.set(key, arr);
-            }
-            arr.push(file);
-        }
-    }
-
-    for (const [comboKey, files] of comboToFiles.entries()) {
-        if (files.length < MIN_FILES_FOR_SYSTEMIC) continue;
-        const sortedFiles = [...files].sort();
-        const detSet = comboKey.split("+");
-        const sourceIds = sortedFiles
-            .flatMap((f) => (byFile.get(f) || []).filter((i) => detSet.includes(i.detector)).map((i) => i.id))
-            .sort();
-        const fp = concernFingerprint("systemic_pattern", sortedFiles.slice(0, 5).join(","), detSet);
-        if (seenFp.has(fp) || isConcernDismissed(dismissals, fp, sourceIds)) continue;
-        seenFp.add(fp);
-
-        concerns.push({
-            fingerprint: fp,
-            type: "systemic_pattern",
-            target_dimension: "design_coherence",
-            file: sortedFiles[0],
-            affected_files: sortedFiles,
-            detectors: detSet,
-            source_issues: sourceIds,
-            summary: `${sortedFiles.length} files share the same structural pattern (${detSet.join(", ")})`,
-            evidence: [
-                `Affected files (${sortedFiles.length}): ${sortedFiles.slice(0, 8).join(", ")}`,
-                `Shared detectors: ${detSet.join(", ")}`,
-            ],
-            question: `These ${sortedFiles.length} files all exhibit (${detSet.join(", ")}). Should this be solved systemically at the architecture level rather than patched file-by-file?`,
-        });
-    }
-
+    appendSystemicPatternConcerns(byFile, dismissals, seenFp, concerns);
     appendSystemicSmellConcerns(openIssues, dismissals, seenFp, concerns);
     return concerns;
 }
@@ -200,7 +222,7 @@ export function cleanupStaleDismissals(state) {
     if (!dismissals || typeof dismissals !== "object") return 0;
     const openIds = new Set(
         Object.values(state.issues || {})
-            .filter((i) => i.status === "open")
+            .filter((i) => i.status === "open" && !i.suppressed)
             .map((i) => i.id),
     );
     let removed = 0;
@@ -244,6 +266,20 @@ function computeCouplingMatrix(graph, nodeById) {
         .map(([edge, count]) => ({ edge, count }));
 }
 
+function filterHolisticOpenIssues(state, zoneMap) {
+    return Object.values(state.issues || {}).filter((i) => {
+        if (i.status !== "open" || i.suppressed) return false;
+        if (i.detector === "hollow_tests") return true;
+        if (i.file && i.file !== "repo") {
+            const z =
+                (zoneMap && typeof zoneMap.get === "function" ? zoneMap.get(i.file) : null) ||
+                i.zone;
+            if (z && !SCORED_ZONES.has(z)) return false;
+        }
+        return true;
+    });
+}
+
 /**
  * Build the objective Holistic Context packet (`architecture`, `conventions`, `errors`,
  * `testing`, `structure`, `codebase_stats`, `concerns`) for `review_packet_blind.json`.
@@ -256,14 +292,17 @@ export function buildHolisticContext(graph, state, zoneMap, readLines) {
     const prodFiles = [];
     const testFiles = [];
     let totalProdLoc = 0;
-    const namingByDir = {};
-    const dirProfiles = {};
+    const namingByDir = Object.create(null);
+    const dirProfiles = Object.create(null);
 
     for (const node of graph.nodes) {
         if (node.kind !== "file") continue;
-        const zone = zoneMap.get(node.path) || "production";
-        const lines = readLines ? readLines(node.path) || [] : [];
-        const loc = lines.length;
+        const zone =
+            (zoneMap && typeof zoneMap.get === "function" ? zoneMap.get(node.path) : null) ||
+            "production";
+        const lines = typeof readLines === "function" ? readLines(node.path) : null;
+        const loc =
+            Array.isArray(lines) && lines.length > 0 ? lines.length : Number(node.lineCount) || 0;
 
         if (zone === "test") {
             testFiles.push({ path: node.path, loc });
@@ -279,7 +318,7 @@ export function buildHolisticContext(graph, state, zoneMap, readLines) {
         const dir = dirname(node.path);
         const conv = classifyStemConvention(basename(node.path), true);
         if (conv) {
-            if (!namingByDir[dir]) namingByDir[dir] = {};
+            if (!namingByDir[dir]) namingByDir[dir] = Object.create(null);
             namingByDir[dir][conv] = (namingByDir[dir][conv] || 0) + 1;
         }
 
@@ -297,7 +336,7 @@ export function buildHolisticContext(graph, state, zoneMap, readLines) {
         .sort((a, b) => b.fan_in - a.fan_in || b.loc - a.loc)
         .slice(0, 12);
     const rootFiles = prodFiles.filter((f) => dirname(f.path) === ".");
-    const openIssues = Object.values(state.issues || {}).filter((i) => i.status === "open");
+    const openIssues = filterHolisticOpenIssues(state, zoneMap);
     const errorByDir = {};
     for (const iss of openIssues) {
         if (iss.category === "catches" || iss.detector === "silent_catches") {
@@ -332,6 +371,6 @@ export function buildHolisticContext(graph, state, zoneMap, readLines) {
             untested_hubs: openIssues.filter((i) => i.detector === "untested_hubs").map((i) => i.file),
             hollow_tests: openIssues.filter((i) => i.detector === "hollow_tests").map((i) => i.file),
         },
-        concerns: generateConcerns(state),
+        concerns: generateConcerns(state, graph, zoneMap),
     };
 }

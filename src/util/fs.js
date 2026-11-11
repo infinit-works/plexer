@@ -5,6 +5,18 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { toPosixPath } from "./paths.js";
+/** Safe directory-existence check (`false` on absent or non-directory paths). */
+export function dirExists(p) {
+    let isDir = false;
+    try {
+        isDir = statSync(p).isDirectory();
+    }
+    catch {
+        /* absent or unreadable */
+    }
+    return isDir;
+}
+
 /** Directories that are dependency/build output, never source. */
 export const SKIP_DIRS = new Set([
     "node_modules",
@@ -30,7 +42,7 @@ export const MAX_FILE_BYTES = 1_000_000;
  * any dot-prefixed directory (`.git`, `.github`, `.vscode`, ...) or one of
  * {@link SKIP_DIRS} not named in `includes`. The single source of truth for
  * "is this dir source" — `skippedPath` and `walkFilesystem` below and the
- * git-child discovery in `graph/scopes.js` share it, so they can never
+ * git-child discovery in `graph/scope-discovery.js` share it, so they can never
  * independently drift on what counts as skippable.
  *
  * `includes` is the explicit, per-repo `plexer build --include-dir` override
@@ -163,7 +175,7 @@ function gitVisibleFiles(dir, includes, opts = {}, traversal) {
     state.activeRoots.add(rootKey);
     // Following uses `-t --stage` so one process can distinguish gitlinks from
     // tracked and untracked files. `-z` keeps either form safe for unusual paths.
-    const result = spawnSync("git", ["ls-files", "-t", "--stage", "--cached", "--others", "--exclude-standard", "-z", "--"], {
+    const result = spawnSync("git", ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "ls-files", "-t", "--stage", "--cached", "--others", "--exclude-standard", "-z", "--"], {
         cwd: root,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
@@ -252,7 +264,7 @@ function isIndexableFile(abs) {
  * exactly the same command, filtering, ordering, and duplicate handling as it
  * did before submodule support existed. */
 function gitVisibleFilesShallow(root, includes) {
-    const result = spawnSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"], {
+    const result = spawnSync("git", ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"], {
         cwd: root,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
@@ -273,8 +285,12 @@ function gitVisibleFilesShallow(root, includes) {
 /** A path (git-relative, either separator) is skipped when any of its
  * segments is a skippable directory name — the final segment doubles as the
  * dot-FILE check (`.eslintrc.js` and friends are not source either). */
+const MINIFIED_BUNDLE_RE = /\.(?:min|bundle)\.(?:js|mjs|cjs|css)$/i;
 function skippedPath(path, includes) {
-    return toPosixPath(path).split("/").some((segment) => shouldSkipDir(segment, includes));
+    const posix = toPosixPath(path);
+    if (MINIFIED_BUNDLE_RE.test(posix))
+        return true;
+    return posix.split("/").some((segment) => shouldSkipDir(segment, includes));
 }
 function walkFilesystem(dir, includes) {
     const out = [];
@@ -293,8 +309,8 @@ function walkFilesystem(dir, includes) {
             out.push(...walkFilesystem(full, includes));
         }
         else if (entry.isFile()) {
-            if (entry.name.startsWith("."))
-                continue; // dot-files are not source either
+            if (entry.name.startsWith(".") || MINIFIED_BUNDLE_RE.test(entry.name))
+                continue; // dot-files and minified vendor bundles are not source either
             try {
                 const st = statSync(full);
                 if (st.size > MAX_FILE_BYTES)

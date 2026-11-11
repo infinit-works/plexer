@@ -2,9 +2,10 @@
  * The `plexer/.cache/` sidecar state: statusline stats snapshot, per-session state,
  * persisted repository walk settings (`config.json`), and the build lock that serializes rebuilds.
  */
-import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname, isAbsolute, resolve } from "node:path";
+import { basename, join, dirname, isAbsolute, relative, resolve } from "node:path";
+import { contextDirFor } from "./paths.js";
 
 const LOCK_STALE_MS = 300000;
 const SESSION_STALE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -25,19 +26,8 @@ export function emptyStats() {
     };
 }
 
-/**
- * Resolve the context graph directory when no explicit `--dir` CLI option is threaded
- * (e.g. Claude Code hooks, `sync-run`, statusline). `PLEXER_DIR` wins over `<projectDir>/plexer`.
- */
-export function resolveContextDir(projectDir, override) {
-    const chosen = override || process.env.PLEXER_DIR?.trim();
-    if (!chosen)
-        return join(projectDir, "plexer");
-    return isAbsolute(chosen) ? chosen : join(projectDir, chosen);
-}
-
 export function cacheDir(projectDir, override) {
-    return join(resolveContextDir(projectDir, override), ".cache");
+    return join(contextDirFor(projectDir, override), ".cache");
 }
 
 function statsPath(d) {
@@ -90,7 +80,7 @@ export function patchStats(d, patch) {
 }
 
 export function readWiring(projectDir) {
-    return readJson(join(resolveContextDir(projectDir), ".graph", "wiring.json"));
+    return readJson(join(contextDirFor(projectDir), ".graph", "wiring.json"));
 }
 
 export function computeStats(w) {
@@ -174,7 +164,7 @@ export function projectDir(input) {
 export function resolveGitExcludePath(root) {
     try {
         const dot = join(root, ".git");
-        if (!existsSync(dot))
+        if (!existsSync(dot) || lstatSync(dot).isSymbolicLink())
             return null;
         const st = statSync(dot);
         if (st.isDirectory())
@@ -188,23 +178,37 @@ export function resolveGitExcludePath(root) {
         if (!target)
             return null;
         const gitdir = isAbsolute(target) ? target : resolve(root, target);
+        const realRoot = realpathSync(resolve(root));
         const commondirFile = join(gitdir, "commondir");
         if (existsSync(commondirFile)) {
             const rel = readFileSync(commondirFile, "utf8").trim();
             if (rel) {
                 const common = isAbsolute(rel) ? rel : resolve(gitdir, rel);
-                if (existsSync(common) && statSync(common).isDirectory())
+                if (
+                    basename(common) === ".git" &&
+                    existsSync(common) &&
+                    statSync(common).isDirectory() &&
+                    basename(dirname(gitdir)) === "worktrees" &&
+                    realpathSync(join(common, "worktrees", basename(gitdir))) === realpathSync(gitdir)
+                ) {
                     return join(common, "info", "exclude");
+                }
             }
         }
-        if (existsSync(gitdir) && statSync(gitdir).isDirectory())
-            return join(gitdir, "info", "exclude");
+        if (existsSync(gitdir) && statSync(gitdir).isDirectory()) {
+            const realGitdir = realpathSync(gitdir);
+            const relToRoot = relative(realRoot, realGitdir);
+            if (relToRoot && !relToRoot.startsWith("..") && !isAbsolute(relToRoot)) {
+                return join(gitdir, "info", "exclude");
+            }
+        }
         return null;
     }
     catch (err) {
-        const noExcludePath = null;
-        void err;
-        return noExcludePath;
+        if (err && typeof err === "object" && "code" in err && typeof err.code === "string") {
+            return null;
+        }
+        throw err;
     }
 }
 
@@ -404,88 +408,4 @@ export function writeAgyLastRepo(repoDir) {
         writeJsonAtomic(agyLastRepoPath(), { repoDir, updatedAt: Date.now() }, true);
     }
     catch { /* best-effort */ }
-}
-
-export function writeOwned(id, path, content, mode) {
-    const existed = existsSync(path);
-    if (existed && readFileSync(path, "utf8") === content) {
-        if (mode !== undefined && (statSync(path).mode & 0o777) !== mode)
-            chmodSync(path, mode);
-        return { id, path, action: "unchanged" };
-    }
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, content);
-    if (mode !== undefined)
-        chmodSync(path, mode);
-    return { id, path, action: existed ? "updated" : "created" };
-}
-
-export function isPlexerEntry(entry) {
-    return JSON.stringify(entry ?? "").includes("plexer-hooks.cjs");
-}
-
-export function readJsonObject(path) {
-    if (!existsSync(path))
-        return { root: {}, existed: false };
-    let root;
-    try {
-        root = JSON.parse(readFileSync(path, "utf8"));
-    }
-    catch {
-        return "unparseable";
-    }
-    if (typeof root !== "object" || root === null || Array.isArray(root))
-        return "unparseable";
-    return { root, existed: true };
-}
-
-export function dirExists(p) {
-    try {
-        return statSync(p).isDirectory();
-    }
-    catch {
-        return false;
-    }
-}
-
-export function updateJsonConfig(id, path, mutate) {
-    const loaded = readJsonObject(path);
-    if (loaded === "unparseable")
-        return { id, path, action: "skipped-unparseable" };
-    const { root, existed } = loaded;
-    const before = JSON.stringify(root);
-    const next = mutate(root);
-    if (next === "unparseable")
-        return { id, path, action: "skipped-unparseable" };
-    const target = next ?? root;
-    if (JSON.stringify(target) === before)
-        return { id, path, action: "unchanged" };
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(target, null, 2)}\n`);
-    return { id, path, action: existed ? "updated" : "created" };
-}
-
-export function upsertHookEvents(id, path, entries, buildEntry) {
-    return updateJsonConfig(id, path, (root) => {
-        const hooks = (root.hooks ??= {});
-        if (typeof hooks !== "object" || hooks === null || Array.isArray(hooks))
-            return "unparseable";
-        for (const d of entries) {
-            if (hooks[d.event] !== undefined && !Array.isArray(hooks[d.event]))
-                return "unparseable";
-            const prior = Array.isArray(hooks[d.event]) ? hooks[d.event] : [];
-            hooks[d.event] = [...prior.filter((e) => !isPlexerEntry(e)), buildEntry(d)];
-        }
-    });
-}
-
-export const BIN_LAUNCH = { command: "plexer", args: ["mcp"] };
-
-export function mergeJsonKey(id, path, topKey, entry) {
-    return updateJsonConfig(id, path, (root) => {
-        const bucket = (root[topKey] ??= {});
-        if (typeof bucket !== "object" || bucket === null || Array.isArray(bucket))
-            return "unparseable";
-        bucket.plexer = entry;
-    });
 }

@@ -12,9 +12,8 @@
  *   changed  a node's body_hash differs from the committed one   (run `plexer build`)
  */
 import { resolve } from "node:path";
-import { contextDirFor } from "../context/node-file.js";
+import { contextDirFor, readGraph, wiringPath } from "../context/node-file.js";
 import { listSourceStats } from "./source-files.js";
-import { readGraph, wiringPath } from "./write.js";
 import { extractSourceFiles, readExtractCache } from "./extract-cache.js";
 import { readFingerprint } from "./fingerprint.js";
 export async function checkGraph(dir, opts = {}) {

@@ -1,4 +1,4 @@
-import { WALK_RELATIONS } from "../util/id.js";
+import { WALK_RELATIONS } from "../context/symbol-query.js";
 import { pushMap } from "../util/paths.js";
 const emptyTopology = () => ({
     ids: new Set(),

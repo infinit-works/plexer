@@ -13,12 +13,11 @@
  * nothing about the receiver.
  */
 import { posix } from "node:path";
-import { pushMap, toPosixPath } from "../util/paths.js";
+import { pathUnderPrefix, pushMap, toPosixPath } from "../util/paths.js";
 import { containerLangOf } from "./container.js";
 import { languageOf } from "./extract.js";
 import { genericLangOf } from "./generic.js";
 import { resolveLuauEdges } from "./luau.js";
-import { pathUnderPrefix } from "./scopes.js";
 const IMPORT_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py"];
 /** C/C++ source + header extensions, for resolving `#include` targets. */
 const C_EXT = /\.(c|h|cc|cpp|cxx|hpp|hh|hxx|inl|ipp|c\+\+|h\+\+)$/i;
@@ -256,11 +255,50 @@ function resolveReferenceEdge(e, resIdx, emitResolvedEdge, opts) {
             emitResolvedEdge(e.source, hit.id, "references", hit.confidence, Boolean(e.typeOnly));
     }
 }
+function resolveImportedMemberCall(e, resIdx, emitResolvedEdge, opts) {
+    const { byId, perFileName, goFilesByDir } = resIdx;
+    let targetFile = resolveImportTargetForFile(e.specifier, e.file, resIdx, opts);
+    if (!byId.has(targetFile) && e.fallbackSpecifier) {
+        targetFile = resolveImportTargetForFile(e.fallbackSpecifier, e.file, resIdx, opts);
+    }
+    if (!byId.has(targetFile))
+        return;
+    if (e.file.endsWith(".go")) {
+        const pkgDir = posix.dirname(toPosixPath(targetFile));
+        const pkgFiles = (goFilesByDir.get(pkgDir) ?? [targetFile]).filter((f) => !f.endsWith("_test.go"));
+        const matches = [];
+        for (const pf of pkgFiles) {
+            const inFile = (perFileName.get(pf)?.get(e.name) ?? []).filter((n) => n.kind === "function" || n.kind === "struct" || n.kind === "interface" || n.kind === "type");
+            matches.push(...inFile);
+        }
+        if (matches.length === 1) {
+            emitResolvedEdge(e.source, matches[0].id, "calls", "extracted", Boolean(e.typeOnly));
+        }
+        return;
+    }
+    let searchFile = targetFile;
+    if (e.subModule) {
+        const subReexport = (resIdx.reexportsByFile?.get(targetFile) ?? []).find((r) => r.exportedName === e.subModule);
+        const nextFile = subReexport
+            ? resolveImportTargetForFile(subReexport.specifier, targetFile, resIdx, opts)
+            : resolveImportTargetForFile(`./${e.subModule}`, targetFile, resIdx, opts);
+        if (byId.has(nextFile))
+            searchFile = nextFile;
+    }
+    const found = resolveExportedSymbolInFile(searchFile, e.name, ["function", "method", "class"], resIdx, opts);
+    if (found) {
+        emitResolvedEdge(e.source, found.node.id, "calls", "extracted", Boolean(e.typeOnly || found.typeOnly));
+    }
+}
+
 function resolveCallEdge(e, resIdx, emitResolvedEdge, opts) {
     const { byId, perFileName, globalName, ownerMethod, classParents, classTraits } = resIdx;
     if (e.viaMember) {
-        if (!e.recvType)
+        if (!e.recvType) {
+            if (e.specifier)
+                resolveImportedMemberCall(e, resIdx, emitResolvedEdge, opts);
             return;
+        }
         const hit = resolveTypedMember(e.recvType, e.name, e.file, ownerMethod, classParents, classTraits, e.argCount);
         if (hit === "ambiguous")
             return;
@@ -293,11 +331,12 @@ function resolveCallEdge(e, resIdx, emitResolvedEdge, opts) {
             return;
     }
     const lookupFile = !e.viaMember && e.specifier ? "" : e.file;
-    let hit = resolveName(e.name, lookupFile, callKinds, perFileName, globalName);
+    const globalPool = e.sameFileOnly ? null : globalName;
+    let hit = resolveName(e.name, lookupFile, callKinds, perFileName, globalPool);
     if (!hit && PY_EXT.test(e.file))
-        hit = resolveName(e.name, lookupFile, PY_CTOR_KINDS, perFileName, globalName);
+        hit = resolveName(e.name, lookupFile, PY_CTOR_KINDS, perFileName, globalPool);
     if (!hit && SWIFT_EXT.test(e.file))
-        hit = resolveName(e.name, lookupFile, SWIFT_CTOR_KINDS, perFileName, globalName);
+        hit = resolveName(e.name, lookupFile, SWIFT_CTOR_KINDS, perFileName, globalPool);
     if (hit)
         emitResolvedEdge(e.source, hit.id, "calls", hit.confidence, Boolean(e.typeOnly));
 }
@@ -367,6 +406,8 @@ function resolveName(name, file, kinds, perFileName, globalName) {
     // guess this module's header says it does not make.
     if (local.length === 1)
         return { id: local[0].id, confidence: "extracted" };
+    if (!globalName)
+        return null;
     // Cross-file: also require a language that could actually reach this one.
     // Without it a unique name match ANYWHERE in the repo wins, which is how a Go
     // builtin ended up resolving into a TypeScript test — see FAMILIES above.
@@ -815,58 +856,96 @@ function resolvePhpUse(fqn, bySuffix) {
     }
     return fqn;
 }
-/**
- * Resolve a Rust `crate`-relative module path (`crate/a/b`, from `use crate::a::b::Item`)
- * to the in-repo module file — `<crate root>/a/b.rs` or `<crate root>/a/b/mod.rs`, where
- * the crate root is the `lib.rs`/`main.rs` directory the importing file lives under. The
- * per-file crate root keeps a multi-crate workspace unambiguous. Not found or ambiguous
- * (two roots, both `a/b.rs` and `a/b/mod.rs`) stays a `crate::…` string — never a guess.
- */
-function resolveRustUse(spec, file, byId, crateRoots) {
-    const full = spec.replace(/^crate\/?/, ""); // "crate/a/b/Item" → "a/b/Item"; "crate" → ""
-    const fpath = toPosixPath(file);
-    // the crate this file belongs to: the longest root that contains it (workspace-safe)
-    const owning = crateRoots
-        .filter((r) => pathUnderPrefix(fpath, r))
-        .sort((a, b) => b.length - a.length);
-    // No owning crate root (e.g. an integration test under `tests/`, whose `crate::` is the
-    // TEST binary's own root, not a lib) → do NOT search every crate in a workspace: that
-    // resolves `crate::util` to some unrelated crate's util.rs. Keep it a string instead.
-    if (owning.length === 0)
-        return full === "" ? "crate" : `crate::${full.replace(/\//g, "::")}`;
-    const roots = [owning[0]];
-    const segs = full === "" ? [] : full.split("/");
-    const hitsFor = (rels) => {
-        const hits = new Set();
-        for (const r of roots)
-            for (const rel of rels) {
-                const cand = r === "" ? rel : `${r}/${rel}`;
-                if (byId.has(cand))
-                    hits.add(cand);
-            }
-        return hits;
-    };
-    // Try the longest module prefix first, shrinking toward — but NOT past — the first
-    // segment. `crate::a::b::C` resolves as module `a/b` (C is the item); `crate::net` as
-    // module `net`. The first prefix naming exactly one in-repo file wins; two matches at a
-    // level are ambiguous → drop rather than guess.
+function rustModuleDirForFile(fpath) {
+    const dir = posix.dirname(fpath) === "." ? "" : posix.dirname(fpath);
+    const base = posix.basename(fpath);
+    if (base === "mod.rs" || base === "lib.rs" || base === "main.rs")
+        return dir;
+    const stem = base.replace(/\.rs$/i, "");
+    return dir ? `${dir}/${stem}` : stem;
+}
+
+function resolveRustModuleCandidates(baseDir, segs, rootFallbackRels, byId) {
+    const candFor = (rel) => (baseDir === "" ? rel : `${baseDir}/${rel}`);
     for (let k = segs.length; k >= 1; k--) {
         const modPath = segs.slice(0, k).join("/");
-        const hits = hitsFor([`${modPath}.rs`, `${modPath}/mod.rs`]);
-        if (hits.size === 1)
-            return [...hits][0];
-        if (hits.size > 1)
-            break;
+        const hits = [`${modPath}.rs`, `${modPath}/mod.rs`].map(candFor).filter((c) => byId.has(c));
+        if (hits.length === 1)
+            return hits[0];
+        if (hits.length > 1)
+            return null;
     }
-    // The crate root (`lib.rs`/`main.rs`) is a target ONLY for `use crate::Item` or
-    // `use crate::{…}` — a deeper path whose module chain didn't resolve is genuinely
-    // unknown (a re-export, an inline `mod`, or out-of-tree), so keep it as a string.
-    if (segs.length <= 1) {
-        const hits = hitsFor(["lib.rs", "main.rs"]);
-        if (hits.size === 1)
-            return [...hits][0];
+    if (segs.length <= 1 && rootFallbackRels.length > 0) {
+        const hits = rootFallbackRels.filter((c) => byId.has(c));
+        if (hits.length === 1)
+            return hits[0];
     }
-    return full === "" ? "crate" : `crate::${full.replace(/\//g, "::")}`;
+    return null;
+}
+
+function resolveRustRelativeUse(normSpec, fpath, byId, owningRoot) {
+    const parts = normSpec.split("/").filter(Boolean);
+    const fallback = parts.join("::");
+    let curModDir = rustModuleDirForFile(fpath);
+    let idx = 0;
+    while (idx < parts.length && (parts[idx] === "self" || parts[idx] === "super")) {
+        if (parts[idx] === "super") {
+            if (curModDir === "" || (owningRoot !== null && curModDir === owningRoot))
+                return fallback;
+            const slash = curModDir.lastIndexOf("/");
+            curModDir = slash >= 0 ? curModDir.slice(0, slash) : "";
+            if (owningRoot !== null && curModDir !== owningRoot && !pathUnderPrefix(curModDir, owningRoot))
+                return fallback;
+        }
+        idx++;
+    }
+    const remSegs = parts.slice(idx);
+    const fallbackRels = owningRoot !== null && curModDir === owningRoot
+        ? [curModDir ? `${curModDir}/lib.rs` : "lib.rs", curModDir ? `${curModDir}/main.rs` : "main.rs"]
+        : curModDir
+            ? [`${curModDir}.rs`, `${curModDir}/mod.rs`]
+            : ["lib.rs", "main.rs", "mod.rs"];
+    return resolveRustModuleCandidates(curModDir, remSegs, fallbackRels, byId) ?? fallback;
+}
+
+function inferCrateRootsFromById(byId) {
+    const roots = [];
+    if (!byId || typeof byId.keys !== "function")
+        return roots;
+    for (const rawKey of byId.keys()) {
+        if (typeof rawKey !== "string" || rawKey.includes("#"))
+            continue;
+        const p = toPosixPath(rawKey);
+        if (p === "lib.rs" || p === "main.rs")
+            roots.push("");
+        else if (p.endsWith("/lib.rs") || p.endsWith("/main.rs"))
+            roots.push(posix.dirname(p));
+    }
+    return roots;
+}
+
+/**
+ * Resolve a Rust `crate::` / `self::` / `super::` module path to an in-repo `.rs` file.
+ * Ambiguous or out-of-crate paths remain `crate::…` / `super::…` / `self::…` strings.
+ */
+export function resolveRustUse(spec, file, byId, crateRoots) {
+    const effectiveCrateRoots = crateRoots ?? inferCrateRootsFromById(byId);
+    const normSpec = spec.trim().replace(/::/g, "/").replace(/\/+$/, "");
+    const fpath = toPosixPath(file);
+    const owning = effectiveCrateRoots
+        .filter((r) => pathUnderPrefix(fpath, r))
+        .sort((a, b) => b.length - a.length);
+    const owningRoot = owning.length > 0 ? owning[0] : null;
+    if (normSpec === "self" || normSpec.startsWith("self/") || normSpec === "super" || normSpec.startsWith("super/")) {
+        return resolveRustRelativeUse(normSpec, fpath, byId, owningRoot);
+    }
+    const full = normSpec.replace(/^crate\/?/, "");
+    const fallback = full === "" ? "crate" : `crate::${full.replace(/\//g, "::")}`;
+    if (owningRoot === null)
+        return fallback;
+    const segs = full === "" ? [] : full.split("/");
+    const crateRootFiles = [owningRoot ? `${owningRoot}/lib.rs` : "lib.rs", owningRoot ? `${owningRoot}/main.rs` : "main.rs"];
+    return resolveRustModuleCandidates(owningRoot, segs, crateRootFiles, byId) ?? fallback;
 }
 /**
  * Resolve a Go import package path to an in-repo file node when it points inside one of

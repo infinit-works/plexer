@@ -1,15 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Plexer, buildGraph } from "../src/index.js";
 import { blastRadiusIn } from "../src/blast/blast.js";
 import { markdownReport, textReport } from "../src/blast/render.js";
-import { loadGraphCached } from "../src/graph/load.js";
+import { loadGraphCached } from "../src/context/graph-store.js";
 import { callTool } from "../src/mcp/tools.js";
 import { classifyStemConvention } from "../src/health/concerns.js";
 import { SUBJECTIVE_DIMENSIONS } from "../src/health/constants.js";
+import { computeCognitiveComplexity } from "../src/health/graph-checks.js";
+import { formatHealthText } from "../src/health/render.js";
 import { emptyHealthConfig, healthDir, mintIssueId } from "../src/health/state.js";
 import { classifyZone, hasInlineSuppression, loadIgnoreRules } from "../src/health/zones.js";
 import { buildVizHealthPayload } from "../src/viz/serve.js";
@@ -1261,6 +1264,804 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
                 hasInlineSuppression(["// eslint-disable-next-line", "eval(userInput);"], 2, "security_traps"),
                 false,
                 "generic eslint-disable-next-line must not suppress security_traps",
+            );
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("enforces fail-closed anti-gaming, ghost detectors (package_census, enum_bypasses), cognitive complexity, hotspots, deceptive_queries, clone clustering/drift, parallel work lanes, reminder decay, and MCP parity", async () => {
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-health-antigaming-"));
+        try {
+            mkdirSync(join(tmp, "src", "core"), { recursive: true });
+            mkdirSync(join(tmp, "src", "consumers"), { recursive: true });
+            mkdirSync(join(tmp, "src", "barrel"), { recursive: true });
+            mkdirSync(join(tmp, "src", "clones"), { recursive: true });
+
+            // 1. Barrel bloat (`package_census` barrel_bloat: >= 4 re-exports and 0 local functions)
+            writeFileSync(
+                join(tmp, "src", "barrel", "index.ts"),
+                [
+                    'export * from "../core/state_a.ts";',
+                    'export * from "../core/state_b.ts";',
+                    'export * from "../core/state_c.ts";',
+                    'export * from "../consumers/runner.ts";',
+                ].join("\n"),
+                "utf8",
+            );
+
+            // 2. Core engine with:
+            //    - High cognitive complexity function (< 100 LOC, cognitive >= 25) -> `monster_functions`
+            //    - Deceptive query (`getUserAccount` calling `saveAuditRecord` and `localStorage.setItem`) -> `deceptive_queries`
+            //    - Unreferenced export alongside a referenced export -> symbol-level `unreferenced_exports`
+            //    - Dead symbol `unusedAlpha` where `unusedAlphaBeta` is called -> word-boundary `dead_symbols`
+            //    - Multi-line return expression -> must NOT trigger `unreachable_code`
+            writeFileSync(
+                join(tmp, "src", "core", "engine.ts"),
+                [
+                    "export function saveAuditRecord(payload: string): void {",
+                    "    localStorage.setItem('audit', payload);",
+                    "}",
+                    "",
+                    "export function getUserAccount(id: string): string {",
+                    "    saveAuditRecord(id);",
+                    "    localStorage.setItem('last_user', id);",
+                    "    return id",
+                    "        + ':ok';",
+                    "}",
+                    "",
+                    "export function neverImportedSiblingExport(x: number): number {",
+                    "    return x * 2;",
+                    "}",
+                    "",
+                    "function unusedAlpha(): number {",
+                    "    return 1;",
+                    "}",
+                    "",
+                    "function unusedAlphaBeta(): number {",
+                    "    return 2;",
+                    "}",
+                    "",
+                    "export function deeplyNestedBrain(a: number, b: number, c: number, d: number): number {",
+                    "    let total = unusedAlphaBeta();",
+                    "    if (a > 0 && b > 0 || c > 0) {",
+                    "        for (let i = 0; i < a; i++) {",
+                    "            if (b > i && c > i) {",
+                    "                while (d > 0) {",
+                    "                    if (a === b || c === d) {",
+                    "                        if (total > 10) {",
+                    "                            total += 1;",
+                    "                        } else if (total > 5) {",
+                    "                            total += 2;",
+                    "                        } else {",
+                    "                            total += 3;",
+                    "                        }",
+                    "                    }",
+                    "                    d--;",
+                    "                }",
+                    "            }",
+                    "        }",
+                    "    }",
+                    "    return total;",
+                    "}",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // 3. `enum_bypasses`: scattered string-enum comparisons across >= 3 files (`order.status === "..."`)
+            writeFileSync(
+                join(tmp, "src", "core", "state_a.ts"),
+                [
+                    'import { getUserAccount, deeplyNestedBrain } from "./engine.ts";',
+                    "export function handleStateA(order: { status: string }): number {",
+                    '    if (order.status === "PENDING_APPROVAL") return deeplyNestedBrain(1, 2, 3, 4);',
+                    '    if (order.status === "REJECTED_FINAL") return 0;',
+                    '    return getUserAccount("a").length;',
+                    "}",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "core", "state_b.ts"),
+                [
+                    'import { deeplyNestedBrain } from "./engine.ts";',
+                    "export function handleStateB(order: { status: string }): number {",
+                    '    if (order.status === "PENDING_APPROVAL") return deeplyNestedBrain(2, 3, 4, 5);',
+                    '    if (order.status === "APPROVED_SETTLED") return 1;',
+                    "    return 0;",
+                    "}",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "core", "state_c.ts"),
+                [
+                    'import { deeplyNestedBrain } from "./engine.ts";',
+                    "export function handleStateC(order: { status: string }): number {",
+                    '    if (order.status === "REJECTED_FINAL") return deeplyNestedBrain(3, 4, 5, 6);',
+                    '    if (order.status === "APPROVED_SETTLED") return 2;',
+                    "    return 0;",
+                    "}",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "consumers", "runner.ts"),
+                [
+                    'import { deeplyNestedBrain } from "../core/engine.ts";',
+                    "export function runAll(): number {",
+                    "    return deeplyNestedBrain(1, 1, 1, 1);",
+                    "}",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // 4. 3 near-duplicate functions across files (`duplicates` connected-component clustering + `clone_drift`)
+            const makeCloneSource = (fnName, offset) =>
+                [
+                    `export function ${fnName}(items: number[]): number {`,
+                    "    let acc = 0;",
+                    "    for (let i = 0; i < items.length; i++) {",
+                    "        const val = items[i] * 3;",
+                    "        if (val > 10) {",
+                    `            acc += val + ${offset};`,
+                    "        } else {",
+                    "            acc -= val;",
+                    "        }",
+                    "    }",
+                    "    return acc;",
+                    "}",
+                ].join("\n");
+            writeFileSync(join(tmp, "src", "clones", "clone1.ts"), makeCloneSource("calcAlpha", 1), "utf8");
+            writeFileSync(join(tmp, "src", "clones", "clone2.ts"), makeCloneSource("calcBeta", 1), "utf8");
+            writeFileSync(join(tmp, "src", "clones", "clone3.ts"), makeCloneSource("calcGamma", 1), "utf8");
+
+            // Initialize git repo and create 4 commits touching `src/core/engine.ts` + co-changing `clone1.ts` & `clone2.ts`
+            execFileSync("git", ["init"], { cwd: tmp, stdio: "pipe" });
+            execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tmp, stdio: "pipe" });
+            execFileSync("git", ["config", "user.name", "Test"], { cwd: tmp, stdio: "pipe" });
+            execFileSync("git", ["add", "."], { cwd: tmp, stdio: "pipe" });
+            execFileSync("git", ["commit", "-m", "initial"], { cwd: tmp, stdio: "pipe" });
+
+            for (let c = 1; c <= 3; c++) {
+                writeFileSync(
+                    join(tmp, "src", "clones", "clone1.ts"),
+                    `${makeCloneSource("calcAlpha", c)}\n// rev ${c}\n`,
+                    "utf8",
+                );
+                writeFileSync(
+                    join(tmp, "src", "clones", "clone2.ts"),
+                    `${makeCloneSource("calcBeta", c)}\n// rev ${c}\n`,
+                    "utf8",
+                );
+                execFileSync("git", ["add", "."], { cwd: tmp, stdio: "pipe" });
+                execFileSync("git", ["commit", "-m", `clone co-change ${c}`], { cwd: tmp, stdio: "pipe" });
+            }
+            for (let c = 1; c <= 4; c++) {
+                const engTxt = readFileSync(join(tmp, "src", "core", "engine.ts"), "utf8");
+                writeFileSync(join(tmp, "src", "core", "engine.ts"), `${engTxt}\n// churn ${c}`, "utf8");
+                execFileSync("git", ["add", "."], { cwd: tmp, stdio: "pipe" });
+                execFileSync("git", ["commit", "-m", `engine churn ${c}`], { cwd: tmp, stdio: "pipe" });
+            }
+
+            const px = new Plexer();
+            await px.graph(tmp);
+
+            const scan1 = px.health(tmp, { action: "scan" });
+            assert.equal(scan1.diff.noop, false);
+            const allItems = scan1.queue.all_items;
+            const byDetector = new Set(allItems.map((i) => i.detector));
+
+            // Verify ghost detectors + new graph/evolutionary detectors fired
+            assert.ok(byDetector.has("package_census"), "package_census should detect barrel_bloat");
+            assert.ok(byDetector.has("enum_bypasses"), "enum_bypasses should detect scattered order.status string comparisons");
+            assert.ok(byDetector.has("monster_functions"), "monster_functions should detect cognitive complexity >= 25");
+            assert.ok(byDetector.has("hotspots"), "hotspots should detect high-churn high-complexity deeplyNestedBrain");
+            assert.ok(byDetector.has("deceptive_queries"), "deceptive_queries should detect getUserAccount calling saveAuditRecord/setItem");
+
+            // Verify symbol-level unreferenced_exports (`neverImportedSiblingExport` flagged even though `getUserAccount` in same file is imported)
+            assert.ok(
+                allItems.some((i) => i.detector === "unreferenced_exports" && i.identifier === "neverImportedSiblingExport"),
+                "symbol-level unreferenced_exports should flag neverImportedSiblingExport",
+            );
+            // Verify word-boundary dead_symbols (`unusedAlpha` flagged even though `unusedAlphaBeta` is called)
+            assert.ok(
+                allItems.some((i) => i.detector === "dead_symbols" && i.identifier === "unusedAlpha"),
+                "word-boundary dead_symbols should flag unusedAlpha",
+            );
+            // Verify multi-line return expression in `getUserAccount` did NOT trigger `unreachable_code`
+            assert.ok(
+                !allItems.some((i) => i.detector === "unreachable_code" && i.file === "src/core/engine.ts"),
+                "multi-line return expression must not false-positive as unreachable_code",
+            );
+            // Verify 3 near-duplicate clones collapsed into 1 connected-component cluster with `clone_drift` escalation
+            const nearDupIssues = allItems.filter(
+                (i) => i.detector === "duplicates" && i.file.startsWith("src/clones/"),
+            );
+            assert.equal(nearDupIssues.length, 1, "3 near-duplicate clones should form 1 connected-component cluster issue");
+            assert.ok(nearDupIssues[0].clone_drift, "co-changing clones should include clone_drift metadata");
+            assert.equal(nearDupIssues[0].tier, "T2", "clone_drift should escalate near-duplicate cluster to T2");
+
+            // Verify JSON payload deduplication (non-enumerable `findings` & `queue.all_items`)
+            const serializedScan = JSON.parse(JSON.stringify(scan1));
+            assert.equal(serializedScan.findings, undefined, "scan.findings should be non-enumerable in JSON output");
+            assert.equal(serializedScan.queue.all_items, undefined, "queue.all_items should be non-enumerable in JSON output");
+            assert.ok(Array.isArray(scan1.findings), "scan.findings remains accessible as a JS property");
+
+            // Verify idempotent back-to-back scan (`diff.noop === true`)
+            const scanNoop = px.health(tmp, { action: "scan" });
+            assert.equal(scanNoop.diff.noop, true, "unchanged back-to-back scan should be a fast no-op");
+            assert.equal(scanNoop.diff.scan_count, 1, "noop scan must not increment scan_count");
+
+            // Verify `next --lanes` parallel subagent work lanes & compact text rendering
+            const nextLanes = px.health(tmp, { action: "next", count: 5, lanes: true });
+            assert.ok(nextLanes.work_lanes, "next --lanes should return work_lanes");
+            assert.ok(nextLanes.work_lanes.lane_count >= 2, "disjoint files (barrel/clones vs core) should form >= 2 lanes");
+            assert.ok(
+                nextLanes.work_lanes.independent_lanes[0].subagent_hint.includes("worker"),
+                "lanes should include subagent worker dispatch hint",
+            );
+            const compactNextText = formatHealthText(nextLanes);
+            assert.ok(
+                !compactNextText.includes("Mechanical dimensions (25% weight):"),
+                "compact next text should omit full dimension tables unless --verbose",
+            );
+            assert.ok(
+                compactNextText.includes("Parallel workstream lanes"),
+                "next --lanes text should render parallel workstream lanes",
+            );
+
+            // Verify `parallel_lanes_available` is emitted initially and decays after 3 displays
+            assert.ok(
+                nextLanes.reminders.some((r) => r.type === "parallel_lanes_available"),
+                "parallel_lanes_available reminder should be emitted when >= 2 disjoint lanes exist",
+            );
+            px.health(tmp, { action: "next" });
+            px.health(tmp, { action: "next" });
+            const nextAfterDecay = px.health(tmp, { action: "next" });
+            assert.ok(
+                !nextAfterDecay.reminders.some((r) => r.type === "parallel_lanes_available"),
+                "medium-priority reminders should decay after 3 displays",
+            );
+
+            // Verify fail-closed anti-gaming:
+            // (a) Mechanical resolve stays `verified: false` and does NOT inflate `strict` or `verified`
+            const strictBeforeResolve = scan1.scores.strict;
+            const firstMechIssue = allItems[0];
+            const res1 = px.health(tmp, {
+                action: "resolve",
+                patterns: [firstMechIssue.id],
+                confirm: true,
+                note: "claimed fix without editing file",
+            });
+            assert.equal(res1.status, "resolved");
+            assert.equal(
+                res1.scores.strict,
+                strictBeforeResolve,
+                "unverified mechanical resolve must NOT increase strict score before rescan",
+            );
+            assert.equal(
+                res1.scores.verified,
+                strictBeforeResolve,
+                "unverified mechanical resolve must NOT increase verified score before rescan",
+            );
+
+            // (b) Pre-loop 10-resolve scan gate blocks wildcard `resolve "*"` when matched count exceeds limit
+            const gateBlocked = px.health(tmp, {
+                action: "resolve",
+                patterns: ["*"],
+                confirm: true,
+            });
+            assert.equal(gateBlocked.status, "scan_gate_blocked", "wildcard resolve exceeding 10 issues must be blocked pre-loop");
+
+            // (c) `false_positive` requires valid `--attest` and counts against `strict`
+            const fpRejected = px.health(tmp, {
+                action: "plan",
+                subAction: "skip",
+                falsePositive: true,
+                patterns: [allItems[1].id],
+                confirm: true,
+            });
+            assert.equal(fpRejected.status, "attestation_invalid", "false_positive without --attest must be rejected");
+
+            const fpAccepted = px.health(tmp, {
+                action: "plan",
+                subAction: "skip",
+                falsePositive: true,
+                patterns: [allItems[1].id],
+                confirm: true,
+                attest: "I have actually verified this is a false positive and I am not gaming the score.",
+            });
+            assert.equal(fpAccepted.status, "false_positive");
+            assert.equal(fpAccepted.scores.false_positive_count, 1);
+            assert.equal(
+                fpAccepted.scores.strict,
+                strictBeforeResolve,
+                "false_positive must still count as failing in strict score",
+            );
+
+            // (d) Inline suppression transitions an existing open issue to `wontfix` + `suppressed: true` (not `fixed`)
+            //     and populates `scores.ignore_integrity`
+            const barrelTxt = readFileSync(join(tmp, "src", "barrel", "index.ts"), "utf8");
+            writeFileSync(
+                join(tmp, "src", "barrel", "index.ts"),
+                `// plexer-ignore-file: package_census\n${barrelTxt}`,
+                "utf8",
+            );
+            await px.graph(tmp);
+            const scanAfterIgnore = px.health(tmp, { action: "scan" });
+            assert.ok(
+                scanAfterIgnore.scores.ignore_integrity.ignored_count >= 1,
+                "ignore_integrity should record inline suppression",
+            );
+            const barrelShow = px.health(tmp, {
+                action: "show",
+                patterns: ["package_census::src/barrel/index.ts::barrel_bloat"],
+                status: "wontfix",
+            });
+            assert.equal(
+                barrelShow.count,
+                1,
+                "open issue hidden by newly added inline ignore must become wontfix (suppressed), not fixed",
+            );
+            assert.equal(barrelShow.items[0].suppressed, true);
+
+            // (e) Subjective coverage scaling, single-use session token, and `target_anchored_reset`
+            const prep = px.health(tmp, { action: "review", prepare: true });
+            const blindPkt = JSON.parse(readFileSync(prep.blind_packet_path, "utf8"));
+            const partialImportPath = join(tmp, "partial-review.json");
+            writeFileSync(
+                partialImportPath,
+                JSON.stringify({
+                    session: blindPkt.session,
+                    assessments: { high_level_elegance: 92 },
+                    findings: [],
+                }),
+                "utf8",
+            );
+            const impOk = px.health(tmp, {
+                action: "review",
+                importFile: partialImportPath,
+                attestedExternal: true,
+                attest: prep.attest_example,
+            });
+            assert.equal(impOk.status, "imported");
+            // Re-using the same session token after a successful import must be rejected
+            const impReplay = px.health(tmp, {
+                action: "review",
+                importFile: partialImportPath,
+                attestedExternal: true,
+                attest: prep.attest_example,
+            });
+            assert.equal(impReplay.status, "error", "replaying a consumed blind review session must fail");
+
+            // Prepare a second session and trigger `target_anchored_reset` (all dimensions = 98.0 target)
+            const prep2 = px.health(tmp, { action: "review", prepare: true });
+            const blindPkt2 = JSON.parse(readFileSync(prep2.blind_packet_path, "utf8"));
+            const anchoredPath = join(tmp, "anchored-review.json");
+            writeFileSync(
+                anchoredPath,
+                JSON.stringify({
+                    session: blindPkt2.session,
+                    assessments: { high_level_elegance: 98, mid_level_elegance: 98 },
+                    findings: [],
+                }),
+                "utf8",
+            );
+            const impAnchored = px.health(tmp, {
+                action: "review",
+                importFile: anchoredPath,
+                attestedExternal: true,
+                attest: prep2.attest_example,
+            });
+            assert.equal(impAnchored.status, "target_anchored_reset");
+            const statusAfterAnchor = px.health(tmp, { action: "status" });
+            assert.ok(
+                statusAfterAnchor.scores.strict < statusAfterAnchor.scores.objective,
+                "target_anchored_reset must zero targeted dimensions rather than reverting strict to 100% objective",
+            );
+
+            // (f) `buildVizHealthPayload` ranks T1 more urgent than T4 in `max_tier`
+            const vizPayload = buildVizHealthPayload(join(tmp, "plexer"));
+            assert.ok(vizPayload && vizPayload.by_file["src/core/engine.ts"]);
+            assert.notEqual(vizPayload.by_file["src/core/engine.ts"].max_tier, "T4");
+
+            // (g) MCP `plexer_health` default action ("status"), `next` with `lanes: true`, `skip`, and `reopen`
+            const mcpDefault = await callTool(tmp, "plexer_health", {});
+            assert.equal(mcpDefault.isError, false);
+            assert.ok(mcpDefault.text.includes("scores: strict"), "default MCP plexer_health action should return status");
+
+            const mcpLanes = await callTool(tmp, "plexer_health", { action: "next", lanes: true });
+            assert.equal(mcpLanes.isError, false);
+            assert.ok(mcpLanes.text.includes("Parallel workstream lanes"));
+
+            const mcpSkip = await callTool(tmp, "plexer_health", {
+                action: "skip",
+                patterns: [allItems[2].id],
+                note: "defer via MCP",
+            });
+            assert.equal(mcpSkip.isError, false);
+            assert.ok(mcpSkip.text.includes("deferred"));
+
+            const mcpReopen = await callTool(tmp, "plexer_health", {
+                action: "reopen",
+                patterns: [allItems[2].id],
+            });
+            assert.equal(mcpReopen.isError, false);
+            assert.ok(mcpReopen.text.includes("Reopened"));
+
+            // Direct unit check on computeCognitiveComplexity
+            assert.ok(
+                computeCognitiveComplexity(
+                    readFileSync(join(tmp, "src", "core", "engine.ts"), "utf8").split(/\r?\n/).slice(23),
+                    ".ts",
+                    "deeplyNestedBrain",
+                ) >= 25,
+            );
+
+            // (h) Scoped `scan --detector` preserves out-of-scope open issues in state.json
+            const openBeforeScoped = px.health(tmp, { action: "status" }).scores.open_count;
+            px.health(tmp, { action: "scan", detector: "enum_bypasses" });
+            const openAfterScoped = px.health(tmp, { action: "status" }).scores.open_count;
+            assert.equal(
+                openAfterScoped,
+                openBeforeScoped,
+                "scoped scan --detector must not auto-resolve or wipe out-of-scope detectors in state.json",
+            );
+
+            // (i) Scoped `target_anchored_reset` preserves pre-existing valid subjective dimensions,
+            //     and `scores.verified` penalizes unverified resolved review findings
+            const prep3 = px.health(tmp, { action: "review", prepare: true });
+            const blindPkt3 = JSON.parse(readFileSync(prep3.blind_packet_path, "utf8"));
+            const validReviewPath = join(tmp, "valid-review.json");
+            writeFileSync(
+                validReviewPath,
+                JSON.stringify({
+                    session: blindPkt3.session,
+                    assessments: {
+                        high_level_elegance: 82,
+                        mid_level_elegance: 88,
+                    },
+                    dimension_judgment: {
+                        high_level_elegance: {
+                            dimension_character: "Core engine and billing modules have some coupling.",
+                            score_rationale: "Scored 82 due to boundary friction in engine.ts.",
+                            strengths: ["Clear directory layout"],
+                        },
+                        mid_level_elegance: {
+                            dimension_character: "Handoffs are mostly clean.",
+                            score_rationale: "Scored 88 with minor seam glue.",
+                            strengths: ["Typed interfaces"],
+                        },
+                    },
+                    findings: [
+                        {
+                            dimension: "high_level_elegance",
+                            identifier: "engine_seam",
+                            summary: "Engine mixes billing orchestration with state transitions",
+                            related_files: ["src/core/engine.ts"],
+                            evidence: ["src/core/engine.ts:L1-L25"],
+                            suggestion: "Extract billing seam into a dedicated collaborator",
+                            confidence: "high",
+                        },
+                    ],
+                }),
+                "utf8",
+            );
+            const impValid = px.health(tmp, {
+                action: "review",
+                importFile: validReviewPath,
+                attestedExternal: true,
+                attest: prep3.attest_example,
+            });
+            assert.equal(impValid.status, "imported");
+
+            // Resolve the subjective review finding without --force (verified: false)
+            const revItems = px.health(tmp, { action: "show", patterns: ["review::*"], status: "open" }).items;
+            assert.equal(revItems.length, 1);
+            const revResolved = px.health(tmp, {
+                action: "resolve",
+                patterns: [revItems[0].id],
+                confirm: true,
+                note: "extracted billing collaborator",
+            });
+            assert.equal(revResolved.status, "resolved");
+            assert.ok(
+                revResolved.scores.verified < revResolved.scores.strict,
+                "unverified resolved review finding must still penalize scores.verified while crediting scores.strict",
+            );
+
+            // Now trigger target_anchored_reset on only `low_level_elegance` and verify `mid_level_elegance` (88) is preserved
+            const prep4 = px.health(tmp, { action: "review", prepare: true });
+            const blindPkt4 = JSON.parse(readFileSync(prep4.blind_packet_path, "utf8"));
+            const scopedAnchoredPath = join(tmp, "scoped-anchored.json");
+            writeFileSync(
+                scopedAnchoredPath,
+                JSON.stringify({
+                    session: blindPkt4.session,
+                    assessments: { low_level_elegance: 98, logic_clarity: 98 },
+                    findings: [],
+                }),
+                "utf8",
+            );
+            const impScopedAnchored = px.health(tmp, {
+                action: "review",
+                importFile: scopedAnchoredPath,
+                attestedExternal: true,
+                attest: prep4.attest_example,
+            });
+            assert.equal(impScopedAnchored.status, "target_anchored_reset");
+            const stAfterScopedAnchor = px.health(tmp, { action: "status" });
+            assert.equal(
+                stAfterScopedAnchor.scores.subjective_dimensions.mid_level_elegance.score,
+                88,
+                "scoped target_anchored_reset must preserve previously valid assessments for other dimensions",
+            );
+            assert.equal(
+                stAfterScopedAnchor.scores.subjective_dimensions.low_level_elegance.score,
+                0,
+                "scoped target_anchored_reset must zero the anchored dimensions in the payload",
+            );
+
+            // (j) `plan backlog` demotes an issue from `next` while keeping it in `backlog`,
+            //     and `plan cluster move` supports both `--to` and positional cluster names
+            const nextBeforeBacklog = px.health(tmp, { action: "next", max: "all" });
+            const targetDemoteId = nextBeforeBacklog.queue.items[0].id;
+            px.health(tmp, {
+                action: "plan",
+                subAction: "backlog",
+                patterns: [targetDemoteId],
+            });
+            const nextAfterBacklog = px.health(tmp, { action: "next", max: "all" });
+            assert.ok(
+                !nextAfterBacklog.queue.items.some((i) => i.id === targetDemoteId),
+                "issue demoted via plan backlog must not appear in active `next` queue",
+            );
+            const backlogView = px.health(tmp, { action: "backlog", max: "all" });
+            assert.ok(
+                backlogView.queue.items.some((i) => i.id === targetDemoteId),
+                "issue demoted via plan backlog must appear in `backlog` view",
+            );
+
+            const moveClusterRes = px.health(tmp, {
+                action: "plan",
+                subAction: "cluster",
+                clusterAction: "move",
+                patterns: [targetDemoteId],
+                to: "cleanup_wave",
+            });
+            assert.ok(moveClusterRes.cluster.issue_ids.includes(targetDemoteId));
+
+            // (k) Luau inline `if ... then ... else` expressions do not inflate cognitive complexity
+            const luauInlineIfComplexity = computeCognitiveComplexity(
+                [
+                    "local function evalFlag(a: boolean, b: boolean, c: boolean): number",
+                    "    local x = if a then 1 else 0",
+                    "    local y = if b then 2 else 0",
+                    "    local z = if c then 3 else 0",
+                    "    return x + y + z",
+                    "end",
+                ],
+                ".luau",
+                "evalFlag",
+            );
+            assert.ok(
+                luauInlineIfComplexity <= 6,
+                `Luau inline if-then-else expressions should not ratchet nesting (got ${luauInlineIfComplexity})`,
+            );
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("handles Roblox/Luau patterns without false positives (client_server_boundary, DI barrel calls, alias duplicates, multiline pcall/Connect, factory GetService)", async () => {
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-health-roblox-"));
+        try {
+            mkdirSync(join(tmp, "src", "Client"), { recursive: true });
+            mkdirSync(join(tmp, "src", "Shared"), { recursive: true });
+            mkdirSync(join(tmp, "src", "Server"), { recursive: true });
+            mkdirSync(join(tmp, "test", "fixtures"), { recursive: true });
+
+            // Root barrel `src/init.luau` routing `_K.Client.Notify`
+            writeFileSync(
+                join(tmp, "src", "init.luau"),
+                [
+                    "local _K = {}",
+                    "_K.Shared = require(script.Shared)",
+                    "_K.Client = require(script.Client)",
+                    "_K.Notify = _K.Client.Notify",
+                    "return _K",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // Test fixture barrel under `test/` that must NOT hijack production `@root` barrel routes
+            writeFileSync(
+                join(tmp, "test", "fixtures", "init.luau"),
+                [
+                    "local _K = {}",
+                    "_K.Notify = function() return 'fake' end",
+                    "return _K",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // Client module with:
+            // 1. Dictionary keys `ServerScriptService = 30, ServerStorage = 30` (must NOT trigger roblox_security)
+            // 2. Actual server-only `game:GetService("DataStoreService")` and `HttpService:GetAsync(...)` (MUST trigger roblox_security)
+            // 3. Multiline `local ok, res =\n pcall(...)` and `table.insert(cleanup,\n sig:Connect(...))` (must NOT trigger silent_catches or untracked_connect)
+            writeFileSync(
+                join(tmp, "src", "Client", "init.luau"),
+                [
+                    "--!strict",
+                    'local HttpService = game:GetService("HttpService")',
+                    'local DataStoreService = game:GetService("DataStoreService")',
+                    "local ExplorerOrder = {",
+                    "    ServerScriptService = 30,",
+                    "    ServerStorage = 30,",
+                    "    DataStoreService = 40,",
+                    "}",
+                    "local Client = { ExplorerOrder = ExplorerOrder }",
+                    "function Client.Notify(sig: any): boolean",
+                    "    local cleanup = {}",
+                    "    table.insert(",
+                    "        cleanup,",
+                    "        sig:Connect(function() end)",
+                    "    )",
+                    "    local ok, res =",
+                    "        pcall(function()",
+                    '            return HttpService:GetAsync("https://example.com")',
+                    "        end)",
+                    "    return ok and res ~= nil and DataStoreService ~= nil",
+                    "end",
+                    "return Client",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // Shared module with:
+            // 1. `return function(_K)` top-level module factory calling `game:GetService("Players")` at top of factory + inside `pcall`
+            // 2. DI call `_K.Notify(...)` (must emit symbol `calls` edge to `Client.Notify` WITHOUT fabricating a `Shared -> Client` `layer_violation` or `directory_cycles`)
+            // 3. Same-file `Shared.Method = applyHelper` alias (must NOT trigger `duplicates` or `unreferenced_exports` on `applyHelper`)
+            writeFileSync(
+                join(tmp, "src", "Shared", "init.luau"),
+                [
+                    "export type function Merge(base: type, extra: type)",
+                    "    return base",
+                    "end",
+                    "return function(_K: any)",
+                    '    local Players = game:GetService("Players")',
+                    '    local _, TextService = pcall(function() return game:GetService("TextService") end)',
+                    "    local Shared = {}",
+                    "    local function applyHelper(a: number, b: number): number",
+                    "        local total = 0",
+                    "        for i = 1, a do",
+                    "            if i % 2 == 0 then",
+                    "                total += i * b",
+                    "            else",
+                    "                total += i + b",
+                    "            end",
+                    "        end",
+                    "        _K.Notify({ Connect = function() return {} end })",
+                    "        return total + (if Players and TextService then 1 else 0)",
+                    "    end",
+                    "    Shared.Method = applyHelper",
+                    "    return Shared",
+                    "end",
+                ].join("\n"),
+                "utf8",
+            );
+
+            const px = new Plexer();
+            await px.graph(tmp);
+            const scan = px.health(tmp, { action: "scan" });
+            const items = scan.queue.all_items;
+
+            // 1. `roblox_security` flags actual DataStoreService and HttpService:GetAsync on lines 3 and 18, NOT dictionary keys on lines 5-7
+            const secItems = items.filter((i) => i.detector === "roblox_security" && i.file === "src/Client/init.luau");
+            assert.ok(
+                secItems.some((i) => i.line === 3 && i.summary.includes("DataStoreService")),
+                "should flag game:GetService('DataStoreService') in Client module",
+            );
+            assert.ok(
+                secItems.some((i) => i.line === 18 && i.summary.includes("HttpService:GetAsync")),
+                "should flag HttpService:GetAsync in Client module",
+            );
+            assert.ok(
+                !secItems.some((i) => i.line >= 4 && i.line <= 8),
+                "must NOT flag ExplorerOrder dictionary keys (ServerScriptService = 30, ServerStorage = 30)",
+            );
+
+            // 2. DI parameter call `_K.Notify(...)` in Shared must NOT fabricate `layer_violation` or `directory_cycles`
+            assert.ok(
+                !items.some((i) => i.detector === "layer_violation" && i.file === "src/Shared/init.luau"),
+                "DI call _K.Notify(...) in Shared must not trigger Shared -> Client layer_violation",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "directory_cycles"),
+                "DI call _K.Notify(...) must not fabricate directory_cycles",
+            );
+            // Yet the symbol call edge `applyHelper -> Client.Notify` is preserved so `Client.Notify` is NOT flagged as unreferenced
+            assert.ok(
+                !items.some((i) => i.detector === "unreferenced_exports" && i.identifier.includes("Notify")),
+                "DI call _K.Notify(...) must still resolve symbol call edge to Client.Notify",
+            );
+
+            // 3. Same-file `Shared.Method = applyHelper` alias and `export type function Merge` must NOT trigger `duplicates`, `dead_symbols`, or `unreferenced_exports`
+            assert.ok(
+                !items.some((i) => i.detector === "duplicates" && i.file === "src/Shared/init.luau"),
+                "same-file table alias Shared.Method = applyHelper must not flag as duplicate of itself",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "dead_symbols" && i.identifier === "Merge"),
+                "Luau 2024+ export type function Merge must be extracted as kind=type and not flagged as dead_symbols",
+            );
+
+            // 4. Multiline `pcall` and `:Connect` must NOT trigger `silent_catches` or `untracked_connect`
+            assert.ok(
+                !items.some((i) => i.detector === "silent_catches" && i.file === "src/Client/init.luau"),
+                "multiline local ok, res =\\n pcall(...) must not trigger silent_catches",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "untracked_connect" && i.file === "src/Client/init.luau"),
+                "multiline table.insert(cleanup,\\n sig:Connect(...)) must not trigger untracked_connect",
+            );
+
+            // 5. `return function(_K)` module factory and `pcall` GetService must NOT trigger `luau_quality` (`service_in_fn`) or `luau-hoist-getservice`
+            assert.ok(
+                !items.some((i) => i.detector === "luau_quality" && i.file === "src/Shared/init.luau"),
+                "top-of-factory and pcall-guarded game:GetService must not trigger service_in_fn",
+            );
+            const fixRes = px.health(tmp, { action: "autofix", fixer: "luau-hoist-getservice", dryRun: false });
+            assert.equal(
+                fixRes.total_edits,
+                0,
+                "luau-hoist-getservice must not hoist game:GetService out of return function(_K) module factory",
+            );
+
+            // 6. Compact vs --verbose health status rendering
+            const { formatHealthText } = await import("../src/health/render.js");
+            const statusPayload = px.health(tmp, { action: "status" });
+            const verbosePayload = px.health(tmp, { action: "status", verbose: true });
+            const compactTxt = formatHealthText(statusPayload);
+            const verboseTxt = formatHealthText(verbosePayload);
+            assert.ok(
+                compactTxt.includes("clean dimensions at 100.0% (0 drag — pass --verbose for all)"),
+                "compact health status should collapse 100.0% zero-drag dimensions",
+            );
+            assert.ok(
+                !verboseTxt.includes("pass --verbose for all"),
+                "verbose health status should expand all dimensions without collapse summary",
+            );
+            assert.ok(verboseTxt.length > compactTxt.length, "verbose output should be longer than compact output");
+
+            // 7. Python @lru_cache global constant vs mutable global trap precision
+            writeFileSync(
+                join(tmp, "src", "py_cache.py"),
+                [
+                    "from functools import lru_cache",
+                    "ALLOWED_ROLES = {'admin', 'editor'}",
+                    "session_items = {}",
+                    "",
+                    "@lru_cache(maxsize=64)",
+                    "def is_allowed_role(role: str) -> bool:",
+                    "    return role in ALLOWED_ROLES",
+                    "",
+                    "@lru_cache(maxsize=64)",
+                    "def get_session_item(key: str):",
+                    "    return session_items.get(key)",
+                ].join("\n"),
+                "utf8",
+            );
+            await px.graph(tmp);
+            const pyTrapRes = px.health(tmp, { action: "detect", detector: "language_traps" });
+            assert.ok(
+                !pyTrapRes.items.some((i) => i.id.includes("lru_cache_global_is_allowed_role")),
+                "UPPERCASE constant ALLOWED_ROLES inside @lru_cache must not trigger false-positive lru_cache_global",
+            );
+            assert.ok(
+                pyTrapRes.items.some((i) => i.id.includes("lru_cache_global_get_session_item")),
+                "lowercase mutable global session_items inside @lru_cache must trigger lru_cache_global",
             );
         } finally {
             rmSync(tmp, { recursive: true, force: true });

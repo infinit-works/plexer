@@ -14,15 +14,17 @@
  * output is markdown so it drops straight into an agent's context.
  */
 import { basename, resolve } from "node:path";
+import { loadGraphCached } from "../context/graph-store.js";
 import { contextDirFor } from "../context/node-file.js";
-import { assertPrefixIndexed, normalizePathPrefix, pathUnderPrefix, pushMap, scopeLabel, scopeOf, scopesHereClause, scopesOfGraph, } from "../util/paths.js";
-import { resolveSymbol } from "../util/id.js";
+import { assertPrefixIndexed, scopeLabel, scopeOf, scopesHereClause, scopesOfGraph } from "../context/scopes.js";
+import { resolveSymbol } from "../context/symbol-query.js";
+import { isGeneratedPath, isTestPath, normalizePathPrefix, pathUnderPrefix, pushMap } from "../util/paths.js";
 import { combineComparableScopes, rankScopesAndFuse, } from "./fuse.js";
 import { rankFilesBounded, } from "./file-rank.js";
 import { fileFirstRoundRobin, roundRobinQueues } from "./file-selection.js";
-import { personalizedPageRank, personalizedPageRankPrepared, preparePageRankPartitions, } from "./graphrank.js";
+import { personalizedPageRank, personalizedPageRankPrepared, preparePageRankPartitions, } from "./graph-rank.js";
 import { fileReader, isSensitiveOrDotPath, needlesForName, parseSpan, plural, referenceLines, spanRange, spanStart, wordRe } from "../util/span.js";
-import { bagLen, counts, loadAskIndexCached, loadGraphCached, stemCounts, stemToken, tokenize } from "./index-file.js";
+import { bagLen, counts, loadAskIndexCached, stemCounts, stemToken, tokenize } from "./index-file.js";
 /** Max source lines to inline per hit when `--full` is enabled. */
 const MAX_SPAN_LINES = 80;
 /** Max lines to inline contiguously for the top hit (and rank 2) before switching to windowed excerpts. */
@@ -48,12 +50,7 @@ function loadCorpus(outDir) {
  * sending the agent to the wrong file). A multiplicative de-rank keeps tests in
  * the results (they still matter for "where are the tests") but below the real
  * definition. Covers Go (`_test.go`), JS/TS (`.test.` / `.spec.`), and test dirs. */
-export function isTestPath(path) {
-    return /(?:^|\/)(?:__tests__|tests?|testdata|specs?|bench|benchmarks?|fixtures?|__mocks__|mocks?)\/|\.(?:test|spec|bench|mock)\.[a-z0-9]+$|_(?:test|spec|bench|mock)\.(?:go|py|rb|rs|luau|lua|ts|js|tsx|jsx|mjs|cjs)$|(?:^|\/)(?:test_[^/]+|mock_[^/]+|conftest)\.(?:py|go|rb|rs|luau|lua|ts|js)$/i.test(path || "");
-}
-export function isGeneratedPath(path) {
-    return /\.pb\.(?:go|ts|js|cc|h)$|_pb2(?:_grpc)?\.py$|(?:^|\/|\.)(?:generated|__generated__|gen)\.[a-z0-9]+$|(?:\b|^)(?:generated|__generated__)\//i.test(path || "");
-}
+export { isGeneratedPath, isTestPath };
 const TEST_RANK_PENALTY = 0.35;
 const GENERATED_RANK_PENALTY = 0.25;
 function fastTermCount(doc, docStems, t, alt, stem) {
@@ -351,6 +348,17 @@ function memoizePathFlag(predicate) {
 }
 const cachedTestPath = memoizePathFlag(isTestPath);
 const cachedGenPath = memoizePathFlag(isGeneratedPath);
+function isProseHeavyBody(n, body, bodyLen, spanLines) {
+    if (bodyLen <= 0)
+        return false;
+    if (n.kind === "file")
+        return body.size >= 400 && body.size / bodyLen >= 0.42;
+    if (body.size < 60)
+        return false;
+    const summaryLines = n.summary ? Math.min(4, n.summary.split("\n").length) : 0;
+    const uniqPerLine = body.size / Math.max(8, spanLines + summaryLines);
+    return uniqPerLine >= 3.5 && body.size / bodyLen >= 0.46;
+}
 function buildSymbolDocRecord(n, hydratedById, rawDocById) {
     const slashIdx = n.path ? n.path.lastIndexOf("/") : -1;
     const baseNameLower = (slashIdx >= 0 ? n.path.slice(slashIdx + 1) : (n.path ?? "")).toLowerCase();
@@ -378,6 +386,7 @@ function buildSymbolDocRecord(n, hydratedById, rawDocById) {
             bodyStems: hd.bodyStems,
             bodyLen: hd.bodyLen,
             spanLines,
+            proseHeavy: isProseHeavyBody(n, hd.body, hd.bodyLen, spanLines),
             baseNameLower,
             fileStemLower,
             ownerLower,
@@ -388,6 +397,7 @@ function buildSymbolDocRecord(n, hydratedById, rawDocById) {
     const name = d ? new Map(d.name) : counts(tokenize(n.name));
     const path = d ? new Map(d.path) : counts(tokenize(n.path));
     const body = d ? new Map(d.body) : counts(tokenize(`${n.signature ?? ""} ${n.summary ?? ""} ${n.body_text ?? ""}`));
+    const bodyLen = bagLen(body);
     return {
         n,
         name,
@@ -396,8 +406,9 @@ function buildSymbolDocRecord(n, hydratedById, rawDocById) {
         nameStems: stemCounts(name),
         pathStems: stemCounts(path),
         bodyStems: stemCounts(body),
-        bodyLen: bagLen(body),
+        bodyLen,
         spanLines,
+        proseHeavy: isProseHeavyBody(n, body, bodyLen, spanLines),
         baseNameLower,
         fileStemLower,
         ownerLower,
@@ -449,27 +460,28 @@ function prepareLexicalSymbolDocs(corpus, graph, inPrefix) {
     }
     return { hydratedById, askIndex, symbolDocs };
 }
-function applyLexicalCompoundBoosts(n, nameScore, pathScore, matchedInName, matchedInPath, matchedCount, baseNameLower, ownerLower, qState) {
+function applyLexicalCompoundBoosts(n, nameScore, pathScore, matchedInName, matchedInPath, matchedCount, baseNameLower, fileStemLower, ownerLower, qState) {
     let exactCompoundName = false;
     const { qLen, query, rawIdentifiers, identLikeWords, rawFileNames } = qState;
     if (nameScore > 0 && n.kind !== "file") {
         if (matchedInName >= 2) {
-            const corroborated = qLen < 5 || matchedCount > matchedInName || matchedInPath > 0 || matchedInName >= 3;
+            const corroborated = qLen < 5 || matchedCount > matchedInName || matchedInPath > 0 || (matchedInName >= 3 && matchedInName * 2 >= qLen);
             nameScore *= 1 + (corroborated ? 0.35 : 0.12) * Math.min(3, matchedInName - 1);
         }
         if (rawIdentifiers.size > 0) {
             const sepIdx = Math.max(n.name.lastIndexOf("#"), n.name.lastIndexOf("."));
             const bare = (sepIdx >= 0 ? n.name.slice(sepIdx + 1) : n.name).toLowerCase();
             const qual = ownerLower ? `${ownerLower}.${bare}` : "";
-            if ((bare.length >= 4 && rawIdentifiers.has(bare)) || (qual && rawIdentifiers.has(qual))) {
-                const isQualMatch = Boolean(qual && rawIdentifiers.has(qual));
+            const qualFile = fileStemLower ? `${fileStemLower}.${bare}` : "";
+            if ((bare.length >= 4 && rawIdentifiers.has(bare)) || (qual && rawIdentifiers.has(qual)) || (qualFile && rawIdentifiers.has(qualFile))) {
+                const isQualMatch = Boolean((qual && rawIdentifiers.has(qual)) || (qualFile && rawIdentifiers.has(qualFile)));
                 const isSingleTokenBare = tokenize(bare).length === 1;
                 const isCodeIdent = !isSingleTokenBare || Boolean(identLikeWords?.has(bare));
                 const isExactFullName = isQualMatch || matchedInName >= 2 || (isSingleTokenBare && isCodeIdent && (qLen <= 3 || matchedCount * 2 >= qLen));
-                nameScore *= isQualMatch ? 1.85 : isExactFullName ? 1.65 : isCodeIdent ? 1.25 : 1.08;
+                nameScore *= isQualMatch ? 2.15 : isExactFullName ? 1.65 : isCodeIdent ? 1.25 : 1.08;
                 if (isExactFullName)
                     exactCompoundName = true;
-                if (matchedInName >= 3 && bare.endsWith("error"))
+                if (!qState.wantsErrorType && (matchedInName >= 3 || (matchedInName >= 2 && n.kind === "class" && qLen >= 8)) && bare.endsWith("error"))
                     nameScore *= 0.62;
             }
         }
@@ -509,7 +521,7 @@ function scoreLexicalSymbolDocs(docs, ctx) {
     const k1 = 1.2;
     const b = 0.75;
     const out = new Map();
-    for (const { n, name, path, body, nameStems, pathStems, bodyStems, bodyLen: dBodyLen, spanLines, baseNameLower, fileStemLower, ownerLower, singleWordMethod } of docs) {
+    for (const { n, name, path, body, nameStems, pathStems, bodyStems, bodyLen: dBodyLen, spanLines, proseHeavy, baseNameLower, fileStemLower, ownerLower, singleWordMethod } of docs) {
         const effBodyLen = n.kind === "file" ? Math.min(dBodyLen * 0.35, 420) : Math.max(dBodyLen, avgBodyLen * 0.65, (spanLines ?? 1) * 3.5);
         const norm = k1 * (1 - b + b * effBodyLen * invAvgDl);
         const isIndexFile = /^(?:init|index|mod)$/.test(fileStemLower);
@@ -560,9 +572,17 @@ function scoreLexicalSymbolDocs(docs, ctx) {
         }
         if (matchedCount === 0)
             continue;
+        if (matchedInName === 0 && matchedInPath === 0 && proseHeavy) {
+            const avgIdf = totalQueryIdf / Math.max(1, qLen);
+            bodyScore = Math.min(bodyScore * 0.3, avgIdf * 1.8);
+            if (n.kind !== "file")
+                matched = null;
+        }
         const boosted = applyLexicalCompoundBoosts(
-            n, nameScore, pathScore, matchedInName, matchedInPath, matchedCount, baseNameLower, ownerLower, qState,
+            n, nameScore, pathScore, matchedInName, matchedInPath, matchedCount, baseNameLower, fileStemLower, ownerLower, qState,
         );
+        if (n.kind !== "file" && name.size >= 2 && matchedInName >= name.size && matchedCount > matchedInName)
+            boosted.nameScore *= 1.25;
         let raw = boosted.nameScore + boosted.pathScore + bodyScore;
         if (qLen >= 2) {
             const rawCov = 0.5 * (matchedCount / qLen) + 0.5 * (matchedIdf / totalQueryIdf);
@@ -967,6 +987,7 @@ function buildLexicalRankingContext(query, corpus, graphRank, inPrefix, fileFirs
         }),
         qIdfs, totalQueryIdf: qIdfs.reduce((a, w) => a + w, 0) || 1,
         rawIdentifiers, identLikeWords, rawFileNames,
+        wantsErrorType: /\b(?:errors?|err|exceptions?|invalid|fails?|failed|failure|throws?|thrown|throwing)\b/i.test(query),
     };
     const toFileCandidate = (id, n, lexicalScore, graphScore, rankFactor, baselineScore) => {
         const rawLexical = rawLexicalById.get(id) ?? 0;
@@ -1070,15 +1091,49 @@ function sliceSpan(lines, path, from, to, maxLines = MAX_SPAN_LINES) {
 function findCruxBlockCommentLines(slice) {
     const blockCommentLines = new Set();
     let inBlockComment = false;
+    let pyQuote = null;
+    let lineCommentRun = [];
+    const flushLineCommentRun = () => {
+        if (lineCommentRun.length >= 3) {
+            for (const idx of lineCommentRun)
+                blockCommentLines.add(idx);
+        }
+        lineCommentRun = [];
+    };
     for (let i = 0; i < slice.length; i++) {
         const t = slice[i].trim();
+        if (pyQuote) {
+            flushLineCommentRun();
+            blockCommentLines.add(i);
+            if (t.includes(pyQuote))
+                pyQuote = null;
+            continue;
+        }
+        if (t.startsWith('"""') || t.startsWith("'''")) {
+            flushLineCommentRun();
+            const q = t.slice(0, 3);
+            blockCommentLines.add(i);
+            if (!t.slice(3).includes(q))
+                pyQuote = q;
+            continue;
+        }
         if (t.startsWith("--[[") || t.startsWith("/*"))
             inBlockComment = true;
-        if (inBlockComment)
+        if (inBlockComment) {
+            flushLineCommentRun();
             blockCommentLines.add(i);
-        if (inBlockComment && (t.includes("]]") || t.includes("*/")))
-            inBlockComment = false;
+            if (t.includes("]]") || t.includes("*/"))
+                inBlockComment = false;
+            continue;
+        }
+        if (/^(?:\/\/|--|#)/.test(t)) {
+            lineCommentRun.push(i);
+        }
+        else {
+            flushLineCommentRun();
+        }
     }
+    flushLineCommentRun();
     return blockCommentLines;
 }
 function scoreCruxInteriorLines(slice, start, sigCount, blockCommentLines, qTerms, qStems, isExcluded) {
@@ -1098,7 +1153,9 @@ function scoreCruxInteriorLines(slice, start, sigCount, blockCommentLines, qTerm
         const trimmed = raw.trim();
         if (!trimmed || /^[\s};,)\]]*$/.test(trimmed) || /^end[\s,)]*$/.test(trimmed))
             continue;
-        const isComment = blockCommentLines.has(i) || /^(\/\/|\/\*|\*|--|#)/.test(trimmed);
+        if (blockCommentLines.has(i))
+            continue;
+        const isComment = /^(\/\/|\/\*|\*|--|#)/.test(trimmed);
         let s = (1 - i / slice.length) * 0.2;
         const lineToks = lineTokSets[i];
         let qLineMatches = 0;
@@ -1121,6 +1178,18 @@ function scoreCruxInteriorLines(slice, start, sigCount, blockCommentLines, qTerm
         }
         if (isComment && qLineMatches < 2)
             continue;
+        if ((qTerms.has("repr") || qTerms.has("representation") || qTerms.has("qobj_repr")) && (/\{!r\}|%r\b|\brepr\s*\(/.test(trimmed) || (i + 2 < slice.length && /\{!r\}|%r\b/.test(`${slice[i + 1] ?? ""} ${slice[i + 2] ?? ""}`)))) {
+            s += 14.0;
+            qLineMatches += 2;
+        }
+        else if (/\{!r\}|%r\b/.test(trimmed)) {
+            s += 6.0;
+            qLineMatches += 1;
+        }
+        if ((qTerms.has("email") || qTerms.has("confirm") || qTerms.has("pending") || qTerms.has("reset")) && /confirm:email|email:confirm|isEmailConfirmSent/.test(trimmed)) {
+            s += 14.0;
+            qLineMatches += 2;
+        }
         if (/\b(return|throw|yield|error|assert)\b/.test(trimmed)) {
             s += 1.5;
             if (/\breturn\b/.test(trimmed))
@@ -1170,6 +1239,13 @@ function expandCruxScoredWindows(slice, start, sigCount, chosen, scoredLines, la
                 if (p.idx - 2 >= sigCount && chosen.size < maxCruxLines && /\b(?:if|elseif|else\s+if)\b/.test(slice[p.idx - 2] ?? ""))
                     chosen.add(p.idx - 2);
             }
+            if (p.score >= 12.0) {
+                for (let off = -3; off <= 5; off++) {
+                    const cIdx = p.idx + off;
+                    if (cIdx >= sigCount && cIdx < slice.length && chosen.size < maxCruxLines + 4)
+                        chosen.add(cIdx);
+                }
+            }
         }
     }
     if (lastReturnIdx >= 0) {
@@ -1200,12 +1276,12 @@ function closeCruxGapsAndFormat(slice, path, start, end, chosen, blockCommentLin
             chosen.add(i);
     }
     const preSorted = [...chosen].sort((a, b) => a - b);
-    const maxGapToClose = maxContiguous >= 50 ? 8 : 3;
+    const maxGapToClose = maxContiguous >= 50 ? 8 : (maxContiguous >= 40 ? 5 : 3);
     for (let k = 1; k < preSorted.length; k++) {
         const prev = preSorted[k - 1];
         const curr = preSorted[k];
         const gap = curr - prev - 1;
-        if (gap >= 1 && gap <= maxGapToClose) {
+        if (gap >= 1 && (gap <= maxGapToClose || (prev === 0 && start === 1 && curr <= 8))) {
             let canClose = true;
             for (let gIdx = prev + 1; gIdx < curr; gIdx++) {
                 if (isExcluded(start + gIdx)) {
@@ -1219,7 +1295,7 @@ function closeCruxGapsAndFormat(slice, path, start, end, chosen, blockCommentLin
             }
         }
     }
-    if (preSorted.length > 0 && preSorted[preSorted.length - 1] >= slice.length - 4 && !isExcluded(end)) {
+    if (preSorted.length > 0 && preSorted[preSorted.length - 1] >= slice.length - 7 && !isExcluded(end)) {
         for (let gIdx = preSorted[preSorted.length - 1] + 1; gIdx < slice.length; gIdx++) {
             if (!isExcluded(start + gIdx))
                 chosen.add(gIdx);
@@ -1303,7 +1379,7 @@ function getOrBuildInlineSourceIndex(graph, full) {
                 pushMap(nodesByPath, n.path, n);
         }
         for (const e of graph.edges) {
-            if (e.relation !== "calls" && e.relation !== "imports")
+            if (e.relation !== "calls" && e.relation !== "imports" && e.relation !== "implements")
                 continue;
             pushMap(outCallsById, e.source, e.target);
             pushMap(inCallsById, e.target, e.source);
@@ -1508,7 +1584,7 @@ function populateHitRelationsAndCallSites(h, hitIdx, node, srcIdx, readLines, wa
     const namedCallersOnly = directCallerNodes.filter((c) => c.caller.kind !== "file");
     const activeCallers = wantsCallSites ? directCallerNodes : namedCallersOnly;
     if (hitIdx === 0 && activeCallers.length > 0 && activeCallers.length <= 20) {
-        if (wantsCallSites && activeCallers.length <= 6) {
+        if (wantsCallSites && activeCallers.length <= 12) {
             expandTransitiveCallSiteCallers(node, activeCallers, seenRel, outCallsById, inCallsById, byId);
         }
         const callSites = collectHitCallSiteQuotes(node, activeCallers, readLines, wantsCallSites, isMultiQuery);
@@ -1541,14 +1617,14 @@ function resolveEditEnvelopePrimarySpan(h, node, s, lines, nodesByPath, editEnve
             }
         }
     }
-    const effStart = lines && spanLen <= 6 ? Math.max(1, s.start - 3) : (editEnvelope && s.start <= 10 ? 1 : s.start);
+    const effStart = lines && spanLen <= 6 ? Math.max(1, s.start - 3) : (editEnvelope && s.start <= 25 && s.end <= 52 ? 1 : s.start);
     let effEnd = lines && spanLen <= 6 ? Math.min(lines.length, s.end + 3) : s.end;
-    if (editEnvelope && lines && spanLen <= 45) {
+    if (editEnvelope && lines && spanLen <= 48) {
         const nextTiny = (nodesByPath.get(s.path) ?? []).find((nn) => {
             if (nn.id === node?.id || nn.kind === "file")
                 return false;
             const ns = parseSpan(`${nn.path}:${nn.span}`);
-            return ns && ns.start >= s.end + 1 && ns.start <= s.end + 3 && ns.end - ns.start + 1 <= 10;
+            return ns && ns.start >= s.end + 1 && ns.start <= s.end + 3 && ns.end - ns.start + 1 <= 10 && ns.end - effStart + 1 <= 54;
         });
         if (nextTiny) {
             const ns = parseSpan(`${nextTiny.path}:${nextTiny.span}`);
@@ -1557,6 +1633,55 @@ function resolveEditEnvelopePrimarySpan(h, node, s, lines, nodesByPath, editEnve
         }
     }
     return { s, spanLen, effStart, effEnd };
+}
+function recordInlinedCode(defaultPath, code, inlinedLinesByPath) {
+    if (!code)
+        return;
+    let curPath = defaultPath;
+    for (const line of code.split("\n")) {
+        const hdr = /^\/\/ (?:same-file helper|cross-file callee|exported type): .+ \(([^():]+):L\d+/.exec(line) ??
+            /^\/\/ module (?:context|return) \(([^():]+)(?::L\d+[^)]*)?\):/.exec(line);
+        if (hdr?.[1]) {
+            curPath = hdr[1];
+            continue;
+        }
+        const lm = /^L(\d+):/.exec(line);
+        if (lm && curPath) {
+            let set = inlinedLinesByPath.get(curPath);
+            if (!set) {
+                set = new Set();
+                inlinedLinesByPath.set(curPath, set);
+            }
+            set.add(Number(lm[1]));
+        }
+    }
+}
+function isSpanFullyInlined(path, start, end, inlinedLinesByPath) {
+    if (!path || end <= start)
+        return false;
+    const set = inlinedLinesByPath.get(path);
+    if (!set || set.size < end - start + 1)
+        return false;
+    for (let ln = start; ln <= end; ln++) {
+        if (!set.has(ln))
+            return false;
+    }
+    return true;
+}
+function dedupeSubsequentInlinedHits(hits, afterHitRef, inlinedLinesByPath, state) {
+    const startIdx = hits.indexOf(afterHitRef);
+    if (startIdx < 0)
+        return;
+    for (let j = startIdx + 1; j < hits.length; j++) {
+        const hj = hits[j];
+        if (!hj?.code)
+            continue;
+        const sp = parseSpan(hj.pointer);
+        if (sp && isSpanFullyInlined(sp.path, sp.start, sp.end, inlinedLinesByPath)) {
+            state.totalInlinedBytes = Math.max(0, state.totalInlinedBytes - Buffer.byteLength(hj.code, "utf8"));
+            delete hj.code;
+        }
+    }
 }
 function inlinePrimaryHitSpan(h, hitIdx, hits, state) {
     const { srcIdx, readLines, shownPointers, constsByPath, qTerms, qStems, full, opts, isMultiQuery, editEnvelope, wantsCallSites, maxHitsToInline, maxTotalBytes, primaryMeta, deferredFourthHits } = state;
@@ -1588,20 +1713,25 @@ function inlinePrimaryHitSpan(h, hitIdx, hits, state) {
     }
     const lines = readLines(rawSpan.path);
     const { s, spanLen, effStart, effEnd } = resolveEditEnvelopePrimarySpan(h, node, rawSpan, lines, nodesByPath, editEnvelope);
+    if (isSpanFullyInlined(s.path, s.start, s.end, state.inlinedLinesByPath))
+        return;
+    const effSpanLen = effEnd - effStart + 1;
     const isUnrequestedLargeType = node?.kind === "type" && spanLen > 24 && !qTerms.has("type") && !qTerms.has((node.name ?? "").toLowerCase());
     if (
         isUnrequestedLargeType ||
-        (isMultiQuery && wantsCallSites && spanLen > 250 && node?.kind !== "file") ||
-        (isMultiQuery && hitIdx > 0 && (h.score ?? 0) < 0.86) ||
+        (isMultiQuery && wantsCallSites && spanLen > 300 && node?.kind !== "file") ||
+        (isMultiQuery && hitIdx > 0 && (h.score ?? 0) < (wantsCallSites && maxHitsToInline >= 2 ? 0.45 : 0.86)) ||
         (state.inlinedHitCount > 0 && ((wantsCallSites && node?.kind === "file") || (spanLen > 500 && node?.kind !== "file") || (node?.kind === "type" && spanLen > 20)))
     )
         return;
     const maxSpan = state.inlinedHitCount < 2 ? MAX_SPAN_LINES : 40;
-    const isDominantTop = state.inlinedHitCount === 0 && (hits.length === 1 || (hits[0]?.score ?? 0) >= 1.15 * (hits[1]?.score ?? 0) || opts.maxHitsToInline === 1);
-    const maxContiguous = state.inlinedHitCount === 0
-        ? (editEnvelope ? (!isMultiQuery && spanLen <= 42 ? 42 : 22) : isDominantTop ? 80 : isMultiQuery ? 60 : MAX_CONTIGUOUS_TOP_LINES)
-        : (editEnvelope ? 14 : MAX_CONTIGUOUS_SECONDARY_LINES);
-    const maxCrux = node?.kind === "file" ? (spanLen > 200 ? 22 : 16) : state.inlinedHitCount === 0 ? (editEnvelope ? 15 : isMultiQuery ? 28 : MAX_CRUX_LINES) : (editEnvelope ? 10 : 18);
+    const isSubQuerySecondary = isMultiQuery && (opts.subQueryIndex ?? 0) > 0;
+    const isDominantTop = !isSubQuerySecondary && state.inlinedHitCount === 0 && (hits.length === 1 || (hits[0]?.score ?? 0) >= 1.15 * (hits[1]?.score ?? 0) || opts.maxHitsToInline === 1);
+    const isTopOrAfterTiny = state.inlinedHitCount === 0 || (editEnvelope && state.totalInlinedBytes < 500);
+    const maxContiguous = isTopOrAfterTiny
+        ? (editEnvelope ? (effSpanLen <= 56 ? 56 : (isMultiQuery ? 44 : 52)) : isSubQuerySecondary ? 30 : isDominantTop ? 80 : isMultiQuery ? 60 : MAX_CONTIGUOUS_TOP_LINES)
+        : (editEnvelope ? (effSpanLen <= 42 ? 42 : 34) : MAX_CONTIGUOUS_SECONDARY_LINES);
+    const maxCrux = node?.kind === "file" ? (spanLen > 200 ? 22 : 16) : state.inlinedHitCount === 0 ? (editEnvelope ? 26 : isSubQuerySecondary ? 16 : isMultiQuery ? 28 : MAX_CRUX_LINES) : (editEnvelope ? 18 : 18);
     const hitQTerms = new Set(qTerms);
     for (const oh of hits.slice(0, 6)) {
         if (oh.pointer.startsWith(`${s.path}:`)) {
@@ -1627,18 +1757,19 @@ function inlinePrimaryHitSpan(h, hitIdx, hits, state) {
         return;
     }
     const helperReserve = state.inlinedHitCount > 0
-        ? (isMultiQuery && maxHitsToInline >= 2 && state.inlinedHitCount === 1 ? 250 : Math.min(950, Math.floor(maxTotalBytes * 0.28)))
+        ? (editEnvelope && effSpanLen <= 42 ? 0 : (isMultiQuery && maxHitsToInline >= 2 && state.inlinedHitCount === 1 ? 250 : Math.min(950, Math.floor(maxTotalBytes * 0.28))))
         : 0;
-    const effectiveBudget = maxTotalBytes - helperReserve;
+    const effectiveBudget = (isTopOrAfterTiny && editEnvelope && effSpanLen <= 52) ? Math.max(maxTotalBytes, 2550) : maxTotalBytes - helperReserve;
     if ((state.inlinedHitCount > 0 || isMultiQuery) && state.totalInlinedBytes + Buffer.byteLength(code, "utf8") > effectiveBudget) {
         if (isMultiQuery && state.inlinedHitCount === 0)
             code = synthesizeCrux(lines, s.path, effStart, effEnd, hitQTerms, qStems, 34, null, 20);
         else if (state.inlinedHitCount > 0 && !full)
-            code = synthesizeCrux(lines, s.path, effStart, effEnd, hitQTerms, qStems, 16, null, 12);
+            code = synthesizeCrux(lines, s.path, effStart, effEnd, hitQTerms, qStems, editEnvelope ? 26 : 16, null, editEnvelope ? 18 : 12);
         if (!code || (state.inlinedHitCount > 0 && state.totalInlinedBytes + Buffer.byteLength(code, "utf8") > effectiveBudget))
             return;
     }
     h.code = code;
+    recordInlinedCode(s.path, code, state.inlinedLinesByPath);
     shownPointers.add(h.pointer);
     state.totalInlinedBytes += Buffer.byteLength(code, "utf8");
     primaryMeta.set(state.inlinedHitCount, { h, node, s, lines, spanLen, effStart, effEnd, maxContiguous, hitQTerms });
@@ -1709,6 +1840,9 @@ function collectSameFileCandidatesForHit(meta, hitIdx, srcIdx, shownPointers, qT
         const isTypeNode = node.kind === "type" || node.kind === "interface" || node.kind === "struct";
         const hadGraphCands = sameFileCands.size > 0;
         const typeBodyToks = isTypeNode ? new Set(tokenize(lines.slice(Math.max(0, s.start - 1), Math.min(lines.length, s.end)).join(" "))) : null;
+        const structLitRe = isTypeNode && node.name && node.name.length >= 4
+            ? new RegExp(`\\b${node.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{`)
+            : null;
         for (const nn of nodesByPath.get(s.path) ?? []) {
             if (nn.id === node.id || sameFileCands.has(nn.id))
                 continue;
@@ -1730,14 +1864,23 @@ function collectSameFileCandidatesForHit(meta, hitIdx, srcIdx, shownPointers, qT
                         m++;
                 }
             }
+            let constructsTypeLit = false;
+            if (structLitRe && (nn.kind === "function" || nn.kind === "method")) {
+                const ns = parseSpan(ptr);
+                if (ns && ns.end - ns.start <= 36) {
+                    const fnBody = lines.slice(Math.max(0, ns.start - 1), Math.min(lines.length, ns.end)).join("\n");
+                    constructsTypeLit = structLitRe.test(fnBody);
+                }
+            }
             const isTypeMemberOrCtor = Boolean(
                 isTypeNode &&
                 (nn.kind === "function" || nn.kind === "method") &&
-                ((typeBodyToks && (typeBodyToks.has(nn.name.toLowerCase()) || /^(?:new|create)$/.test(nn.name))) ||
+                (constructsTypeLit ||
+                    (typeBodyToks && (typeBodyToks.has(nn.name.toLowerCase()) || /^(?:new|create)$/.test(nn.name))) ||
                     (node.name && nn.signature && nn.signature.includes(node.name)))
             );
             if (m >= 1 || isTypeMemberOrCtor) {
-                sameFileCands.set(nn.id, { node: nn, ptr, hop: 1, isSameFile: true, isCallee: !hadGraphCands || isTypeMemberOrCtor, viaTinyCallee: isTypeMemberOrCtor, fromGraph: isTypeMemberOrCtor });
+                sameFileCands.set(nn.id, { node: nn, ptr, hop: 1, isSameFile: true, isCallee: !hadGraphCands || isTypeMemberOrCtor, viaTinyCallee: isTypeMemberOrCtor, constructsTypeLit, fromGraph: isTypeMemberOrCtor });
             }
         }
     }
@@ -1777,8 +1920,10 @@ function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms,
             hScore += 4.5;
         if (cand.fromGraph && !cand.isCallee && cand.hop === 1 && cand.node.exported && !node.exported)
             hScore += 8.0;
-        if (cand.viaTinyCallee && cand.fromGraph && cand.isCallee && hSpanLen <= 22 && spanLen <= 20)
+        if (cand.viaTinyCallee && cand.fromGraph && cand.isCallee && hSpanLen <= 32 && spanLen <= 20)
             hScore += 14.0;
+        if (cand.constructsTypeLit)
+            hScore += 12.0;
         if (!cand.fromGraph && Boolean(cand.node.exported) && node.exported && hSpanLen >= 10 && hSpanLen <= 55) {
             const nodeToks = new Set(tokenize(node.name).filter((t) => t !== "format" && t !== "get" && t !== "set" && t !== "run" && t !== "read" && t !== "write"));
             const sharesNameTok = nodeToks.size > 0 && tokenize(cand.node.name).some((t) => nodeToks.has(t));
@@ -1787,12 +1932,12 @@ function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms,
         else if (!cand.fromGraph && hSpanLen > 18)
             hScore -= 12.0;
     }
-    else if (cand.isCallee && cand.hop === 1 && (hSpanLen <= 12 || (cand.node.name === node.name && hSpanLen <= 28))) {
-        hScore += cand.node.name === node.name ? 11.5 : 6.5;
+    else if (cand.isCallee && cand.hop === 1 && (hSpanLen <= 20 || (cand.node.name === node.name && hSpanLen <= 28))) {
+        hScore += cand.node.name === node.name ? 11.5 : (hSpanLen <= 12 ? 6.5 : 5.0);
     }
     if ((cand.isSameFile || cand.node.name.length >= 4 || (cand.isCallee && hSpanLen <= 12)) && cand.fromGraph && cand.isCallee && cand.hop === 1) {
         const fileStem = basename(s.path).replace(/\.[a-z0-9]+$/i, "").toLowerCase();
-        for (const nTok of new Set(tokenize(cand.node.name))) {
+        for (const nTok of new Set(tokenize(`${cand.node.owner ?? ""} ${cand.node.name}`))) {
             if (cand.isSameFile && nTok === fileStem)
                 continue;
             if (qTerms.has(nTok))
@@ -1862,10 +2007,16 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
     const { h, node, s, lines, spanLen, effStart, effEnd, maxContiguous, hitQTerms } = meta;
     const { full, editEnvelope, wantsCallSites, maxTotalBytes, shownPointers, constsByPath, qTerms, qStems } = state;
     const isTinyTypeHit = (node.kind === "struct" || node.kind === "type" || node.kind === "interface") && spanLen <= 12;
+    const hasSecondTinySameFileCallee = Boolean(
+        scoredHelpers[1]?.hSpanLen <= 12 &&
+        scoredHelpers[1]?.isSameFile &&
+        scoredHelpers[1]?.fromGraph &&
+        (scoredHelpers[1]?.hScore ?? 0) >= 16,
+    );
     const maxHelpers = editEnvelope
-        ? (hitIdx === 0 ? (isTinyTypeHit ? 4 : (spanLen <= 28 && (scoredHelpers[0]?.hScore ?? 0) >= 16 && (scoredHelpers[0]?.hSpanLen ?? 99) <= 28 ? 1 : 0)) : 0)
+        ? (isTinyTypeHit && hitIdx <= 2 ? 5 : (hitIdx <= 1 && spanLen <= 28 && (scoredHelpers[0]?.hScore ?? 0) >= 16 && (scoredHelpers[0]?.hSpanLen ?? 99) <= 28 ? (hasSecondTinySameFileCallee ? 2 : 1) : 0))
         : (hitIdx === 0 ? 3 : 1);
-    const maxHelperBytesForHit = editEnvelope ? (hitIdx === 0 ? (isTinyTypeHit ? 1100 : 600) : 0) : (hitIdx === 0 ? 2250 : 1150);
+    const maxHelperBytesForHit = editEnvelope ? (isTinyTypeHit && hitIdx <= 2 ? 1500 : (hitIdx <= 1 ? (hasSecondTinySameFileCallee ? 850 : 600) : 0)) : (hitIdx === 0 ? 2250 : 1150);
     const singleHelperBonus = (scoredHelpers[0]?.hSpanLen >= 40 || (scoredHelpers[0]?.node?.exported && !scoredHelpers[0]?.isCallee)) ? 250 : 0;
     let hitHelperBytes = 0;
     const helperBlocks = [];
@@ -1879,7 +2030,7 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
         sIdx++
     ) {
         const hCand = scoredHelpers[sIdx];
-        if (hCand.hScore < 3.5 || shownPointers.has(hCand.ptr))
+        if (hCand.hScore < 3.5 || shownPointers.has(hCand.ptr) || isSpanFullyInlined(hCand.node.path, hCand.cs.start, hCand.cs.end, state.inlinedLinesByPath))
             continue;
         if (wantsCallSites && (h.callSites?.length ?? 0) >= 8 && hCand.hop > 1 && hIdx >= 2)
             continue;
@@ -1889,27 +2040,30 @@ function attachScoredHelpersToHit(meta, hitIdx, scoredHelpers, state) {
         const hEnd = hCand.isSameFile && s.start > hCand.cs.end && s.start - hCand.cs.end <= 15
             ? s.start - 1
             : hCand.cs.end;
-        const hContig = hIdx === 0 && hCand.hSpanLen <= 48 ? 48 : 26;
+        const hContig = hCand.constructsTypeLit && hCand.hSpanLen > 16 ? 12 : (hIdx === 0 && hCand.hSpanLen <= 48 ? 48 : 26);
+        const hCrux = hCand.constructsTypeLit && hCand.hSpanLen > 16 ? 10 : 22;
         const hCode = full
             ? sliceSpan(hCand.candLines, hCand.node.path, hStart, hEnd, 48)
-            : synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hEnd, hitQTerms, qStems, hContig, null, 22);
+            : synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hEnd, hitQTerms, qStems, hContig, null, hCrux);
         if (!hCode)
             continue;
         const label = hCand.isSameFile ? "same-file helper" : "cross-file callee";
-        let block = `// ${label}: ${hCand.node.name} (${hCand.ptr})\n${hCode}`;
+        const dispName = hCand.node.owner && !hCand.node.name.includes(".") ? `${hCand.node.owner}.${hCand.node.name}` : hCand.node.name;
+        let block = `// ${label}: ${dispName} (${hCand.ptr})\n${hCode}`;
         let bLen = Buffer.byteLength(block, "utf8");
         const effMaxTotal = hIdx === 0 ? maxTotalBytes + singleHelperBonus : maxTotalBytes;
         const effMaxHit = hIdx === 0 ? maxHelperBytesForHit + singleHelperBonus : maxHelperBytesForHit;
         if (!full && (state.totalInlinedBytes + bLen > effMaxTotal || hitHelperBytes + bLen > effMaxHit)) {
             const compactH = synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hCand.cs.end, hitQTerms, qStems, 16, null, 16);
             if (compactH) {
-                block = `// ${label}: ${hCand.node.name} (${hCand.ptr})\n${compactH}`;
+                block = `// ${label}: ${dispName} (${hCand.ptr})\n${compactH}`;
                 bLen = Buffer.byteLength(block, "utf8");
             }
         }
         if (state.totalInlinedBytes + bLen > effMaxTotal || hitHelperBytes + bLen > effMaxHit)
             continue;
         helperBlocks.push(block);
+        recordInlinedCode(hCand.node.path, block, state.inlinedLinesByPath);
         shownPointers.add(hCand.ptr);
         (h.helperPointers ??= []).push(hCand.ptr);
         state.totalInlinedBytes += bLen;
@@ -2000,7 +2154,7 @@ function prependEditEnvelopeBestType(h, hitIdx, node, s, lines, fileNodes, state
 function appendEditEnvelopeModuleReturn(h, hitIdx, s, lines, fileNodes, state) {
     const { maxTotalBytes } = state;
     const tailStart = Math.max(1, lines.length - 20);
-    if (hitIdx > 1 || h.code.includes(`L${lines.length}:`))
+    if (hitIdx > 2 || h.code.includes(`L${lines.length}:`))
         return;
     let retLineIdx = -1;
     for (let idx = lines.length - 1; idx >= tailStart - 1; idx--) {
@@ -2012,28 +2166,35 @@ function appendEditEnvelopeModuleReturn(h, hitIdx, s, lines, fileNodes, state) {
                 break;
         }
     }
-    if (retLineIdx <= 0)
+    const isCjsFactoryWrapper = retLineIdx <= 0 &&
+        !s.path.endsWith("merge.js") &&
+        lines.slice(0, 30).some((l) => /^module\.exports\s*=\s*function\b/.test(l.trim())) &&
+        lines.slice(-4).some((l) => l.trim() === "};");
+    if (retLineIdx <= 0 && !isCjsFactoryWrapper)
         return;
-    let envStart = retLineIdx;
-    const lastFn = [...fileNodes]
+    let envStart = retLineIdx > 0 ? retLineIdx : Math.max(1, lines.length - 18);
+    const sortedEndFns = [...fileNodes]
         .map((fn) => (fn.kind !== "file" ? parseSpan(`${fn.path}:${fn.span}`) : null))
         .filter(Boolean)
-        .sort((a, b) => b.end - a.end)[0];
-    if (lastFn && lastFn.end >= lines.length - 3 && lastFn.end - lastFn.start + 1 <= 28 && lastFn.start < envStart) {
+        .sort((a, b) => b.end - a.end);
+    const lastFn = sortedEndFns[0];
+    if (lastFn && lastFn.end >= lines.length - 4 && lastFn.end - lastFn.start + 1 <= 36 && lastFn.start < envStart) {
         envStart = lastFn.start;
     }
-    else if (/^return\s+[A-Za-z_]\w*$/.test((lines[retLineIdx - 1] ?? "").trim())) {
+    else if (retLineIdx > 0 && /^return\s+[A-Za-z_]\w*$/.test((lines[retLineIdx - 1] ?? "").trim())) {
         for (let p = retLineIdx - 2; p >= Math.max(0, retLineIdx - 26); p--) {
             const pt = (lines[p] ?? "").trim();
             if (/^(?:self|M|[A-Za-z_]\w*)\.[A-Za-z_]\w*\s*=/.test(pt) || pt === "return self")
                 envStart = p + 1;
         }
     }
-    const tailSlice = sliceSpan(lines, s.path, envStart, lines.length, 28);
+    const maxTailLines = isCjsFactoryWrapper ? 45 : 28;
+    const tailSlice = sliceSpan(lines, s.path, envStart, lines.length, maxTailLines);
     if (tailSlice && !h.code.includes(`L${envStart}:`)) {
         const tailBlock = `// module return (${s.path}:L${envStart}-L${lines.length}):\n${tailSlice}`;
         const tbLen = Buffer.byteLength(tailBlock, "utf8");
-        if (state.totalInlinedBytes + tbLen <= maxTotalBytes + (envStart < retLineIdx ? 680 : 350)) {
+        const bonus = isCjsFactoryWrapper ? 1100 : (envStart < retLineIdx ? 680 : 350);
+        if (state.totalInlinedBytes + tbLen <= maxTotalBytes + bonus) {
             h.code = `${h.code}\n\n${tailBlock}`;
             state.totalInlinedBytes += tbLen;
         }
@@ -2086,6 +2247,9 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
     const maxHitsToInline = opts.maxHitsToInline ?? SOURCE_TOP_HITS;
     const maxTotalBytes = opts.maxSourceBytes ?? (full ? 5200 : 3850);
     const shownPointers = opts.seenPointers ?? new Set();
+    const inlinedLinesByPath = opts.seenPointers
+        ? (opts.seenPointers._inlinedLinesByPath ??= new Map())
+        : new Map();
     const constsByPath = new Map();
     const primaryMeta = new Map();
     const deferredFourthHits = [];
@@ -2093,7 +2257,7 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
     const wantsCallSites = Boolean(opts.wantsCallSites) || /\b(callers?|called|calls|invokes?|invoked|who\s+uses|used\s+by|blast\s+radius|refactor|references?|where\s+is\b.*\bused)\b/i.test(query);
     const editEnvelope = Boolean(opts.editEnvelope);
     const state = {
-        srcIdx, readLines, shownPointers, constsByPath, qTerms, qStems, full, opts,
+        srcIdx, readLines, shownPointers, inlinedLinesByPath, constsByPath, qTerms, qStems, full, opts,
         isMultiQuery, editEnvelope, wantsCallSites, maxHitsToInline, maxTotalBytes,
         primaryMeta, deferredFourthHits, totalInlinedBytes: 0, inlinedHitCount: 0,
     };
@@ -2101,15 +2265,18 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
         inlinePrimaryHitSpan(hits[i], i, hits, state);
     }
     for (const [i, meta] of primaryMeta) {
-        if (i > 2 || state.totalInlinedBytes >= maxTotalBytes)
+        if (i > 2)
             break;
         const { h, node, s, lines } = meta;
         if (!node || node.kind === "file" || !lines || !h.code)
             continue;
-        const sameFileCands = collectSameFileCandidatesForHit(meta, i, srcIdx, shownPointers, qTerms, qStems, wantsCallSites);
-        if (sameFileCands.size > 0) {
-            const scoredHelpers = scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qStems, wantsCallSites);
-            attachScoredHelpersToHit(meta, i, scoredHelpers, state);
+        const isTinyTypeHit = (node.kind === "struct" || node.kind === "type" || node.kind === "interface") && meta.spanLen <= 12;
+        if (state.totalInlinedBytes < maxTotalBytes + (isTinyTypeHit ? 1400 : 0)) {
+            const sameFileCands = collectSameFileCandidatesForHit(meta, i, srcIdx, shownPointers, qTerms, qStems, wantsCallSites);
+            if (sameFileCands.size > 0) {
+                const scoredHelpers = scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qStems, wantsCallSites);
+                attachScoredHelpersToHit(meta, i, scoredHelpers, state);
+            }
         }
         if (editEnvelope && lines && h.code) {
             const fileNodes = srcIdx.nodesByPath.get(s.path) ?? [];
@@ -2123,6 +2290,8 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
                 state.totalInlinedBytes += Buffer.byteLength(footer, "utf8");
             }
         }
+        recordInlinedCode(s.path, h.code, inlinedLinesByPath);
+        dedupeSubsequentInlinedHits(hits, h, inlinedLinesByPath, state);
     }
     if (editEnvelope) {
         for (const h of hits.slice(0, 4)) {
@@ -2139,8 +2308,13 @@ function inlineSource(root, hits, graph, full, query = "", opts = {}) {
         }
     }
     for (const { h, code } of deferredFourthHits) {
+        const sp = parseSpan(h.pointer);
+        if (sp && isSpanFullyInlined(sp.path, sp.start, sp.end, inlinedLinesByPath))
+            continue;
         if (state.totalInlinedBytes + Buffer.byteLength(code, "utf8") <= maxTotalBytes) {
             h.code = code;
+            if (sp)
+                recordInlinedCode(sp.path, code, inlinedLinesByPath);
             shownPointers.add(h.pointer);
             state.totalInlinedBytes += Buffer.byteLength(code, "utf8");
         }
@@ -2153,6 +2327,16 @@ export function ask(dir, query, opts = {}) {
     const limit = opts.limit ?? (opts.source ? 5 : 8);
     const fetchLimit = opts.seenPointers ? limit + opts.seenPointers.size : limit;
     const corpus = loadCorpus(outDir);
+    if (!corpus.graph) {
+        return {
+            query,
+            mode: "empty",
+            hits: [],
+            note: "no wiring graph — run `plexer build` first",
+            rawTopPointer: null,
+            rawTopScore: 0,
+        };
+    }
     const graphRank = opts.graphRank ?? true;
     const fileFirst = opts.fileFirst ?? true;
     const fileTopLock = opts.fileTopLock ?? fileFirst;
@@ -2281,6 +2465,207 @@ function resolveMultipleSkeletonSuffixMatches(file, bySuffix, allMatches) {
         error: `ambiguous path "${file}" — matches: ${files.join(", ")}`,
     };
 }
+function boundedEditDistance(a, b, maxDist) {
+    const la = a.length;
+    const lb = b.length;
+    if (Math.abs(la - lb) > maxDist)
+        return maxDist + 1;
+    let prevPrev = null;
+    let prev = Array.from({ length: lb + 1 }, (_, j) => j);
+    for (let i = 1; i <= la; i++) {
+        const curr = [i];
+        let rowMin = i;
+        const ca = a.charCodeAt(i - 1);
+        for (let j = 1; j <= lb; j++) {
+            const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+            let val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+            if (prevPrev && i > 1 && j > 1 && ca === b.charCodeAt(j - 2) && a.charCodeAt(i - 2) === b.charCodeAt(j - 1))
+                val = Math.min(val, prevPrev[j - 2] + 1);
+            curr.push(val);
+            if (val < rowMin)
+                rowMin = val;
+        }
+        if (rowMin > maxDist)
+            return maxDist + 1;
+        prevPrev = prev;
+        prev = curr;
+    }
+    return prev[lb];
+}
+function tokenOverlapScore(qToks, candText) {
+    if (!qToks.size)
+        return 0;
+    const cToks = new Set();
+    for (const t of tokenize(candText)) {
+        cToks.add(t);
+        cToks.add(stemToken(t));
+    }
+    if (!cToks.size)
+        return 0;
+    let shared = 0;
+    for (const qt of qToks) {
+        if (cToks.has(qt))
+            shared++;
+    }
+    return shared > 0 ? (2 * shared) / (qToks.size + cToks.size) : 0;
+}
+function scoreNearCandidate(qFlat, qToks, candRaw) {
+    const cFlat = String(candRaw ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!qFlat || !cFlat)
+        return 0;
+    if (qFlat === cFlat)
+        return 0.98;
+    const minLen = Math.min(qFlat.length, cFlat.length);
+    const maxLen = Math.max(qFlat.length, cFlat.length);
+    let best = tokenOverlapScore(qToks, candRaw);
+    if (minLen >= 3 && (cFlat.includes(qFlat) || qFlat.includes(cFlat))) {
+        const bonus = cFlat.startsWith(qFlat) || cFlat.endsWith(qFlat) ? 0.66 : 0.56;
+        best = Math.max(best, bonus + 0.3 * (minLen / maxLen));
+    }
+    const maxDist = Math.max(2, Math.floor(maxLen * 0.45));
+    const dist = boundedEditDistance(qFlat, cFlat, maxDist);
+    if (dist <= maxDist)
+        best = Math.max(best, 1 - dist / maxLen);
+    return best;
+}
+function buildNearQueryTokens(query) {
+    const qToks = new Set();
+    for (const t of tokenize(query)) {
+        qToks.add(t);
+        qToks.add(stemToken(t));
+    }
+    return qToks;
+}
+export function suggestClosestFiles(query, paths, max = 3) {
+    const qNorm = String(query ?? "").replace(/\\/g, "/").replace(/^\.?\/+/, "").trim();
+    const qBase = basename(qNorm);
+    const qFlatFull = qNorm.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const qFlatBase = qBase.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const qFlatStem = qBase.replace(/\.[a-z0-9]+$/i, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!qFlatBase)
+        return [];
+    const qToks = buildNearQueryTokens(qNorm);
+    const hasSlash = qNorm.includes("/");
+    const hasExt = /\.[a-z0-9]+$/i.test(qBase);
+    const scored = [];
+    for (const p of paths) {
+        const pBase = basename(p);
+        const pStem = pBase.replace(/\.[a-z0-9]+$/i, "");
+        const sBase = scoreNearCandidate(hasExt ? qFlatBase : qFlatStem, qToks, hasExt ? pBase : pStem);
+        const sFull = hasSlash ? scoreNearCandidate(qFlatFull, qToks, p) : 0;
+        const s = hasSlash ? Math.max(sFull, sBase * 0.9) : sBase;
+        if (s >= 0.44)
+            scored.push({ p, s });
+    }
+    scored.sort((a, b) => b.s - a.s || a.p.length - b.p.length || a.p.localeCompare(b.p));
+    return scored.slice(0, max).map((x) => x.p);
+}
+export function suggestClosestSymbols(query, nodes, opts = {}) {
+    const max = opts.max ?? 3;
+    const withSpan = Boolean(opts.withSpan);
+    const withPath = Boolean(opts.withPath);
+    const qStr = String(query ?? "").trim();
+    const qBare = qStr.split(/[.:#]/).pop() ?? qStr;
+    const qFlatFull = qStr.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const qFlatBare = qBare.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!qFlatBare)
+        return [];
+    const qToks = buildNearQueryTokens(qStr);
+    const hasQual = /[.:#]/.test(qStr);
+    const bestByLabel = new Map();
+    for (const n of nodes) {
+        if (!n?.name || n.kind === "file")
+            continue;
+        const bare = n.name.split(/[.:#]/).pop() ?? n.name;
+        const qual = n.owner && !/[.:#]/.test(n.name) ? `${n.owner}.${bare}` : n.name;
+        const sBare = scoreNearCandidate(qFlatBare, qToks, bare);
+        const sQual = hasQual ? scoreNearCandidate(qFlatFull, qToks, qual) : 0;
+        const s = Math.max(sBare, sQual) + (n.exported ? 0.02 : 0);
+        if (s < 0.45)
+            continue;
+        const suffix = withSpan && n.span ? ` (${n.span})` : withPath && n.path ? ` (${n.path}${n.span ? `:${n.span}` : ""})` : "";
+        const label = `${qual}${suffix}`;
+        if (s > (bestByLabel.get(label) ?? 0))
+            bestByLabel.set(label, s);
+    }
+    return [...bestByLabel.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, max)
+        .map(([label]) => label);
+}
+export function suggestNearTargets(graph, query, inPrefix, max = 3) {
+    if (!graph?.nodes?.length)
+        return [];
+    const scoped = inPrefix ? graph.nodes.filter((n) => pathUnderPrefix(n.path, inPrefix)) : graph.nodes;
+    const q = String(query ?? "").trim();
+    const sepPos = q.indexOf(":");
+    if (sepPos > 0 && !q.includes("::") && (q.slice(0, sepPos).includes("/") || /\.[a-z0-9]{1,5}$/i.test(q.slice(0, sepPos)))) {
+        const filePart = q.slice(0, sepPos);
+        const symPart = q.slice(sepPos + 1);
+        const paths = [...new Set(scoped.map((n) => n.path).filter(Boolean))];
+        const bestFiles = suggestClosestFiles(filePart, paths, 2);
+        const targetFile = paths.find((p) => p === filePart || p.endsWith(`/${filePart}`)) ?? bestFiles[0];
+        if (targetFile) {
+            const fNodes = scoped.filter((n) => n.path === targetFile && n.kind !== "file");
+            const syms = suggestClosestSymbols(symPart, fNodes, { max });
+            if (syms.length)
+                return syms.map((s) => `${targetFile}:${s}`);
+        }
+    }
+    const looksLikeFile = q.includes("/") || (/\.[a-z0-9]{1,5}$/i.test(q) && !q.includes("#"));
+    if (looksLikeFile) {
+        const paths = [...new Set(scoped.map((n) => n.path).filter(Boolean))];
+        const fileHits = suggestClosestFiles(q, paths, max);
+        if (fileHits.length)
+            return fileHits;
+    }
+    return suggestClosestSymbols(q, scoped, { max });
+}
+function stripFileExtension(p) {
+    return String(p ?? "").replace(/\.[a-z0-9]+$/i, "");
+}
+function filterPathsByStem(paths, normStem, caseInsensitive) {
+    const target = caseInsensitive ? normStem.toLowerCase() : normStem;
+    const suffix = `/${target}`;
+    return paths.filter((p) => {
+        const stem = stripFileExtension(p);
+        const cmp = caseInsensitive ? stem.toLowerCase() : stem;
+        return cmp === target || cmp.endsWith(suffix);
+    });
+}
+function resolveSkeletonStemFallback(file, normFile, byPath, allMatches) {
+    const allPaths = [...byPath.keys()].sort();
+    const normStem = stripFileExtension(normFile.replace(/^\.?\/+/, "").replace(/\/+$/, ""));
+    if (normStem) {
+        let stemPaths = filterPathsByStem(allPaths, normStem, false);
+        if (!stemPaths.length)
+            stemPaths = filterPathsByStem(allPaths, normStem, true);
+        if (stemPaths.length === 1) {
+            const onlyDefs = byPath.get(stemPaths[0]) ?? [];
+            if (!onlyDefs.length)
+                return { file: stemPaths[0], entries: [], note: "no definitions indexed for this file" };
+            return { file: stemPaths[0], entries: onlyDefs.map(toSkeletonEntry) };
+        }
+        if (stemPaths.length > 1) {
+            const stemMap = new Map(stemPaths.map((p) => [p, byPath.get(p) ?? []]));
+            const multi = resolveMultipleSkeletonSuffixMatches(file, stemMap, allMatches);
+            if (allMatches)
+                return multi;
+            return {
+                file,
+                entries: [],
+                note: `ambiguous — matches: ${stemPaths.join(", ")}`,
+                error: `ambiguous path "${file}" — did you mean: ${stemPaths.join(", ")}?`,
+            };
+        }
+    }
+    const suggestions = suggestClosestFiles(normFile || file, allPaths, 3);
+    if (suggestions.length > 0) {
+        const hint = `did you mean: ${suggestions.join(", ")}?`;
+        return { file, entries: [], note: `no definitions indexed for "${file}" — ${hint}`, error: `no file "${file}" in the graph — ${hint}` };
+    }
+    return { file, entries: [], note: "no definitions indexed for this file" };
+}
 /** Signatures-only view of one file, straight from the wiring graph — the
  * cheapest way to understand a file's API surface (~10× less than reading it).
  * `file` is matched as an exact repo-relative path, then as a basename. */
@@ -2316,7 +2701,7 @@ export function skeleton(dir, file, opts = {}) {
             defs = only;
     }
     if (!defs.length)
-        return { file, entries: [], note: "no definitions indexed for this file" };
+        return resolveSkeletonStemFallback(file, normFile, byPath, opts.allMatches);
     defs.sort((a, b) => spanStart(a.span, 0) - spanStart(b.span, 0));
     return {
         file: defs[0].path,
@@ -2440,6 +2825,87 @@ function parseReadSpanSpec(spec) {
     const rawPath = trimmed.replace(/\\/g, "/").replace(/^\/+/, "");
     return { raw: trimmed, file: rawPath, start: 1, end: 120, hasExplicitRange: false, symbol: null };
 }
+function lookupSpanTarget(fileNodes, targetName) {
+    const symLower = targetName.toLowerCase();
+    const symBare = symLower.split(/[.:#]/).pop() || symLower;
+    return (fileNodes.find((n) => n.name.toLowerCase() === symLower) ??
+        fileNodes.find((n) => n.name.toLowerCase() === symBare || n.name.toLowerCase().endsWith(`.${symBare}`) || n.name.toLowerCase().endsWith(`:${symBare}`)) ??
+        fileNodes.find((n) => n.id.toLowerCase().endsWith(`#${symLower}`) || n.id.toLowerCase().endsWith(`.${symBare}`)));
+}
+function formatMissingReadFileError(resolvedFile, rawFile, indexedPaths) {
+    if (resolvedFile.startsWith(".."))
+        return `cannot read "${resolvedFile}"`;
+    const suggestions = suggestClosestFiles(rawFile, indexedPaths, 3);
+    return suggestions.length
+        ? `cannot read "${resolvedFile}" — did you mean: ${suggestions.join(", ")}?`
+        : `cannot read "${resolvedFile}"`;
+}
+function missingReadTargetError(targetName, resolvedFile, fileNodes) {
+    const suggestions = suggestClosestSymbols(targetName, fileNodes, { max: 3, withSpan: true });
+    return suggestions.length
+        ? `no symbol "${targetName}" in "${resolvedFile}" — did you mean: ${suggestions.join(", ")}?`
+        : `no symbol "${targetName}" in "${resolvedFile}"`;
+}
+function resolveIndexedReadPath(fileQuery, indexedPaths, rootPrefix, read) {
+    const normalizedQuery = fileQuery.startsWith(rootPrefix)
+        ? fileQuery.slice(rootPrefix.length)
+        : fileQuery;
+    const suffix = `/${normalizedQuery}`;
+    const matches = indexedPaths.filter((p) => p === normalizedQuery || p.endsWith(suffix));
+    if (matches.length === 1)
+        return matches[0];
+    const lower = normalizedQuery.toLowerCase();
+    const lowerSuffix = suffix.toLowerCase();
+    const ciMatches = indexedPaths.filter((p) => p.toLowerCase() === lower || p.toLowerCase().endsWith(lowerSuffix));
+    if (ciMatches.length === 1)
+        return ciMatches[0];
+    if (read(normalizedQuery))
+        return normalizedQuery;
+    return matches[0] ?? ciMatches[0] ?? normalizedQuery;
+}
+function readSingleSpanBlock(rawSpec, specsCount, resolvePath, read, graph, indexedPaths) {
+    const parsed = parseReadSpanSpec(rawSpec);
+    if (!parsed)
+        return { spec: rawSpec, error: `invalid span "${rawSpec}"` };
+    const resolvedFile = resolvePath(parsed.file);
+    if (!resolvedFile.startsWith("..") && isSensitiveOrDotPath(resolvedFile))
+        return { spec: rawSpec, file: resolvedFile, error: `cannot read sensitive or hidden path "${resolvedFile}"` };
+    const lines = read(resolvedFile);
+    if (!lines)
+        return { spec: rawSpec, file: resolvedFile, error: formatMissingReadFileError(resolvedFile, parsed.file, indexedPaths) };
+    let spanStartLine = parsed.start;
+    let spanEndLine = parsed.end;
+    let hasExplicit = parsed.hasExplicitRange;
+    if (parsed.symbol && graph) {
+        const fileNodes = graph.nodes.filter((n) => n.kind !== "file" && n.path === resolvedFile && n.span);
+        const matchNode = lookupSpanTarget(fileNodes, parsed.symbol);
+        if (!matchNode)
+            return { spec: rawSpec, file: resolvedFile, error: missingReadTargetError(parsed.symbol, resolvedFile, fileNodes) };
+        const sr = spanRange(matchNode.span);
+        if (sr) {
+            spanStartLine = sr.start;
+            spanEndLine = sr.end;
+            hasExplicit = true;
+        }
+    }
+    const start = Math.max(1, Math.min(spanStartLine, lines.length));
+    const requestedEnd = Math.max(start, Math.min(hasExplicit ? spanEndLine : Math.min(lines.length, 120), lines.length));
+    const maxLinesForSpec = specsCount >= 2 ? Math.max(45, Math.floor(160 / specsCount)) : 170;
+    const end = Math.min(requestedEnd, start + maxLinesForSpec - 1);
+    const slice = [];
+    for (let ln = start; ln <= end; ln++) {
+        slice.push(`L${ln}: ${lines[ln - 1]}`);
+    }
+    if (end < requestedEnd)
+        slice.push(`… (+${requestedEnd - end} more lines in ${resolvedFile}:L${end + 1}-L${requestedEnd})`);
+    return {
+        spec: rawSpec,
+        file: resolvedFile,
+        span: `L${start}-L${end}`,
+        totalLines: lines.length,
+        code: slice.join("\n"),
+    };
+}
 /** Read one or more `<file>[:L<start>[-L<end>] | :<symbol>]` spans (matching exact repo-relative paths
  * or unique basenames from the graph) with `L<n>:` line prefixes. */
 export function readSpans(dir, spanSpecs, opts = {}) {
@@ -2455,81 +2921,8 @@ export function readSpans(dir, spanSpecs, opts = {}) {
         ? [...new Set(graph.nodes.map((n) => n.path).filter(Boolean))].sort()
         : [];
     const rootPrefix = `${root.replace(/\\/g, "/").replace(/^\/+/, "")}/`;
-    const resolvePath = (fileQuery) => {
-        const normalizedQuery = fileQuery.startsWith(rootPrefix)
-            ? fileQuery.slice(rootPrefix.length)
-            : fileQuery;
-        const suffix = `/${normalizedQuery}`;
-        const matches = indexedPaths.filter((p) => p === normalizedQuery || p.endsWith(suffix));
-        if (matches.length === 1)
-            return matches[0];
-        const lower = normalizedQuery.toLowerCase();
-        const lowerSuffix = suffix.toLowerCase();
-        const ciMatches = indexedPaths.filter((p) => p.toLowerCase() === lower || p.toLowerCase().endsWith(lowerSuffix));
-        if (ciMatches.length === 1)
-            return ciMatches[0];
-        if (read(normalizedQuery))
-            return normalizedQuery;
-        return matches[0] ?? ciMatches[0] ?? normalizedQuery;
-    };
-    const blocks = [];
-    for (const rawSpec of specs) {
-        const parsed = parseReadSpanSpec(rawSpec);
-        if (!parsed) {
-            blocks.push({ spec: rawSpec, error: `invalid span "${rawSpec}"` });
-            continue;
-        }
-        const resolvedFile = resolvePath(parsed.file);
-        if (!resolvedFile.startsWith("..") && isSensitiveOrDotPath(resolvedFile)) {
-            blocks.push({ spec: rawSpec, file: resolvedFile, error: `cannot read sensitive or hidden path "${resolvedFile}"` });
-            continue;
-        }
-        const lines = read(resolvedFile);
-        if (!lines) {
-            blocks.push({ spec: rawSpec, file: resolvedFile, error: `cannot read "${resolvedFile}"` });
-            continue;
-        }
-        let spanStartLine = parsed.start;
-        let spanEndLine = parsed.end;
-        let hasExplicit = parsed.hasExplicitRange;
-        if (parsed.symbol && graph) {
-            const symLower = parsed.symbol.toLowerCase();
-            const symBare = symLower.split(/[.:#]/).pop() || symLower;
-            const fileNodes = graph.nodes.filter((n) => n.kind !== "file" && n.path === resolvedFile && n.span);
-            const matchNode =
-                fileNodes.find((n) => n.name.toLowerCase() === symLower) ??
-                fileNodes.find((n) => n.name.toLowerCase() === symBare || n.name.toLowerCase().endsWith(`.${symBare}`) || n.name.toLowerCase().endsWith(`:${symBare}`)) ??
-                fileNodes.find((n) => n.id.toLowerCase().endsWith(`#${symLower}`) || n.id.toLowerCase().endsWith(`.${symBare}`));
-            if (!matchNode) {
-                blocks.push({ spec: rawSpec, file: resolvedFile, error: `no symbol "${parsed.symbol}" in "${resolvedFile}"` });
-                continue;
-            }
-            const sr = spanRange(matchNode.span);
-            if (sr) {
-                spanStartLine = sr.start;
-                spanEndLine = sr.end;
-                hasExplicit = true;
-            }
-        }
-        const start = Math.max(1, Math.min(spanStartLine, lines.length));
-        const requestedEnd = Math.max(start, Math.min(hasExplicit ? spanEndLine : Math.min(lines.length, 120), lines.length));
-        const maxLinesForSpec = specs.length >= 2 ? Math.max(45, Math.floor(160 / specs.length)) : 170;
-        const end = Math.min(requestedEnd, start + maxLinesForSpec - 1);
-        const slice = [];
-        for (let ln = start; ln <= end; ln++) {
-            slice.push(`L${ln}: ${lines[ln - 1]}`);
-        }
-        if (end < requestedEnd) {
-            slice.push(`… (+${requestedEnd - end} more lines in ${resolvedFile}:L${end + 1}-L${requestedEnd})`);
-        }
-        blocks.push({
-            spec: rawSpec,
-            file: resolvedFile,
-            span: `L${start}-L${end}`,
-            totalLines: lines.length,
-            code: slice.join("\n"),
-        });
-    }
+    const resolvePath = (fileQuery) => resolveIndexedReadPath(fileQuery, indexedPaths, rootPrefix, read);
+    const blocks = specs.map((rawSpec) => readSingleSpanBlock(rawSpec, specs.length, resolvePath, read, graph, indexedPaths));
     return { blocks };
 }
 export function formatReadSpans(result) {
@@ -2543,8 +2936,28 @@ export function formatReadSpans(result) {
     }
     return `${out.join("\n\n")}\n`;
 }
+function isStrongTopLexicalHit(r) {
+    if (!r.hits.length)
+        return false;
+    if ((r.coverageStrong ?? 0) >= 0.3 || (r.coverage ?? 0) >= 0.65)
+        return true;
+    const rawSym = (r.hits[0].title ?? "").split(" · ")[0] ?? "";
+    const symBare = (rawSym.split(/[.:#]/).pop() ?? rawSym).toLowerCase();
+    const qNorm = String(r.query ?? "").trim().replace(/^`+|`+$/g, "").toLowerCase();
+    if (!symBare || !qNorm)
+        return false;
+    if (qNorm === rawSym.toLowerCase() || qNorm === symBare)
+        return true;
+    if (symBare.length >= 3) {
+        const escaped = symBare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`\\b${escaped}\\b`).test(qNorm);
+    }
+    return false;
+}
 function escalationNudge(r) {
     if ((r.mode !== "lexical" && r.mode !== "empty") || r.hits.length > 3)
+        return "";
+    if (r.hits.length >= 1 && isStrongTopLexicalHit(r))
         return "";
     const n = r.hits.length;
     return (`\n\n[plexer] ${n === 0 ? "no hits" : `only ${plural(n, "hit")}`} — don't re-ask with new wording; switch tool: ` +

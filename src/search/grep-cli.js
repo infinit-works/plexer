@@ -10,7 +10,7 @@
 import { resolve } from "node:path";
 import { plural } from "../util/span.js";
 import { contextDirFor } from "../context/node-file.js";
-import { loadGraphCached } from "../ask/index-file.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { grepGraph } from "./grep.js";
 function groupHeader(g) {
     if (g.symbol)

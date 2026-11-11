@@ -24,26 +24,8 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { shouldSkipDir, walkDir } from "../util/fs.js";
-import {
-    assertPrefixIndexed,
-    pathUnderPrefix,
-    relPosix,
-    scopeLabel,
-    scopeOf,
-    scopesHereClause,
-    scopesOfGraph,
-    stripTrailingSlashes,
-    toPosixPath,
-} from "../util/paths.js";
+import { relPosix, stripTrailingSlashes, toPosixPath } from "../util/paths.js";
 import { readJson, readWalkConfig } from "../util/state.js";
-export {
-    assertPrefixIndexed,
-    pathUnderPrefix,
-    scopeLabel,
-    scopeOf,
-    scopesHereClause,
-    scopesOfGraph,
-};
 /** Project-marker files, checked in this order (also the order `markers` is built in). */
 const MARKERS = ["package.json", "go.mod", "pyproject.toml", "setup.py", "Cargo.toml", "composer.json", "pom.xml", "build.gradle", "build.gradle.kts"];
 const CANONICAL_ROOT = [{ prefix: "", label: "", markers: [] }];
@@ -175,11 +157,8 @@ function collectScopeCandidates(absRoot, dirs) {
     }
     // Workspace-matched dirs are candidates even without a marker file of their own.
     for (const dir of workspaceMatches) {
-        const existing = candidates.get(dir);
-        if (existing)
-            existing.isWorkspace = true;
-        else
-            candidates.set(dir, { markers: markerMap.get(dir) ?? [], isWorkspace: true });
+        if (!candidates.has(dir))
+            candidates.set(dir, { markers: [], isWorkspace: true });
     }
     return candidates;
 }
@@ -228,10 +207,14 @@ function collapseNestedScopeCandidates(candidates) {
 }
 /** Walk the tree (reusing `walkDir`'s persisted directory and submodule
  * choices) and find project-marker dirs. */
-export function discoverScopes(root, repoFiles) {
+export function discoverScopes(root, repoFiles, contextDir) {
+    if (repoFiles && !Array.isArray(repoFiles) && typeof repoFiles === "object") {
+        contextDir = repoFiles.contextDir;
+        repoFiles = repoFiles.repoFiles;
+    }
     const absRoot = resolve(root);
     if (!repoFiles) {
-        const walkCfg = readWalkConfig(absRoot);
+        const walkCfg = readWalkConfig(absRoot, contextDir);
         repoFiles = walkDir(root, walkCfg.includeDirs, {
             followSubmodules: walkCfg.followSubmodules,
             followNestedRepos: walkCfg.followNestedRepos,
@@ -258,9 +241,12 @@ export function discoverScopes(root, repoFiles) {
 }
 /** Immediate subdirs of `root` that are themselves git repos (have `.git`).
  * Used by workspace federation (Task 5). */
-export function discoverWorkspaceChildren(root) {
+export function discoverWorkspaceChildren(root, contextDir) {
+    if (contextDir && typeof contextDir === "object") {
+        contextDir = contextDir.contextDir;
+    }
     const absRoot = resolve(root);
-    const { includeDirs: includes } = readWalkConfig(absRoot);
+    const { includeDirs: includes } = readWalkConfig(absRoot, contextDir);
     let entries = [];
     try {
         entries = readdirSync(absRoot, { withFileTypes: true });

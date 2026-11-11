@@ -21,19 +21,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
-import {
-    KIND,
-    contentHash,
-    defScope,
-    enclosingDef,
-    extractLeadingSummary,
-    fileResidual,
-    mintId,
-    searchBody,
-} from "../util/id.js";
+import { contentHash, fileResidual, mintId, searchBody } from "../util/id.js";
+import { KIND, defScope, enclosingDef, extractLeadingSummary } from "./extract/ast.js";
 import { extractLuau } from "./luau.js";
-
-export { KIND, defScope, enclosingDef };
+import { cCppExported, rustExported } from "./extract/visibility.js";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 // queries/ ships beside the compiled JS (copied by the build); fall back to src.
@@ -239,10 +230,15 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
             const startRow = whole.startPosition.row, endRow = whole.endPosition.row;
             const sigLine = (lines[startRow] ?? "").trim().replace(/\s*\{?\s*$/, "");
             const rawSlice = source.slice(whole.startIndex, whole.endIndex);
+            const exported = langName === "rust"
+                ? rustExported(whole)
+                : langName === "c" || langName === "cpp"
+                    ? cCppExported(whole)
+                    : true;
             nodes.push({
                 id, name, kind, path: rel,
                 span: `L${startRow + 1}-L${endRow + 1}`,
-                signature: sigLine || null, exported: true, origin: "generic",
+                signature: sigLine || null, exported, origin: "generic",
                 body_hash: contentHash(rawSlice),
                 body_text: searchBody(rawSlice),
                 summary_state: "pending",
@@ -268,16 +264,15 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
     nodes[0].body_text = fileResidual(source, nodes.slice(1));
     return { nodes, rawEdges };
 }
-/** Rust `use crate::a::b::Item` → a file→module `imports` raw edge whose specifier is the
- * crate-relative module path (`a/b`). Only in-crate imports are captured; `std::`,
- * `super::`, `self::`, external crates, and globs are skipped — resolve.js settles the
- * path against the file's crate root, and drops it when it can't. */
+/** Rust `use crate::…` / `use self::…` / `use super::…` → a file→module `imports` raw edge.
+ * External crates, `std::`, and globs are skipped; resolve.js settles in-crate and relative
+ * module paths against the file's crate root / module directory. */
 function extractUses(root, rel, rawEdges) {
     const visitUseNode = (n) => {
         if (n.type === "use_declaration") {
             const spec = rustUseModule(n.text);
             if (spec !== null)
-                rawEdges.push({ source: rel, relation: "imports", specifier: spec ? `crate/${spec}` : "crate", file: rel });
+                rawEdges.push({ source: rel, relation: "imports", specifier: spec, file: rel });
         }
         for (let i = 0; i < (n.namedChildCount ?? 0); i++) {
             const c = n.namedChild?.(i);
@@ -287,24 +282,21 @@ function extractUses(root, rel, rawEdges) {
     };
     visitUseNode(root);
 }
-/** The crate-relative path a Rust `use crate::…` names (`::`→`/`), or null when it is not
- * an in-crate import. The FULL path is returned — including any trailing item segment —
- * because a single `crate::lexical` can be either a module OR a crate-root item; the
- * resolver settles that by finding the longest prefix that is a real module file. A
- * `{ … }` group has no single item, so its prefix (before `{`) is the path. */
+/** The normalized path a Rust `use crate::…` / `self::…` / `super::…` names (`::`→`/`), or null
+ * when it is an external crate or glob import. */
 function rustUseModule(text) {
-    let s = text.replace(/^\s*use\s+/, "").replace(/;\s*$/, "").trim();
+    let s = text.replace(/^\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+/, "").replace(/;\s*$/, "").trim();
     const brace = s.indexOf("{");
     if (brace >= 0)
         s = s.slice(0, brace).replace(/::\s*$/, "");
     else
         s = s.replace(/\s+as\s+\w+$/, "");
     s = s.trim();
-    if (s !== "crate" && !s.startsWith("crate::"))
-        return null; // only in-crate absolute imports
+    if (!/^(?:crate|self|super)(?:$|::)/.test(s))
+        return null;
     if (s.includes("*"))
-        return null; // glob — no single module target
-    return s.replace(/^crate::?/, "").replace(/\s+/g, "").replace(/::/g, "/"); // "" = crate root
+        return null;
+    return s.replace(/\s+/g, "").replace(/::/g, "/");
 }
 /** C/C++ `#include "header.h"` → a file→file `imports` raw edge. Only LOCAL includes
  * (quoted) are captured; system includes (`<stdio.h>`) are skipped — high volume, and

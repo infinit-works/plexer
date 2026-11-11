@@ -36,7 +36,7 @@ import { containerLangOf, extractContainer, warmContainerGrammars } from "./cont
 import { extractFile, languageLabelOf, languageOf, warmDepthGrammars } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 /** Bump when the on-disk shape below changes. */
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 export const EXTRACT_CACHE_PREFIX = "extract";
 /**
  * Where this plexer's memo lives: `<outDir>/.cache/extract.<stamp>.json`.
@@ -200,107 +200,134 @@ export function writeExtractCache(outDir, cache) {
         return false;
     }
 }
+function classifySourceFile(rel) {
+    const lang = languageOf(rel);
+    const container = lang ? null : containerLangOf(rel);
+    const generic = lang || container ? null : genericLangOf(rel);
+    const label = languageLabelOf(rel) ?? container?.name ?? generic?.name ?? "unknown";
+    return { lang, container, generic, label };
+}
+
+function isValidCachedNodes(cached, rel) {
+    return Boolean(cached && Array.isArray(cached.nodes) && cached.nodes.every((n) => n && n.path === rel));
+}
+
+function canReuseByStat(cached, f, rel, trustStat) {
+    return Boolean(
+        trustStat &&
+            cached?.hash &&
+            !cached.error &&
+            cached.size === f.size &&
+            cached.mtimeMs === f.mtimeMs &&
+            isValidCachedNodes(cached, rel),
+    );
+}
+
+function appendCachedResult(cached, label, state) {
+    state.nodes.push(...cached.nodes);
+    state.rawEdges.push(...cached.rawEdges);
+    state.langs.add(label);
+}
+
+function inspectOrQueueSourceFile(f, prevCache, trustStat, state) {
+    const rel = f.rel;
+    const classified = classifySourceFile(rel);
+    const cached = prevCache.files[rel];
+    if (canReuseByStat(cached, f, rel, trustStat)) {
+        state.entries[rel] = cached;
+        state.reused++;
+        appendCachedResult(cached, classified.label, state);
+        return;
+    }
+    let source;
+    try {
+        source = readSourceFile(f.abs);
+    }
+    catch (err) {
+        const message = `${rel}: ${err instanceof Error ? err.message : String(err)}`;
+        state.errors.push(message);
+        state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
+        state.mtimeDirty = true;
+        return;
+    }
+    if (source === null) {
+        state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+        state.mtimeDirty = true;
+        return;
+    }
+    const hash = contentHash(source);
+    if (hash === cached?.hash && isValidCachedNodes(cached, rel)) {
+        state.entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
+        state.mtimeDirty = true;
+        state.reused++;
+        if (cached.error)
+            state.errors.push(cached.error);
+        else
+            appendCachedResult(cached, classified.label, state);
+        return;
+    }
+    state.toParse.push({ f, rel, source, hash, ...classified });
+}
+
+function runSingleFileExtractor(item) {
+    if (item.lang)
+        return extractFile(item.rel, item.source, item.lang);
+    if (item.container)
+        return extractContainer(item.rel, item.source, item.container);
+    if (item.generic)
+        return extractGeneric(item.rel, item.source, item.generic.name);
+    return null;
+}
+
+async function parseQueuedSourceFiles(state) {
+    const { toParse } = state;
+    if (toParse.length === 0)
+        return;
+    await Promise.all([
+        warmDepthGrammars(new Set(toParse.map((p) => p.lang).filter(Boolean))),
+        warmGenericGrammars(new Set(toParse.map((p) => p.generic?.name).filter(Boolean))),
+        warmContainerGrammars(new Set(toParse.map((p) => p.container?.name).filter(Boolean))),
+    ]);
+    for (const item of toParse) {
+        const { f, rel, hash, label } = item;
+        state.parsed++;
+        try {
+            const extracted = runSingleFileExtractor(item);
+            if (!extracted)
+                continue;
+            appendCachedResult(extracted, label, state);
+            state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: extracted.nodes, rawEdges: extracted.rawEdges };
+        }
+        catch (err) {
+            const message = `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}`;
+            state.errors.push(message);
+            state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
+        }
+    }
+}
+
 /**
  * Shared 3-tier classification, cache replay, concurrent WASM warming, and
  * extraction used by `buildGraph` and `checkGraph`.
  */
 export async function extractSourceFiles(files, prevCache, opts = {}) {
-    const nodes = [];
-    const rawEdges = [];
-    const langs = new Set();
-    const errors = [];
-    const entries = {};
-    let parsed = 0;
-    let reused = 0;
-    let mtimeDirty = false;
     const trustStat = (opts.trustStat ?? true) && process.env.PLEXER_REFRESH !== "hash";
-    const toParse = [];
+    const state = {
+        nodes: [],
+        rawEdges: [],
+        langs: new Set(),
+        errors: [],
+        entries: {},
+        toParse: [],
+        parsed: 0,
+        reused: 0,
+        mtimeDirty: false,
+    };
     for (let i = 0; i < files.length; i++) {
-        const f = files[i];
-        const rel = f.rel;
-        opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
-        const lang = languageOf(rel);
-        const container = lang ? null : containerLangOf(rel);
-        const generic = lang || container ? null : genericLangOf(rel);
-        const label = languageLabelOf(rel) ?? container?.name ?? generic?.name ?? "unknown";
-        const cached = prevCache.files[rel];
-        if (
-            trustStat &&
-            cached &&
-            cached.size === f.size &&
-            cached.mtimeMs === f.mtimeMs &&
-            Boolean(cached.hash) &&
-            !cached.error
-        ) {
-            entries[rel] = cached;
-            reused++;
-            nodes.push(...cached.nodes);
-            rawEdges.push(...cached.rawEdges);
-            langs.add(label);
-            continue;
-        }
-        let source;
-        try {
-            source = readSourceFile(f.abs);
-        }
-        catch (err) {
-            const message = `${rel}: ${err instanceof Error ? err.message : String(err)}`;
-            errors.push(message);
-            entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
-            mtimeDirty = true;
-            continue;
-        }
-        if (source === null) {
-            entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
-            mtimeDirty = true;
-            continue;
-        }
-        const hash = contentHash(source);
-        if (cached && hash === cached.hash) {
-            entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
-            mtimeDirty = true;
-            reused++;
-            if (cached.error) {
-                errors.push(cached.error);
-                continue;
-            }
-            nodes.push(...cached.nodes);
-            rawEdges.push(...cached.rawEdges);
-            langs.add(label);
-            continue;
-        }
-        toParse.push({ f, rel, source, hash, lang, container, generic, label });
+        opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: files[i].rel });
+        inspectOrQueueSourceFile(files[i], prevCache, trustStat, state);
     }
-    if (toParse.length > 0) {
-        await Promise.all([
-            warmDepthGrammars(new Set(toParse.map((p) => p.lang).filter(Boolean))),
-            warmGenericGrammars(new Set(toParse.map((p) => p.generic?.name).filter(Boolean))),
-            warmContainerGrammars(new Set(toParse.map((p) => p.container?.name).filter(Boolean))),
-        ]);
-        for (const { f, rel, source, hash, lang, container, generic, label } of toParse) {
-            parsed++;
-            try {
-                let extracted = null;
-                if (lang)
-                    extracted = extractFile(rel, source, lang);
-                else if (container)
-                    extracted = extractContainer(rel, source, container);
-                else if (generic)
-                    extracted = extractGeneric(rel, source, generic.name);
-                if (!extracted)
-                    continue;
-                const { nodes: fileNodes, rawEdges: fileEdges } = extracted;
-                nodes.push(...fileNodes);
-                rawEdges.push(...fileEdges);
-                langs.add(label);
-                entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: fileNodes, rawEdges: fileEdges };
-            }
-            catch (err) {
-                const message = `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}`;
-                errors.push(message);
-                entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
-            }
-        }
-    }
+    await parseQueuedSourceFiles(state);
+    const { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty } = state;
     return { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty };
 }

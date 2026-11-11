@@ -6,7 +6,7 @@
 import { writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { analyzeGitHistory } from "../blast/history.js";
-import { computeInDegree } from "../graph/relations.js";
+import { computeInDegree } from "../context/symbol-query.js";
 import { computeOutDegree } from "./concerns.js";
 import { computeScoreSnapshot } from "./scoring.js";
 import { healthDir } from "./state.js";
@@ -110,7 +110,7 @@ export function buildHealthTreeData(graph, state, zoneMap, readLines, opts = {})
 
     const issuesByFile = new Map();
     for (const iss of Object.values(state?.issues || {})) {
-        if (iss.status !== "open") continue;
+        if (iss.status !== "open" || iss.suppressed) continue;
         const f = iss.file || "repo";
         let arr = issuesByFile.get(f);
         if (!arr) {

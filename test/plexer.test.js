@@ -19,18 +19,17 @@ import {
 import { extractFile, warmDepthGrammars } from "../src/graph/extract.js";
 import { warmGenericGrammars, extractGeneric } from "../src/graph/generic.js";
 import { normalizeLuauForParse } from "../src/graph/luau.js";
-import { loadGraphCached } from "../src/graph/load.js";
+import { loadGraphCached } from "../src/context/graph-store.js";
 import { callTool } from "../src/mcp/tools.js";
 import { claudeDistDir, claudeScriptPath, packageRootDir } from "../src/claude/paths.js";
-import { contextDirFor, envTruthy } from "../src/context/node-file.js";
-import { WALK_RELATIONS, computeInDegree } from "../src/graph/relations.js";
+import { contextDirFor, envTruthy, readGraph, wiringPath } from "../src/context/node-file.js";
+import { scopeLabel, scopeOf, scopesHereClause } from "../src/context/scopes.js";
+import { WALK_RELATIONS, computeInDegree } from "../src/context/symbol-query.js";
 import { hasPlexerIndex, isAutoBuildableRepo, nearestPlexerRoot } from "../src/graph/root.js";
-import { pathUnderPrefix, scopeLabel, scopeOf, scopesHereClause } from "../src/graph/scopes.js";
-import { readGraph, wiringPath, writeGraph } from "../src/graph/write.js";
-import { isPlexerEntry, readJsonObject, writeOwned } from "../src/hosts/config-write.js";
-import { BIN_LAUNCH, mergeJsonKey } from "../src/hosts/mcp-config.js";
+import { writeGraph } from "../src/graph/write.js";
+import { BIN_LAUNCH, isPlexerEntry, mergeJsonKey, readJsonObject, writeOwned } from "../src/util/config-write.js";
 import { contentHash } from "../src/util/id.js";
-import { normalizePathPrefix, pushMap, relPosix, stripTrailingSlashes, toPosixPath } from "../src/util/paths.js";
+import { normalizePathPrefix, pathUnderPrefix, pushMap, relPosix, stripTrailingSlashes, toPosixPath } from "../src/util/paths.js";
 import { needlesForName, parseSpan, plural, spanRange, spanStart } from "../src/util/span.js";
 
 describe("WASM Tree-Sitter Extraction (Depth + Breadth + Luau)", () => {
@@ -349,6 +348,44 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
                     headers: { "Sec-Fetch-Site": "cross-site" },
                 });
                 assert.equal(crossSite.status, 403);
+
+                const sameSiteCrossPort = await fetch(`${srv.url}/api/source?path=src/Shared/Validate.luau`, {
+                    headers: { "Sec-Fetch-Site": "same-site" },
+                });
+                assert.equal(sameSiteCrossPort.status, 403, "must reject same-site cross-port requests");
+
+                const crossPortOrigin = await fetch(`${srv.url}/api/source?path=src/Shared/Validate.luau`, {
+                    headers: { Origin: "http://127.0.0.1:65432" },
+                });
+                assert.equal(crossPortOrigin.status, 403, "must reject Origin from a different loopback port");
+
+                const headEvents = await fetch(`${srv.url}/events`, { method: "HEAD" });
+                assert.equal(headEvents.status, 200, "HEAD /events must return 200 and close immediately");
+                assert.ok(
+                    headEvents.headers.get("content-security-policy")?.includes("default-src 'self'"),
+                    "responses must include Content-Security-Policy header",
+                );
+
+                // Scheme-relative malformed URL must return 400 without crashing the server
+                const { request: httpRequest } = await import("node:http");
+                const badUrlStatus = await new Promise((resolveReq, rejectReq) => {
+                    const req = httpRequest(
+                        {
+                            host: "127.0.0.1",
+                            port: srv.port,
+                            method: "GET",
+                            path: "//:bad",
+                            headers: { Host: `127.0.0.1:${srv.port}` },
+                        },
+                        (res) => {
+                            res.resume();
+                            resolveReq(res.statusCode);
+                        },
+                    );
+                    req.on("error", rejectReq);
+                    req.end();
+                });
+                assert.equal(badUrlStatus, 400, "scheme-relative malformed URL must return 400 instead of crashing");
 
                 const postMethod = await fetch(`${srv.url}/api/source?path=src/Shared/Validate.luau`, {
                     method: "POST",
@@ -1251,7 +1288,7 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             });
             assert.equal(secondPost.trim(), "", "second edit to same file in same session should suppress duplicate blast-radius dump");
             const sessState = readSession(tmp, "dedup-test-session");
-            assert.ok(sessState.emittedBlastFiles.includes("scheduler.ts"));
+            assert.ok(sessState.emittedBlastFiles.includes("src/scheduler.ts"));
 
             // Variadic CLI grep with default -C 2 context
             const multiGrepOut = execFileSync(
@@ -1638,6 +1675,312 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             const afterOrphan = readFileSync(orphanMd, "utf8");
             assert.ok(afterOrphan.includes("plexer body v2"), "upsertSection updates fenced body");
             assert.ok(afterOrphan.includes("## User Custom Rules\nKeep this section safe."), "upsertSection preserves user text after orphan start marker across consecutive runs");
+
+            // 7. Third-party repository security regressions (POSIX .\ dotfile, workspace.json traversal, stepLuauBlockDepth ReDoS)
+            const { isSensitiveOrDotPath } = await import("../src/util/span.js");
+            assert.equal(isSensitiveOrDotPath(".\\env"), true, "POSIX .\\env dotfile must be blocked");
+            assert.equal(isSensitiveOrDotPath(".\\\\secret"), true, "POSIX .\\\\secret dotfile must be blocked");
+
+            const { readWorkspace, writeWorkspace } = await import("../src/graph/workspace.js");
+            writeWorkspace(tmp, { version: 1, children: ["../outside-repo", "/etc", ".hidden"] });
+            assert.equal(readWorkspace(tmp), null, "readWorkspace must reject path-traversal and dot-prefixed children");
+
+            const { stepLuauBlockDepth } = await import("../src/health/zones.js");
+            const t0 = performance.now();
+            const redosLine = `local x = if a then 1 ${"elseif a then 1 ".repeat(28)}`;
+            stepLuauBlockDepth(0, redosLine);
+            assert.ok(performance.now() - t0 < 50, "stepLuauBlockDepth must not catastrophically backtrack on repeated elseif clauses");
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("covers stemToken protected roots, Turn-0 gating/dedup, near-match hints, multi-lang exports/shadowing/typeOnly, and SDK parity", async () => {
+        const { stemToken } = await import("../src/ask/index-file.js");
+        const { cleanPromptBoilerplate, isSyntheticOrMetaPrompt } = await import("../src/claude/hooks.js");
+        const { readSpans } = await import("../src/ask/ask.js");
+        const { formatRepoMap } = await import("../src/graph/map.js");
+        const { healthAsync } = await import("../src/index.js");
+
+        // 1. Protected roots & morphological equivalence in stemToken
+        for (const [word, pluralForm, expected] of [
+            ["string", "strings", "string"],
+            ["spring", "springs", "spring"],
+            ["number", "numbers", "number"],
+            ["buffer", "buffers", "buffer"],
+            ["header", "headers", "header"],
+            ["footer", "footers", "footer"],
+            ["integer", "integers", "integer"],
+            ["render", "rendering", "render"],
+            ["filter", "filtering", "filter"],
+            ["trigger", "triggering", "trigger"],
+        ]) {
+            assert.equal(stemToken(word), expected, `stemToken(${word}) should equal ${expected}`);
+            assert.equal(stemToken(pluralForm), expected, `stemToken(${pluralForm}) should equal ${expected}`);
+        }
+
+        // 2. Multi-slash command stripping & meta-prompt gating
+        assert.equal(
+            cleanPromptBoilerplate("/plan /grill-me Fix checkGuard in src/scheduler.ts"),
+            "Fix checkGuard in src/scheduler.ts",
+        );
+        assert.equal(isSyntheticOrMetaPrompt("What is the status of the project?"), true);
+        assert.equal(isSyntheticOrMetaPrompt("Can you run the tests and commit the changes?"), true);
+        assert.equal(isSyntheticOrMetaPrompt("Fix checkGuard in src/scheduler.ts when count exceeds MAX_RERUNS"), false);
+
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-parity-"));
+        try {
+            mkdirSync(join(tmp, "src", "pkgA"), { recursive: true });
+            mkdirSync(join(tmp, "src", "pkgB"), { recursive: true });
+            mkdirSync(join(tmp, "src", "pkgC"), { recursive: true });
+            mkdirSync(join(tmp, "src", "rust", "sub"), { recursive: true });
+            mkdirSync(join(tmp, "src", "c"), { recursive: true });
+            mkdirSync(join(tmp, "src", "luau"), { recursive: true });
+            mkdirSync(join(tmp, "test"), { recursive: true });
+
+            writeFileSync(
+                join(tmp, "src", "pkgA", "index.ts"),
+                [
+                    "export function computeAlpha(value: number): number {",
+                    "  return value + 1;",
+                    "}",
+                    "export function shadowedCaller({ computeAlpha }: { computeAlpha: (n: number) => number }): number {",
+                    "  return computeAlpha(5);",
+                    "}",
+                ].join("\n") + "\n",
+            );
+            writeFileSync(
+                join(tmp, "src", "pkgB", "index.ts"),
+                [
+                    "import { computeAlpha } from '../pkgA/index';",
+                    "export function computeBeta(n: number): number {",
+                    "  return computeAlpha(n) * 2;",
+                    "}",
+                    "export function localShadow({ computeAlpha }: { computeAlpha: (n: number) => number }): number {",
+                    "  return computeAlpha(10);",
+                    "}",
+                ].join("\n") + "\n",
+            );
+            writeFileSync(
+                join(tmp, "src", "pkgC", "entry.ts"),
+                "import { computeBeta } from '../pkgB/index';\nexport function runEntry() { return computeBeta(7); }\n",
+            );
+            writeFileSync(
+                join(tmp, "test", "alpha.test.ts"),
+                "import { computeBeta } from '../src/pkgB/index';\nexport function testBeta() { return computeBeta(3); }\n",
+            );
+
+            // Rust pub/private visibility + self:: / super:: module resolution
+            writeFileSync(
+                join(tmp, "src", "rust", "mod.rs"),
+                [
+                    "mod sub;",
+                    "use self::sub::sub_helper;",
+                    "pub fn root_api() -> i32 { sub_helper() }",
+                    "fn private_helper() -> i32 { 1 }",
+                ].join("\n") + "\n",
+            );
+            writeFileSync(
+                join(tmp, "src", "rust", "sub", "mod.rs"),
+                [
+                    "use super::root_api;",
+                    "pub(crate) fn sub_helper() -> i32 { 42 }",
+                    "pub fn call_parent() -> i32 { root_api() }",
+                ].join("\n") + "\n",
+            );
+
+            // C non-static vs static visibility
+            writeFileSync(
+                join(tmp, "src", "c", "codec.c"),
+                [
+                    "static int internal_step(int x) { return x + 1; }",
+                    "int public_encode(int x) { return internal_step(x); }",
+                ].join("\n") + "\n",
+            );
+
+            // Luau type-only require vs runtime require
+            writeFileSync(
+                join(tmp, "src", "luau", "Types.luau"),
+                "--!strict\nexport type Options = { retries: number }\nreturn {}\n",
+            );
+            writeFileSync(
+                join(tmp, "src", "luau", "Worker.luau"),
+                [
+                    "--!strict",
+                    "local Types = require(script.Parent.Types)",
+                    "local Worker = {}",
+                    "function Worker.run(opts: Types.Options): number",
+                    "  return opts.retries",
+                    "end",
+                    "return Worker",
+                ].join("\n") + "\n",
+            );
+
+            await buildGraph(tmp);
+            const g = loadGraphCached(join(tmp, "plexer"));
+            const cliPath = join(packageRootDir(), "bin", "plexer.js");
+
+            // 3. Destructuring parameter shadowing does not fabricate cross-file calls
+            const alphaNode = g.nodes.find((n) => n.name === "computeAlpha" && n.path === "src/pkgA/index.ts");
+            const betaNode = g.nodes.find((n) => n.name === "computeBeta" && n.path === "src/pkgB/index.ts");
+            const shadowNode = g.nodes.find((n) => n.name === "localShadow" && n.path === "src/pkgB/index.ts");
+            assert.ok(alphaNode && betaNode && shadowNode);
+            assert.ok(
+                g.edges.some((e) => e.source === betaNode.id && e.target === alphaNode.id && e.relation === "calls"),
+                "computeBeta should have a real call edge to computeAlpha",
+            );
+            assert.ok(
+                !g.edges.some((e) => e.source === shadowNode.id && e.target === alphaNode.id && e.relation === "calls"),
+                "destructured parameter { computeAlpha } in localShadow must not create a false cross-file call edge",
+            );
+
+            // 4. Rust & C visibility + Rust self::/super:: resolution + Luau typeOnly edge
+            const rustPub = g.nodes.find((n) => n.name === "root_api" && n.path === "src/rust/mod.rs");
+            const rustPriv = g.nodes.find((n) => n.name === "private_helper" && n.path === "src/rust/mod.rs");
+            const rustSub = g.nodes.find((n) => n.name === "sub_helper" && n.path === "src/rust/sub/mod.rs");
+            const rustCallParent = g.nodes.find((n) => n.name === "call_parent" && n.path === "src/rust/sub/mod.rs");
+            assert.equal(rustPub?.exported, true, "Rust pub fn should be exported");
+            assert.equal(rustPriv?.exported, false, "Rust private fn should not be exported");
+            assert.equal(rustSub?.exported, true, "Rust pub(crate) fn should be marked module-visible/exported");
+            assert.ok(
+                g.edges.some((e) => e.source === rustPub.id && e.target === rustSub.id && e.relation === "calls"),
+                "Rust use self::sub::sub_helper should resolve call edge",
+            );
+            assert.ok(
+                g.edges.some((e) => e.source === rustCallParent.id && e.target === rustPub.id && e.relation === "calls"),
+                "Rust use super::root_api should resolve call edge",
+            );
+
+            const cPub = g.nodes.find((n) => n.name === "public_encode" && n.path === "src/c/codec.c");
+            const cStatic = g.nodes.find((n) => n.name === "internal_step" && n.path === "src/c/codec.c");
+            assert.equal(cPub?.exported, true, "C non-static function should be exported");
+            assert.equal(cStatic?.exported, false, "C static function should not be exported");
+
+            const luauWorkerFile = g.nodes.find((n) => n.kind === "file" && n.path === "src/luau/Worker.luau");
+            const luauTypesFile = g.nodes.find((n) => n.kind === "file" && n.path === "src/luau/Types.luau");
+            const luauImportEdge = g.edges.find(
+                (e) => e.source === luauWorkerFile?.id && e.target === luauTypesFile?.id && e.relation === "imports",
+            );
+            assert.ok(luauImportEdge, "Luau Worker.luau should have imports edge to Types.luau");
+            assert.equal(luauImportEdge.typeOnly, true, "Luau require used only in type annotations should set typeOnly: true");
+
+            // 5. Near-match recovery hints across readSpans, skeleton, callers CLI, and MCP
+            const missSpan = readSpans(tmp, ["src/pkgA/index.ts:computeAlpa"]);
+            assert.ok(missSpan.blocks[0]?.error?.includes("did you mean:"), "readSpans symbol miss should suggest computeAlpha");
+            const skelExt = skeleton(tmp, "src/pkgA/index");
+            assert.equal(skelExt.file, "src/pkgA/index.ts", "skeleton should auto-complete unambiguous bare extensionless stem");
+            const skelMiss = skeleton(tmp, "src/pkgA/indx.ts");
+            assert.ok(skelMiss.note?.includes("did you mean:"), "skeleton file miss should suggest near path");
+
+            let callersMissOut = "";
+            try {
+                execFileSync(process.execPath, [cliPath, "callers", "computeAlpa", tmp, "--no-refresh"], {
+                    encoding: "utf8",
+                    stdio: ["ignore", "pipe", "pipe"],
+                });
+            } catch (err) {
+                callersMissOut = `${err.stdout || ""}${err.stderr || ""}`;
+            }
+            assert.ok(callersMissOut.includes("did you mean:") && callersMissOut.includes("computeAlpha"), "CLI callers miss should suggest computeAlpha");
+
+            // 6. Non-code Turn-0 hook emits 0 tokens & repo-relative Antigravity post-edit dedup distinguishes same-basename files
+            const metaHookOut = execFileSync(process.execPath, [cliPath, "_hook", "prompt"], {
+                input: JSON.stringify({ session_id: "meta-s1", cwd: tmp, prompt: "What is the status of the project?" }),
+                encoding: "utf8",
+            });
+            assert.equal(metaHookOut.trim(), "", "non-code status prompt should emit 0 Turn-0 hook tokens");
+
+            const { readAgySession } = await import("../src/hosts/antigravity-hooks.js");
+            const claudeEditA = execFileSync(process.execPath, [cliPath, "_hook", "post-edit"], {
+                input: JSON.stringify({
+                    session_id: "claude-rel-dedup",
+                    cwd: tmp,
+                    tool_input: { file_path: join(tmp, "src", "pkgA", "index.ts") },
+                }),
+                encoding: "utf8",
+            });
+            const claudeEditB = execFileSync(process.execPath, [cliPath, "_hook", "post-edit"], {
+                input: JSON.stringify({
+                    session_id: "claude-rel-dedup",
+                    cwd: tmp,
+                    tool_input: { file_path: join(tmp, "src", "pkgB", "index.ts") },
+                }),
+                encoding: "utf8",
+            });
+            assert.ok(claudeEditA.includes("src/pkgA/index.ts"), "first edit to pkgA/index.ts should emit blast radius");
+            assert.ok(claudeEditB.includes("src/pkgB/index.ts"), "editing pkgB/index.ts must not collide with pkgA/index.ts basename");
+
+            const agySid = `agy-rel-dedup-${Date.now()}`;
+            execFileSync(process.execPath, [cliPath, "_hook", "agy-post-edit"], {
+                input: JSON.stringify({
+                    sessionId: agySid,
+                    workspacePaths: [tmp],
+                    tool_name: "edit_file",
+                    tool_input: { Path: join(tmp, "src", "pkgA", "index.ts") },
+                }),
+                encoding: "utf8",
+            });
+            execFileSync(process.execPath, [cliPath, "_hook", "agy-post-edit"], {
+                input: JSON.stringify({
+                    sessionId: agySid,
+                    workspacePaths: [tmp],
+                    tool_name: "edit_file",
+                    tool_input: { Path: join(tmp, "src", "pkgB", "index.ts") },
+                }),
+                encoding: "utf8",
+            });
+            const agySaved = readAgySession(agySid);
+            assert.deepEqual(
+                agySaved.emittedBlastFiles,
+                ["src/pkgA/index.ts", "src/pkgB/index.ts"],
+                "Antigravity post-edit should record distinct repo-relative paths for same-basename files",
+            );
+
+            // 7. SDK parity: includeCoupling, includeTests, healthAsync
+            const mapCoupled = buildRepoMap(g, { includeCoupling: true });
+            assert.ok(Array.isArray(mapCoupled.coupling) && mapCoupled.coupling.length > 0, "includeCoupling populates coupling");
+            assert.ok(formatRepoMap(mapCoupled).includes("coupling:"), "formatRepoMap renders coupling");
+
+            const px = new Plexer();
+            const callersNoTests = px.callers(tmp, "computeBeta");
+            const callersWithTests = px.callers(tmp, "computeBeta", { includeTests: true });
+            assert.equal(callersNoTests[0].tests, undefined, "px.callers omits tests array by default");
+            assert.ok(callersWithTests[0].tests?.some((t) => t.path === "test/alpha.test.ts"), "px.callers({ includeTests: true }) populates companion/caller tests");
+
+            const asyncStatus = await px.healthAsync(tmp, { action: "status" });
+            const rootAsyncStatus = await healthAsync(tmp, { action: "status" });
+            assert.equal(asyncStatus.action, "status");
+            assert.equal(rootAsyncStatus.action, "status");
+
+            // 8. Linked git worktree & submodule resolveGitExcludePath regression check
+            const { resolveGitExcludePath } = await import("../src/util/state.js");
+            const wtTmp = mkdtempSync(join(tmpdir(), "plexer-wt-"));
+            try {
+                const mainRepo = join(wtTmp, "main");
+                const commonGit = join(mainRepo, ".git");
+                const wtGitDir = join(commonGit, "worktrees", "wt1");
+                const wtRoot = join(wtTmp, "wt1");
+                mkdirSync(join(commonGit, "info"), { recursive: true });
+                mkdirSync(wtGitDir, { recursive: true });
+                mkdirSync(wtRoot, { recursive: true });
+                writeFileSync(join(wtRoot, ".git"), `gitdir: ../main/.git/worktrees/wt1\n`);
+                writeFileSync(join(wtGitDir, "commondir"), `../..\n`);
+                assert.equal(resolveGitExcludePath(wtRoot), join(commonGit, "info", "exclude"));
+
+                const subRoot = join(wtTmp, "sub");
+                const subGitDir = join(subRoot, ".git-sub");
+                mkdirSync(join(subGitDir, "info"), { recursive: true });
+                writeFileSync(join(subRoot, ".git"), `gitdir: .git-sub\n`);
+                assert.equal(resolveGitExcludePath(subRoot), join(subGitDir, "info", "exclude"));
+
+                // 9. ask() on an unbuilt directory returns empty AskResult without throwing
+                const emptyAsk = ask(wtTmp, "where is main");
+                assert.equal(emptyAsk.mode, "empty");
+                assert.deepEqual(emptyAsk.hits, []);
+                assert.ok(emptyAsk.note?.includes("no wiring graph"));
+            } finally {
+                rmSync(wtTmp, { recursive: true, force: true });
+            }
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }

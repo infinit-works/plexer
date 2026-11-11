@@ -7,8 +7,7 @@
  *                         `foo.spec.luau` <-> `foo.luau`, `test_foo.py` <-> `foo.py`).
  */
 import { posix } from "node:path";
-import { isTestPath } from "../ask/ask.js";
-import { pushMap, toPosixPath } from "../util/paths.js";
+import { isTestPath, pushMap, toPosixPath } from "../util/paths.js";
 
 const TIER_RANK = {
     symbol_call: 3,

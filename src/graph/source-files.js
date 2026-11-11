@@ -7,12 +7,11 @@
 import { statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 import { takeCachedStat, walkDir } from "../util/fs.js";
-import { relPosix } from "../util/paths.js";
+import { pathUnderPrefix, relPosix } from "../util/paths.js";
 import { readWalkConfig } from "../util/state.js";
 import { languageOf, depthExtensions } from "./extract.js";
 import { genericLangOf, genericExtensions } from "./generic.js";
 import { containerLangOf, containerExtensions } from "./container.js";
-import { pathUnderPrefix } from "./scopes.js";
 /** Every extension plexer has a parser for (depth + breadth + container), sorted
  * and de-duped — the authoritative answer to "what does `-e` actually support". */
 export function supportedExtensions() {

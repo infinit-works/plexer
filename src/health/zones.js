@@ -5,14 +5,25 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { globToRegExp } from "../util/paths.js";
+import { DETECTOR_CATEGORY } from "./constants.js";
 
 export const VALID_ZONES = new Set(["production", "script", "test", "config", "generated", "vendor"]);
 export const SCORED_ZONES = new Set(["production", "script"]);
 
 const VENDOR_SEGMENTS = new Set([
-    "node_modules", "vendor", "third_party", "third-party", "external", "packages",
+    "node_modules", "vendor", "third_party", "third-party", "external",
     "wallypackages", "serverpackages", "devpackages", "robloxpackages", "roblox_packages", "luau_packages", "_index",
 ]);
+
+function hasRobloxManifest(rootDir) {
+    if (!rootDir || typeof rootDir !== "string") return false;
+    return (
+        existsSync(join(rootDir, "wally.toml")) ||
+        existsSync(join(rootDir, "rotriever.toml")) ||
+        existsSync(join(rootDir, "aftman.toml")) ||
+        existsSync(join(rootDir, "rokit.toml"))
+    );
+}
 
 const GENERATED_SEGMENTS = new Set([
     "dist", "build", "out", "coverage", ".next", ".nuxt", "generated", "__generated__", "proto_gen",
@@ -35,7 +46,7 @@ const CONFIG_BASENAMES = new Set([
  * Classify a repo-relative path into a zone (`production`, `script`, `test`, `config`, `generated`, `vendor`).
  * User overrides in `config.zones` take highest precedence.
  */
-export function classifyZone(relPath, zoneOverrides = {}) {
+export function classifyZone(relPath, zoneOverrides = {}, rootDir = null) {
     const norm = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
     if (zoneOverrides && typeof zoneOverrides === "object") {
         if (zoneOverrides[norm] && VALID_ZONES.has(zoneOverrides[norm])) {
@@ -53,9 +64,16 @@ export function classifyZone(relPath, zoneOverrides = {}) {
     const parts = norm.split("/");
     const lowerParts = parts.map((p) => p.toLowerCase());
     const base = lowerParts[lowerParts.length - 1] || "";
+    const isLuauPath = base.endsWith(".luau") || base.endsWith(".lua");
+    const isRobloxRepo = hasRobloxManifest(rootDir);
 
-    for (const seg of lowerParts.slice(0, -1)) {
+    for (let i = 0; i < lowerParts.length - 1; i++) {
+        const seg = lowerParts[i];
+        const rawSeg = parts[i];
         if (VENDOR_SEGMENTS.has(seg)) return "vendor";
+        if (seg === "packages" && (rawSeg === "Packages" || isLuauPath || isRobloxRepo)) {
+            return "vendor";
+        }
         if (GENERATED_SEGMENTS.has(seg)) return "generated";
     }
 
@@ -134,11 +152,11 @@ export function isSupportOrBenchFile(relPath) {
     );
 }
 
-function isPathIgnoredByRules(rules, relPath, detectorOrCategory = null) {
+function isPathIgnoredByRules(rules, relPath, detectorOrCategory = null, ledger = null) {
     const norm = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
-    const cat = detectorOrCategory ? String(detectorOrCategory).toLowerCase() : null;
+    const cat = detectorOrCategory ? String(detectorOrCategory).toLowerCase().replace(/-/g, "_") : null;
     for (const r of rules) {
-        if (r.category && cat && r.category !== cat && !cat.includes(r.category)) {
+        if (r.category && cat && r.category !== cat && DETECTOR_CATEGORY[cat] !== r.category) {
             continue;
         }
         if (r.category && !cat) continue;
@@ -148,19 +166,85 @@ function isPathIgnoredByRules(rules, relPath, detectorOrCategory = null) {
             norm.includes(`/${r.pattern}/`) ||
             (r.regex && r.regex.test(norm))
         ) {
+            if (ledger && !r.fromConfigExclude && cat) {
+                ledger.record(r.category || "all", norm, null, "plexerignore");
+            }
             return true;
         }
     }
     return false;
 }
 
+export function createSuppressionLedger() {
+    const entries = new Map();
+    const lineKeys = new Map();
+    const fileKeys = new Map();
+
+    return {
+        record(detector, file = null, line = null, kind = "inline", isFile = false) {
+            const det = String(detector || "all").toLowerCase();
+            const normFile = file ? String(file).replace(/\\/g, "/").replace(/^\.\//, "") : "";
+            const key = `${det}::${normFile}::${line ?? "*"}::${kind}`;
+            if (!entries.has(key)) {
+                entries.set(key, { detector: det, file: normFile, line, kind });
+            }
+            if (normFile) {
+                if (line !== null && line !== undefined) {
+                    lineKeys.set(`${det}::${normFile}::${line}`, kind);
+                }
+                if (isFile || line === null || line === undefined) {
+                    fileKeys.set(`${det}::${normFile}`, kind);
+                }
+            }
+        },
+        matchIssue(issue) {
+            if (!issue) return null;
+            const det = String(issue.detector || "").toLowerCase();
+            const cat = String(issue.category || "").toLowerCase();
+            const file = issue.file ? String(issue.file).replace(/\\/g, "/").replace(/^\.\//, "") : "";
+            const line = issue.line;
+            if (file && line !== null && line !== undefined) {
+                for (const d of [det, cat, "all", "*"]) {
+                    if (!d) continue;
+                    for (const ln of [line, line - 1, line + 1]) {
+                        const hit = lineKeys.get(`${d}::${file}::${ln}`);
+                        if (hit) return hit;
+                    }
+                }
+            }
+            if (file) {
+                for (const d of [det, cat, "all", "*"]) {
+                    if (!d) continue;
+                    const hit = fileKeys.get(`${d}::${file}`);
+                    if (hit) return hit;
+                }
+            }
+            return null;
+        },
+        summary(totalDetectedCount = 0) {
+            const ignoredByDetector = {};
+            for (const e of entries.values()) {
+                ignoredByDetector[e.detector] = (ignoredByDetector[e.detector] || 0) + 1;
+            }
+            const ignoredCount = entries.size;
+            const denom = ignoredCount + Math.max(0, Number(totalDetectedCount) || 0);
+            const suppressedPct = denom > 0 ? Math.round((ignoredCount / denom) * 1000) / 10 : 0;
+            return {
+                ignored_count: ignoredCount,
+                suppressed_pct: suppressedPct,
+                ignored_by_detector: ignoredByDetector,
+            };
+        },
+    };
+}
+
 /**
  * Load ignore rules from `.plexerignore`, `.reviewignore`, and `config.excludes`.
  * Supports `<glob>` or `<category>:<glob>`.
  */
-export function loadIgnoreRules(rootDir, configExcludes = []) {
+export function loadIgnoreRules(rootDir, configExcludes = [], ledger = null) {
     const rules = [];
-    const addRawLine = (raw) => {
+    const addRawLine = (raw, fromConfigExclude = false) => {
         const line = raw.trim();
         if (!line || line.startsWith("#")) return;
         let category = null;
@@ -173,7 +257,7 @@ export function loadIgnoreRules(rootDir, configExcludes = []) {
         const normPat = pattern.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
         if (!normPat) return;
         const regex = normPat.includes("*") || normPat.includes("?") ? globToRegExp(normPat) : null;
-        rules.push({ category, pattern: normPat, regex });
+        rules.push({ category, pattern: normPat, regex, fromConfigExclude });
     };
 
     for (const fname of [".plexerignore", ".reviewignore"]) {
@@ -181,7 +265,7 @@ export function loadIgnoreRules(rootDir, configExcludes = []) {
         if (existsSync(p)) {
             try {
                 const content = readFileSync(p, "utf8");
-                for (const line of content.split(/\r?\n/)) addRawLine(line);
+                for (const line of content.split(/\r?\n/)) addRawLine(line, false);
             } catch {
                 // Ignore unreadable files
             }
@@ -189,44 +273,222 @@ export function loadIgnoreRules(rootDir, configExcludes = []) {
     }
 
     for (const ex of configExcludes || []) {
-        if (typeof ex === "string") addRawLine(ex);
+        if (typeof ex === "string") addRawLine(ex, true);
     }
 
     return {
         rules,
+        ledger,
         isIgnored: (relPath, detectorOrCategory = null) =>
-            isPathIgnoredByRules(rules, relPath, detectorOrCategory),
+            isPathIgnoredByRules(rules, relPath, detectorOrCategory, ledger),
     };
 }
 
-const INLINE_SUPPRESS_RE = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore|--\s*selene:\s*allow)/i;
+const INLINE_SUPPRESS_RE = /(?:\/\/|--|#|\/\*)\s*(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore|selene:\s*allow)/i;
 
 /**
- * Check if `lineNum` (1-based) or its preceding line has an inline suppression directive.
+ * Check if `lineNum` (1-based), its preceding line, or a file-header `plexer-ignore-file` directive
+ * in the first 5 lines has an inline suppression directive.
  */
-export function hasInlineSuppression(lines, lineNum, detectorName = "") {
+export function hasInlineSuppression(lines, lineNum, detectorName = "", ledger = null, relPath = null) {
     if (!Array.isArray(lines) || lineNum < 1) return false;
-    const candidates = [lines[lineNum - 1], lineNum >= 2 ? lines[lineNum - 2] : null];
+    const candidates = [
+        { line: lines[lineNum - 1], lineNo: lineNum, isPreceding: false, fileOnly: false },
+        lineNum >= 2
+            ? { line: lines[lineNum - 2], lineNo: lineNum - 1, isPreceding: true, fileOnly: false }
+            : null,
+    ];
+    const headerLimit = Math.min(5, lines.length);
+    for (let k = 0; k < headerLimit; k++) {
+        if (k === lineNum - 1 || k === lineNum - 2) continue;
+        if (typeof lines[k] === "string" && /plexer-ignore-file/i.test(lines[k])) {
+            candidates.push({ line: lines[k], lineNo: k + 1, isPreceding: false, fileOnly: true });
+        }
+    }
     const detLower = String(detectorName || "").toLowerCase();
-    for (let candIdx = 0; candIdx < candidates.length; candIdx++) {
-        const line = candidates[candIdx];
-        if (typeof line !== "string") continue;
-        if (candIdx === 1 && !/^\s*(?:\/\/|--|#|\/\*)/.test(line)) continue;
+    const detNorm = detLower.replace(/-/g, "_");
+    const detCat = DETECTOR_CATEGORY[detNorm] || DETECTOR_CATEGORY[detLower] || null;
+    const activeLedger = ledger || lines._suppressionLedger || null;
+    const activeFile = relPath || lines._relPath || null;
+
+    for (const cand of candidates) {
+        if (!cand || typeof cand.line !== "string") continue;
+        const line = cand.line;
+        if (cand.isPreceding && !/^\s*(?:\/\/|--|#|\/\*)/.test(line)) continue;
         if (!INLINE_SUPPRESS_RE.test(line)) continue;
         if (
             /--\s*selene:\s*allow/i.test(line) &&
             !/(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)/i.test(line) &&
-            detLower &&
-            detLower !== "luau_quality" &&
-            detLower !== "language_traps"
+            detNorm &&
+            detNorm !== "luau_quality" &&
+            detNorm !== "language_traps"
         ) continue;
-        const specificMatch = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)\s*\[([^\]]+)\]/i.exec(line);
-        if (specificMatch && detLower) {
-            const tokens = specificMatch[1].split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-            const detParts = detLower.split("_");
-            if (tokens.length > 0 && !tokens.some((t) => t === "all" || t === detLower || detParts.includes(t))) continue;
+
+        const bracketMatch = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)(?:-file)?\s*\[([^\]]+)\]/i.exec(line);
+        const colonMatch = !bracketMatch
+            ? /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)(?:-file)?\s*:\s*([A-Za-z0-9_,\s*-]+)/i.exec(line)
+            : null;
+        const rawSpec = bracketMatch ? bracketMatch[1] : colonMatch ? colonMatch[1] : null;
+
+        if (rawSpec !== null && detNorm) {
+            const cleanedSpec = rawSpec.replace(/(?:--|\/\/|#).*$/, "").trim();
+            const tokens = cleanedSpec
+                .split(/[\s,]+/)
+                .map((s) => s.trim().toLowerCase().replace(/-/g, "_"))
+                .filter(Boolean);
+            const detParts = detNorm.split("_");
+            if (
+                tokens.length > 0 &&
+                !tokens.some(
+                    (t) =>
+                        t === "all" ||
+                        t === "*" ||
+                        t === detNorm ||
+                        t === detLower ||
+                        (detCat && t === detCat) ||
+                        detParts.includes(t),
+                )
+            ) {
+                continue;
+            }
+        }
+        if (activeLedger) {
+            const isFileDirective = /plexer-ignore-file/i.test(line);
+            const recordedLine = isFileDirective ? cand.lineNo : lineNum;
+            activeLedger.record(detNorm || "all", activeFile, recordedLine, "inline", isFileDirective);
         }
         return true;
     }
     return false;
+}
+
+export function stripCodeStringsAndComments(rawLine, isLuauOrLua = false, isPython = false) {
+    if (typeof rawLine !== "string" || !rawLine) return "";
+    let s = rawLine;
+    if (!isLuauOrLua && !isPython && s.includes("`")) {
+        // Strip non-interpolated template text segments first while keeping ${...} expressions intact
+        s = s
+            .replace(/`(?:\\.|[^`$\\]|\$(?!\{))*`/g, "``")
+            .replace(/`(?:\\.|[^`$\\]|\$(?!\{))*\$\{/g, "${")
+            .replace(/\}(?:\\.|[^`$\\]|\$(?!\{))*\$\{/g, "} ${")
+            .replace(/\}(?:\\.|[^`$\\]|\$(?!\{))*`/g, "}");
+    }
+    if (isLuauOrLua) {
+        s = s
+            .replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, " ")
+            .replace(/\[(=*)\[[\s\S]*?\]\1\]|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""')
+            .replace(/--.*$/, "");
+    } else if (isPython) {
+        s = s
+            .replace(/"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""')
+            .replace(/#.*$/, "");
+    } else {
+        s = s
+            .replace(/\/\*[\s\S]*?\*\//g, " ")
+            .replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""')
+            .replace(/\/\/.*$/, "")
+            .replace(/(?<=[=(,:!&|?[{;]\s*|^)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\r\n*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\r\n])*\/[dgimsuvy]*/g, '""');
+    }
+    return s;
+}
+
+const WORD_TOKEN_RE_CACHE = new Map();
+const MAX_WORD_TOKEN_CACHE = 8192;
+
+export function hasWordToken(line, token) {
+    if (!line || !token) return false;
+    const str = typeof line === "string" ? line : String(line);
+    const tok = typeof token === "string" ? token : String(token);
+    if (!str.includes(tok)) return false;
+    let re = WORD_TOKEN_RE_CACHE.get(tok);
+    if (!re) {
+        if (WORD_TOKEN_RE_CACHE.size >= MAX_WORD_TOKEN_CACHE) {
+            WORD_TOKEN_RE_CACHE.clear();
+        }
+        const escaped = tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        re = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
+        WORD_TOKEN_RE_CACHE.set(tok, re);
+    }
+    return re.test(str);
+}
+
+/**
+ * Compute updated Luau block nesting depth for `rawLine`, ignoring strings, comments,
+ * and inline `if <cond> then <a> else <b>` conditional expressions (which have no `end`).
+ */
+export function stepLuauBlockDepth(depthOrLine, lineOrDepth = 0) {
+    const depth = typeof depthOrLine === "number" ? depthOrLine : Number(lineOrDepth) || 0;
+    const rawLine = typeof depthOrLine === "string" ? depthOrLine : String(lineOrDepth || "");
+    const cleaned = stripCodeStringsAndComments(rawLine, true, false).trim();
+    if (!cleaned) return depth;
+    const withoutInlineIf = cleaned.replace(
+        /([=(,{[\-+*/%^<>~]|==|~=|<=|>=|\.\.|\b(?:return|and|or|not)\b)\s*if\b(?:(?!\b(?:end|return|local)\b).)*?\bthen\b(?:(?!\b(?:end|return|local)\b).)*?\belse\b/g,
+        "$1 ",
+    );
+    const opens = (withoutInlineIf.match(/\b(?:function|then|do|repeat)\b/g) || []).length;
+    const elseifs = (withoutInlineIf.match(/\belseif\b/g) || []).length;
+    const closes = (withoutInlineIf.match(/\b(?:end|until)\b/g) || []).length;
+    return Math.max(0, depth + Math.max(0, opens - elseifs) - closes);
+}
+
+export class UnionFind {
+    constructor(size = 0) {
+        this.parent = new Map();
+        this.rank = new Map();
+        for (let i = 0; i < size; i++) {
+            this.parent.set(i, i);
+            this.rank.set(i, 0);
+        }
+    }
+    makeSet(x) {
+        if (!this.parent.has(x)) {
+            this.parent.set(x, x);
+            this.rank.set(x, 0);
+        }
+    }
+    find(x) {
+        if (!this.parent.has(x)) {
+            this.makeSet(x);
+            return x;
+        }
+        let cur = x;
+        while (this.parent.get(cur) !== cur) {
+            const p = this.parent.get(cur);
+            const gp = this.parent.get(p);
+            this.parent.set(cur, gp);
+            cur = gp;
+        }
+        return cur;
+    }
+    union(a, b) {
+        let ra = this.find(a);
+        let rb = this.find(b);
+        if (ra === rb) return false;
+        const rankA = this.rank.get(ra) || 0;
+        const rankB = this.rank.get(rb) || 0;
+        if (rankA < rankB) {
+            const tmp = ra;
+            ra = rb;
+            rb = tmp;
+        }
+        this.parent.set(rb, ra);
+        if (rankA === rankB) this.rank.set(ra, rankA + 1);
+        return true;
+    }
+    components() {
+        const byRoot = new Map();
+        for (const x of this.parent.keys()) {
+            const r = this.find(x);
+            let list = byRoot.get(r);
+            if (!list) {
+                list = [];
+                byRoot.set(r, list);
+            }
+            list.push(x);
+        }
+        return [...byRoot.values()];
+    }
+    groups() {
+        return this.components();
+    }
 }

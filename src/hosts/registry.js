@@ -9,8 +9,8 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { instructionBody, cursorRule, kiroSteering, windsurfRule } from './instructions.js';
-import { skillTemplate } from './skill-template.js';
-import { dirExists } from './config-write.js';
+import { skillTemplate } from '../claude/shim-template.js';
+import { dirExists } from '../util/fs.js';
 export const HOSTS = [
     {
         id: 'agents',
@@ -108,8 +108,11 @@ export const HOSTS = [
         detect: (home, repo) => dirExists(join(home, '.codeium', 'windsurf')) || dirExists(join(repo, '.windsurf')),
     },
 ];
-export function hostIds() {
-    return HOSTS.map((h) => h.id);
+export function allHostIds() {
+    return [...HOSTS.map((h) => h.id), 'claude'];
+}
+export function detectClaude(home, repo) {
+    return dirExists(join(home, '.claude')) || dirExists(join(repo, '.claude'));
 }
 export function detectHosts(home, repo) {
     return HOSTS.filter((h) => h.detect(home, repo));

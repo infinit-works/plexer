@@ -13,29 +13,30 @@
 import { createServer } from "node:http";
 import { readFileSync, existsSync, realpathSync, statSync, watch } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { loadGraphCached } from "../graph/load.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { computeScoreSnapshot } from "../health/scoring.js";
 import { loadHealthState, stateFilePath } from "../health/state.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
-import { isSensitiveOrDotPath } from "../util/span.js";
+import { isSensitiveOrDotPath, MAX_SOURCE_READ_BYTES } from "../util/span.js";
 
 export function buildVizHealthPayload(contextDir) {
     if (!contextDir || !existsSync(stateFilePath(contextDir))) return null;
     const state = loadHealthState(contextDir);
     const scores = computeScoreSnapshot(state);
-    const byFile = {};
+    const byFile = Object.create(null);
     let openCount = 0;
     const sevRank = { critical: 4, high: 3, medium: 2, low: 1 };
+    const tierUrgency = { T1: 4, T2: 3, T3: 2, T4: 1 };
     for (const iss of Object.values(state.issues || {})) {
-        if (iss.status !== "open" || iss.suppressed || !iss.file) continue;
+        if (!iss || typeof iss !== "object" || iss.status !== "open" || iss.suppressed || typeof iss.file !== "string" || !iss.file) continue;
         openCount += 1;
         let entry = byFile[iss.file];
         if (!entry) {
             entry = {
                 count: 0,
                 max_severity: "low",
-                max_tier: "T1",
+                max_tier: iss.tier || "T4",
                 issues: [],
             };
             byFile[iss.file] = entry;
@@ -44,7 +45,7 @@ export function buildVizHealthPayload(contextDir) {
         if ((sevRank[iss.severity] || 1) > (sevRank[entry.max_severity] || 1)) {
             entry.max_severity = iss.severity || "medium";
         }
-        if (String(iss.tier || "T1") > String(entry.max_tier || "T1")) {
+        if ((tierUrgency[iss.tier] || 0) > (tierUrgency[entry.max_tier] || 0)) {
             entry.max_tier = iss.tier || "T2";
         }
         if (entry.issues.length < 15) {
@@ -71,10 +72,13 @@ export function buildVizHealthPayload(contextDir) {
     };
 }
 const PORT_ATTEMPTS = 10;
+const MAX_SSE_CLIENTS = 32;
 const WATCH_DEBOUNCE_MS = 300;
-const LOOPBACK_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
-const LOOPBACK_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
+const LOOPBACK_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d+))?$/i;
+const LOOPBACK_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d+))?$/i;
 const SECURITY_HEADERS = {
+    "content-security-policy":
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     "cross-origin-resource-policy": "same-origin",
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
@@ -86,12 +90,17 @@ const STATIC_FILES = {
     "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
 };
 function sendJson(res, status, body) {
+    const payload = JSON.stringify(body);
     res.writeHead(status, {
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
         ...SECURITY_HEADERS,
     });
-    res.end(JSON.stringify(body));
+    if (String(res.req?.method ?? "GET").toUpperCase() === "HEAD") {
+        res.end();
+        return;
+    }
+    res.end(payload);
 }
 function listen(server, port) {
     return new Promise((resolve, reject) => {
@@ -140,6 +149,11 @@ function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot, contextD
             sendJson(res, 403, { error: "path outside repository root or restricted" });
             return;
         }
+        const realStat = statSync(realFile);
+        if (!realStat.isFile() || realStat.size > MAX_SOURCE_READ_BYTES) {
+            sendJson(res, 413, { error: "source file too large or not a regular file" });
+            return;
+        }
         const raw = readSourceFile(realFile);
         if (raw === null) {
             sendJson(res, 500, { error: "unable to read source file" });
@@ -181,16 +195,50 @@ function handleSourceApiRequest(parsedUrl, res, repoRoot, realRepoRoot, contextD
     }
 }
 
-function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients) {
+function handleVizEventsRequest(req, res, method, sseClients) {
+    res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        ...SECURITY_HEADERS,
+    });
+    if (method === "HEAD") {
+        res.end();
+        return;
+    }
+    res.write(": connected\n\n");
+    while (sseClients.size >= MAX_SSE_CLIENTS) {
+        const oldest = sseClients.values().next().value;
+        if (!oldest) break;
+        sseClients.delete(oldest);
+        try {
+            oldest.end();
+        }
+        catch { /* ignore close error */ }
+    }
+    sseClients.add(res);
+    const cleanup = () => sseClients.delete(res);
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
+}
+
+function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients, boundPort) {
     const hostHeader = String(req.headers?.host ?? "").trim();
-    if (!hostHeader || !LOOPBACK_HOST_RE.test(hostHeader)) {
+    const hostMatch = LOOPBACK_HOST_RE.exec(hostHeader);
+    if (!hostMatch || (boundPort && hostMatch[1] && Number(hostMatch[1]) !== boundPort)) {
         sendJson(res, 403, { error: "forbidden Host header" });
         return;
     }
+    const secFetchSite = String(req.headers?.["sec-fetch-site"] ?? "").trim().toLowerCase();
     const originHeader = String(req.headers?.origin ?? "").trim();
+    const originMatch = originHeader ? LOOPBACK_ORIGIN_RE.exec(originHeader) : null;
+    const originPortMismatch =
+        Boolean(originHeader) &&
+        (!originMatch || (boundPort && Number(originMatch[1] || 80) !== boundPort));
     if (
-        req.headers?.["sec-fetch-site"] === "cross-site" ||
-        (originHeader && !LOOPBACK_ORIGIN_RE.test(originHeader))
+        (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") ||
+        originPortMismatch
     ) {
         sendJson(res, 403, { error: "cross-site requests are forbidden" });
         return;
@@ -200,18 +248,30 @@ function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients
         sendJson(res, 405, { error: "method not allowed" });
         return;
     }
-    const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    const rawTarget = String(req.url ?? "/");
+    if (!rawTarget.startsWith("/") || rawTarget.startsWith("//")) {
+        sendJson(res, 400, { error: "invalid request URL" });
+        return;
+    }
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(rawTarget, "http://127.0.0.1");
+    }
+    catch {
+        sendJson(res, 400, { error: "invalid request URL" });
+        return;
+    }
     const path = parsedUrl.pathname;
-    const asset = STATIC_FILES[path];
+    const asset = Object.hasOwn(STATIC_FILES, path) ? STATIC_FILES[path] : null;
     if (asset) {
         const file = join(opts.viewerDir, asset.file);
         if (!existsSync(file)) {
             res.writeHead(404, { "content-type": "text/plain", ...SECURITY_HEADERS });
-            res.end("viewer bundle missing — run the package build");
+            res.end(method === "HEAD" ? undefined : "viewer bundle missing — run the package build");
             return;
         }
         res.writeHead(200, { "content-type": asset.type, ...SECURITY_HEADERS });
-        res.end(readFileSync(file));
+        res.end(method === "HEAD" ? undefined : readFileSync(file));
         return;
     }
     if (path === "/api/context-graph") {
@@ -237,19 +297,11 @@ function handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients
         return;
     }
     if (path === "/events") {
-        res.writeHead(200, {
-            "content-type": "text/event-stream",
-            "cache-control": "no-cache",
-            connection: "keep-alive",
-            ...SECURITY_HEADERS,
-        });
-        res.write(": connected\n\n");
-        sseClients.add(res);
-        req.on("close", () => sseClients.delete(res));
+        handleVizEventsRequest(req, res, method, sseClients);
         return;
     }
     res.writeHead(404, { "content-type": "text/plain", ...SECURITY_HEADERS });
-    res.end("not found");
+    res.end(method === "HEAD" ? undefined : "not found");
 }
 
 export async function startVizServer(opts) {
@@ -260,27 +312,52 @@ export async function startVizServer(opts) {
     }
     catch { /* use resolved repoRoot */ }
     const sseClients = new Set();
-    const server = createServer((req, res) => handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients));
-    const basePort = Number.isInteger(opts?.port) && opts.port > 0 ? opts.port : 4400;
-    let port = basePort;
+    let port = 0;
+    const server = createServer((req, res) => {
+        try {
+            handleVizHttpRequest(req, res, opts, repoRoot, realRepoRoot, sseClients, port);
+        }
+        catch {
+            if (!res.headersSent) {
+                sendJson(res, 500, { error: "internal server error" });
+            }
+            else {
+                res.destroy();
+            }
+        }
+    });
+    const basePort =
+        Number.isInteger(opts?.port) && opts.port > 0 && opts.port <= 65535 ? opts.port : 4400;
+    port = basePort;
     let bound = false;
-    for (let i = 0; i < PORT_ATTEMPTS && !bound; i++) {
+    for (let i = 0; i < PORT_ATTEMPTS && !bound && basePort + i <= 65535; i++) {
         port = basePort + i;
         bound = await listen(server, port);
     }
     if (!bound) {
-        throw new Error(`no free port in ${basePort}–${basePort + PORT_ATTEMPTS - 1}`);
+        const maxTried = Math.min(65535, basePort + PORT_ATTEMPTS - 1);
+        throw new Error(`no free port in ${basePort}–${maxTried}`);
     }
     const watchers = [];
     let debounce;
     const notifyChange = () => {
         clearTimeout(debounce);
         debounce = setTimeout(() => {
-            for (const client of sseClients)
-                client.write("data: change\n\n");
+            for (const client of sseClients) {
+                if (client.destroyed || client.writableEnded) {
+                    sseClients.delete(client);
+                    continue;
+                }
+                try {
+                    client.write("data: change\n\n");
+                }
+                catch {
+                    sseClients.delete(client);
+                }
+            }
         }, WATCH_DEBOUNCE_MS);
     };
-    for (const watchDir of [opts.contextDir, join(opts.contextDir, ".graph")]) {
+    for (const watchDir of [opts.contextDir, join(opts.contextDir, ".graph"), join(opts.contextDir, ".health")]) {
         if (existsSync(watchDir)) {
             try {
                 const w = watch(watchDir, notifyChange);

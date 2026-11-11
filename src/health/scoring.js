@@ -18,6 +18,7 @@ import {
     SCORECARD_FILE,
     SUBJECTIVE_DIMENSIONS,
     SUBJECTIVE_POOL_WEIGHT,
+    SUBJECTIVE_TOTAL_WEIGHT,
     normalizeDimensionKey,
 } from "./constants.js";
 import { healthDir } from "./state.js";
@@ -38,22 +39,36 @@ function fileCappedFailureUnits(weightedCount) {
 
 function countsTowardVariant(issue, variant) {
     const st = issue.status || "open";
-    if (st === "false_positive") return false;
+    const isMechUnverifiedFix =
+        st === "fixed" && issue.detector !== "review" && issue.source !== "review" && issue.verified === false;
     if (variant === "lenient") {
-        if (issue.suppressed) return false;
+        if (issue.suppressed || st === "false_positive") return false;
         // `open`, `deferred`, `triaged_out` count as failures; `wontfix`, `fixed`, `auto_resolved` do not
         return st === "open" || st === "deferred" || st === "triaged_out";
     }
     if (variant === "strict") {
-        // `wontfix` also counts as failure in strict mode!
-        return st === "open" || st === "deferred" || st === "triaged_out" || st === "wontfix";
+        if (isMechUnverifiedFix) return true;
+        // `wontfix` and `false_positive` also count as failure in strict mode!
+        return (
+            st === "open" ||
+            st === "deferred" ||
+            st === "triaged_out" ||
+            st === "wontfix" ||
+            st === "false_positive"
+        );
     }
     if (variant === "verified") {
-        // Like strict, plus unverified `fixed` items still count as failure until rescan confirms them!
+        // Like strict, plus unverified `fixed` items (including review issues) count as failure until rescan confirms them!
         if (st === "fixed" && !issue.verified) return true;
-        return st === "open" || st === "deferred" || st === "triaged_out" || st === "wontfix";
+        return (
+            st === "open" ||
+            st === "deferred" ||
+            st === "triaged_out" ||
+            st === "wontfix" ||
+            st === "false_positive"
+        );
     }
-    if (issue.suppressed) return false;
+    if (issue.suppressed || st === "false_positive") return false;
     return st === "open";
 }
 
@@ -144,11 +159,24 @@ function reviewIssuesByDim(allIssues, variant) {
     return counts;
 }
 
-function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
-    const isPlaceholder = Boolean(entry?.placeholder || entry?.reset_by === "scan_reset_subjective");
+function calcReviewPenalty(revWeight, span = REVIEW_ISSUE_PENALTY_SPAN) {
+    if (revWeight <= 0) return 0;
+    return Math.min(span, (revWeight / MAX_REVIEW_ISSUES_FOR_SPAN) * span);
+}
+
+function buildSubjectiveDimEntry(
+    sDef,
+    entry,
+    openRevWeight,
+    lenientRevWeight,
+    verifiedRevWeight = openRevWeight,
+) {
+    const isScanReset = entry?.reset_by === "scan_reset_subjective";
+    const isTargetReset = entry?.reset_by === "target_anchored_reset";
     const hasScore =
         entry &&
-        !isPlaceholder &&
+        !isScanReset &&
+        (isTargetReset || !entry.placeholder) &&
         typeof entry.score === "number" &&
         Number.isFinite(entry.score);
     if (!hasScore) {
@@ -171,36 +199,27 @@ function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
                 overall_per_point: 0,
                 overall_drag: 0,
                 assessed_at: null,
-                stale: false,
-                stale_reason: null,
+                stale: Boolean(entry?.stale || isScanReset),
+                stale_reason: entry?.stale_reason || (isScanReset ? "reset_on_scan" : null),
+                reset_by: entry?.reset_by || null,
                 judgment: null,
             },
         };
     }
 
     const rawAssessment = Math.max(0, Math.min(100, Number(entry.score)));
-    const strictPenalty =
-        openRevWeight > 0
-            ? Math.min(
-                  REVIEW_ISSUE_PENALTY_SPAN,
-                  (openRevWeight / MAX_REVIEW_ISSUES_FOR_SPAN) * REVIEW_ISSUE_PENALTY_SPAN,
-              )
-            : 0;
-    const lenientPenalty =
-        lenientRevWeight > 0
-            ? Math.min(
-                  REVIEW_ISSUE_PENALTY_SPAN * 0.5,
-                  (lenientRevWeight / MAX_REVIEW_ISSUES_FOR_SPAN) *
-                      (REVIEW_ISSUE_PENALTY_SPAN * 0.5),
-              )
-            : 0;
+    const strictPenalty = calcReviewPenalty(openRevWeight, REVIEW_ISSUE_PENALTY_SPAN);
+    const verifiedPenalty = calcReviewPenalty(verifiedRevWeight, REVIEW_ISSUE_PENALTY_SPAN);
+    const lenientPenalty = calcReviewPenalty(lenientRevWeight, REVIEW_ISSUE_PENALTY_SPAN * 0.5);
 
     const strictDimScore = Math.max(0, round(rawAssessment - strictPenalty, 2));
+    const verifiedDimScore = Math.max(0, round(rawAssessment - verifiedPenalty, 2));
     const lenientDimScore = Math.max(0, round(rawAssessment - lenientPenalty, 2));
 
     return {
         hasScore: true,
         strictDimScore,
+        verifiedDimScore,
         lenientDimScore,
         dimObj: {
             id: sDef.id,
@@ -221,12 +240,19 @@ function buildSubjectiveDimEntry(sDef, entry, openRevWeight, lenientRevWeight) {
             assessed_at: entry.assessed_at || null,
             stale: Boolean(entry.stale),
             stale_reason: entry.stale_reason || null,
+            placeholder: Boolean(entry.placeholder),
+            reset_by: entry.reset_by || null,
             judgment: entry.judgment || null,
         },
     };
 }
 
-function computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, lenientReviewIssues) {
+function computeSubjectivePoolBreakdown(
+    rawSubjAssessments,
+    strictReviewIssues,
+    lenientReviewIssues,
+    verifiedReviewIssues = strictReviewIssues,
+) {
     const subjAssessments = {};
     for (const [k, v] of Object.entries(rawSubjAssessments)) {
         const norm = normalizeDimensionKey(k);
@@ -236,6 +262,7 @@ function computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, 
     const subjDims = {};
     let subjLenientWeightedSum = 0;
     let subjStrictWeightedSum = 0;
+    let subjVerifiedWeightedSum = 0;
     let subjTotalWeight = 0;
     let hasSubjectiveScores = false;
 
@@ -245,6 +272,7 @@ function computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, 
             subjAssessments[sDef.id],
             strictReviewIssues.get(sDef.id) || 0,
             lenientReviewIssues.get(sDef.id) || 0,
+            verifiedReviewIssues.get(sDef.id) || 0,
         );
         subjDims[sDef.id] = built.dimObj;
         if (sDef.short_id && sDef.short_id !== sDef.id) {
@@ -258,15 +286,20 @@ function computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, 
             hasSubjectiveScores = true;
             subjLenientWeightedSum += built.lenientDimScore * sDef.weight;
             subjStrictWeightedSum += built.strictDimScore * sDef.weight;
+            subjVerifiedWeightedSum += built.verifiedDimScore * sDef.weight;
             subjTotalWeight += sDef.weight;
         }
     }
+
+    const coverage =
+        SUBJECTIVE_TOTAL_WEIGHT > 0 ? Math.min(1.0, subjTotalWeight / SUBJECTIVE_TOTAL_WEIGHT) : 0;
+    const effectivePoolWeight = hasSubjectiveScores ? round(SUBJECTIVE_POOL_WEIGHT * coverage, 4) : 0;
 
     for (const sDef of Object.values(SUBJECTIVE_DIMENSIONS)) {
         const d = subjDims[sDef.id];
         if (d && d.score !== null && subjTotalWeight > 0) {
             d.pool_share = round(d.effective_weight / subjTotalWeight, 4);
-            d.overall_per_point = round(d.pool_share * SUBJECTIVE_POOL_WEIGHT, 4);
+            d.overall_per_point = round(d.pool_share * effectivePoolWeight, 4);
             d.overall_drag = round((100 - d.strict) * d.overall_per_point, 2);
         }
     }
@@ -274,6 +307,10 @@ function computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, 
     const subjectiveStrictPoolScore =
         hasSubjectiveScores && subjTotalWeight > 0
             ? round(subjStrictWeightedSum / subjTotalWeight, 2)
+            : null;
+    const subjectiveVerifiedPoolScore =
+        hasSubjectiveScores && subjTotalWeight > 0
+            ? round(subjVerifiedWeightedSum / subjTotalWeight, 2)
             : null;
     const subjectiveLenientPoolScore =
         hasSubjectiveScores && subjTotalWeight > 0
@@ -284,7 +321,10 @@ function computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, 
         subjDims,
         hasSubjectiveScores,
         subjectiveStrictPoolScore,
+        subjectiveVerifiedPoolScore,
         subjectiveLenientPoolScore,
+        coverage: round(coverage, 4),
+        effectivePoolWeight,
     };
 }
 
@@ -302,15 +342,24 @@ export function computeScoreSnapshot(state) {
 
     const lenientReviewIssues = reviewIssuesByDim(allIssues, "lenient");
     const strictReviewIssues = reviewIssuesByDim(allIssues, "strict");
+    const verifiedReviewIssues = reviewIssuesByDim(allIssues, "verified");
 
     const {
         subjDims,
         hasSubjectiveScores,
         subjectiveStrictPoolScore,
+        subjectiveVerifiedPoolScore,
         subjectiveLenientPoolScore,
-    } = computeSubjectivePoolBreakdown(rawSubjAssessments, strictReviewIssues, lenientReviewIssues);
+        coverage: subjectiveCoverage,
+        effectivePoolWeight,
+    } = computeSubjectivePoolBreakdown(
+        rawSubjAssessments,
+        strictReviewIssues,
+        lenientReviewIssues,
+        verifiedReviewIssues,
+    );
 
-    const mechPoolFactor = hasSubjectiveScores ? MECHANICAL_POOL_WEIGHT : 1.0;
+    const mechPoolFactor = hasSubjectiveScores ? round(1.0 - effectivePoolWeight, 4) : 1.0;
     for (const d of Object.values(strictMech.dims)) {
         d.lenient_score = lenientMech.dims[d.id]?.score ?? d.score;
         d.overall_per_point = round(d.pool_share * mechPoolFactor, 4);
@@ -320,13 +369,17 @@ export function computeScoreSnapshot(state) {
     const blend = (mechScore, subjScore) =>
         subjScore === null
             ? mechScore
-            : round(mechScore * MECHANICAL_POOL_WEIGHT + subjScore * SUBJECTIVE_POOL_WEIGHT, 2);
+            : round(mechScore * (1.0 - effectivePoolWeight) + subjScore * effectivePoolWeight, 2);
 
     const overall = blend(lenientMech.poolScore, subjectiveLenientPoolScore);
     const strict = blend(strictMech.poolScore, subjectiveStrictPoolScore);
-    const verified = blend(verifiedMech.poolScore, subjectiveStrictPoolScore);
+    const verified = blend(verifiedMech.poolScore, subjectiveVerifiedPoolScore);
     const objective = strictMech.poolScore;
     const wontfixCount = allIssues.filter((i) => i.status === "wontfix").length;
+    const falsePositiveCount = allIssues.filter((i) => i.status === "false_positive").length;
+    const unverifiedFixedCount = allIssues.filter(
+        (i) => i.status === "fixed" && i.verified === false,
+    ).length;
     const staleDimensions = Object.values(subjDims)
         .filter((d) => d.stale)
         .map((d) => d.id);
@@ -349,7 +402,16 @@ export function computeScoreSnapshot(state) {
         verified,
         wontfix_gap: round(Math.max(0, overall - strict), 2),
         wontfix_count: wontfixCount,
+        false_positive_count: falsePositiveCount,
+        unverified_fixed_count: unverifiedFixedCount,
+        ignore_integrity: state?.ignore_integrity || {
+            ignored_count: 0,
+            suppressed_pct: 0,
+            ignored_by_detector: {},
+        },
         has_subjective: hasSubjectiveScores,
+        subjective_coverage: subjectiveCoverage,
+        effective_pool_weight: effectivePoolWeight,
         subjective_pool_score: subjectiveStrictPoolScore,
         stale_dimensions: staleDimensions,
         dimensions: allDimensions,

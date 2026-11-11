@@ -10,7 +10,8 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { BIN_LAUNCH, dirExists, mergeJsonKey, updateJsonConfig } from '../util/state.js';
+import { BIN_LAUNCH, mergeJsonKey, updateJsonConfig } from '../util/config-write.js';
+import { dirExists } from '../util/fs.js';
 export { BIN_LAUNCH, mergeJsonKey };
 /**
  * CLI/skill hosts (`claude`, `agents`/Codex, `antigravity`, `gemini`) already

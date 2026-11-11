@@ -9,13 +9,11 @@
  */
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { HOSTS, detectHosts } from './registry.js';
+import { HOSTS, detectClaude, detectHosts } from './registry.js';
 import { CLI_MCP_OPT_IN_HOSTS, mcpTargets } from './mcp-config.js';
 import { hookTargets } from './codex-hooks.js';
 import { antigravitySkillTargets } from './antigravity.js';
-import { claudeTargets } from '../claude/init.js';
-import { claudeGlobalTargets } from './claude-global.js';
-import { dirExists } from './config-write.js';
+import { claudeGlobalTargets, claudeTargets } from '../claude/init.js';
 /** The instruction-file write for one host, derived from its registry entry. */
 function instructionTarget(repo, host) {
     return {
@@ -34,7 +32,7 @@ function instructionTarget(repo, host) {
 export function planInit(repo, opts = {}) {
     const home = opts.home ?? homedir();
     const detected = new Set(detectHosts(home, repo).map((h) => h.id));
-    const claudeDetected = dirExists(join(home, '.claude')) || dirExists(join(repo, '.claude'));
+    const claudeDetected = detectClaude(home, repo);
     const plans = [
         { id: 'claude', name: 'Claude Code', detected: claudeDetected, writes: [...claudeTargets(repo), ...claudeGlobalTargets(home)] },
         ...HOSTS.map((host) => ({

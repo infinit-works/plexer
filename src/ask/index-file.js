@@ -19,9 +19,9 @@
  * contribution is folded into the stored `df` at query time (see `ask.js`),
  * which is why `df` here counts symbol/file nodes only.
  */
-import { statSync } from "node:fs";
-import { join } from "node:path";
-import { CACHE_DIR, readGraph, wiringPath } from "../context/node-file.js";
+import { basename, join } from "node:path";
+import { loadFileCached, registerGraphCacheClearer, statOf } from "../context/graph-store.js";
+import { CACHE_DIR } from "../context/node-file.js";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 /** Words too common/short to carry query intent — dropped before scoring. */
 const STOP = new Set([
@@ -42,21 +42,33 @@ export function tokenize(text) {
         .split(/[^a-z0-9]+/)
         .filter((t) => t.length > 1 && !STOP.has(t));
 }
+const PROTECTED_ING = new Set([
+    "string", "spring", "thing", "bring", "ring", "king", "ping", "sing", "wing",
+    "cling", "fling", "sling", "sting", "swing", "wring",
+    "anything", "nothing", "something", "everything",
+]);
+const PROTECTED_ER_OR = new Set([
+    "number", "member", "buffer", "header", "footer", "render", "filter", "trigger",
+    "center", "master", "cluster", "counter", "integer", "docker", "folder", "pointer",
+    "order", "error", "color", "vector", "cursor", "tensor", "mirror", "anchor",
+    "author", "vendor", "factor", "sensor", "sector",
+]);
+function stripPluralSuffix(w) {
+    if (w.length > 4 && w.endsWith("ies"))
+        return `${w.slice(0, -3)}y`;
+    if (w.length > 4 && /(ches|shes|xes|zes|ses)$/.test(w))
+        return w.slice(0, -2);
+    if (w.length > 3 && w.endsWith("s") && !/(ss|us|is)$/.test(w))
+        return w.slice(0, -1);
+    return w;
+}
 /** Fast, deterministic morphological stemmer for code identifiers and natural-language queries. */
 export function stemToken(raw) {
     let w = raw;
     if (w.length <= 3)
         return w;
-    if (w.length > 4 && w.endsWith("ies")) {
-        w = w.slice(0, -3) + "y";
-    }
-    else if (w.length > 4 && /(ches|shes|xes|zes|ses)$/.test(w)) {
-        w = w.slice(0, -2);
-    }
-    else if (w.length > 3 && w.endsWith("s") && !/(ss|us|is)$/.test(w)) {
-        w = w.slice(0, -1);
-    }
-    if (w.length > 5 && w.endsWith("ing")) {
+    w = stripPluralSuffix(w);
+    if (w.length > 5 && w.endsWith("ing") && !PROTECTED_ING.has(w) && /[aeiouy]/.test(w.slice(0, -3))) {
         w = w.slice(0, -3);
         if (/([bcdgklmnprstvz])\1$/.test(w))
             w = w.slice(0, -1);
@@ -67,18 +79,18 @@ export function stemToken(raw) {
     else if (w.length > 4 && w.endsWith("ed")) {
         w = w.slice(0, -2);
         if (w.endsWith("i"))
-            w = w.slice(0, -1) + "y";
+            w = `${w.slice(0, -1)}y`;
         else if (/([bcdgklmnprstvz])\1$/.test(w))
             w = w.slice(0, -1);
     }
-    else if (w.length > 5 && /(er|or)$/.test(w)) {
+    else if (w.length > 5 && /(er|or)$/.test(w) && !PROTECTED_ER_OR.has(w)) {
         w = w.slice(0, -2);
     }
     if (w.length > 4 && w.endsWith("e") && !w.endsWith("ee")) {
         w = w.slice(0, -1);
     }
     if (w.length > 6 && w.endsWith("icat")) {
-        w = w.slice(0, -4) + "y";
+        w = `${w.slice(0, -4)}y`;
     }
     else if (w.length > 5 && w.endsWith("at")) {
         w = w.slice(0, -2);
@@ -86,10 +98,10 @@ export function stemToken(raw) {
     return w;
 }
 const COMPOUND_STEMS = new Map([
-    ["varint", ["variabl", "integ"]],
-    ["varints", ["variabl", "integ"]],
-    ["uint", ["unsign", "integ"]],
-    ["sint", ["sign", "integ"]],
+    ["varint", ["variabl", "integ", "integer"]],
+    ["varints", ["variabl", "integ", "integer"]],
+    ["uint", ["unsign", "integ", "integer"]],
+    ["sint", ["sign", "integ", "integer"]],
     ["bitwidth", ["bit", "width"]],
     ["bitwidths", ["bit", "width"]],
     ["cframe", ["coordin", "fram"]],
@@ -123,7 +135,7 @@ export function counts(tokens) {
     return m;
 }
 export const ASK_INDEX_FILE = "ask-index.json";
-const ASK_INDEX_VERSION = 2;
+export const ASK_INDEX_VERSION = 3;
 /** Absolute path to the ask sidecar for a context dir: `<dir>/.cache/ask-index.json`.
  * `.cache/` is the established uncommitted-cache location — this sidecar is a
  * derived, regenerate-anytime cache, not checked-in graph data. */
@@ -139,6 +151,72 @@ export function bagLen(p) {
     for (const [, c] of p)
         n += c;
     return n;
+}
+function isQualifiedCompoundOwner(owner, bare) {
+    return Boolean(owner &&
+        !bare.includes("_") &&
+        !/[A-Z]/.test(bare.slice(1)) &&
+        owner !== "Command" &&
+        !/^(?:module|exports|window|global|self|this)$/i.test(owner) &&
+        !owner.startsWith("Socket"));
+}
+export function recordNodeCompoundVocab(n, compoundSymbols) {
+    if (n.path) {
+        const base = basename(n.path).replace(/\.[a-z0-9]+$/i, "");
+        if (base.length >= 6)
+            compoundSymbols.set(base.toLowerCase(), base);
+    }
+    if (n.kind === "file" || !n.name)
+        return;
+    const bare = n.name.split(/[.:#]/).pop() ?? "";
+    const bareToks = tokenize(bare);
+    if (bare.length >= 6 && (!bare.includes("_") || bareToks.length >= 3 || bareToks.some((t) => t.length >= 7))) {
+        compoundSymbols.set(bare.toLowerCase(), bare);
+        const flat = bare.replace(/^_+/, "").replaceAll("_", "").toLowerCase();
+        if (flat.length >= 6 && !compoundSymbols.has(flat))
+            compoundSymbols.set(flat, bare);
+        const strippedPrefix = bare.replace(/^(?:_?(?:on|handle|is)_|(?:on|handle|is|get)(?=[A-Z]))/, "");
+        const flatStripped = strippedPrefix.replaceAll("_", "").toLowerCase();
+        if (flatStripped.length >= 6 && !compoundSymbols.has(flatStripped))
+            compoundSymbols.set(flatStripped, bare);
+    }
+    if (isQualifiedCompoundOwner(n.owner, bare)) {
+        const qualKey = `${stemToken(n.owner.toLowerCase())}${stemToken(bare.toLowerCase())}`;
+        if (qualKey.length >= 8 && !compoundSymbols.has(qualKey))
+            compoundSymbols.set(qualKey, `${n.owner}.${bare}`);
+    }
+}
+function buildAskVocab(nodes) {
+    const compoundSymbols = new Map();
+    const nameTokSet = new Set();
+    const nameStems = new Map();
+    const pathTokSet = new Set();
+    for (const n of nodes) {
+        recordNodeCompoundVocab(n, compoundSymbols);
+        for (const t of tokenize(n.path ?? "")) {
+            if (t.length >= 3)
+                pathTokSet.add(t);
+        }
+        if (n.kind === "file")
+            continue;
+        const seenStems = new Set();
+        for (const t of tokenize(n.name ?? "")) {
+            if (t.length < 3)
+                continue;
+            nameTokSet.add(t);
+            const s = stemToken(t);
+            if (!seenStems.has(s)) {
+                seenStems.add(s);
+                nameStems.set(s, (nameStems.get(s) ?? 0) + 1);
+            }
+        }
+    }
+    return {
+        compoundSymbols: pairs(compoundSymbols),
+        nameToks: [...nameTokSet].sort(),
+        nameStemCounts: pairs(nameStems),
+        pathToks: [...pathTokSet].sort(),
+    };
 }
 /**
  * Tokenize every node in `graph` (exactly as `ask.js`'s lexical pass does) and
@@ -188,10 +266,15 @@ export function writeAskIndex(outDir, graph, prior = readAskIndex(outDir)) {
         avgBodyLen,
         df: pairs(df),
         docCount: nodes.length,
+        vocab: buildAskVocab(nodes),
         docs,
     };
     const outPath = askIndexPath(outDir);
     writeJsonAtomic(outPath, index, true);
+    hydrateAskIndex(index);
+    const st = statOf(outPath);
+    if (st)
+        askIndexCache.set(outPath, { mtimeMs: st.mtimeMs, size: st.size, value: index });
     return outPath;
 }
 /** Read the ask sidecar. Returns null on a missing file, unparseable JSON, an
@@ -203,7 +286,9 @@ export function readAskIndex(outDir) {
     const raw = readJson(askIndexPath(outDir));
     if (!raw ||
         typeof raw !== "object" ||
-        (raw.version !== 1 && raw.version !== ASK_INDEX_VERSION) ||
+        raw.version !== ASK_INDEX_VERSION ||
+        !raw.vocab ||
+        typeof raw.vocab !== "object" ||
         typeof raw.docCount !== "number" ||
         typeof raw.avgBodyLen !== "number" ||
         !Array.isArray(raw.df) ||
@@ -214,32 +299,21 @@ export function readAskIndex(outDir) {
     return raw;
 }
 
-const graphCache = new Map();
 const askIndexCache = new Map();
-function statOf(path) {
-    let st = null;
-    try {
-        const s = statSync(path);
-        st = { mtimeMs: s.mtimeMs, size: s.size };
-    }
-    catch {
-        /* file absent or unreadable */
-    }
-    return st;
-}
-function loadCached(cache, path, parse) {
-    const st = statOf(path);
-    if (!st) {
-        cache.delete(path);
-        return null;
-    }
-    const cached = cache.get(path);
-    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
-        return cached.value;
-    }
-    const value = parse();
-    cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, value });
-    return value;
+registerGraphCacheClearer((outDir) => {
+    askIndexCache.delete(askIndexPath(outDir));
+});
+function buildVocabHydrated(raw, dfMap, stemDfMap) {
+    const vocab = raw.vocab ?? {};
+    return {
+        dfMap,
+        stemDf: stemDfMap,
+        nameTokens: new Set(vocab.nameToks ?? []),
+        nameStems: new Map(vocab.nameStemCounts ?? []),
+        pathTokens: new Set(vocab.pathToks ?? []),
+        compoundSymbols: new Map(vocab.compoundSymbols ?? []),
+        nDocs: raw.docCount || 100,
+    };
 }
 function hydrateAskIndex(raw) {
     if (!raw)
@@ -269,32 +343,21 @@ function hydrateAskIndex(raw) {
             bodyLen: bagLen(d.body),
         });
     }
-    Object.defineProperty(raw, "_hydrated", {
-        value: { dfMap, stemDfMap, byId },
-        enumerable: false,
-        configurable: true,
+    Object.defineProperties(raw, {
+        _hydrated: {
+            value: { dfMap, stemDfMap, byId },
+            enumerable: false,
+            configurable: true,
+        },
+        vocabHydrated: {
+            value: buildVocabHydrated(raw, dfMap, stemDfMap),
+            enumerable: false,
+            configurable: true,
+        },
     });
     return raw;
 }
-export function loadGraphCached(outDir) {
-    const path = wiringPath(outDir);
-    return loadCached(graphCache, path, () => {
-        const g = readGraph(path);
-        if (g && Array.isArray(g.nodes)) {
-            Object.defineProperty(g, "_byId", {
-                value: new Map(g.nodes.map((n) => [n.id, n])),
-                enumerable: false,
-                configurable: true,
-            });
-        }
-        return g;
-    });
-}
 export function loadAskIndexCached(outDir) {
     const path = askIndexPath(outDir);
-    return loadCached(askIndexCache, path, () => hydrateAskIndex(readAskIndex(outDir)));
-}
-export function invalidateGraphCaches(outDir) {
-    graphCache.delete(wiringPath(outDir));
-    askIndexCache.delete(askIndexPath(outDir));
+    return loadFileCached(askIndexCache, path, () => hydrateAskIndex(readAskIndex(outDir)));
 }

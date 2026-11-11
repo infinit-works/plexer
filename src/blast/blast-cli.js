@@ -6,7 +6,7 @@
  */
 import { basename, resolve } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
-import { loadGraphCached } from "../graph/load.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { resolveCliChoice, resolveCliDepth } from "../graph/traverse-cli.js";
 import { blastRadiusIn } from "./blast.js";
 import { changedFiles, git, refExists } from "./diff.js";

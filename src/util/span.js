@@ -1,6 +1,8 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { readSourceFile } from "./source.js";
+
+export const MAX_SOURCE_READ_BYTES = 10 * 1024 * 1024;
 
 export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
@@ -155,15 +157,47 @@ const SENSITIVE_BASENAME_RE = /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)$|\.(?:pem|
 
 /** True when a repo-relative path contains a dot-prefixed segment (`.git`, `.env`, `.aws`) or private key file. */
 export function isSensitiveOrDotPath(relPath) {
-    const norm = String(relPath ?? "").replace(/\\/g, "/").replace(/^\.\//, "");
-    if (!norm)
+    const raw = String(relPath ?? "").replace(/^\.\//, "");
+    if (!raw || raw.startsWith("."))
         return true;
-    const parts = norm.split("/").filter(Boolean);
+    const parts = raw.split(/[\\/]+/).filter(Boolean);
     if (parts.length === 0)
         return true;
     if (parts.some((seg) => seg.startsWith(".")))
         return true;
     return SENSITIVE_BASENAME_RE.test(parts[parts.length - 1]);
+}
+
+/**
+ * Resolve and validate a repo-relative path against `absRoot` and `realRoot`,
+ * rejecting path traversal, symlink escapes, sensitive/dot paths, non-regular files,
+ * and files exceeding `maxBytes`.
+ */
+export function resolveSafeRepoFile(absRoot, realRoot, relPath, opts = {}) {
+    if (!absRoot || !realRoot || typeof relPath !== "string" || !relPath)
+        return null;
+    try {
+        const absFile = resolve(absRoot, relPath);
+        const rel = relative(absRoot, absFile);
+        if (!rel || rel.startsWith("..") || isAbsolute(rel) || (!opts.allowDot && isSensitiveOrDotPath(rel)))
+            return null;
+        if (opts.noSymlinks && lstatSync(absFile).isSymbolicLink())
+            return null;
+        const realFile = realpathSync(absFile);
+        const realRel = relative(realRoot, realFile);
+        if (!realRel || realRel.startsWith("..") || isAbsolute(realRel) || (!opts.allowDot && isSensitiveOrDotPath(realRel)))
+            return null;
+        const st = statSync(realFile);
+        const maxBytes = opts.maxBytes ?? MAX_SOURCE_READ_BYTES;
+        if (!st.isFile() || (maxBytes > 0 && st.size > maxBytes))
+            return null;
+        return { absFile, realFile, rel, realRel, stat: st };
+    }
+    catch (err) {
+        if (err && typeof err === "object" && "code" in err && /^(?:ENOENT|EISDIR|ENOTDIR|EACCES|EPERM|EINVAL|ELOOP|ENAMETOOLONG)$/.test(String(err.code)))
+            return null;
+        throw err;
+    }
 }
 
 /** Read each file once via `readSourceFile` (UTF-8 / UTF-16LE aware), returning split lines or null. */
@@ -187,19 +221,12 @@ export function fileReader(root) {
             return hit;
         let lines = null;
         try {
-            const absFile = resolve(absRoot, path);
-            const rel = relative(absRoot, absFile);
-            if (!rel || rel.startsWith("..") || isAbsolute(rel) || isSensitiveOrDotPath(rel)) {
+            const safe = resolveSafeRepoFile(absRoot, realRoot, path);
+            if (!safe) {
                 cache.set(path, null);
                 return null;
             }
-            const realFile = realpathSync(absFile);
-            const realRel = relative(realRoot, realFile);
-            if (!realRel || realRel.startsWith("..") || isAbsolute(realRel) || isSensitiveOrDotPath(realRel)) {
-                cache.set(path, null);
-                return null;
-            }
-            const raw = readSourceFile(realFile);
+            const raw = readSourceFile(safe.realFile);
             lines = raw !== null ? raw.split(/\r?\n/) : null;
         }
         catch {

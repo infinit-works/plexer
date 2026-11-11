@@ -182,6 +182,7 @@ export function analyzeGitHistory(root, contextDir = null, opts = {}) {
     const out = git(absRoot, [
         "log",
         "--no-merges",
+        "--no-textconv",
         `--since=${since}`,
         "-n",
         String(maxCommits),

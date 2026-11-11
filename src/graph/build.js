@@ -10,7 +10,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { walkDir } from "../util/fs.js";
-import { CACHE_DIR, contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
+import { CACHE_DIR, contextDirFor, ensureGitignored, ensureSearchable, readGraph, wiringPath } from "../context/node-file.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { acquireLockIn, patchStats, readWalkConfig, releaseLockIn } from "../util/state.js";
@@ -19,10 +19,11 @@ import { readFingerprint, snapshotDirMtimes, writeFingerprint } from "./fingerpr
 import { seedGraph } from "./seed.js";
 import { filterByOnlyDirs, listSourceStats } from "./source-files.js";
 import { resolveEdges } from "./resolve.js";
-import { readGraph, writeGraph, wiringPath } from "./write.js";
+import { writeGraph } from "./write.js";
 import { writeCards, writeIndex } from "./cards.js";
-import { readAskIndex, writeAskIndex } from "../ask/index-file.js";
-import { discoverScopes, scopeOf } from "./scopes.js";
+import { ASK_INDEX_VERSION, readAskIndex, writeAskIndex } from "../ask/index-file.js";
+import { scopeOf } from "../context/scopes.js";
+import { discoverScopes } from "./scope-discovery.js";
 /** Minimum non-file node count for a discovered sub-scope to stand on its own.
  * A scope with fewer nodes than this is folded into the root scope. */
 const MIN_SCOPE_NODES = 5;
@@ -240,7 +241,7 @@ function isGraphBuildUnchanged(opts, parsed, seed, priorAskIndex, priorExtract, 
     if (opts.reuse === false ||
         parsed !== 0 ||
         Boolean(seed.from) ||
-        priorAskIndex?.version !== 2 ||
+        priorAskIndex?.version !== ASK_INDEX_VERSION ||
         Object.keys(priorExtract.files).length !== files.length ||
         !Object.keys(entries).every((k) => k in priorExtract.files) ||
         prior === null ||
@@ -303,7 +304,7 @@ export async function buildGraph(dir, opts = {}) {
         const onlyDirs = opts.onlyDirs && opts.onlyDirs.length > 0 ? new Set(opts.onlyDirs) : undefined;
         const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
         const files = listSourceStats(root, outDir, repoFiles, undefined, opts.extensions);
-        const discoveredScopes = discoverScopes(root, repoFiles);
+        const discoveredScopes = discoverScopes(root, repoFiles, opts.contextDir);
         const seed = opts.reuse === false ? { seeded: false } : seedGraph(root, { contextDir: opts.contextDir });
         const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
         const { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty } = await extractSourceFiles(files, priorExtract, {

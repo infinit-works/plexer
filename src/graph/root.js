@@ -16,8 +16,7 @@
 import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { contextDirFor } from "../context/node-file.js";
-import { wiringPath } from "./write.js";
+import { contextDirFor, wiringPath } from "../context/node-file.js";
 import { workspacePath } from "./workspace.js";
 
 const REPO_ROOT_MARKERS = [

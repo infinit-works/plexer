@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { hasPlexerIndex } from '../graph/root.js';
 import { toPosixPath } from '../util/paths.js';
-import { BIN_LAUNCH, mergeJsonKey, readJsonObject, updateJsonConfig, writeOwned } from '../util/state.js';
+import { BIN_LAUNCH, mergeJsonKey, readJsonObject, updateJsonConfig, writeOwned } from '../util/config-write.js';
 import { mergePlexerHooks, mergePlexerSettings } from './settings-merge.js';
 import { statuslineShim, hooksShim, skillTemplate } from './shim-template.js';
 import { claudeDistDir } from './paths.js';

@@ -23,6 +23,12 @@ export const DEFAULT_TARGET_STRICT_SCORE = 98.0;
 export const SAMPLE_DAMPENING_THRESHOLD = 200;
 export const MECHANICAL_POOL_WEIGHT = 0.25;
 export const SUBJECTIVE_POOL_WEIGHT = 0.75;
+export const SUBJECTIVE_TOTAL_WEIGHT = Object.values(SUBJECTIVE_DIMENSIONS).reduce(
+    (sum, d) => sum + (Number(d.weight) || 0),
+    0,
+);
+export const RESOLVE_SCAN_GATE_LIMIT = 10;
+export const SCORE_MODEL_VERSION = 2;
 
 export const CONFIDENCE_WEIGHTS = {
     high: 1.0,
@@ -46,6 +52,7 @@ export const MECHANICAL_DIMENSIONS = {
             "flat_dirs",
             "package_census",
             "naming_inconsistencies",
+            "hotspots",
         ],
     },
     code_quality: {
@@ -75,6 +82,7 @@ export const MECHANICAL_DIMENSIONS = {
             "reactive_smells",
             "luau_quality",
             "temporal_coupling",
+            "deceptive_queries",
         ],
     },
     duplication: {
@@ -141,6 +149,8 @@ export const DETECTOR_CATEGORY = {
     low_cohesion_files: "cohesion",
     monster_functions: "cohesion",
     god_classes: "cohesion",
+    hotspots: "cohesion",
+    deceptive_queries: "traps",
     untested_hubs: "tests",
     hollow_tests: "tests",
     silent_catches: "catches",
@@ -224,11 +234,30 @@ export const DETECTOR_STALE_DIMENSIONS = {
     low_cohesion_files: ["design_coherence", "abstraction_fitness"],
     monster_functions: ["design_coherence", "abstraction_fitness", "logic_clarity"],
     god_classes: ["design_coherence", "abstraction_fitness", "logic_clarity"],
+    hotspots: ["design_coherence", "logic_clarity"],
+    package_census: ["package_organization", "cross_module_architecture", "abstraction_fitness"],
+    enum_bypasses: ["type_safety", "convention_outlier"],
+    deceptive_queries: ["naming_quality", "contract_coherence", "logic_clarity"],
     duplicates: ["convention_outlier"],
     dict_keys: ["type_safety"],
     silent_catches: ["error_consistency"],
     language_traps: ["design_coherence", "logic_clarity"],
     reactive_smells: ["design_coherence", "logic_clarity"],
+    untested_hubs: ["test_strategy"],
+    hollow_tests: ["test_strategy"],
+    type_bypasses: ["type_safety"],
+    ai_slop: ["ai_generated_debt"],
+    debug_logs: ["ai_generated_debt"],
+    stale_deprecations: ["incomplete_migration"],
+    passthrough_wrappers: ["abstraction_fitness"],
+    facade_modules: ["abstraction_fitness"],
+    delegation_heavy_classes: ["abstraction_fitness"],
+    single_importer_files: ["abstraction_fitness", "package_organization"],
+    unreferenced_exports: ["api_surface_coherence", "high_level_elegance"],
+    signature_variance: ["api_surface_coherence", "contract_coherence"],
+    luau_quality: ["logic_clarity", "contract_coherence"],
+    security_traps: ["authorization_consistency", "error_consistency"],
+    roblox_security: ["authorization_consistency", "contract_coherence"],
 };
 
 export const AVAILABLE_DIRECTIVE_PHASES = [

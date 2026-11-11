@@ -48,11 +48,83 @@ function appendQueueLines(lines, queue) {
             );
         }
     }
+
+    const lanesObj = queue.lanes;
+    if (lanesObj && Array.isArray(lanesObj.independent_lanes) && lanesObj.independent_lanes.length > 0) {
+        lines.push("");
+        lines.push(
+            `Parallel workstream lanes (${lanesObj.independent_lanes.length} graph-disjoint lane(s)):`,
+        );
+        for (const ln of lanesObj.independent_lanes) {
+            lines.push(
+                `  • [${ln.lane_id}] ${ln.label} — ${ln.issue_count} finding(s), +${ln.score_impact.toFixed(1)} strict pts (${ln.files.slice(0, 3).join(", ")})`,
+            );
+        }
+        if (lanesObj.strategy_hint) {
+            lines.push(`  Strategy: ${lanesObj.strategy_hint}`);
+        }
+    }
+}
+
+function isCleanStatusDimension(dim) {
+    const open = Number(dim.open_count ?? dim.open_review_issues ?? dim.open ?? 0);
+    const drag = Number(dim.overall_drag ?? dim.drag ?? 0);
+    if (open > 0 || Math.abs(drag) >= 0.005) return false;
+    if (typeof dim.score !== "number" || !Number.isFinite(dim.score) || dim.score < 99.95) return false;
+    if (dim.stale === true) return false;
+    return true;
+}
+
+function appendMechanicalDimensions(lines, mechDims, compactStatus) {
+    lines.push("");
+    lines.push("Mechanical dimensions (25% pool):");
+    let cleanCount = 0;
+    for (const dim of Object.values(mechDims)) {
+        if (compactStatus && isCleanStatusDimension(dim)) {
+            cleanCount += 1;
+            continue;
+        }
+        const dragTag =
+            Number(dim.overall_drag) > 0
+                ? `  (drag: -${Number(dim.overall_drag).toFixed(2)} pts)`
+                : "";
+        lines.push(
+            `  ${dim.name.padEnd(22)} ${String(dim.score.toFixed(1) + "%").padStart(6)}  (${dim.open_count} open / ${dim.potential} checks)${dragTag}`,
+        );
+    }
+    if (cleanCount > 0) {
+        lines.push(`  +${cleanCount} clean dimensions at 100.0% (0 drag — pass --verbose for all)`);
+    }
+}
+
+function appendSubjectiveDimensions(lines, scores, compactStatus) {
+    lines.push("");
+    lines.push(
+        `Subjective dimensions (75% pool — pool score ${scores.subjective_pool_score}%):`,
+    );
+    let cleanCount = 0;
+    for (const dim of Object.values(scores.subjective_dimensions)) {
+        if (compactStatus && isCleanStatusDimension(dim)) {
+            cleanCount += 1;
+            continue;
+        }
+        const label = dim.score === null ? "unassessed" : `${dim.score.toFixed(1)}%`;
+        const dragTag =
+            Number(dim.overall_drag) > 0
+                ? `  (drag: -${Number(dim.overall_drag).toFixed(2)} pts)`
+                : "";
+        lines.push(`  ${dim.name.padEnd(22)} ${label.padStart(10)}  (weight ${dim.weight})${dragTag}`);
+    }
+    if (cleanCount > 0) {
+        lines.push(`  +${cleanCount} clean dimensions at 100.0% (0 drag — pass --verbose for all)`);
+    }
 }
 
 export function formatHealthText(result) {
     const lines = [];
-    const { scores, headline, diff, reminders, queue, showWorkflowGuide } = result;
+    const { action, scores, headline, diff, reminders, queue, lanes, showWorkflowGuide, verbose } = result;
+    const isCompactQueue = (action === "next" || action === "backlog") && !verbose;
+    const isCompactStatus = action === "status" && !verbose;
 
     if (headline) {
         lines.push(`plexer health — ${headline}`);
@@ -86,36 +158,17 @@ export function formatHealthText(result) {
         }
     }
 
-    if (scores?.mechanical_dimensions) {
-        lines.push("");
-        lines.push("Mechanical dimensions (25% pool):");
-        for (const dim of Object.values(scores.mechanical_dimensions)) {
-            const dragTag =
-                Number(dim.overall_drag) > 0
-                    ? `  (drag: -${Number(dim.overall_drag).toFixed(2)} pts)`
-                    : "";
-            lines.push(
-                `  ${dim.name.padEnd(22)} ${String(dim.score.toFixed(1) + "%").padStart(6)}  (${dim.open_count} open / ${dim.potential} checks)${dragTag}`,
-            );
-        }
+    if (!isCompactQueue && scores?.mechanical_dimensions) {
+        appendMechanicalDimensions(lines, scores.mechanical_dimensions, isCompactStatus);
     }
 
-    if (scores?.subjective_dimensions && scores.has_subjective) {
-        lines.push("");
-        lines.push(
-            `Subjective dimensions (75% pool — pool score ${scores.subjective_pool_score}%):`,
-        );
-        for (const dim of Object.values(scores.subjective_dimensions)) {
-            const label = dim.score === null ? "unassessed" : `${dim.score.toFixed(1)}%`;
-            const dragTag =
-                Number(dim.overall_drag) > 0
-                    ? `  (drag: -${Number(dim.overall_drag).toFixed(2)} pts)`
-                    : "";
-            lines.push(`  ${dim.name.padEnd(22)} ${label.padStart(10)}  (weight ${dim.weight})${dragTag}`);
-        }
+    if (!isCompactQueue && scores?.subjective_dimensions && scores.has_subjective) {
+        appendSubjectiveDimensions(lines, scores, isCompactStatus);
     }
 
-    if (queue) appendQueueLines(lines, queue);
+    if (queue) {
+        appendQueueLines(lines, lanes && !queue.lanes ? { ...queue, lanes } : queue);
+    }
 
     if (Array.isArray(reminders) && reminders.length > 0) {
         lines.push("");

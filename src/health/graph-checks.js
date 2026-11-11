@@ -2,15 +2,23 @@
  * Structural, coupling, dead-code, wrapper, cohesion, and test-topology detectors
  * operating directly on `plexer`'s `wiring.json` graph + source lines.
  */
-import { basename, dirname } from "node:path";
+import { basename, dirname, extname } from "node:path";
 import { analyzeGitHistory } from "../blast/history.js";
-import { WALK_RELATIONS } from "../graph/relations.js";
+import { parseLayerRuleEntry } from "../blast/layer-rules.js";
+import { WALK_RELATIONS } from "../context/symbol-query.js";
 import { linkTestsForGraph } from "../graph/test-links.js";
-import { globToRegExp, parseLayerRuleEntry } from "../util/paths.js";
+import { globToRegExp } from "../util/paths.js";
 import { spanRange } from "../util/span.js";
 import { classifyStemConvention } from "./concerns.js";
 import { mintIssueId } from "./state.js";
-import { SCORED_ZONES, classifyZone, hasInlineSuppression, isSupportOrBenchFile } from "./zones.js";
+import {
+    SCORED_ZONES,
+    classifyZone,
+    hasInlineSuppression,
+    hasWordToken,
+    isSupportOrBenchFile,
+    stripCodeStringsAndComments,
+} from "./zones.js";
 
 export { globToRegExp, parseLayerRuleEntry };
 
@@ -201,13 +209,17 @@ function buildGraphCheckTopology(rawGraph) {
         addEdgeMap(incomingByTarget, edge.target, edge.source);
         addEdgeMap(outgoingBySource, edge.source, edge.target);
 
-        const srcNode = nodeById.get(edge.source);
-        const tgtNode = nodeById.get(edge.target);
-        if (srcNode && tgtNode && srcNode.path !== tgtNode.path) {
-            addEdgeMap(fileImportOut, srcNode.path, tgtNode.path);
-            addEdgeMap(fileImportIn, tgtNode.path, srcNode.path);
-            if (edge.typeOnly !== true) {
-                addEdgeMap(runtimeFileImportOut, srcNode.path, tgtNode.path);
+        if (edge.relation === "imports") {
+            const srcNode = nodeById.get(edge.source);
+            const tgtNode = nodeById.get(edge.target);
+            if (srcNode && tgtNode && srcNode.path !== tgtNode.path) {
+                addEdgeMap(fileImportIn, tgtNode.path, srcNode.path);
+                if (edge.confidence !== "inferred") {
+                    addEdgeMap(fileImportOut, srcNode.path, tgtNode.path);
+                    if (edge.typeOnly !== true) {
+                        addEdgeMap(runtimeFileImportOut, srcNode.path, tgtNode.path);
+                    }
+                }
             }
         }
     }
@@ -221,12 +233,161 @@ function buildGraphCheckTopology(rawGraph) {
         fileImportOut,
         runtimeFileImportOut,
         fileImportIn,
+        fileComplexity: new Map(),
     };
 }
 
-function checkDeadSymbolsAndWrappersInFile(fNode, lines, fileSymbols, importers, incomingByTarget, potentials, issues) {
+/**
+ * Build an undirected file adjacency map (`Map<filePath, Set<filePath>>`) across scored files.
+ * Used by `computeWorkLanes` to partition open findings into non-overlapping parallel subagent lanes.
+ */
+export function buildUndirectedFileAdjacency(rawGraph, zoneMap = null) {
+    const graph = normalizeGraphShape(rawGraph);
+    const nodeById = new Map((graph.nodes || []).map((n) => [n.id, n]));
+    const adj = new Map();
+    for (const n of graph.nodes || []) {
+        if (n.kind !== "file" || !n.path) continue;
+        const z = resolveZone(zoneMap, n.path);
+        if (!SCORED_ZONES.has(z)) continue;
+        adj.set(n.path, new Set());
+    }
+    for (const e of graph.edges || []) {
+        if (!WALK_RELATIONS.has(e.relation)) continue;
+        const sNode = nodeById.get(e.source);
+        const tNode = nodeById.get(e.target);
+        const sPath = sNode?.path || (adj.has(e.source) ? e.source : null);
+        const tPath = tNode?.path || (adj.has(e.target) ? e.target : null);
+        if (!sPath || !tPath || sPath === tPath) continue;
+        if (!adj.has(sPath) || !adj.has(tPath)) continue;
+        adj.get(sPath).add(tPath);
+        adj.get(tPath).add(sPath);
+    }
+    return adj;
+}
+
+const PURE_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const IDENT_TOKEN_SCAN_RE = /(?<![A-Za-z0-9_$])[A-Za-z_$][A-Za-z0-9_$]*/g;
+
+function buildRepoIdentifierIndex(allFileNodes, readLines) {
+    const index = new Map();
+    for (const fNode of allFileNodes || []) {
+        if (!fNode.path) continue;
+        const fLines = readLines(fNode.path) || [];
+        const fileTokens = new Set();
+        for (const rawLine of fLines) {
+            if (!rawLine) continue;
+            const matches = rawLine.match(IDENT_TOKEN_SCAN_RE);
+            if (!matches) continue;
+            for (let i = 0; i < matches.length; i++) {
+                fileTokens.add(matches[i]);
+            }
+        }
+        for (const tok of fileTokens) {
+            let paths = index.get(tok);
+            if (!paths) {
+                paths = new Set();
+                index.set(tok, paths);
+            }
+            paths.add(fNode.path);
+        }
+    }
+    return index;
+}
+
+function hasImporterReferenceOrStarReexport(shortName, importers, readLines) {
+    if (!importers || importers.size === 0) return false;
+    for (const impPath of importers) {
+        const impLines = readLines(impPath) || [];
+        const ext = extname(impPath).toLowerCase();
+        const isLuau = ext === ".luau" || ext === ".lua";
+        const isPy = ext === ".py";
+        for (const rawLine of impLines) {
+            if (rawLine.includes(shortName) && hasWordToken(rawLine, shortName)) return true;
+            if (rawLine.includes("*")) {
+                const stripped = stripCodeStringsAndComments(rawLine, isLuau, isPy);
+                if (stripped && /\b(?:import\s*\*\s*as|export\s*\*\s*from)\b/.test(stripped)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+function isSymbolReferencedAcrossRepo(shortName, importers, repoState, selfPath) {
+    const { allFileNodes, readLines } = repoState;
+    if (!readLines || !shortName) return false;
+    if (hasImporterReferenceOrStarReexport(shortName, importers, readLines)) return true;
+    if (PURE_IDENT_RE.test(shortName)) {
+        if (!repoState.tokenIndex) {
+            repoState.tokenIndex = buildRepoIdentifierIndex(allFileNodes, readLines);
+        }
+        const candidatePaths = repoState.tokenIndex.get(shortName);
+        if (!candidatePaths || candidatePaths.size === 0) return false;
+        for (const filePath of candidatePaths) {
+            if (filePath === selfPath || (importers && importers.has(filePath))) continue;
+            const fLines = readLines(filePath) || [];
+            for (const rawLine of fLines) {
+                if (rawLine.includes(shortName) && hasWordToken(rawLine, shortName)) return true;
+            }
+        }
+        return false;
+    }
+    for (const fNode of allFileNodes || []) {
+        if (!fNode.path || fNode.path === selfPath || (importers && importers.has(fNode.path))) continue;
+        const fLines = readLines(fNode.path) || [];
+        for (const rawLine of fLines) {
+            if (rawLine.includes(shortName) && hasWordToken(rawLine, shortName)) return true;
+        }
+    }
+    return false;
+}
+
+function checkPassthroughWrapperInFile(fNode, lines, sym, range, externalCallers, potentials, issues) {
+    potentials.passthrough_wrappers += 1;
+    const loc = range.end - range.start + 1;
+    if (loc < 2 || loc > 5 || externalCallers.length > 1 || sym.exported) return;
+    const bodySlice = lines
+        .slice(range.start - 1, range.end)
+        .map((l) => l.trim())
+        .filter(Boolean);
+    const inner = bodySlice.slice(1, -1).join(" ").trim() || bodySlice[bodySlice.length - 1] || "";
+    if (/^return\s+[A-Za-z0-9_.:]+\([^()]*\)\s*;?$/.test(inner)) {
+        issues.push({
+            id: mintIssueId("passthrough_wrappers", fNode.path, sym.name),
+            detector: "passthrough_wrappers",
+            category: "dead",
+            dimension: "code_quality",
+            tier: "T2",
+            confidence: "medium",
+            severity: "low",
+            file: fNode.path,
+            line: range.start,
+            end_line: range.end,
+            span: sym.span,
+            identifier: sym.name,
+            summary: `Single-use pass-through wrapper \`${sym.name}\` (${loc} LOC) forwards directly to another function without transformation.`,
+            suggestion: `Inline \`${sym.name}\` at its call site and call the target function directly.`,
+        });
+    }
+}
+
+function checkDeadSymbolsAndWrappersInFile(
+    fNode,
+    lines,
+    fileSymbols,
+    importers,
+    incomingByTarget,
+    repoState,
+    potentials,
+    issues,
+) {
+    const ext = extname(fNode.path).toLowerCase();
+    const isLuau = ext === ".luau" || ext === ".lua";
+    const isPy = ext === ".py";
+    const strippedLines = lines.map((l) => stripCodeStringsAndComments(l, isLuau, isPy));
+
     for (const sym of fileSymbols) {
         if (sym.kind !== "function" && sym.kind !== "method") continue;
+        if (sym.name.startsWith("Command.") || sym.owner === "Command") continue;
         const lowerName = sym.name.toLowerCase();
         if (LIFECYCLE_METHOD_NAMES.has(lowerName) || lowerName.startsWith("test")) continue;
 
@@ -235,14 +396,14 @@ function checkDeadSymbolsAndWrappersInFile(fNode, lines, fileSymbols, importers,
 
         const callers = incomingByTarget.get(sym.id) || new Set();
         const externalCallers = [...callers].filter((cid) => cid !== sym.id);
+        const shortName = sym.name.includes(".") ? sym.name.split(".").pop() : sym.name;
 
-        if (!sym.exported) {
+        if (!sym.exported && sym.kind === "function") {
             potentials.dead_symbols += 1;
             if (externalCallers.length === 0) {
-                const shortName = sym.name.includes(".") ? sym.name.split(".").pop() : sym.name;
                 let nameOccurrences = 0;
-                for (let i = 0; i < lines.length && nameOccurrences <= 1; i++) {
-                    if (lines[i].includes(shortName)) nameOccurrences += 1;
+                for (let i = 0; i < strippedLines.length && nameOccurrences <= 1; i++) {
+                    if (hasWordToken(strippedLines[i], shortName)) nameOccurrences += 1;
                 }
                 if (nameOccurrences <= 1) {
                     issues.push({
@@ -263,55 +424,39 @@ function checkDeadSymbolsAndWrappersInFile(fNode, lines, fileSymbols, importers,
                     });
                 }
             }
-        } else if (!isEntrypointPath(fNode.path, fileSymbols)) {
+        } else if (sym.exported && !isEntrypointPath(fNode.path, fileSymbols)) {
             potentials.unreferenced_exports += 1;
-            if (externalCallers.length === 0 && importers.size === 0) {
-                issues.push({
-                    id: mintIssueId("unreferenced_exports", fNode.path, sym.name),
-                    detector: "unreferenced_exports",
-                    category: "dead",
-                    dimension: "code_quality",
-                    tier: "T2",
-                    confidence: "medium",
-                    severity: "low",
-                    file: fNode.path,
-                    line: range.start,
-                    end_line: range.end,
-                    span: sym.span,
-                    identifier: sym.name,
-                    summary: `Exported ${sym.kind} \`${sym.name}\` has 0 callers across the repository.`,
-                    suggestion: `Remove the unused export or delete \`${sym.name}\` if it is not part of an external public SDK.`,
-                });
+            if (
+                externalCallers.length === 0 &&
+                !hasInlineSuppression(lines, range.start, "unreferenced_exports") &&
+                !isSymbolReferencedAcrossRepo(shortName, importers, repoState, fNode.path)
+            ) {
+                let internalUses = 0;
+                for (let i = 0; i < strippedLines.length && internalUses <= 1; i++) {
+                    if (hasWordToken(strippedLines[i], shortName)) internalUses += 1;
+                }
+                if (importers.size === 0 || internalUses <= 1) {
+                    issues.push({
+                        id: mintIssueId("unreferenced_exports", fNode.path, sym.name),
+                        detector: "unreferenced_exports",
+                        category: "dead",
+                        dimension: "code_quality",
+                        tier: "T2",
+                        confidence: "medium",
+                        severity: "low",
+                        file: fNode.path,
+                        line: range.start,
+                        end_line: range.end,
+                        span: sym.span,
+                        identifier: sym.name,
+                        summary: `Exported ${sym.kind} \`${sym.name}\` has 0 cross-file callers or symbol references across the repository.`,
+                        suggestion: `Remove the unused export or delete \`${sym.name}\` if it is not part of an external public SDK.`,
+                    });
+                }
             }
         }
 
-        potentials.passthrough_wrappers += 1;
-        const loc = range.end - range.start + 1;
-        if (loc >= 2 && loc <= 5 && externalCallers.length <= 1) {
-            const bodySlice = lines
-                .slice(range.start - 1, range.end)
-                .map((l) => l.trim())
-                .filter(Boolean);
-            const inner = bodySlice.slice(1, -1).join(" ").trim() || bodySlice[bodySlice.length - 1] || "";
-            if (/^return\s+[A-Za-z0-9_.:]+\([^()]*\)\s*;?$/.test(inner) && !sym.exported) {
-                issues.push({
-                    id: mintIssueId("passthrough_wrappers", fNode.path, sym.name),
-                    detector: "passthrough_wrappers",
-                    category: "dead",
-                    dimension: "code_quality",
-                    tier: "T2",
-                    confidence: "medium",
-                    severity: "low",
-                    file: fNode.path,
-                    line: range.start,
-                    end_line: range.end,
-                    span: sym.span,
-                    identifier: sym.name,
-                    summary: `Single-use pass-through wrapper \`${sym.name}\` (${loc} LOC) forwards directly to another function without transformation.`,
-                    suggestion: `Inline \`${sym.name}\` at its call site and call the target function directly.`,
-                });
-            }
-        }
+        checkPassthroughWrapperInFile(fNode, lines, sym, range, externalCallers, potentials, issues);
     }
 }
 
@@ -367,6 +512,7 @@ function checkFacadeModuleInFile(fNode, lines, fileSymbols, issues) {
 
 function checkDeadAndWrapperIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues) {
     const { nodeById, symbolsByFile, fileNodes, incomingByTarget, fileImportIn } = ctx;
+    const repoState = { allFileNodes: fileNodes, readLines, tokenIndex: null };
     for (const fNode of fileNodes) {
         const zone = zoneMap.get(fNode.path) || "production";
         if (!SCORED_ZONES.has(zone)) continue;
@@ -437,7 +583,16 @@ function checkDeadAndWrapperIssues(ctx, readLines, zoneMap, ignoreRules, potenti
         }
 
         checkFacadeModuleInFile(fNode, lines, fileSymbols, issues);
-        checkDeadSymbolsAndWrappersInFile(fNode, lines, fileSymbols, importers, incomingByTarget, potentials, issues);
+        checkDeadSymbolsAndWrappersInFile(
+            fNode,
+            lines,
+            fileSymbols,
+            importers,
+            incomingByTarget,
+            repoState,
+            potentials,
+            issues,
+        );
     }
 }
 
@@ -454,7 +609,7 @@ function buildRuntimeScoredFileAdj(rawGraph, zoneMap = null, fileFilter = null) 
     }
     for (const e of graph.edges || []) {
         if (e.typeOnly === true) continue;
-        if (!WALK_RELATIONS.has(e.relation)) continue;
+        if (e.relation !== "imports" || e.confidence === "inferred") continue;
         const sNode = nodeById.get(e.source);
         const tNode = nodeById.get(e.target);
         const sPath = sNode?.path || (adj.has(e.source) ? e.source : null);
@@ -946,24 +1101,252 @@ function checkClassCohesionInFile(fNode, lines, funcs, classes, potentials, issu
     }
 }
 
+/**
+ * Sonar-style Cognitive Complexity estimator over a function's source lines.
+ * Penalizes nested control flow (`1 + nesting`), flat continuations (`else if`/`elif`/`else`, `+1`),
+ * boolean operator chain transitions (`&&`, `||`, `and`, `or`, `+1`), and direct recursion (`+1`).
+ */
+function stepCognitiveNesting(raw, trimmed, idx, isPy, isLuau, hasControlKeyword, isContinuationBranch, state) {
+    if (isPy) {
+        if (/:\s*$/.test(trimmed) && /^(?:if|elif|else|for|while|try|except|with|def|async\s+def)\b/.test(trimmed)) {
+            if (idx > 0 && !isContinuationBranch) {
+                const indent = (raw.match(/^\s*/) || [""])[0].length;
+                state.pyIndentStack.push(indent);
+                if (state.pyIndentStack.length > state.maxNesting) {
+                    state.maxNesting = state.pyIndentStack.length;
+                }
+            }
+        }
+        return;
+    }
+    if (isLuau) {
+        const withoutInlineIf = trimmed.replace(
+            /(?:[=(,{[\-+*/%^<>~]|==|~=|<=|>=|\.\.|\b(?:return|and|or|not)\b)\s*if\b(?:(?!\bend\b).)*?\bthen\b(?:(?!\bend\b).)*?\belse\b/g,
+            " ",
+        );
+        const opens =
+            (withoutInlineIf.match(/\b(?:then|do|repeat)\b/g) || []).length +
+            (idx > 0 ? (withoutInlineIf.match(/\bfunction\b/g) || []).length : 0) -
+            (withoutInlineIf.match(/\belseif\b/g) || []).length;
+        const closes = (withoutInlineIf.match(/\b(?:end|until)\b/g) || []).length;
+        state.nesting = Math.max(0, state.nesting + opens - closes);
+        if (state.nesting > state.maxNesting) state.maxNesting = state.nesting;
+        return;
+    }
+    const isControlHeader = idx > 0 && (hasControlKeyword || /\bdo\b/.test(trimmed));
+    let opens = (trimmed.match(/\{/g) || []).length;
+    let closes = (trimmed.match(/\}/g) || []).length;
+    if (idx === 0) {
+        if (opens > closes) state.braceStack.push("root");
+        return;
+    }
+    if (isControlHeader && opens === 0 && !/;\s*$/.test(trimmed)) {
+        state.pendingControl = true;
+    }
+    if (trimmed.startsWith("}") && closes > 0) {
+        const popped = state.braceStack.pop();
+        if (popped === "control") state.nesting = Math.max(0, state.nesting - 1);
+        closes -= 1;
+    }
+    const netDelta = opens - closes;
+    if (netDelta > 0) {
+        const isControlLine = isControlHeader || (state.pendingControl && /\)\s*\{/.test(trimmed));
+        state.pendingControl = false;
+        const tag = isControlLine || isContinuationBranch ? "control" : "data";
+        for (let k = 0; k < netDelta; k++) {
+            state.braceStack.push(tag);
+            if (tag === "control") {
+                state.nesting += 1;
+                if (state.nesting > state.maxNesting) state.maxNesting = state.nesting;
+            }
+        }
+    } else if (netDelta < 0) {
+        state.pendingControl = false;
+        for (let k = 0; k < -netDelta; k++) {
+            const popped = state.braceStack.pop();
+            if (popped === "control") state.nesting = Math.max(0, state.nesting - 1);
+        }
+    } else if (/;\s*$/.test(trimmed)) {
+        state.pendingControl = false;
+    }
+}
+
+/**
+ * Sonar-style Cognitive Complexity estimator over a function's source lines.
+ * Penalizes nested control flow (`1 + nesting`), flat continuations (`else if`/`elif`/`else`, `+1`),
+ * boolean operator chain transitions (`&&`, `||`, `and`, `or`, `+1`), and direct recursion (`+1`).
+ */
+export function computeCognitiveComplexity(fnLines, ext = ".js", fnName = "", returnDetail = false) {
+    const isLuau = ext === ".luau" || ext === ".lua";
+    const isPy = ext === ".py";
+    const safeName = typeof fnName === "string" ? fnName : "";
+    const shortName = safeName.includes(".") ? safeName.split(".").pop() : safeName;
+    const callRe =
+        shortName && shortName.length >= 2
+            ? new RegExp(`(?<![A-Za-z0-9_$])${shortName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\(`)
+            : null;
+    let score = 0;
+    const state = { nesting: 0, maxNesting: 0, pyIndentStack: [], braceStack: [] };
+
+    for (let idx = 0; idx < fnLines.length; idx++) {
+        const raw = fnLines[idx] || "";
+        const code = stripCodeStringsAndComments(raw, isLuau, isPy);
+        const trimmed = code.trim();
+        if (!trimmed) continue;
+
+        if (isPy) {
+            const indent = (raw.match(/^\s*/) || [""])[0].length;
+            while (state.pyIndentStack.length > 0 && indent <= state.pyIndentStack[state.pyIndentStack.length - 1]) {
+                state.pyIndentStack.pop();
+            }
+            state.nesting = state.pyIndentStack.length;
+        }
+
+        const isContinuationBranch = /^(?:\}?\s*else\s+if\b|elseif\b|elif\b|\}?\s*else\b)/.test(trimmed);
+        const hasControlKeyword =
+            !isContinuationBranch &&
+            /\b(?:if|for|while|switch|match|catch|except)\b/.test(trimmed) &&
+            !(idx === 0 && /\bfunction\b|\bdef\b/.test(trimmed));
+        if (isContinuationBranch) {
+            score += 1;
+        } else if (hasControlKeyword) {
+            score += 1 + state.nesting;
+        }
+
+        if (/\?[^?.:]/.test(trimmed) && trimmed.includes(":")) {
+            score += 1 + state.nesting;
+        }
+
+        const boolOps = isLuau || isPy
+            ? trimmed.match(/\b(?:and|or)\b/g) || []
+            : trimmed.match(/&&|\|\|/g) || [];
+        let prevOp = null;
+        for (const op of boolOps) {
+            if (op !== prevOp) {
+                score += 1;
+                prevOp = op;
+            }
+        }
+
+        if (/\b(?:break|continue)\s+[A-Za-z_][A-Za-z0-9_]*\b/.test(trimmed)) {
+            score += 1;
+        }
+
+        if (idx > 0 && callRe && hasWordToken(trimmed, shortName) && callRe.test(trimmed)) {
+            score += 1;
+        }
+
+        stepCognitiveNesting(raw, trimmed, idx, isPy, isLuau, hasControlKeyword, isContinuationBranch, state);
+    }
+
+    return returnDetail ? { score, maxNesting: state.maxNesting } : score;
+}
+
+function splitParamsTopLevel(paramStr) {
+    const out = [];
+    let cur = "";
+    let depth = 0;
+    for (let i = 0; i < paramStr.length; i++) {
+        const ch = paramStr[i];
+        if (ch === "(" || ch === "<" || ch === "[" || ch === "{") depth += 1;
+        else if (ch === ")" || ch === ">" || ch === "]" || ch === "}") depth = Math.max(0, depth - 1);
+        else if (ch === "," && depth === 0) {
+            out.push(cur);
+            cur = "";
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur.trim()) out.push(cur);
+    return out;
+}
+
+function normalizeParamName(rawParam) {
+    let p = rawParam.trim();
+    if (!p) return "";
+    let depth = 0;
+    let cutIdx = -1;
+    for (let i = 0; i < p.length; i++) {
+        const ch = p[i];
+        if (ch === "(" || ch === "<" || ch === "[" || ch === "{") depth += 1;
+        else if (ch === ")" || ch === ">" || ch === "]" || ch === "}") depth = Math.max(0, depth - 1);
+        else if ((ch === ":" || ch === "=") && depth === 0) {
+            cutIdx = i;
+            break;
+        }
+    }
+    if (cutIdx !== -1) p = p.slice(0, cutIdx).trim();
+    p = p.replace(/^\.\.\./, "").replace(/\?$/, "").trim();
+    return p;
+}
+
+const COMMON_LOCAL_HELPER_NAMES = new Set([
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "handle",
+    "run",
+    "configure",
+    "new",
+    "helper",
+    "parse",
+    "format",
+    "render",
+    "validate",
+    "norm",
+    "normalize",
+    "visit",
+    "walk",
+    "check",
+    "cmp",
+    "compare",
+    "sort",
+    "filter",
+    "map",
+    "reduce",
+    "clone",
+    "merge",
+    "toPosix",
+    "resolveZone",
+]);
+
 function checkMonsterAndClassCohesionIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues) {
-    const { symbolsByFile, fileNodes, outgoingBySource } = ctx;
+    const { symbolsByFile, fileNodes, outgoingBySource, fileComplexity } = ctx;
     for (const fNode of fileNodes) {
         const zone = zoneMap.get(fNode.path) || "production";
         if (!SCORED_ZONES.has(zone)) continue;
         if (ignoreRules.isIgnored(fNode.path, "cohesion")) continue;
 
         const lines = readLines(fNode.path) || [];
+        const ext = extname(fNode.path).toLowerCase();
         const fileSymbols = symbolsByFile.get(fNode.path) || [];
         const funcs = fileSymbols.filter((s) => s.kind === "function" || s.kind === "method");
         const classes = fileSymbols.filter((s) => s.kind === "class" || s.kind === "struct");
 
+        let maxFileCognitive = 0;
+        let sumFileCognitive = 0;
+        let maxFileNesting = 0;
+        let maxFnLoc = 0;
+
         for (const fn of funcs) {
+            if (fn.aliasOf) continue;
+            if (fn.owner === "Command" || fn.name.startsWith("Command.")) continue;
             potentials.monster_functions += 1;
             const range = spanRange(fn.span);
             if (!range) continue;
             const loc = range.end - range.start + 1;
-            if (loc > 100 && !hasInlineSuppression(lines, range.start, "monster_functions")) {
+            if (loc > maxFnLoc) maxFnLoc = loc;
+            const fnLines = lines.slice(range.start - 1, range.end);
+            const { score: cognitive, maxNesting } = computeCognitiveComplexity(fnLines, ext, fn.name, true);
+            if (cognitive > maxFileCognitive) maxFileCognitive = cognitive;
+            if (maxNesting > maxFileNesting) maxFileNesting = maxNesting;
+            sumFileCognitive += cognitive;
+
+            const hasLoop = /\b(?:for|while)\b/.test(fnLines.join("\n"));
+            const isMonster = loc > 100 || (cognitive >= 25 && maxNesting >= 6 && hasLoop);
+            if (isMonster && !hasInlineSuppression(lines, range.start, "monster_functions")) {
                 issues.push({
                     id: mintIssueId("monster_functions", fNode.path, fn.name),
                     detector: "monster_functions",
@@ -971,21 +1354,57 @@ function checkMonsterAndClassCohesionIssues(ctx, readLines, zoneMap, ignoreRules
                     dimension: "file_health",
                     tier: "T3",
                     confidence: "high",
-                    severity: loc > 180 ? "high" : "medium",
+                    severity: loc > 180 || cognitive >= 40 ? "high" : "medium",
                     file: fNode.path,
                     line: range.start,
                     end_line: range.end,
                     span: fn.span,
                     identifier: fn.name,
-                    summary: `Monster ${fn.kind} \`${fn.name}\` spans ${loc} LOC (${fNode.path}:${fn.span}).`,
-                    suggestion: `Decompose \`${fn.name}\` into smaller single-responsibility helpers with early guard clauses.`,
+                    loc,
+                    cognitive_complexity: cognitive,
+                    detail: { loc, cognitive_complexity: cognitive, max_nesting: maxNesting },
+                    summary: `Monster ${fn.kind} \`${fn.name}\` spans ${loc} LOC with cognitive complexity ${cognitive} (${fNode.path}:${fn.span}).`,
+                    suggestion: `Decompose \`${fn.name}\` into smaller single-responsibility helpers with early guard clauses to reduce nesting and branching.`,
                 });
             }
+        }
+
+        if (fileComplexity) {
+            fileComplexity.set(fNode.path, {
+                max: maxFileCognitive,
+                sum: sumFileCognitive,
+                maxNesting: maxFileNesting,
+                maxFnLoc,
+                loc: lines.length,
+            });
         }
 
         checkClassCohesionInFile(fNode, lines, funcs, classes, potentials, issues);
         checkLowCohesionInFile(fNode, lines, funcs, classes, outgoingBySource, potentials, issues);
     }
+}
+
+function extractBalancedSignatureParams(lines, startLine, fallbackSig = "") {
+    if (!startLine || startLine < 1 || startLine > lines.length) {
+        const m = /\(([\s\S]*?)\)/.exec(fallbackSig);
+        return m ? m[1] : null;
+    }
+    const maxEnd = Math.min(lines.length, startLine + 7);
+    const joined = lines.slice(startLine - 1, maxEnd).join(" ");
+    const openIdx = joined.indexOf("(");
+    if (openIdx === -1) return null;
+    let depth = 0;
+    for (let i = openIdx; i < joined.length; i++) {
+        const ch = joined[i];
+        if (ch === "(") depth += 1;
+        else if (ch === ")") {
+            depth -= 1;
+            if (depth === 0) {
+                return joined.slice(openIdx + 1, i);
+            }
+        }
+    }
+    return null;
 }
 
 function checkSignatureVarianceIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues) {
@@ -1001,31 +1420,20 @@ function checkSignatureVarianceIssues(ctx, readLines, zoneMap, ignoreRules, pote
         const fileSymbols = symbolsByFile.get(fNode.path) || [];
 
         for (const sym of fileSymbols) {
+            if (sym.aliasOf) continue;
             if (sym.kind !== "function") continue;
             const name = sym.name;
             if (!name || name.startsWith("_") || name.toLowerCase().startsWith("test")) continue;
             if (LIFECYCLE_METHOD_NAMES.has(name.toLowerCase())) continue;
-            if (
-                ["get", "post", "put", "delete", "patch", "handle", "run", "configure", "new"].includes(
-                    name.toLowerCase(),
-                )
-            ) {
+            if (COMMON_LOCAL_HELPER_NAMES.has(name) || COMMON_LOCAL_HELPER_NAMES.has(name.toLowerCase())) {
                 continue;
             }
 
             const range = spanRange(sym.span);
-            const defLine = range ? lines[range.start - 1] || "" : sym.signature || "";
-            const parenMatch = /\(([^)]*)\)/.exec(defLine);
-            if (!parenMatch) continue;
-            const rawParams = parenMatch[1]
-                .split(",")
-                .map((p) =>
-                    p
-                        .trim()
-                        .replace(/:.*$/, "")
-                        .replace(/=.*$/, "")
-                        .trim(),
-                )
+            const rawInner = extractBalancedSignatureParams(lines, range ? range.start : 0, sym.signature || "");
+            if (rawInner === null) continue;
+            const rawParams = splitParamsTopLevel(rawInner)
+                .map(normalizeParamName)
                 .filter((p) => p && p !== "self" && p !== "cls" && p !== "this");
 
             totalFnsChecked += 1;
@@ -1038,6 +1446,7 @@ function checkSignatureVarianceIssues(ctx, readLines, zoneMap, ignoreRules, pote
                 file: fNode.path,
                 line: range ? range.start : 1,
                 span: sym.span || "L1-L1",
+                exported: Boolean(sym.exported),
                 params: rawParams,
                 sigKey: `${rawParams.length}:${rawParams.join(",")}`,
             });
@@ -1493,9 +1902,351 @@ export function detectTemporalCoupling(
     return out;
 }
 
+function computeTransitiveReach(startFile, runtimeAdj) {
+    const visited = new Set([startFile]);
+    const queue = [startFile];
+    while (queue.length > 0) {
+        const cur = queue.shift();
+        for (const nxt of runtimeAdj.get(cur) || []) {
+            if (!visited.has(nxt)) {
+                visited.add(nxt);
+                queue.push(nxt);
+            }
+        }
+    }
+    visited.delete(startFile);
+    return visited;
+}
+
+function checkBarrelBloatIssues(ctx, runtimeScoredFileAdj, readLines, zoneMap, ignoreRules, issues) {
+    const { symbolsByFile, fileImportIn } = ctx;
+    for (const [filePath, directOuts] of runtimeScoredFileAdj.entries()) {
+        if (directOuts.length < 3) continue;
+        if (ignoreRules.isIgnored(filePath, "coupling") || ignoreRules.isIgnored(filePath, "package_census")) {
+            continue;
+        }
+        const base = basename(filePath);
+        const lines = readLines ? readLines(filePath) || [] : [];
+        const reexportLines = lines.filter((l) =>
+            /^\s*(?:export\s+\*\s+from|export\s+\{[^}]*\}\s+from|from\s+\S+\s+import\s+\*)/.test(l),
+        ).length;
+        const isBarrel = /^(?:index|init|mod|__init__)\.[a-z0-9]+$/i.test(base) || reexportLines >= 3;
+        if (!isBarrel) continue;
+
+        const importers = [...(fileImportIn.get(filePath) || [])].filter((s) =>
+            SCORED_ZONES.has(zoneMap.get(s) || "production"),
+        );
+        const localSyms = symbolsByFile.get(filePath) || [];
+        const transitive = computeTransitiveReach(filePath, runtimeScoredFileAdj);
+        const isTransitiveBloat =
+            importers.length > 0 &&
+            transitive.size >= 6 &&
+            transitive.size >= directOuts.length * 2 &&
+            reexportLines >= 2;
+        const isPureWideBarrel =
+            isEntrypointPath(filePath, localSyms) &&
+            reexportLines >= 4 &&
+            localSyms.length === 0 &&
+            directOuts.length >= 3;
+        if ((isTransitiveBloat || isPureWideBarrel) && !hasInlineSuppression(lines, 1, "package_census")) {
+            issues.push({
+                id: mintIssueId("package_census", filePath, "barrel_bloat"),
+                detector: "package_census",
+                category: "coupling",
+                dimension: "file_health",
+                tier: "T3",
+                confidence: "high",
+                severity: transitive.size >= 12 ? "high" : "medium",
+                file: filePath,
+                line: 1,
+                end_line: Math.max(1, lines.length),
+                span: `L1-L${Math.max(1, lines.length)}`,
+                identifier: base,
+                kind: "barrel_bloat",
+                detail: {
+                    direct_reexports: directOuts.length,
+                    transitive_modules: transitive.size,
+                    importers: importers.length,
+                },
+                summary: `Barrel bloat: importing \`${filePath}\` (${directOuts.length} direct targets) transitively pulls in ${transitive.size} runtime modules across ${importers.length} importer(s).`,
+                suggestion: `Import leaf modules directly instead of routing through the \`${filePath}\` barrel, or split heavy subgraphs out of the barrel.`,
+            });
+        }
+    }
+}
+
+/**
+ * Package census (`package_census`):
+ * 1. Robert C. Martin Package Coupling Metrics ($C_a$, $C_e$, Instability $I = C_e / (C_a + C_e)$,
+ *    Abstractness $A$, Distance $D = |A + I - 1|$ Zone of Pain).
+ * 2. Transitive Barrel Bloat (`barrel_bloat`).
+ */
+function checkPackageCensusIssues(ctx, filesByDir, scoredFileAdj, runtimeScoredFileAdj, readLines, zoneMap, ignoreRules, potentials, issues) {
+    const { symbolsByFile, fileImportIn } = ctx;
+    potentials.package_census = Math.max(1, filesByDir.size);
+
+    for (const [dir, dirFiles] of filesByDir.entries()) {
+        if (dir === "." || dirFiles.length < 3) continue;
+        const repFile = dirFiles[0];
+        if (ignoreRules.isIgnored(repFile, "coupling") || ignoreRules.isIgnored(repFile, "package_census")) continue;
+
+        const dirSet = new Set(dirFiles);
+        const afferentFiles = new Set();
+        const efferentFiles = new Set();
+        let internalEdges = 0;
+        let totalSymbols = 0;
+        let abstractSymbols = 0;
+
+        for (const fPath of dirFiles) {
+            for (const outFile of scoredFileAdj.get(fPath) || []) {
+                if (dirSet.has(outFile)) internalEdges += 1;
+                else efferentFiles.add(outFile);
+            }
+            for (const inFile of fileImportIn.get(fPath) || []) {
+                if (SCORED_ZONES.has(zoneMap.get(inFile) || "production") && !dirSet.has(inFile)) {
+                    afferentFiles.add(inFile);
+                }
+            }
+            const syms = symbolsByFile.get(fPath) || [];
+            totalSymbols += syms.length;
+            const fileAbstract = syms.filter(
+                (s) => s.kind === "interface" || s.kind === "type" || s.kind === "protocol" || s.abstract,
+            ).length;
+            abstractSymbols += fileAbstract;
+            if (fileAbstract === 0) {
+                for (const l of readLines ? readLines(fPath) || [] : []) {
+                    if (/^\s*export\s+(?:interface|type|abstract\s+class)\b/.test(l)) {
+                        abstractSymbols += 1;
+                        totalSymbols += 1;
+                    }
+                }
+            }
+        }
+
+        const ca = afferentFiles.size;
+        const ce = efferentFiles.size;
+        if (ca + ce === 0) continue;
+        const instability = ce / (ca + ce);
+        const abstractness = totalSymbols > 0 ? Math.min(1, abstractSymbols / totalSymbols) : 0;
+        const distance = Math.abs(abstractness + instability - 1);
+
+        if (ca >= 5 && instability <= 0.25 && abstractness <= 0.1 && distance >= 0.78 && internalEdges === 0) {
+            issues.push({
+                id: mintIssueId("package_census", repFile, `zone_of_pain_${basename(dir)}`),
+                detector: "package_census",
+                category: "coupling",
+                dimension: "file_health",
+                tier: "T3",
+                confidence: "medium",
+                severity: ca >= 8 ? "high" : "medium",
+                file: repFile,
+                line: 1,
+                end_line: 1,
+                span: "L1-L1",
+                identifier: dir,
+                kind: "zone_of_pain",
+                detail: {
+                    directory: dir,
+                    afferent_coupling: ca,
+                    efferent_coupling: ce,
+                    instability: Number(instability.toFixed(2)),
+                    abstractness: Number(abstractness.toFixed(2)),
+                    distance: Number(distance.toFixed(2)),
+                    internal_edges: internalEdges,
+                },
+                summary: `Package \`${dir}/\` sits in the Zone of Pain (Ca=${ca}, Ce=${ce}, I=${instability.toFixed(2)}, A=${abstractness.toFixed(2)}, D=${distance.toFixed(2)}, 0 internal cohesion edges across ${dirFiles.length} files).`,
+                suggestion: `Extract stable interfaces/contracts for \`${dir}/\` or split unrelated concrete modules in \`${dir}/\` into domain-aligned packages.`,
+            });
+        }
+    }
+
+    checkBarrelBloatIssues(ctx, runtimeScoredFileAdj, readLines, zoneMap, ignoreRules, issues);
+}
+
+/**
+ * Evolutionary Churn × Cognitive Complexity × In-Degree hotspot detector (`hotspots`).
+ */
+function checkHotspotIssues(
+    graph,
+    ctx,
+    readLines,
+    zoneMap,
+    ignoreRules,
+    config,
+    opts,
+    potentials,
+    issues,
+) {
+    const history =
+        config?.gitHistory ||
+        (opts?.rootDir ? analyzeGitHistory(opts.rootDir, opts.contextDir || null) : null);
+    if (config && history && !config.gitHistory) {
+        config.gitHistory = history;
+    }
+    const fileStats = history?.files;
+    if (!fileStats || typeof fileStats !== "object") return;
+
+    for (const fNode of ctx.fileNodes) {
+        const zone = zoneMap.get(fNode.path) || "production";
+        if (!SCORED_ZONES.has(zone)) continue;
+        if (ignoreRules.isIgnored(fNode.path, "cohesion") || ignoreRules.isIgnored(fNode.path, "hotspots")) {
+            continue;
+        }
+        potentials.hotspots += 1;
+
+        const st = fileStats[fNode.path];
+        if (!st) continue;
+        const commits = Number(st.commits || 0);
+        const churnScore = Number(st.churnScore || 0);
+        const totalRepoCommits = Math.max(
+            1,
+            Number(history.totalCommits ?? history.commitsScanned ?? commits),
+        );
+        const commitShare = commits / totalRepoCommits;
+        if (commits < 4 || churnScore < 2.0) continue;
+        if (commits < 12 && commitShare < 0.25) continue;
+
+        const lines = readLines(fNode.path) || [];
+        const comp = ctx.fileComplexity.get(fNode.path) || {
+            max: 0,
+            sum: 0,
+            maxNesting: 0,
+            maxFnLoc: 0,
+            loc: lines.length,
+        };
+        if (comp.max < 25 || (comp.maxNesting < 6 && comp.maxFnLoc <= 100)) continue;
+
+        const inDegree = (ctx.fileImportIn.get(fNode.path) || new Set()).size;
+        const riskScore =
+            churnScore *
+            Math.log2(1 + comp.max + comp.sum * 0.25) *
+            Math.log2(2 + inDegree);
+
+        if (riskScore >= 16 && !hasInlineSuppression(lines, 1, "hotspots")) {
+            issues.push({
+                id: mintIssueId("hotspots", fNode.path, "churn_complexity_hotspot"),
+                detector: "hotspots",
+                category: "cohesion",
+                dimension: "file_health",
+                tier: "T2",
+                confidence: "high",
+                severity: riskScore >= 32 || comp.max >= 35 ? "high" : "medium",
+                file: fNode.path,
+                line: 1,
+                end_line: Math.max(1, lines.length),
+                span: `L1-L${Math.max(1, lines.length)}`,
+                identifier: basename(fNode.path),
+                detail: {
+                    commits,
+                    churn_score: churnScore,
+                    max_cognitive_complexity: comp.max,
+                    total_cognitive_complexity: comp.sum,
+                    in_degree: inDegree,
+                    risk_score: Number(riskScore.toFixed(1)),
+                },
+                summary: `Evolutionary hotspot: \`${fNode.path}\` combines high git churn (${commits} commits, churn=${churnScore.toFixed(1)}) with cognitive complexity (max=${comp.max}, total=${comp.sum}) and fan-in (${inDegree} dependents; risk=${riskScore.toFixed(1)}).`,
+                suggestion: `Decompose complex functions in \`${fNode.path}\` and isolate volatile logic from high-fan-in contracts.`,
+            });
+        }
+    }
+}
+
+const QUERY_FN_PREFIX_RE = /^(?:get|is|has|can|should|check|validate|find|compute)[A-Z_]/;
+const MUTATION_CALLEE_RE =
+    /^(?:set|save|write|delete|remove|destroy|insert|update|drop|exec|execute|mutate|clear|reset|emit|publish|dispatch|send|post|put|patch|unlink|mkdir|rmdir|rename)(?:[A-Z]|_)|^(?:writeFileSync|unlinkSync|rmSync|mkdirSync|renameSync|appendFileSync)$/;
+const PURE_TRANSFORM_CALLEE_RE =
+    /^(?:remove(?:Prefix|Suffix|Quotes|Duplicates|Whitespace|Comments|Leading|Trailing)|setDefault|resetCursor)/i;
+const DIRECT_MUTATION_BODY_RE =
+    /\b(?:writeFileSync|unlinkSync|rmSync|renameSync|appendFileSync)\s*\(|:(?:SetAsync|UpdateAsync|RemoveAsync|IncrementAsync|FireServer|FireClient|FireAllClients|Destroy)\s*\(|\b(?:axios|http)\.(?:post|put|delete|patch)\s*\(/;
+
+/**
+ * Call-graph Command-Query Separation (CQS) violation detector (`deceptive_queries`).
+ * Flags query-named functions (`get*`, `is*`, `has*`, `check*`, `validate*`) that invoke mutating/IO
+ * callees in the call graph or perform direct external storage/filesystem/network writes.
+ */
+function checkDeceptiveQueryIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues) {
+    const { nodeById, symbolsByFile, fileNodes, outgoingBySource } = ctx;
+    for (const fNode of fileNodes) {
+        const zone = zoneMap.get(fNode.path) || "production";
+        if (!SCORED_ZONES.has(zone)) continue;
+        if (ignoreRules.isIgnored(fNode.path, "traps") || ignoreRules.isIgnored(fNode.path, "deceptive_queries")) {
+            continue;
+        }
+
+        const lines = readLines(fNode.path) || [];
+        const ext = extname(fNode.path).toLowerCase();
+        const isLuau = ext === ".luau" || ext === ".lua";
+        const isPy = ext === ".py";
+        const fileSymbols = symbolsByFile.get(fNode.path) || [];
+
+        for (const sym of fileSymbols) {
+            if (sym.kind !== "function" && sym.kind !== "method") continue;
+            const shortName = sym.name.includes(".") ? sym.name.split(".").pop() : sym.name;
+            if (!QUERY_FN_PREFIX_RE.test(shortName)) continue;
+
+            const range = spanRange(sym.span);
+            if (!range) continue;
+            if (hasInlineSuppression(lines, range.start, "deceptive_queries")) continue;
+            potentials.deceptive_queries += 1;
+
+            const mutatingCallees = [];
+            for (const targetId of outgoingBySource.get(sym.id) || []) {
+                if (targetId === sym.id) continue;
+                const tgt = nodeById.get(targetId);
+                if (!tgt) continue;
+                const tgtShort = (tgt.name || "").includes(".") ? tgt.name.split(".").pop() : tgt.name || "";
+                if (MUTATION_CALLEE_RE.test(tgtShort) && !PURE_TRANSFORM_CALLEE_RE.test(tgtShort)) {
+                    mutatingCallees.push(tgt.name);
+                }
+            }
+
+            let directSideEffect = null;
+            if (mutatingCallees.length === 0) {
+                const bodySlice = lines.slice(range.start - 1, range.end);
+                for (const rawLine of bodySlice) {
+                    const code = stripCodeStringsAndComments(rawLine, isLuau, isPy);
+                    const m = DIRECT_MUTATION_BODY_RE.exec(code);
+                    if (m) {
+                        directSideEffect = m[0].replace(/\s*\($/, "");
+                        break;
+                    }
+                }
+            }
+
+            if (mutatingCallees.length > 0 || directSideEffect) {
+                const evidenceDesc =
+                    mutatingCallees.length > 0
+                        ? `calls mutating symbol(s) \`${mutatingCallees.slice(0, 3).join("`, `")}\``
+                        : `performs side-effecting call \`${directSideEffect}\``;
+                issues.push({
+                    id: mintIssueId("deceptive_queries", fNode.path, sym.name),
+                    detector: "deceptive_queries",
+                    category: "traps",
+                    dimension: "code_quality",
+                    tier: "T3",
+                    confidence: "high",
+                    severity: "medium",
+                    file: fNode.path,
+                    line: range.start,
+                    end_line: range.end,
+                    span: sym.span,
+                    identifier: sym.name,
+                    detail: {
+                        mutating_callees: mutatingCallees,
+                        direct_side_effect: directSideEffect,
+                    },
+                    summary: `Command-Query Separation violation: query-named ${sym.kind} \`${sym.name}\` ${evidenceDesc}.`,
+                    suggestion: `Rename \`${sym.name}\` to reflect its side effect or separate the state mutation/IO from the read query.`,
+                });
+            }
+        }
+    }
+}
+
 function runCouplingAndLayerGraphChecks(
     graph,
     ctx,
+    readLines,
     zoneMap,
     ignoreRules,
     wantCoupling,
@@ -1552,13 +2303,24 @@ function runCouplingAndLayerGraphChecks(
         }
         checkImportAffinityIssues(scoredFileAdj, ctx.fileImportIn, zoneMap, potentials, issues);
         const filesByDir = checkDirectoryShapeIssues(ctx.fileNodes, zoneMap, potentials, issues);
+        checkPackageCensusIssues(
+            ctx,
+            filesByDir,
+            scoredFileAdj,
+            runtimeScoredFileAdj,
+            readLines,
+            zoneMap,
+            ignoreRules,
+            potentials,
+            issues,
+        );
         checkPrivateSymbolAccessIssues(ctx, zoneMap, ignoreRules, potentials, issues);
         checkNamingInconsistencyIssues(filesByDir, potentials, issues);
     }
 }
 
 /**
- * Run all graph & topology checks (`dead`, `coupling`, `cohesion`, `tests`).
+ * Run all graph & topology checks (`dead`, `coupling`, `cohesion`, `tests`, `traps`).
  */
 export function runGraphChecks(
     graph,
@@ -1591,6 +2353,8 @@ export function runGraphChecks(
         low_cohesion_files: 0,
         monster_functions: 0,
         god_classes: 0,
+        hotspots: 0,
+        deceptive_queries: 0,
         untested_hubs: 0,
         hollow_tests: 0,
     };
@@ -1601,6 +2365,7 @@ export function runGraphChecks(
     const wantCohesion = enabledCategories.has("cohesion");
     const wantTests = enabledCategories.has("tests");
     const wantSecurity = enabledCategories.has("security");
+    const wantTraps = enabledCategories.has("traps");
 
     if (wantDead) {
         checkDeadAndWrapperIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
@@ -1610,6 +2375,7 @@ export function runGraphChecks(
         runCouplingAndLayerGraphChecks(
             graph,
             ctx,
+            readLines,
             zoneMap,
             ignoreRules,
             wantCoupling,
@@ -1623,6 +2389,11 @@ export function runGraphChecks(
     if (wantCohesion) {
         checkMonsterAndClassCohesionIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
         checkSignatureVarianceIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
+        checkHotspotIssues(graph, ctx, readLines, zoneMap, ignoreRules, config, opts, potentials, issues);
+    }
+
+    if (wantTraps) {
+        checkDeceptiveQueryIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
     }
 
     if (wantTests) {

@@ -33,14 +33,13 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { plural } from "../util/span.js";
-import { CACHE_DIR, contextDirFor, envTruthy } from "../context/node-file.js";
+import { CACHE_DIR, contextDirFor, envTruthy, wiringPath } from "../context/node-file.js";
 import { acquireLockIn, releaseLockIn } from "../util/state.js";
 import { buildGraph } from "./build.js";
 import { driftCount, isClean, probeDrift, readFingerprint } from "./fingerprint.js";
-import { invalidateGraphCaches } from "./load.js";
+import { invalidateGraphCaches } from "../context/graph-store.js";
 import { isAutoBuildableRepo } from "./root.js";
 import { canSeedGraph, seedGraph } from "./seed.js";
-import { wiringPath } from "./write.js";
 /** How long to wait for another process's in-flight rebuild before giving up and
  * answering from the current graph. Long enough to ride out a small repo's build,
  * short enough that a tool call never feels hung. */
@@ -220,7 +219,7 @@ export async function ensureFreshChildren(root, children, opts = {}) {
         // one, each child would build into that single shared dir in turn, the last
         // clobbering the rest.) A child's graph always lives in its own `<child>/plexer`,
         // which is exactly how `loadWorkspaceGraphs` reads them back.
-        const r = await ensureFreshGraph(resolve(root, child));
+        const r = await ensureFreshGraph(resolve(root, child), { autoBuild: opts.autoBuild });
         if (!r.refreshed)
             continue;
         refreshedIn.push(child);

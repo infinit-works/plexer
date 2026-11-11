@@ -14,17 +14,36 @@ export function skillTemplate() {
 
 function shim(entryFile, call, bakedDir, dedupGlobalHooks = false) {
     const dedupBlock = dedupGlobalHooks
-        ? `const globalClaudeHelpers = path.join(os.homedir(), '.claude', 'helpers') + path.sep;
-if (__filename.startsWith(globalClaudeHelpers)) {
-  const proj = path.resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd());
-  if (proj !== path.resolve(os.homedir())) {
-    const localShim = path.join(proj, '.claude', 'helpers', 'plexer-hooks.cjs');
-    const localSettings = path.join(proj, '.claude', 'settings.json');
+        ? `const homeResolved = path.resolve(os.homedir());
+function hasLocalPlexerHook(startDir, relConfigPath, checkFile) {
+  let cur = path.resolve(startDir);
+  for (let i = 0; i < 25 && cur && cur !== homeResolved; i++) {
+    const cfg = path.join(cur, relConfigPath);
     try {
-      if (fs.existsSync(localShim) && fs.existsSync(localSettings) && fs.readFileSync(localSettings, 'utf8').includes('plexer-hooks.cjs')) {
-        process.exit(0);
+      if ((!checkFile || fs.existsSync(path.join(cur, checkFile))) && fs.existsSync(cfg) && fs.readFileSync(cfg, 'utf8').includes('plexer')) {
+        return true;
       }
     } catch {}
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return false;
+}
+const globalClaudeHelpers = path.join(homeResolved, '.claude', 'helpers') + path.sep;
+const globalGeminiHelpers = path.join(homeResolved, '.gemini', 'config', 'helpers') + path.sep;
+const globalCodexHooks = path.join(homeResolved, '.codex', 'hooks', 'plexer') + path.sep;
+if (__filename.startsWith(globalClaudeHelpers)) {
+  if (hasLocalPlexerHook(process.env.CLAUDE_PROJECT_DIR || process.cwd(), path.join('.claude', 'settings.json'), path.join('.claude', 'helpers', 'plexer-hooks.cjs'))) {
+    process.exit(0);
+  }
+} else if (__filename.startsWith(globalGeminiHelpers)) {
+  if (hasLocalPlexerHook(process.env.ANTIGRAVITY_PROJECT_DIR || process.cwd(), path.join('.agents', 'hooks.json'))) {
+    process.exit(0);
+  }
+} else if (__filename.startsWith(globalCodexHooks)) {
+  if (hasLocalPlexerHook(process.env.CODEX_PROJECT_DIR || process.cwd(), path.join('.codex', 'hooks.json'))) {
+    process.exit(0);
   }
 }
 `

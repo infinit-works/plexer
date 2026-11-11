@@ -21,15 +21,16 @@
  * CLI print/exit wrappers and the per-child build orchestration live in
  * `workspace-cli.js`; `mcp/tools.js` calls the federate* functions directly.
  */
-import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, realpathSync, rmSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
 import { checkGraph } from "./check.js";
-import { loadGraphCached } from "./load.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { buildRepoMap, formatRepoMap } from "./map.js";
-import { discoverWorkspaceChildren } from "./scopes.js";
+import { discoverWorkspaceChildren } from "./scope-discovery.js";
 import { headerOf, hitJson, hitLine, looseNoteFor, quoteFor, renderMatchBlock, symbolJson } from "./traverse-cli.js";
-import { edgeWalk, resolveSymbol } from "./traverse.js";
+import { resolveSymbol } from "../context/symbol-query.js";
+import { edgeWalk } from "./traverse.js";
 import { linkTestsForGraph } from "./test-links.js";
 import { ask, readSpans, sameHit, skeleton } from "../ask/ask.js";
 import { roundRobinQueues } from "../ask/file-selection.js";
@@ -43,13 +44,41 @@ const WORKSPACE_FILE = "workspace.json";
 export function workspacePath(root, override) {
     return join(contextDirFor(root, override), WORKSPACE_FILE);
 }
+function isSafeWorkspaceChild(root, child) {
+    if (typeof child !== "string")
+        return false;
+    const c = child.trim();
+    if (!c || c === "." || c === ".." || c.startsWith(".") || /[/\\:]/.test(c))
+        return false;
+    const absRoot = resolve(root);
+    const absChild = resolve(absRoot, c);
+    const rel = relative(absRoot, absChild);
+    if (!rel || rel.startsWith("..") || isAbsolute(rel))
+        return false;
+    if (!existsSync(absChild))
+        return true;
+    try {
+        if (lstatSync(absChild).isSymbolicLink())
+            return false;
+        const realRoot = realpathSync(absRoot);
+        const realChild = realpathSync(absChild);
+        const realRel = relative(realRoot, realChild);
+        return Boolean(realRel && !realRel.startsWith("..") && !isAbsolute(realRel));
+    }
+    catch {
+        return false;
+    }
+}
 /** Read the workspace index, or null when the parent has none (not a workspace,
  * or unparseable/foreign json — treated the same as absent). */
 export function readWorkspace(root, override) {
     const parsed = readJson(workspacePath(root, override));
     if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.children))
         return null;
-    return { version: 1, children: parsed.children.map(String) };
+    const children = parsed.children.map(String).filter((c) => isSafeWorkspaceChild(root, c));
+    if (children.length === 0 && parsed.children.length > 0)
+        return null;
+    return { version: 1, children };
 }
 /** Write the workspace index, sorting children for a stable, minimal git diff. */
 export function writeWorkspace(root, ws, override) {

@@ -7,17 +7,24 @@
  * Each card lists the file's symbols with their `L<start>-L<end>` spans and a
  * one-line doc summary or signature.
  */
-import { mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, writeFileSync, existsSync, lstatSync, readdirSync, rmSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pushMap, relPosix } from "../util/paths.js";
 import { CACHE_DIR, GRAPH_DIR } from "../context/node-file.js";
-import { spanStart } from "../util/span.js";
+import { isSensitiveOrDotPath, spanStart } from "../util/span.js";
 import { buildRepoMap, formatRepoMap } from "./map.js";
 const INDEX_FILE = "INDEX.md";
 /** The card path for a source path: mirror the tree, swap the extension for .md. */
 function cardPathFor(outDir, sourcePath) {
+    if (typeof sourcePath !== "string" || !sourcePath || isSensitiveOrDotPath(sourcePath))
+        return null;
     const md = sourcePath.replace(/\.[^./]+$/, "") + ".md";
-    return join(outDir, md);
+    const absOut = resolve(outDir);
+    const target = resolve(absOut, md);
+    const rel = relPosix(absOut, target);
+    if (!rel || rel.startsWith("..") || isAbsolute(rel) || isSensitiveOrDotPath(rel))
+        return null;
+    return target;
 }
 /** First line of a node's description: doc summary if extracted, else its signature. */
 function oneLiner(node) {
@@ -93,17 +100,26 @@ function pruneEmptyDirs(outDir) {
  * and prune cards whose source no longer exists. Returns what changed.
  */
 export function writeCards(graph, outDir) {
+    if (existsSync(outDir) && lstatSync(outDir).isSymbolicLink()) {
+        throw new Error(`refusing to write cards into symlinked directory: ${outDir}`);
+    }
     const byPath = new Map();
     for (const n of graph.nodes) {
+        if (!n || typeof n.path !== "string" || !n.path)
+            continue;
         pushMap(byPath, n.path, n);
     }
     const written = new Set();
     const files = [];
     for (const [sourcePath, group] of byPath) {
+        const cardPath = cardPathFor(outDir, sourcePath);
+        if (!cardPath)
+            continue;
         const fileNode = group.find((n) => n.kind === "file");
         const symbols = group.filter((n) => n.kind !== "file");
-        const cardPath = cardPathFor(outDir, sourcePath);
         mkdirSync(dirname(cardPath), { recursive: true });
+        if (existsSync(cardPath) && lstatSync(cardPath).isSymbolicLink())
+            continue;
         writeFileSync(cardPath, renderCard(sourcePath, fileNode, symbols));
         written.add(cardPath);
         files.push({ card: relPosix(outDir, cardPath), path: sourcePath, symbols: symbols.length });

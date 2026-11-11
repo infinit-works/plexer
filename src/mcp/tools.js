@@ -2,14 +2,15 @@
  * The MCP tools, as pure functions over the existing engine.
  * `callTool` never throws — hosts get soft errors as isError content.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { ask, formatAsk, skeleton, formatSkeleton, readSpans, formatReadSpans } from '../ask/ask.js';
+import { ask, formatAsk, skeleton, formatSkeleton, readSpans, formatReadSpans, suggestClosestFiles, suggestNearTargets } from '../ask/ask.js';
 import { checkGraph, formatGraphCheckReport } from '../graph/check.js';
-import { loadGraphCached } from '../graph/load.js';
+import { loadGraphCached } from '../context/graph-store.js';
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from '../graph/refresh.js';
 import { contextDirFor } from '../context/node-file.js';
-import { resolveSymbol, edgeWalk, parseWalkDepth } from '../graph/traverse.js';
+import { resolveSymbol } from '../context/symbol-query.js';
+import { edgeWalk, parseWalkDepth } from '../graph/traverse.js';
 import { headerOf, hitLine, looseNoteFor, quoteFor, renderMatchBlock } from '../graph/traverse-cli.js';
 import { linkTestsForGraph } from '../graph/test-links.js';
 import { fileReader, wordRe } from '../blast/evidence.js';
@@ -46,8 +47,38 @@ export const READ_ONLY_ANNOTATIONS = {
     openWorldHint: false,
 };
 
-function unknownSymbolText(query) {
+function unknownSymbolText(query, suggestions = []) {
+    if (suggestions.length > 0)
+        return `no symbol "${query}" in the graph — did you mean: ${suggestions.join(', ')}?`;
     return `no symbol "${query}" in the graph — check spelling or run \`plexer build\``;
+}
+
+function collectWorkspacePaths(root, dirOverride) {
+    const paths = [];
+    for (const { child, graph } of loadWorkspaceGraphs(root, dirOverride).loaded) {
+        const seen = new Set();
+        for (const n of graph.nodes) {
+            if (n.path && !seen.has(n.path)) {
+                seen.add(n.path);
+                paths.push(`${child}/${n.path}`);
+            }
+        }
+    }
+    return paths.sort();
+}
+
+function suggestWorkspaceSymbols(root, dirOverride, symbols) {
+    const out = new Set();
+    for (const { graph } of loadWorkspaceGraphs(root, dirOverride).loaded) {
+        for (const sym of symbols) {
+            for (const cand of suggestNearTargets(graph, sym, undefined, 3)) {
+                out.add(cand);
+                if (out.size >= 3)
+                    return [...out];
+            }
+        }
+    }
+    return [...out];
 }
 
 export const TOOLS = [
@@ -198,19 +229,81 @@ export const TOOLS = [
     },
     {
         name: 'plexer_health',
-        description: 'Codebase health engine and execution queue: run mechanical & Luau/Roblox detectors (`scan`), inspect the next prioritized fix item (`next`), check strict/overall/objective/verified scores (`status`), or run diff-scoped health checks (`diff: true`).',
+        description: 'Codebase health engine and execution queue: check strict/overall/objective/verified scores (`status`), run mechanical & Luau/Roblox detectors (`scan`), inspect the next prioritized fix items or parallel subagent work lanes (`next`), resolve or skip findings (`resolve`, `skip`, `wontfix`, `reopen`), or run diff-scoped health checks (`diff: true`).',
+        // Source-mutating actions (`autofix`, `move`) are intentionally excluded from MCP so `plexer_health`
+        // never modifies repository source files (only `plexer/.health/` local cache metadata) and preserves
+        // zero-prompt MCP auto-approval across Claude Code, Codex, and Cursor.
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
                 action: {
                     type: 'string',
-                    enum: ['scan', 'next', 'backlog', 'status', 'show', 'tree', 'detect', 'prompt'],
-                    description: 'health command action (default "scan")',
+                    enum: ['status', 'scan', 'next', 'backlog', 'show', 'tree', 'detect', 'prompt', 'resolve', 'skip', 'wontfix', 'reopen'],
+                    description: 'health command action (default "status")',
                 },
                 detector: {
                     type: 'string',
-                    description: 'specific detector name for action="detect" (e.g. "signature_variance", "roblox_security")',
+                    description: 'specific detector name for action="detect" or "scan" (e.g. "signature_variance", "package_census", "roblox_security")',
+                },
+                patterns: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'issue ID, file, or detector patterns for show/resolve/skip/wontfix/reopen',
+                },
+                count: {
+                    type: 'number',
+                    description: 'number of queue items for action="next" or "backlog" (default 1 for next, 20 for backlog)',
+                },
+                cluster: {
+                    type: 'string',
+                    description: 'filter action="next" to a specific cluster',
+                },
+                group: {
+                    type: 'string',
+                    enum: ['item', 'file', 'detector'],
+                    description: 'group action="next" items by item (default), file, or detector',
+                },
+                explain: {
+                    type: 'boolean',
+                    description: 'include ranking and score-impact rationale in action="next"',
+                },
+                lanes: {
+                    type: 'boolean',
+                    description: 'compute graph-disjoint parallel subagent workstream lanes in action="next"',
+                },
+                status: {
+                    type: 'string',
+                    enum: ['open', 'fixed', 'wontfix', 'deferred', 'false_positive'],
+                    description: 'filter action="show" by issue status',
+                },
+                chronic: {
+                    type: 'boolean',
+                    description: 'filter action="show" to recurring or reopened issues across multiple scans',
+                },
+                code: {
+                    type: 'boolean',
+                    description: 'inline source code excerpts in action="show"',
+                },
+                note: {
+                    type: 'string',
+                    description: 'resolution or skip note',
+                },
+                attest: {
+                    type: 'string',
+                    description: 'explicit attestation for resolve, permanent skip (wontfix), or false_positive',
+                },
+                confirm: {
+                    type: 'boolean',
+                    description: 'confirm issue resolution or skip',
+                },
+                permanent: {
+                    type: 'boolean',
+                    description: 'mark skipped issue as permanent wontfix (requires attest)',
+                },
+                false_positive: {
+                    type: 'boolean',
+                    description: 'mark skipped issue as permanent false_positive (requires attest)',
                 },
                 diff: {
                     type: 'boolean',
@@ -428,6 +521,73 @@ function workspaceHealth(root, dirOverride, args) {
     return { text: `${chunks.join('\n\n')}\n`, isError: false };
 }
 
+function workspaceRead(root, dirOverride, args) {
+    const specs = parseCommaOrArrayList(args.spans ?? args.file);
+    if (specs.length === 0)
+        return { text: 'plexer_read requires spans', isError: true };
+    const r = federateRead(root, dirOverride, specs);
+    if (r.blocks.some((b) => b.error && !b.error.includes('did you mean:'))) {
+        const wsPaths = collectWorkspacePaths(root, dirOverride);
+        for (const b of r.blocks) {
+            if (b.error && !b.error.includes('did you mean:') && !b.error.includes('sensitive')) {
+                const rawPath = String(b.spec ?? '').split(':')[0];
+                const hints = suggestClosestFiles(rawPath, wsPaths, 3);
+                if (hints.length)
+                    b.error = `${b.error} — did you mean: ${hints.join(', ')}?`;
+            }
+        }
+    }
+    return {
+        text: formatReadSpans(r),
+        isError: r.blocks.length > 0 && r.blocks.every((b) => Boolean(b.error)),
+    };
+}
+
+function workspaceFileApi(root, dirOverride, args) {
+    const files = parseCommaOrArrayList(args.file);
+    if (files.length === 0)
+        return { text: 'plexer_file_api requires a file', isError: true };
+    const skelOpts = { allMatches: Boolean(args.all_matches) };
+    const results = files.map((f) => federateSkeleton(root, dirOverride, f, skelOpts));
+    if (results.some((r) => !r.entries?.length && r.note && !r.note.includes('ambiguous') && !r.note.includes('did you mean:'))) {
+        const wsPaths = collectWorkspacePaths(root, dirOverride);
+        for (const r of results) {
+            if (!r.entries?.length && r.note && !r.note.includes('ambiguous') && !r.note.includes('did you mean:')) {
+                const hints = suggestClosestFiles(r.file, wsPaths, 3);
+                if (hints.length)
+                    r.note = `${r.note} — did you mean: ${hints.join(', ')}?`;
+            }
+        }
+    }
+    const text = results.length === 1
+        ? formatSkeleton(results[0])
+        : `${results.map((r) => formatSkeleton(r).trimEnd()).join('\n\n')}\n`;
+    const isError = results.every((r) => !r.entries?.length && Boolean(r.note || r.error));
+    return { text, isError };
+}
+
+function workspaceTraceCalls(root, dirOverride, args) {
+    const symbols = parseCommaOrArrayList(args.symbol ?? args.file);
+    if (symbols.length === 0)
+        return { text: 'plexer_trace_calls requires a symbol', isError: true };
+    const parsedDepth = resolveTraceDepth(args.depth, 1);
+    if (parsedDepth.error)
+        return { text: parsedDepth.error, isError: true };
+    const { text, found } = federateCallers(root, dirOverride, symbols.length === 1 ? symbols[0] : symbols, {
+        direction: args.direction === 'out' ? 'out' : 'in',
+        depth: parsedDepth.depth,
+        source: args.full === true ? true : args.source !== false,
+        full: args.full === true,
+        in: optIn(args),
+    });
+    if (!found && !text.includes('did you mean:')) {
+        const hints = suggestWorkspaceSymbols(root, dirOverride, symbols);
+        if (hints.length)
+            return { text: `${text.trimEnd()} — did you mean: ${hints.join(', ')}?\n`, isError: true };
+    }
+    return { text, isError: !found };
+}
+
 /** When the MCP server is rooted at a workspace parent, the ask/read/callers/grep/
  * map/check/file_api/blast tools federate across the children — identical to the CLI. */
 async function callWorkspaceTool(root, dirOverride, name, args) {
@@ -446,44 +606,12 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
             });
             return { text: `${blocks.join('\n\n')}\n`, isError: false };
         }
-        case 'plexer_read': {
-            const specs = parseCommaOrArrayList(args.spans ?? args.file);
-            if (specs.length === 0)
-                return { text: 'plexer_read requires spans', isError: true };
-            const r = federateRead(root, dirOverride, specs);
-            return {
-                text: formatReadSpans(r),
-                isError: r.blocks.length > 0 && r.blocks.every((b) => Boolean(b.error)),
-            };
-        }
-        case 'plexer_file_api': {
-            const files = parseCommaOrArrayList(args.file);
-            if (files.length === 0)
-                return { text: 'plexer_file_api requires a file', isError: true };
-            const skelOpts = { allMatches: Boolean(args.all_matches) };
-            const results = files.map((f) => federateSkeleton(root, dirOverride, f, skelOpts));
-            const text = results.length === 1
-                ? formatSkeleton(results[0])
-                : `${results.map((r) => formatSkeleton(r).trimEnd()).join('\n\n')}\n`;
-            const isError = results.every((r) => !r.entries?.length && Boolean(r.note || r.error));
-            return { text, isError };
-        }
-        case 'plexer_trace_calls': {
-            const symbols = parseCommaOrArrayList(args.symbol ?? args.file);
-            if (symbols.length === 0)
-                return { text: 'plexer_trace_calls requires a symbol', isError: true };
-            const parsedDepth = resolveTraceDepth(args.depth, 1);
-            if (parsedDepth.error)
-                return { text: parsedDepth.error, isError: true };
-            const { text, found } = federateCallers(root, dirOverride, symbols.length === 1 ? symbols[0] : symbols, {
-                direction: args.direction === 'out' ? 'out' : 'in',
-                depth: parsedDepth.depth,
-                source: args.full === true ? true : args.source !== false,
-                full: args.full === true,
-                in: optIn(args),
-            });
-            return { text, isError: !found };
-        }
+        case 'plexer_read':
+            return workspaceRead(root, dirOverride, args);
+        case 'plexer_file_api':
+            return workspaceFileApi(root, dirOverride, args);
+        case 'plexer_trace_calls':
+            return workspaceTraceCalls(root, dirOverride, args);
         case 'plexer_find_all':
             return workspaceFindAll(root, dirOverride, args);
         case 'plexer_repo_map':
@@ -553,10 +681,20 @@ function resolveMcpRoot(root, args, dirOverride) {
     return candidate;
 }
 
+function canonicalPath(p) {
+    const abs = resolve(p);
+    try {
+        return realpathSync(abs);
+    }
+    catch {
+        return abs;
+    }
+}
+
 function isInsideRoot(base, target) {
-    if (!base)
+    if (!base || !target)
         return false;
-    const rel = relative(resolve(base), resolve(target));
+    const rel = relative(canonicalPath(base), canonicalPath(target));
     return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
@@ -569,14 +707,14 @@ export async function callTool(root, name, args, dirOverride) {
         const startupRoot = resolve(root);
         const agyRoot = readAgyLastRepo();
         const isTrustedRoot = isInsideRoot(startupRoot, targetRoot) || isInsideRoot(agyRoot, targetRoot);
-        if (!isTrustedRoot && !hasPlexerIndex(targetRoot)) {
+        if (!isTrustedRoot) {
             return { text: NO_GRAPH, isError: true };
         }
         const ws = readWorkspace(targetRoot, dirOverride);
         let note = null;
         if (!NO_REFRESH_TOOLS.has(name)) {
             const r = ws
-                ? await ensureFreshChildren(targetRoot, ws.children, { contextDir: dirOverride })
+                ? await ensureFreshChildren(targetRoot, ws.children, { contextDir: dirOverride, autoBuild: isTrustedRoot })
                 : await ensureFreshGraph(targetRoot, { contextDir: dirOverride, autoBuild: isTrustedRoot });
             note = refreshNote(r);
         }
@@ -639,8 +777,10 @@ function singleTraceCalls(root, args, dirOverride) {
             }
         }
     }
-    if (matches.length === 0)
-        return { text: unknownSymbolText(queries.join(', ')), isError: true };
+    if (matches.length === 0) {
+        const suggestions = [...new Set(queries.flatMap((q) => suggestNearTargets(w, q, inPrefix, 3)))].slice(0, 3);
+        return { text: unknownSymbolText(queries.join(', '), suggestions), isError: true };
+    }
     const direction = args.direction === 'out' ? 'out' : 'in';
     const { depth } = parsedDepth;
     const useSource = args.full === true ? true : args.source !== false;
@@ -675,7 +815,20 @@ function singleFindAll(root, args, dirOverride) {
     return { text: chunks.join('\n\n'), isError: false };
 }
 
-const ALLOWED_MCP_HEALTH_ACTIONS = new Set(['scan', 'next', 'backlog', 'status', 'show', 'tree', 'detect', 'prompt']);
+const ALLOWED_MCP_HEALTH_ACTIONS = new Set([
+    'status',
+    'scan',
+    'next',
+    'backlog',
+    'show',
+    'tree',
+    'detect',
+    'prompt',
+    'resolve',
+    'skip',
+    'wontfix',
+    'reopen',
+]);
 
 function formatShowHealthText(res) {
     if (res.view === 'concerns') {
@@ -697,15 +850,58 @@ function formatShowHealthText(res) {
     const lines = [`plexer health show — ${res.count ?? 0} of ${res.total_matching ?? res.count ?? 0} issues:`];
     for (const iss of res.items ?? []) {
         lines.push(`- [${iss.tier}/${iss.severity}] ${iss.id} — ${iss.summary}`);
+        if (iss.code_excerpt) {
+            for (const line of String(iss.code_excerpt).split('\n')) {
+                lines.push(`    ${line}`);
+            }
+        }
     }
     return `${lines.join('\n')}\n`;
 }
 
-function singleHealth(root, args, dirOverride) {
-    const action = typeof args.action === 'string' ? args.action.toLowerCase() : 'scan';
-    if (!ALLOWED_MCP_HEALTH_ACTIONS.has(action)) {
+function formatDetectHealthText(res) {
+    const lines = [`plexer health detect (${res.detector ?? 'all'}) — ${res.count ?? 0} finding(s):`];
+    for (const it of res.items ?? []) {
+        lines.push(`- [${it.tier}/${it.severity}/${it.detector}] ${it.file}:${it.span} — ${it.summary}`);
+    }
+    return `${lines.join('\n')}\n`;
+}
+
+function formatMcpHealthMutationResult(rawAction, res, fmt) {
+    const failed =
+        res.status === 'scan_gate_blocked' ||
+        res.status === 'attestation_invalid' ||
+        res.status === 'not_found' ||
+        res.status === 'confirm_required';
+    if (failed) {
+        return { text: res.message || res.error || JSON.stringify(res), isError: true };
+    }
+    if (fmt === 'json') {
+        return { text: JSON.stringify(res, null, 2), isError: false };
+    }
+    if (rawAction === 'resolve') {
         return {
-            text: `invalid health action "${action}" — allowed: ${[...ALLOWED_MCP_HEALTH_ACTIONS].join(', ')}`,
+            text: `✓ Resolved ${(res.resolved_ids || []).length} finding(s): ${(res.resolved_ids || []).join(', ')} (Strict: ${res.scores?.strict}%)\n`,
+            isError: false,
+        };
+    }
+    if (rawAction === 'reopen') {
+        return {
+            text: `✓ Reopened ${(res.reopened_ids || []).length} finding(s): ${(res.reopened_ids || []).join(', ')} (Strict: ${res.scores?.strict}%)\n`,
+            isError: false,
+        };
+    }
+    return {
+        text: `✓ Marked ${(res.skipped_ids || []).length} finding(s) as ${res.status}: ${(res.skipped_ids || []).join(', ')} (Strict: ${res.scores?.strict}%)\n`,
+        isError: false,
+    };
+}
+
+function singleHealth(root, args, dirOverride) {
+    const rawAction = typeof args.action === 'string' ? args.action.toLowerCase() : 'status';
+    if (!ALLOWED_MCP_HEALTH_ACTIONS.has(rawAction)) {
+        return {
+            text: `invalid health action "${rawAction}" — allowed: ${[...ALLOWED_MCP_HEALTH_ACTIONS].join(', ')}`,
             isError: true,
         };
     }
@@ -716,11 +912,44 @@ function singleHealth(root, args, dirOverride) {
         ? [String(args.pattern)]
         : Array.isArray(args.patterns)
             ? args.patterns.map(String)
-            : undefined;
+            : typeof args.patterns === 'string'
+                ? [args.patterns]
+                : undefined;
+
+    let engineAction = rawAction;
+    let subAction;
+    let permanent = Boolean(args.permanent);
+    const falsePositive = Boolean(args.false_positive);
+    if (rawAction === 'skip') {
+        engineAction = 'plan';
+        subAction = 'skip';
+    } else if (rawAction === 'wontfix') {
+        engineAction = 'plan';
+        subAction = 'skip';
+        permanent = true;
+    } else if (rawAction === 'reopen') {
+        engineAction = 'plan';
+        subAction = 'reopen';
+    }
+
     const res = health(root, {
         contextDir: dirOverride,
-        action,
+        action: engineAction,
+        subAction,
         patterns,
+        count: typeof args.count === 'number' ? args.count : undefined,
+        cluster: typeof args.cluster === 'string' ? args.cluster : undefined,
+        group: typeof args.group === 'string' ? args.group : undefined,
+        explain: args.explain === true,
+        lanes: args.lanes === true,
+        status: typeof args.status === 'string' ? args.status : undefined,
+        chronic: args.chronic === true,
+        code: args.code === true,
+        note: typeof args.note === 'string' ? args.note : undefined,
+        attest: typeof args.attest === 'string' ? args.attest : undefined,
+        confirm: args.confirm === true,
+        permanent,
+        falsePositive,
         detector: typeof args.detector === 'string' ? args.detector : undefined,
         diff: args.diff === true ? (typeof args.base === 'string' ? args.base : true) : undefined,
         base: typeof args.base === 'string' ? args.base : undefined,
@@ -729,17 +958,19 @@ function singleHealth(root, args, dirOverride) {
         skip: typeof args.skip === 'string' ? args.skip : undefined,
         max: typeof args.max === 'number' ? args.max : 10,
     });
-    if (action === 'prompt') {
-        return { text: res.prompt, isError: false };
-    }
-    if (action === 'tree') {
-        return { text: res.tree_text, isError: false };
-    }
-    if (action === 'detect') {
-        return { text: JSON.stringify(res, null, 2), isError: false };
-    }
+    if (rawAction === 'prompt') return { text: res.prompt, isError: false };
+    if (rawAction === 'tree') return { text: res.tree_text, isError: false };
     const fmt = args.format === 'json' ? 'json' : args.format === 'markdown' ? 'markdown' : 'text';
-    if (action === 'show' && fmt !== 'json') {
+    if (rawAction === 'detect') {
+        return {
+            text: fmt === 'json' ? JSON.stringify(res, null, 2) : formatDetectHealthText(res),
+            isError: false,
+        };
+    }
+    if (rawAction === 'resolve' || rawAction === 'skip' || rawAction === 'wontfix' || rawAction === 'reopen') {
+        return formatMcpHealthMutationResult(rawAction, res, fmt);
+    }
+    if (rawAction === 'show' && fmt !== 'json') {
         return { text: formatShowHealthText(res), isError: false };
     }
     const text = fmt === 'json'

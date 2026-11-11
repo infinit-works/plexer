@@ -1,9 +1,9 @@
 import { existsSync, lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { skillTemplate } from './skill-template.js';
+import { skillTemplate } from '../claude/shim-template.js';
 import { hooksShim } from '../claude/shim-template.js';
 import { claudeDistDir } from '../claude/paths.js';
-import { updateJsonConfig, writeOwned } from './config-write.js';
+import { updateJsonConfig, writeOwned } from '../util/config-write.js';
 
 function skillDir(home) {
     return join(home, '.gemini', 'skills', 'plexer');
@@ -45,7 +45,7 @@ function desiredPlexerHooksBlock(shim) {
         ],
         PostToolUse: [
             {
-                matcher: 'edit_file|write_file',
+                matcher: 'edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file',
                 hooks: [
                     { type: 'command', command: `node "${shim}" agy-post-edit`, timeout: 10 },
                 ],

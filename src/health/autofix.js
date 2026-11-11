@@ -2,12 +2,18 @@
  * Safe mechanical auto-fixers (`plexer health autofix`) and import-rewriting file/directory move
  * (`plexer health move <src> <dst> [--dry-run]`) with JS/TS, Python, and Luau/Roblox support.
  */
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { toPosixPath as toPosix } from "../util/paths.js";
-import { spanRange } from "../util/span.js";
+import { resolveSafeRepoFile, spanRange } from "../util/span.js";
+import { remapMovedIssuePaths } from "./queue.js";
 import { detectGitContext } from "./state.js";
-import { SCORED_ZONES } from "./zones.js";
+import {
+    hasWordToken,
+    SCORED_ZONES,
+    stepLuauBlockDepth,
+    stripCodeStringsAndComments,
+} from "./zones.js";
 
 export const AVAILABLE_FIXERS = [
     "luau-task-scheduler",
@@ -19,7 +25,7 @@ export const AVAILABLE_FIXERS = [
     "unreferenced-exports",
 ];
 
-function countIdentifierUsesOutsideLine(lines, lineIdx, ident, isPy = false) {
+function countIdentifierUsesOutsideLine(lines, lineIdx, ident, isPy = false, isLuau = false) {
     const escaped = ident.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const wordRe = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
     let count = 0;
@@ -27,15 +33,10 @@ function countIdentifierUsesOutsideLine(lines, lineIdx, ident, isPy = false) {
         if (i === lineIdx) continue;
         const l = lines[i].trim();
         if (l.startsWith("//") || l.startsWith("--") || (isPy && l.startsWith("#"))) continue;
-        if (wordRe.test(l)) count += 1;
+        const stripped = stripCodeStringsAndComments(lines[i], isLuau, isPy);
+        if (wordRe.test(stripped)) count += 1;
     }
     return count;
-}
-
-function stripLuauStringsAndComments(line) {
-    return line
-        .replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""')
-        .replace(/--.*$/, "");
 }
 
 function scanExistingTopLuauServices(lines) {
@@ -44,17 +45,15 @@ function scanExistingTopLuauServices(lines) {
     for (const l of lines) {
         const trimmedScan = l.trim();
         if (!trimmedScan.startsWith("--")) {
-            const codeOnly = stripLuauStringsAndComments(trimmedScan);
-            const fOpen = (codeOnly.match(/\bfunction\b/g) || []).length;
-            const bOpen = (codeOnly.match(/\b(?:then|do|repeat)\b/g) || []).length;
-            const ends = (codeOnly.match(/\b(?:end|until)\b/g) || []).length;
-            if (scanDepth === 0 && fOpen === 0) {
+            const codeOnly = stripCodeStringsAndComments(trimmedScan, true, false);
+            const hasFn = /\bfunction\b/.test(codeOnly);
+            if (scanDepth === 0 && !hasFn) {
                 const m = /^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*game:GetService\(\s*["']([A-Za-z0-9_]+)["']\s*\)/.exec(
-                    l,
+                    trimmedScan,
                 );
                 if (m) existingTopServices.add(m[2]);
             }
-            scanDepth = Math.max(0, scanDepth + fOpen + bOpen - ends);
+            scanDepth = stepLuauBlockDepth(scanDepth, trimmedScan);
         }
     }
     return existingTopServices;
@@ -70,22 +69,102 @@ function isEntrypointForAutofix(relPath) {
     );
 }
 
-function collectUnreferencedExportLinesByFile(graph) {
+function hasMultiDeclaratorExport(rawLine) {
+    const cleaned = stripCodeStringsAndComments(rawLine, false, false).trim();
+    if (!/^export\s+(?:const|let|var)\b/.test(cleaned)) return false;
+    let depth = 0;
+    for (let i = 0; i < cleaned.length; i++) {
+        const ch = cleaned[i];
+        if (ch === "(" || ch === "[" || ch === "{") depth++;
+        else if (ch === ")" || ch === "]" || ch === "}") depth = Math.max(0, depth - 1);
+        else if (ch === "," && depth === 0) return true;
+    }
+    return false;
+}
+
+function createStrippedFileTextReader(rootDir) {
+    const absRoot = rootDir ? resolve(rootDir) : null;
+    let realRoot = absRoot;
+    if (absRoot) {
+        try {
+            realRoot = realpathSync(absRoot);
+        } catch {
+            /* fallback */
+        }
+    }
+    const strippedTextCache = new Map();
+    return (relPath) => {
+        if (!absRoot || !realRoot) return "";
+        if (strippedTextCache.has(relPath)) return strippedTextCache.get(relPath);
+        const safe = resolveSafeRepoFile(absRoot, realRoot, relPath, { noSymlinks: true });
+        const raw = safe ? readFileSync(safe.realFile, "utf8") : "";
+        const ext = extname(relPath).toLowerCase();
+        const isLuau = ext === ".luau" || ext === ".lua";
+        const isPy = ext === ".py";
+        const stripped = raw
+            .split(/\r?\n/)
+            .map((l) => stripCodeStringsAndComments(l, isLuau, isPy))
+            .join("\n");
+        strippedTextCache.set(relPath, stripped);
+        return stripped;
+    };
+}
+
+function collectUnreferencedExportLinesByFile(graph, rootDir = null) {
     const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
     const incomingCrossFile = new Map();
+    const importersByPath = new Map();
     for (const edge of graph.edges || []) {
         const src = nodeById.get(edge.source);
         const tgt = nodeById.get(edge.target);
         if (!src || !tgt || src.path === tgt.path) continue;
         incomingCrossFile.set(tgt.id, (incomingCrossFile.get(tgt.id) || 0) + 1);
+        if (edge.relation === "IMPORTS" && src.path && tgt.path) {
+            let set = importersByPath.get(tgt.path);
+            if (!set) {
+                set = new Set();
+                importersByPath.set(tgt.path, set);
+            }
+            set.add(src.path);
+        }
     }
+
+    const getStrippedFileText = createStrippedFileTextReader(rootDir);
     const linesByFile = new Map();
+    const referencedFileLines = new Set();
+
     for (const n of graph.nodes) {
         if (n.kind === "file" || !n.exported || !n.path) continue;
         if (isEntrypointForAutofix(n.path)) continue;
-        if ((incomingCrossFile.get(n.id) || 0) > 0) continue;
         const range = spanRange(n.span);
         if (!range) continue;
+
+        if ((incomingCrossFile.get(n.id) || 0) > 0) {
+            referencedFileLines.add(`${n.path}::${range.start}`);
+            continue;
+        }
+
+        const importers = importersByPath.get(n.path);
+        if (importers && importers.size > 0 && rootDir) {
+            const shortName = n.name.includes(".") ? n.name.split(".").pop() : n.name;
+            let referencedInImporter = false;
+            for (const impPath of importers) {
+                const impText = getStrippedFileText(impPath);
+                if (
+                    hasWordToken(impText, shortName) ||
+                    /\bimport\s*\*\s*as\b/.test(impText) ||
+                    /\bexport\s*\*\s*from\b/.test(impText)
+                ) {
+                    referencedInImporter = true;
+                    break;
+                }
+            }
+            if (referencedInImporter) {
+                referencedFileLines.add(`${n.path}::${range.start}`);
+                continue;
+            }
+        }
+
         let set = linesByFile.get(n.path);
         if (!set) {
             set = new Set();
@@ -93,10 +172,17 @@ function collectUnreferencedExportLinesByFile(graph) {
         }
         set.add(range.start);
     }
+
+    for (const key of referencedFileLines) {
+        const sep = key.lastIndexOf("::");
+        const unrefSet = linesByFile.get(key.slice(0, sep));
+        if (unrefSet) unrefSet.delete(Number(key.slice(sep + 2)));
+    }
     return linesByFile;
 }
 
-function pruneNamedImportLine(line, trimmed, lines, lineIdx, isPy = false) {
+function pruneNamedImportLine(line, trimmed, lines, lineIdx, isPy = false, isLuau = false) {
+    if (/;.*\S/.test(trimmed)) return null;
     const namedMatch = /^(\s*import\s*)\{([^}]+)\}(\s*from\s*["'][^"']+["']\s*;?\s*)$/.exec(line);
     if (!namedMatch) return null;
     const [, prefix, rawSpecs, suffix] = namedMatch;
@@ -119,7 +205,7 @@ function pruneNamedImportLine(line, trimmed, lines, lineIdx, isPy = false) {
             continue;
         }
         const localIdent = aliasMatch[2] || aliasMatch[1];
-        if (countIdentifierUsesOutsideLine(lines, lineIdx, localIdent, isPy) === 0) {
+        if (countIdentifierUsesOutsideLine(lines, lineIdx, localIdent, isPy, isLuau) === 0) {
             removedNames.push(localIdent);
         } else {
             kept.push(spec);
@@ -134,17 +220,28 @@ function pruneNamedImportLine(line, trimmed, lines, lineIdx, isPy = false) {
     return { action: "replace", line: rebuilt, after: rebuilt.trim() };
 }
 
-function applyUnusedImportFixOnLine(line, trimmed, lines, lineIdx, lineNum, fileEdits, isPy = false) {
+function applyUnusedImportFixOnLine(
+    line,
+    trimmed,
+    lines,
+    lineIdx,
+    lineNum,
+    fileEdits,
+    isPy = false,
+    isLuau = false,
+) {
+    if (/;.*\S/.test(trimmed)) return null;
     const luauReq = /^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*require\([^)]+\)\s*$/.exec(trimmed);
     const jsImp = /^import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["'][^"']+["'];?\s*$/.exec(trimmed);
     const pyImp = /^from\s+[A-Za-z0-9_.]+\s+import\s+([A-Za-z_][A-Za-z0-9_]*)\s*$/.exec(trimmed);
     const ident = luauReq?.[1] || jsImp?.[1] || pyImp?.[1];
     const effectiveIsPy = isPy || Boolean(pyImp);
-    if (ident && countIdentifierUsesOutsideLine(lines, lineIdx, ident, effectiveIsPy) === 0) {
+    const effectiveIsLuau = isLuau || Boolean(luauReq);
+    if (ident && countIdentifierUsesOutsideLine(lines, lineIdx, ident, effectiveIsPy, effectiveIsLuau) === 0) {
         fileEdits.push({ line: lineNum, fixer: "unused-imports", before: trimmed, after: "<removed>" });
         return { action: "remove", line };
     }
-    const namedRes = pruneNamedImportLine(line, trimmed, lines, lineIdx, effectiveIsPy);
+    const namedRes = pruneNamedImportLine(line, trimmed, lines, lineIdx, effectiveIsPy, effectiveIsLuau);
     if (namedRes) {
         fileEdits.push({ line: lineNum, fixer: "unused-imports", before: trimmed, after: namedRes.after });
         return { action: namedRes.action, line: namedRes.line };
@@ -191,13 +288,24 @@ function applyLuauLineFixers(line, trimmed, lineNum, flags, inLuauFunctionDepth,
     return { action: "keep", line };
 }
 
-function stepLuauBlockDepth(depth, trimmed) {
-    if (trimmed.startsWith("--")) return depth;
-    const codeOnly = stripLuauStringsAndComments(trimmed);
-    const fOpen = (codeOnly.match(/\bfunction\b/g) || []).length;
-    const bOpen = (codeOnly.match(/\b(?:then|do|repeat)\b/g) || []).length;
-    const ends = (codeOnly.match(/\b(?:end|until)\b/g) || []).length;
-    return Math.max(0, depth + fOpen + bOpen - ends);
+function insertHoistedLuauServices(nextLines, hoistedServices, existingTopServices) {
+    if (hoistedServices.size === 0) return nextLines;
+    const toInsert = [...hoistedServices]
+        .filter((s) => !existingTopServices.has(s))
+        .map((s) => `local ${s} = game:GetService("${s}")`);
+    if (toInsert.length === 0) return nextLines;
+    let insertIdx = 0;
+    for (let k = 0; k < nextLines.length; k++) {
+        const t = nextLines[k].trim();
+        if (!t || t.startsWith("--")) {
+            if (/^--!(?:strict|nonstrict|nocheck|native|optimize)\b/.test(t)) {
+                insertIdx = k + 1;
+            }
+            continue;
+        }
+        break;
+    }
+    return [...nextLines.slice(0, insertIdx), ...toInsert, ...nextLines.slice(insertIdx)];
 }
 
 function autofixSingleFileLines(lines, isLuau, flags, existingTopServices, unrefExportLines = new Set()) {
@@ -217,12 +325,20 @@ function autofixSingleFileLines(lines, isLuau, flags, existingTopServices, unref
     }
 
     let inLuauFunctionDepth = 0;
+    let chunkFactoryDepth = 0;
     for (let i = 0; i < lines.length; i++) {
         let line = lines[i];
         const trimmed = line.trim();
         const lineNum = i + 1;
         const depthBeforeLine = inLuauFunctionDepth;
-        if (isLuau) inLuauFunctionDepth = stepLuauBlockDepth(inLuauFunctionDepth, trimmed);
+        if (isLuau) {
+            if (depthBeforeLine === 0 && /^return\s+function\b/.test(trimmed)) {
+                chunkFactoryDepth = 1;
+            }
+            inLuauFunctionDepth = stepLuauBlockDepth(inLuauFunctionDepth, trimmed);
+            if (inLuauFunctionDepth === 0) chunkFactoryDepth = 0;
+        }
+        const effectiveLuauFnDepth = Math.max(0, depthBeforeLine - chunkFactoryDepth);
 
         if (
             wantDebugLogs &&
@@ -242,7 +358,16 @@ function autofixSingleFileLines(lines, isLuau, flags, existingTopServices, unref
             !trimmed.startsWith("--") &&
             !(flags.isPy && trimmed.startsWith("#"))
         ) {
-            const impRes = applyUnusedImportFixOnLine(line, trimmed, lines, i, lineNum, fileEdits, Boolean(flags.isPy));
+            const impRes = applyUnusedImportFixOnLine(
+                line,
+                trimmed,
+                lines,
+                i,
+                lineNum,
+                fileEdits,
+                Boolean(flags.isPy),
+                isLuau,
+            );
             if (impRes) {
                 modified = true;
                 if (impRes.action === "remove") continue;
@@ -250,7 +375,7 @@ function autofixSingleFileLines(lines, isLuau, flags, existingTopServices, unref
             }
         }
 
-        if (wantUnreferencedExports && unrefExportLines.has(lineNum)) {
+        if (wantUnreferencedExports && unrefExportLines.has(lineNum) && !hasMultiDeclaratorExport(line)) {
             const stripped = line.replace(/^(\s*)export\s+((?:async\s+)?function\b|const\b|let\b|var\b|class\b)/, "$1$2");
             if (stripped !== line) {
                 modified = true;
@@ -261,7 +386,7 @@ function autofixSingleFileLines(lines, isLuau, flags, existingTopServices, unref
 
         if (isLuau) {
             const prevEditsLen = fileEdits.length;
-            const luauRes = applyLuauLineFixers(line, trimmed, lineNum, flags, depthBeforeLine, hoistedServices, fileEdits);
+            const luauRes = applyLuauLineFixers(line, trimmed, lineNum, flags, effectiveLuauFnDepth, hoistedServices, fileEdits);
             if (fileEdits.length > prevEditsLen) modified = true;
             if (luauRes.action === "remove") continue;
             if (luauRes.action === "split") {
@@ -274,16 +399,7 @@ function autofixSingleFileLines(lines, isLuau, flags, existingTopServices, unref
         nextLines.push(line);
     }
 
-    if (hoistedServices.size > 0) {
-        const toInsert = [...hoistedServices]
-            .filter((s) => !existingTopServices.has(s))
-            .map((s) => `local ${s} = game:GetService("${s}")`);
-        if (toInsert.length > 0) {
-            const insertIdx = nextLines[0] && /^--!/.test(nextLines[0].trim()) ? 1 : 0;
-            nextLines = [...nextLines.slice(0, insertIdx), ...toInsert, ...nextLines.slice(insertIdx)];
-        }
-    }
-
+    nextLines = insertHoistedLuauServices(nextLines, hoistedServices, existingTopServices);
     return { modified, nextLines, fileEdits };
 }
 
@@ -354,8 +470,14 @@ export function runAutofix(rootDir, graph, zoneMap, ignoreRules, fixerName = "al
         wantUnreferencedExports: fixerName === "unreferenced-exports",
     };
 
+    const absRoot = resolve(rootDir);
+    let realRoot = absRoot;
+    try {
+        realRoot = realpathSync(absRoot);
+    }
+    catch { /* fallback */ }
     const unrefByFile = flags.wantUnreferencedExports
-        ? collectUnreferencedExportLinesByFile(graph)
+        ? collectUnreferencedExportLinesByFile(graph, rootDir)
         : new Map();
 
     for (const fNode of fileNodes) {
@@ -363,8 +485,9 @@ export function runAutofix(rootDir, graph, zoneMap, ignoreRules, fixerName = "al
         const zone = zoneMap.get(relPath) || "production";
         if (!SCORED_ZONES.has(zone) || ignoreRules.isIgnored(relPath)) continue;
 
-        const absPath = join(rootDir, relPath);
-        if (!existsSync(absPath)) continue;
+        const safeFile = resolveSafeRepoFile(absRoot, realRoot, relPath, { noSymlinks: true });
+        if (!safeFile) continue;
+        const absPath = safeFile.realFile;
 
         const rawContent = readFileSync(absPath, "utf8");
         const eol = rawContent.includes("\r\n") ? "\r\n" : "\n";
@@ -452,53 +575,51 @@ function computeRobloxScriptRequire(fromFileRel, toFileRel) {
     return expr;
 }
 
-function rewriteMovedFileImports(raw, fileRel, effectiveFileRel, ext, movePairs, allFiles) {
+function registerRelativeSpecifierPairs(specMap, fromOld, toOld, fromNew, toNew) {
+    const oldSpecWithExt = computeRelativeSpecifier(fromOld, toOld, true);
+    const oldSpecNoExt = computeRelativeSpecifier(fromOld, toOld, false);
+    const newSpecWithExt = computeRelativeSpecifier(fromNew, toNew, true);
+    const newSpecNoExt = computeRelativeSpecifier(fromNew, toNew, false);
+    const pairs = [
+        [oldSpecWithExt, newSpecWithExt],
+        [oldSpecNoExt, newSpecNoExt],
+    ];
+    if (/\.(?:ts|tsx)$/i.test(toOld) && /\.(?:ts|tsx)$/i.test(toNew)) {
+        pairs.push([
+            oldSpecWithExt.replace(/\.ts(x)?$/i, ".js$1"),
+            newSpecWithExt.replace(/\.ts(x)?$/i, ".js$1"),
+        ]);
+    }
+    for (const [oSpec, nSpec] of pairs) {
+        if (oSpec !== nSpec && !specMap.has(oSpec)) {
+            specMap.set(oSpec, nSpec);
+        }
+    }
+}
+
+function rewriteMovedFileImports(raw, fileRel, effectiveFileRel, ext, movePairs, allFiles, movedOldSet) {
     let updated = raw;
-    const movedOldSet = new Set(movePairs.map((p) => p.oldPath));
     const specMap = new Map();
     const rbxMap = new Map();
     const pyModMap = new Map();
 
+    if (fileRel !== effectiveFileRel) {
+        for (const otherRel of allFiles) {
+            if (movedOldSet.has(otherRel)) continue;
+            registerRelativeSpecifierPairs(specMap, fileRel, otherRel, effectiveFileRel, otherRel);
+            if (ext === ".luau" || ext === ".lua") {
+                const oldRbx = computeRobloxScriptRequire(fileRel, otherRel);
+                const newRbx = computeRobloxScriptRequire(effectiveFileRel, otherRel);
+                if (oldRbx !== newRbx && !rbxMap.has(oldRbx)) {
+                    rbxMap.set(oldRbx, newRbx);
+                }
+            }
+        }
+    }
+
     for (const { oldPath, newPath } of movePairs) {
-        if (fileRel === oldPath && effectiveFileRel === newPath) {
-            for (const otherRel of allFiles) {
-                if (movedOldSet.has(otherRel)) continue;
-                const oldSpecWithExt = computeRelativeSpecifier(oldPath, otherRel, true);
-                const oldSpecNoExt = computeRelativeSpecifier(oldPath, otherRel, false);
-                const newSpecWithExt = computeRelativeSpecifier(newPath, otherRel, true);
-                const newSpecNoExt = computeRelativeSpecifier(newPath, otherRel, false);
-                for (const [oSpec, nSpec] of [
-                    [oldSpecWithExt, newSpecWithExt],
-                    [oldSpecNoExt, newSpecNoExt],
-                ]) {
-                    if (oSpec !== nSpec && !specMap.has(oSpec)) {
-                        specMap.set(oSpec, nSpec);
-                    }
-                }
-                if (ext === ".luau" || ext === ".lua") {
-                    const oldRbx = computeRobloxScriptRequire(oldPath, otherRel);
-                    const newRbx = computeRobloxScriptRequire(newPath, otherRel);
-                    if (oldRbx !== newRbx && !rbxMap.has(oldRbx)) {
-                        rbxMap.set(oldRbx, newRbx);
-                    }
-                }
-            }
-            continue;
-        }
-
-        const oldSpecWithExt = computeRelativeSpecifier(fileRel, oldPath, true);
-        const oldSpecNoExt = computeRelativeSpecifier(fileRel, oldPath, false);
-        const newSpecWithExt = computeRelativeSpecifier(effectiveFileRel, newPath, true);
-        const newSpecNoExt = computeRelativeSpecifier(effectiveFileRel, newPath, false);
-
-        for (const [oSpec, nSpec] of [
-            [oldSpecWithExt, newSpecWithExt],
-            [oldSpecNoExt, newSpecNoExt],
-        ]) {
-            if (oSpec !== nSpec && !specMap.has(oSpec)) {
-                specMap.set(oSpec, nSpec);
-            }
-        }
+        if (fileRel === oldPath && effectiveFileRel === newPath) continue;
+        registerRelativeSpecifierPairs(specMap, fileRel, oldPath, effectiveFileRel, newPath);
 
         if (ext === ".py" && oldPath.endsWith(".py")) {
             const oldMod = oldPath.replace(/\.py$/i, "").replace(/\//g, ".");
@@ -518,8 +639,9 @@ function rewriteMovedFileImports(raw, fileRel, effectiveFileRel, ext, movePairs,
     }
 
     if (specMap.size > 0) {
-        updated = updated.replace(/(["'])([^"'\r\n]+)\1/g, (m, q, spec) =>
-            specMap.has(spec) ? `${q}${specMap.get(spec)}${q}` : m,
+        updated = updated.replace(
+            /(\b(?:import|export)\s+(?:type\s+)?(?!function\b|async\b|class\b|const\b|let\b|var\b|default\b|interface\b|enum\b)[^;()="'`]*?\bfrom\s+|\bimport\s+|\b(?:import|require)\s*\(\s*)(["'])([^"'\r\n]+)\2/g,
+            (m, pre, q, spec) => (specMap.has(spec) ? `${pre}${q}${specMap.get(spec)}${q}` : m),
         );
     }
 
@@ -550,12 +672,7 @@ function assertRealPathInsideRoot(realRoot, targetReal) {
     }
 }
 
-/**
- * Move a file or directory (`srcRel` → `dstRel`) and update all import/require statements
- * across the repository (JS/TS, Python, and Luau/Roblox).
- */
-export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
-    const dryRun = Boolean(opts.dryRun);
+function validateAndResolveMovePaths(rootDir, srcArg, dstArg) {
     const absSrc = resolve(rootDir, srcArg);
     let absDst = resolve(rootDir, dstArg);
 
@@ -564,8 +681,11 @@ export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
     }
 
     const srcStat = statSync(absSrc);
-    if (existsSync(absDst) && statSync(absDst).isDirectory() && !srcStat.isDirectory()) {
+    if (existsSync(absDst) && statSync(absDst).isDirectory() && absDst !== absSrc) {
         absDst = join(absDst, basename(absSrc));
+    }
+    if (existsSync(absDst) && absDst !== absSrc) {
+        throw new Error(`Destination path already exists: ${toPosix(relative(rootDir, absDst))}`);
     }
 
     const relSrc = toPosix(relative(rootDir, absSrc));
@@ -584,6 +704,9 @@ export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
     }
 
     const realRoot = realpathSync(rootDir);
+    if (lstatSync(absSrc).isSymbolicLink()) {
+        throw new Error("moveFileOrDir refuses to move symlinks");
+    }
     assertRealPathInsideRoot(realRoot, realpathSync(dirname(absSrc)));
     assertRealPathInsideRoot(realRoot, realpathSync(absSrc));
     let dstAncestor = existsSync(absDst) ? absDst : dirname(absDst);
@@ -593,6 +716,16 @@ export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
         dstAncestor = parent;
     }
     assertRealPathInsideRoot(realRoot, realpathSync(dstAncestor));
+    return { absSrc, absDst, srcStat, relSrc, relDst };
+}
+
+/**
+ * Move a file or directory (`srcRel` → `dstRel`) and update all import/require statements
+ * across the repository (JS/TS, Python, and Luau/Roblox).
+ */
+export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
+    const dryRun = Boolean(opts.dryRun);
+    const { absSrc, absDst, srcStat, relSrc, relDst } = validateAndResolveMovePaths(rootDir, srcArg, dstArg);
 
     const movePairs = [];
     if (srcStat.isDirectory()) {
@@ -607,26 +740,48 @@ export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
     }
 
     const moveMap = new Map(movePairs.map((p) => [p.oldPath, p.newPath]));
+    const movedOldSet = new Set(moveMap.keys());
     const allFiles = graph.nodes.filter((n) => n.kind === "file").map((n) => n.path);
     const importerUpdates = [];
 
+    const absRoot = resolve(rootDir);
+    let realRoot = absRoot;
+    try {
+        realRoot = realpathSync(absRoot);
+    }
+    catch { /* fallback */ }
+
     for (const fileRel of allFiles) {
-        const absFile = join(rootDir, fileRel);
-        if (!existsSync(absFile)) continue;
+        const safeFile = resolveSafeRepoFile(absRoot, realRoot, fileRel, { noSymlinks: true });
+        if (!safeFile) continue;
+        const absFile = safeFile.realFile;
         const effectiveFileRel = moveMap.get(fileRel) || fileRel;
         const raw = readFileSync(absFile, "utf8");
         const ext = extname(fileRel).toLowerCase();
-        const updated = rewriteMovedFileImports(raw, fileRel, effectiveFileRel, ext, movePairs, allFiles);
+        const updated = rewriteMovedFileImports(
+            raw,
+            fileRel,
+            effectiveFileRel,
+            ext,
+            movePairs,
+            allFiles,
+            movedOldSet,
+        );
         if (updated !== raw) {
             importerUpdates.push({ file: fileRel, effective_file: effectiveFileRel, content: updated });
         }
     }
 
+    let remappedIssues = 0;
     if (!dryRun) {
         mkdirSync(dirname(absDst), { recursive: true });
         renameSync(absSrc, absDst);
         for (const u of importerUpdates) {
             writeFileSync(join(rootDir, u.effective_file), u.content, "utf8");
+        }
+        if (opts.state || opts.plan) {
+            const remapped = remapMovedIssuePaths(opts.state, opts.plan, moveMap);
+            remappedIssues = remapped.remapped_count;
         }
     }
 
@@ -636,5 +791,6 @@ export function moveFileOrDir(rootDir, graph, srcArg, dstArg, opts = {}) {
         to: relDst,
         files_moved: movePairs.length,
         updated_importers: importerUpdates.map((u) => u.file),
+        remapped_issues: remappedIssues,
     };
 }

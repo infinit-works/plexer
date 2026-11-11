@@ -2,8 +2,8 @@ import { lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, rmSync, 
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { packageRootDir } from '../claude/paths.js';
-import { dirExists } from './config-write.js';
-import { installClaudeGlobal } from './claude-global.js';
+import { dirExists } from '../util/fs.js';
+import { installClaudeGlobal } from '../claude/init.js';
 import { installCodexHooks } from './codex-hooks.js';
 import { installAntigravitySkill } from './antigravity.js';
 import { registerMcpConfigs } from './mcp-config.js';

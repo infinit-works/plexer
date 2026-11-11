@@ -11,7 +11,7 @@ import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { computeInDegree } from "../graph/relations.js";
+import { computeInDegree } from "../context/symbol-query.js";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 import { buildHolisticContext, cleanupStaleDismissals, generateConcerns } from "./concerns.js";
 import {
@@ -503,6 +503,7 @@ const RESERVED_HEALTH_JSON_FILES = new Set([
     "query.json",
     "review_packet.json",
     "review_packet_blind.json",
+    "merged_review.json",
 ]);
 
 function resolveBatchEntriesList(filesOrDir) {
@@ -517,6 +518,71 @@ function resolveBatchEntriesList(filesOrDir) {
                   (f) => /\.(?:raw\.txt|json)$/i.test(f) && !RESERVED_HEALTH_JSON_FILES.has(f.toLowerCase()),
               );
     return selected.sort().map((f) => join(filesOrDir, f));
+}
+
+function mergeBatchJudgmentAndContext(dimensionJudgment, contextUpdates, parsed) {
+    if (parsed.dimension_judgment && typeof parsed.dimension_judgment === "object") {
+        for (const [rawDim, jVal] of Object.entries(parsed.dimension_judgment)) {
+            const dim = normalizeDimensionKey(rawDim);
+            if (!dim || !jVal || typeof jVal !== "object") continue;
+            const prev = dimensionJudgment[dim];
+            if (!prev) {
+                dimensionJudgment[dim] = {
+                    ...jVal,
+                    ...(Array.isArray(jVal.strengths) ? { strengths: [...jVal.strengths] } : {}),
+                };
+            } else {
+                const prevChar = String(prev.dimension_character || "").trim();
+                const nextChar = String(jVal.dimension_character || "").trim();
+                const prevRat = String(prev.score_rationale || "").trim();
+                const nextRat = String(jVal.score_rationale || "").trim();
+                const strengths = [
+                    ...new Set([
+                        ...(Array.isArray(prev.strengths) ? prev.strengths : []),
+                        ...(Array.isArray(jVal.strengths) ? jVal.strengths : []),
+                    ]),
+                ];
+                dimensionJudgment[dim] = {
+                    ...prev,
+                    ...jVal,
+                    dimension_character:
+                        nextChar.length >= prevChar.length && nextChar
+                            ? jVal.dimension_character
+                            : prev.dimension_character || jVal.dimension_character,
+                    score_rationale:
+                        nextRat.length >= prevRat.length && nextRat
+                            ? jVal.score_rationale
+                            : prev.score_rationale || jVal.score_rationale,
+                    strengths,
+                };
+            }
+        }
+    }
+    if (parsed.context_updates && typeof parsed.context_updates === "object") {
+        for (const [rawDim, uVal] of Object.entries(parsed.context_updates)) {
+            const dim = normalizeDimensionKey(rawDim);
+            if (!dim || !uVal || typeof uVal !== "object") continue;
+            const prev = contextUpdates[dim];
+            if (!prev) {
+                contextUpdates[dim] = {
+                    ...uVal,
+                    ...(Array.isArray(uVal.add) ? { add: [...uVal.add] } : {}),
+                    ...(Array.isArray(uVal.remove) ? { remove: [...uVal.remove] } : {}),
+                    ...(Array.isArray(uVal.settle) ? { settle: [...uVal.settle] } : {}),
+                    ...(Array.isArray(uVal.unsettle) ? { unsettle: [...uVal.unsettle] } : {}),
+                };
+            } else {
+                for (const key of ["add", "remove", "settle", "unsettle"]) {
+                    if (Array.isArray(prev[key]) || Array.isArray(uVal[key])) {
+                        prev[key] = [
+                            ...(Array.isArray(prev[key]) ? prev[key] : []),
+                            ...(Array.isArray(uVal[key]) ? uVal[key] : []),
+                        ];
+                    }
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -565,22 +631,7 @@ export function mergeReviewBatches(arg1, arg2 = {}, arg3 = null, arg4 = null, ar
                 arr.push(num);
             }
         }
-        if (parsed.dimension_judgment && typeof parsed.dimension_judgment === "object") {
-            for (const [rawDim, jVal] of Object.entries(parsed.dimension_judgment)) {
-                const dim = normalizeDimensionKey(rawDim);
-                if (dim && jVal && typeof jVal === "object") {
-                    dimensionJudgment[dim] = jVal;
-                }
-            }
-        }
-        if (parsed.context_updates && typeof parsed.context_updates === "object") {
-            for (const [rawDim, uVal] of Object.entries(parsed.context_updates)) {
-                const dim = normalizeDimensionKey(rawDim);
-                if (dim && uVal && typeof uVal === "object") {
-                    contextUpdates[dim] = uVal;
-                }
-            }
-        }
+        mergeBatchJudgmentAndContext(dimensionJudgment, contextUpdates, parsed);
         const batchFindings = Array.isArray(parsed.findings)
             ? parsed.findings
             : Array.isArray(parsed.issues)
@@ -744,7 +795,10 @@ function validateReviewPayload(rawAssessments, rawFindings, dimensionJudgment, o
         findingsByDim.set(normDim, (findingsByDim.get(normDim) || 0) + 1);
     }
 
-    if (opts.strictGuard) {
+    const strictGuard =
+        opts.strictGuard !== undefined ? Boolean(opts.strictGuard) : !opts.manualOverride;
+
+    if (strictGuard) {
         for (const [dim, score] of Object.entries(normalizedAssessments)) {
             const hasFinding = (findingsByDim.get(dim) || 0) > 0;
             const hasJudgment = Boolean(
@@ -860,19 +914,8 @@ function applyImportedSubjectiveAssessments(state, normalizedAssessments, dimens
     return importedDims;
 }
 
-function verifyBlindPacketProvenance(contextDir, state, payload, opts) {
-    if (opts.allowPartial || opts.manualOverride) return null;
-    const qPath = contextDir ? queryFilePath(contextDir) : null;
-    const bPath = contextDir ? blindPacketFilePath(contextDir) : null;
-    const queryObj = qPath && existsSync(qPath) ? readJson(qPath) : null;
-    const sessId = payload.session_id || payload.session?.id || queryObj?.session_id;
-    const expectedSha =
-        queryObj?.packet_sha256 ||
-        (sessId && state?.review_sessions?.[sessId]?.packet_sha256) ||
-        null;
-
+function verifyPacketSha256(bPath, expectedSha, payload) {
     if (!expectedSha) return null;
-
     if (bPath) {
         if (!existsSync(bPath)) {
             return {
@@ -909,14 +952,64 @@ function verifyBlindPacketProvenance(contextDir, state, payload, opts) {
             ok: false,
             status: "error",
             reason: "tampered_packet",
-            errors: [
-                `Payload packet_sha256 mismatch (expected ${expectedSha}, got ${payloadSha}).`,
-            ],
+            errors: [`Payload packet_sha256 mismatch (expected ${expectedSha}, got ${payloadSha}).`],
             message:
                 "Review import aborted: payload packet_sha256 does not match query.packet_sha256.",
         };
     }
     return null;
+}
+
+function verifyBlindPacketProvenance(contextDir, state, payload, opts) {
+    if (opts.manualOverride) return null;
+    const qPath = contextDir ? queryFilePath(contextDir) : null;
+    const bPath = contextDir ? blindPacketFilePath(contextDir) : null;
+    const queryObj = qPath && existsSync(qPath) ? readJson(qPath) : null;
+    const explicitSessId = payload.session_id || payload.session?.id || null;
+    const querySessId = queryObj?.session_id || queryObj?.session?.id || null;
+    const sessId = explicitSessId || querySessId;
+    const sessions = state?.review_sessions;
+    const hasSessions = Boolean(sessions && Object.keys(sessions).length > 0);
+
+    if (hasSessions && (!sessId || !sessions[sessId])) {
+        return {
+            ok: false,
+            status: "error",
+            reason: "invalid_session",
+            errors: [
+                `Unknown review session "${sessId || ""}" — run \`plexer health review --prepare\` first.`,
+            ],
+            message: `Review import aborted: unknown review session "${sessId || ""}".`,
+        };
+    }
+
+    const sessEntry = sessId && sessions?.[sessId] ? sessions[sessId] : null;
+    if (sessEntry) {
+        if (sessEntry.used_at) {
+            return {
+                ok: false,
+                status: "error",
+                reason: "session_already_used",
+                errors: [
+                    `Review session "${sessId}" was already consumed at ${sessEntry.used_at}. Prepare a fresh session with \`plexer health review --prepare\`.`,
+                ],
+                message: `Review import aborted: session "${sessId}" has already been used.`,
+            };
+        }
+        const providedToken = payload.session?.token || payload.token;
+        if (sessEntry.token && providedToken !== sessEntry.token) {
+            return {
+                ok: false,
+                status: "error",
+                reason: "invalid_session_token",
+                errors: [`Session token mismatch for review session "${sessId}".`],
+                message: `Review import aborted: invalid session token for "${sessId}".`,
+            };
+        }
+    }
+
+    const expectedSha = queryObj?.packet_sha256 || sessEntry?.packet_sha256 || null;
+    return verifyPacketSha256(bPath, expectedSha, payload);
 }
 
 function normalizeImportReviewCallArgs(arg1, arg2, arg3, arg4, arg5) {
@@ -942,6 +1035,57 @@ function normalizeImportReviewCallArgs(arg1, arg2, arg3, arg4, arg5) {
         throw new Error("Invalid review import payload: expected JSON object");
     }
     return { state, config, payload, opts };
+}
+
+function resetTargetAnchoredAssessments(state, normalizedAssessments) {
+    const resetIso = new Date().toISOString();
+    if (!state.subjective_assessments || typeof state.subjective_assessments !== "object") {
+        state.subjective_assessments = {};
+    }
+    const dimsToReset = new Set(Object.keys(normalizedAssessments));
+    for (const dim of dimsToReset) {
+        const sDef = SUBJECTIVE_DIMENSIONS[dim];
+        if (sDef?.short_id && state.subjective_assessments[sDef.short_id]) {
+            delete state.subjective_assessments[sDef.short_id];
+        }
+        state.subjective_assessments[dim] = {
+            score: 0,
+            placeholder: true,
+            reset_by: "target_anchored_reset",
+            updated_at: resetIso,
+        };
+    }
+    return {
+        status: "target_anchored_reset",
+        errors: [
+            "Anti-gaming trigger: subjective scores anchored at target/>=95 with 0 findings. Targeted dimensions reset to 0.0 placeholder — re-run blind review against review_packet_blind.json.",
+        ],
+        message:
+            "Anti-gaming check triggered: suspicious target-anchored scores detected and reset to 0.0. Score from code evidence only.",
+    };
+}
+
+function checkTargetAnchoredImport(normalizedAssessments, validFindings, dimensionJudgment, config, opts) {
+    if (opts.manualOverride || validFindings.length > 0) return false;
+    const targetScore = Number(config?.target_strict_score ?? DEFAULT_TARGET_STRICT_SCORE);
+    const scoreValues = Object.values(normalizedAssessments).filter(Number.isFinite);
+    if (scoreValues.length === 0) return false;
+    const scoreMean = scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length;
+    if (scoreValues.length === 1) {
+        const singleDim = Object.keys(normalizedAssessments)[0];
+        const singleHasRationale = Boolean(
+            dimensionJudgment[singleDim]?.score_rationale ||
+                dimensionJudgment[SUBJECTIVE_DIMENSIONS[singleDim]?.short_id]?.score_rationale,
+        );
+        return (
+            Math.abs(scoreValues[0] - targetScore) <= 1.0 ||
+            (scoreValues[0] >= 95 && !singleHasRationale)
+        );
+    }
+    return (
+        scoreValues.every((v) => Math.abs(v - targetScore) <= 1.0 || v >= 95) ||
+        (scoreValues.length >= 4 && Math.abs(scoreMean - targetScore) <= 1.0)
+    );
 }
 
 /**
@@ -980,24 +1124,8 @@ export function importReview(arg1, arg2, arg3, arg4 = {}, arg5 = {}) {
         };
     }
 
-    const targetScore = Number(config?.target_strict_score ?? DEFAULT_TARGET_STRICT_SCORE);
-    const scoreValues = Object.values(normalizedAssessments).filter(Number.isFinite);
-    const isTargetAnchored =
-        !opts.manualOverride &&
-        scoreValues.length >= 4 &&
-        validFindings.length === 0 &&
-        scoreValues.every((v) => Math.abs(v - targetScore) < 0.2 || v === 100);
-
-    if (isTargetAnchored) {
-        state.subjective_assessments = {};
-        return {
-            status: "target_anchored_reset",
-            errors: [
-                "Anti-gaming trigger: all subjective scores matched target/100 with 0 findings. Subjective baseline reset to 0 — re-run blind review against review_packet_blind.json.",
-            ],
-            message:
-                "Anti-gaming check triggered: suspicious target-anchored scores detected and reset. Score from code evidence only.",
-        };
+    if (checkTargetAnchoredImport(normalizedAssessments, validFindings, dimensionJudgment, config, opts)) {
+        return resetTargetAnchoredAssessments(state, normalizedAssessments);
     }
 
     const nowIso = new Date().toISOString();
@@ -1022,6 +1150,17 @@ export function importReview(arg1, arg2, arg3, arg4 = {}, arg5 = {}) {
         dimensions_reviewed: [...importedDimSet],
         total_files: Number(opts.totalProdFiles || state.review_cache?.holistic?.total_files || 0),
     };
+
+    const qPath = contextDir ? queryFilePath(contextDir) : null;
+    const queryObj = qPath && existsSync(qPath) ? readJson(qPath) : null;
+    const usedSessId =
+        payload.session_id ||
+        payload.session?.id ||
+        queryObj?.session_id ||
+        queryObj?.session?.id;
+    if (usedSessId && state?.review_sessions?.[usedSessId]) {
+        state.review_sessions[usedSessId].used_at = nowIso;
+    }
 
     cleanupStaleDismissals(state);
 

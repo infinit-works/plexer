@@ -28,11 +28,13 @@ import { PLEXER_START, PLEXER_END, hasSection } from './sections.js';
 import { mcpTargets, stripTomlSection } from './mcp-config.js';
 import { hookTargets } from './codex-hooks.js';
 import { antigravitySkillTargets } from './antigravity.js';
-import { claudeGlobalTargets } from './claude-global.js';
+import { claudeGlobalTargets } from '../claude/init.js';
 import { claudeTargets } from '../claude/init.js';
 import { isPlexerAllowEntry, isPlexerFooterRegex, isPlexerStatusline } from '../claude/settings-merge.js';
-import { dirExists, isPlexerEntry, readJsonObject } from './config-write.js';
-import { resolveContextDir, resolveGitExcludePath } from '../util/state.js';
+import { isPlexerEntry, readJsonObject } from '../util/config-write.js';
+import { dirExists } from '../util/fs.js';
+import { contextDirFor } from '../util/paths.js';
+import { resolveGitExcludePath } from '../util/state.js';
 // ---------------------------------------------------------------------------
 // primitive operations
 // ---------------------------------------------------------------------------
@@ -473,7 +475,7 @@ function targets(repo, opts) {
     // 5. The graph cache and the ignore entries that admit it. Last, so a failure
     //    here can't strand the wiring half-retracted.
     if (opts.cache !== false) {
-        const cache = resolveContextDir(repo);
+        const cache = contextDirFor(repo);
         const gitignore = join(repo, '.gitignore');
         const gitExclude = resolveGitExcludePath(repo);
         const ignore = join(repo, '.ignore');

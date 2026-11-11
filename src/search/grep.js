@@ -9,12 +9,12 @@
  * human text and wires the CLI command; `mcp/tools.js` renders the same
  * shape for the `plexer_find_all` tool.
  */
-import { statSync } from "node:fs";
-import { join } from "node:path";
-import { isTestPath } from "../ask/ask.js";
-import { escapeRegExp, spanRange } from "../util/span.js";
-import { computeInDegree } from "../util/id.js";
-import { assertPrefixIndexed, normalizePathPrefix, pathUnderPrefix, pushMap } from "../util/paths.js";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { escapeRegExp, resolveSafeRepoFile, spanRange } from "../util/span.js";
+import { assertPrefixIndexed } from "../context/scopes.js";
+import { computeInDegree } from "../context/symbol-query.js";
+import { isTestPath, normalizePathPrefix, pathUnderPrefix, pushMap } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
 import { compileSafeUserRegex, findIgnoredMatchDirs } from "./user-regexp.js";
 const DEFAULT_MAX_HITS = 120;
@@ -79,15 +79,20 @@ function collectGrepFileMatches(fileNodes, repoRoot, textCache, isSimpleFixed, p
     const groups = new Map();
     let totalMatchedLines = 0;
     let truncatedFiles = 0;
+    const absRoot = resolve(repoRoot);
+    let realRoot = absRoot;
+    try {
+        realRoot = realpathSync(absRoot);
+    }
+    catch {
+        /* keep absRoot fallback */
+    }
     for (const file of fileNodes) {
-        const absPath = join(repoRoot, file.path);
-        let st = null;
-        try {
-            st = statSync(absPath);
-        }
-        catch {
-            st = null;
-        }
+        const safe = resolveSafeRepoFile(absRoot, realRoot, file.path);
+        if (!safe)
+            continue;
+        const absPath = safe.realFile;
+        const st = safe.stat;
         const cached = textCache.get(file.path);
         let text;
         if (cached !== undefined && st && st.mtimeMs === cached.mtimeMs && st.size === cached.size) {

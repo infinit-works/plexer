@@ -2,10 +2,12 @@
  * The on-disk format of the context directory (`plexer/`): linked markdown cards,
  * `.gitignore` / `.ignore` cache setup, and directory resolution.
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
-import { relPosix, stripTrailingSlashes } from "../util/paths.js";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { contextDirFor, relPosix, stripTrailingSlashes } from "../util/paths.js";
 import { appendGitignoreEntry, readJson } from "../util/state.js";
+
+export { contextDirFor };
 
 /** Gitignored cache dir (extractions, ask-index, fingerprint, config), never committed. */
 export const CACHE_DIR = ".cache";
@@ -35,14 +37,6 @@ export function envTruthy(name) {
     return v !== undefined && v !== "" && v !== "0" && v !== "false";
 }
 
-/** Absolute path of the `plexer/` directory for a repo root. */
-export function contextDirFor(root, override) {
-    const chosen = override || process.env.PLEXER_DIR?.trim();
-    if (chosen)
-        return isAbsolute(chosen) ? chosen : join(root, chosen);
-    return join(root, "plexer");
-}
-
 const GRAPH_CACHE_NOTE = "plexer's local graph cache — regenerable, not committed (run `plexer build`).";
 
 export function ensureGitignored(root, contextDir) {
@@ -67,6 +61,13 @@ export function ensureSearchable(root, contextDir) {
     const dir = stripTrailingSlashes(rel);
     const entry = `!${dir}/`;
     const path = join(root, ".ignore");
+    try {
+        if (existsSync(path) && lstatSync(path).isSymbolicLink())
+            return;
+    }
+    catch {
+        return;
+    }
     let current = "";
     try {
         current = readFileSync(path, "utf8");

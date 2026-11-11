@@ -136,7 +136,8 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
                 }),
             );
             assert.ok(Array.isArray(preOut2.injectSteps));
-            assert.ok(preOut2.injectSteps[0].ephemeralMessage.includes("blast radius for util.ts"));
+            const preMsg2 = preOut2.injectSteps[0].systemMessage?.systemMessage ?? preOut2.injectSteps[0].ephemeralMessage;
+            assert.ok(preMsg2.includes("blast radius for util.ts"));
 
             // 4. agy-stop returns decision: allow
             const stopOut = JSON.parse(

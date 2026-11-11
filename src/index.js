@@ -1,14 +1,17 @@
 import { resolve } from "node:path";
+import { loadGraphCached } from "./context/graph-store.js";
 import { contextDirFor } from "./context/node-file.js";
+import { resolveSymbol } from "./context/symbol-query.js";
 import { buildGraph } from "./graph/build.js";
 import { listSourceFiles } from "./graph/source-files.js";
 import { checkGraph, formatGraphCheckReport } from "./graph/check.js";
-import { loadGraphCached } from "./graph/load.js";
 import { ask, formatAsk, skeleton, formatSkeleton, readSpans, formatReadSpans } from "./ask/ask.js";
+import { isTestPath } from "./util/paths.js";
 import { grepGraph } from "./search/grep.js";
 import { formatGrepResult, runGrepCommand } from "./search/grep-cli.js";
-import { resolveSymbol, edgeWalk, parseWalkDepth } from "./graph/traverse.js";
+import { edgeWalk, parseWalkDepth } from "./graph/traverse.js";
 import { runCallersCommand } from "./graph/traverse-cli.js";
+import { linkTestsForGraph } from "./graph/test-links.js";
 import { buildRepoMap, formatRepoMap } from "./graph/map.js";
 import { blastRadius, blastRadiusIn } from "./blast/blast.js";
 import { analyzeGitHistory } from "./blast/history.js";
@@ -16,8 +19,44 @@ import { textReport, markdownReport, mermaidDiagram } from "./blast/render.js";
 import { startVizServer } from "./viz/serve.js";
 import { exportViz } from "./viz/export.js";
 import { startMcpServer } from "./mcp/server.js";
-import { health } from "./health/health.js";
+import { health, healthAsync } from "./health/health.js";
 import { formatHealthText, formatHealthMarkdown } from "./health/render.js";
+
+const TEST_LINK_CONFIDENCE = {
+    symbol_call: "high",
+    module_import: "medium",
+    stem_companion: "low",
+};
+
+function collectMatchTests(symbol, hits, direction, testLinks) {
+    const rawLinks = symbol.kind === "file"
+        ? testLinks.testsForFile(symbol.path)
+        : testLinks.testsForSymbol(symbol.id, symbol.path, true);
+    const seen = new Set();
+    const out = [];
+    for (const t of rawLinks) {
+        seen.add(t.testFile);
+        out.push({
+            path: t.testFile,
+            confidence: TEST_LINK_CONFIDENCE[t.kind] ?? "low",
+            reason: t.kind,
+        });
+    }
+    if (direction === "in") {
+        for (const h of hits) {
+            const p = h.node?.path;
+            if (p && isTestPath(p) && !seen.has(p)) {
+                seen.add(p);
+                out.push({
+                    path: p,
+                    confidence: h.depth === 1 ? "high" : "medium",
+                    reason: h.depth === 1 ? "symbol_call" : "transitive_call",
+                });
+            }
+        }
+    }
+    return out;
+}
 
 export class Plexer {
     cfg;
@@ -75,7 +114,13 @@ export class Plexer {
         if (Number.isNaN(depth))
             throw new RangeError("depth must be a positive integer or 'all'");
         const matches = resolveSymbol(graph, symbol, opts.in ? { in: opts.in } : {});
-        return matches.map((m) => ({ symbol: m, hits: edgeWalk(graph, m, direction, depth) }));
+        const testLinks = opts.includeTests ? linkTestsForGraph(graph) : null;
+        return matches.map((m) => {
+            const hits = edgeWalk(graph, m, direction, depth);
+            if (!testLinks)
+                return { symbol: m, hits };
+            return { symbol: m, hits, tests: collectMatchTests(m, hits, direction, testLinks) };
+        });
     }
     map(dir, opts = {}) {
         const { root, contextDir, graph } = this.#requireGraph(dir);
@@ -86,6 +131,9 @@ export class Plexer {
     }
     health(dir, opts = {}) {
         return health(dir, { ...opts, contextDir: this.cfg.contextDir });
+    }
+    healthAsync(dir, opts = {}) {
+        return healthAsync(dir, { ...opts, contextDir: this.cfg.contextDir });
     }
 }
 
@@ -117,6 +165,7 @@ export {
     exportViz,
     startMcpServer,
     health,
+    healthAsync,
     formatHealthText,
     formatHealthMarkdown,
 };

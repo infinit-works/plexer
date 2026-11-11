@@ -2,21 +2,22 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { buildGraph } from '../graph/build.js';
-import { readWiring, computeStats, patchStats, releaseLock, resolveContextDir } from '../util/state.js';
+import { contextDirFor } from '../util/paths.js';
+import { readWiring, computeStats, patchStats, releaseLock } from '../util/state.js';
 /** Structural `plexer build` ($0, offline). */
 async function realBuild(dir) {
     const testCli = process.env.PLEXER_TEST_CLI;
     if (testCli) {
         const args = [testCli, 'build', '.'];
         if (process.env.PLEXER_DIR)
-            args.push('--dir', resolveContextDir(dir));
+            args.push('--dir', contextDirFor(dir));
         execFileSync(process.execPath, args, { cwd: dir, stdio: 'ignore', timeout: 120000 });
         return;
     }
-    await buildGraph(dir, { contextDir: resolveContextDir(dir) });
+    await buildGraph(dir, { contextDir: contextDirFor(dir) });
 }
 export async function runSync(dir, build = realBuild) {
-    const ctxDir = resolveContextDir(dir);
+    const ctxDir = contextDirFor(dir);
     if (!existsSync(dir) || !existsSync(ctxDir))
         return;
     try {

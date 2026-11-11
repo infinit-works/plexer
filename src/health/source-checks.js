@@ -3,10 +3,17 @@
  * detectors for `plexer health`.
  */
 import { extname } from "node:path";
-import { WALK_RELATIONS } from "../graph/relations.js";
+import { WALK_RELATIONS } from "../context/symbol-query.js";
 import { spanRange } from "../util/span.js";
+import { DETECTOR_CATEGORY } from "./constants.js";
 import { mintIssueId } from "./state.js";
-import { SCORED_ZONES, hasInlineSuppression } from "./zones.js";
+import {
+    SCORED_ZONES,
+    hasInlineSuppression,
+    hasWordToken,
+    stepLuauBlockDepth,
+    stripCodeStringsAndComments,
+} from "./zones.js";
 
 const AI_PROSE_RE =
     /^\s*(?:\/\/|#|--)\s*(?:Here we|This function simply|Now we will|Note that we|As requested|TODO:\s*implement later|Step \d+:\s+(?:Initialize|Return|Check|Validate)|Helper function to|Function that)\b/i;
@@ -73,7 +80,7 @@ function checkStaleDeprecationsInFile(relPath, lines, fileSymbols, incomingByTar
                 issues.push({
                     id: mintIssueId("stale_deprecations", relPath, sym.name),
                     detector: "stale_deprecations",
-                    category: "types",
+                    category: DETECTOR_CATEGORY.stale_deprecations || "slop",
                     dimension: "code_quality",
                     tier: "T3",
                     confidence: "high",
@@ -136,8 +143,10 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
     }
 
     if (flags.allowTypes && (flags.isTs || flags.isLuau || flags.isPy)) {
-        const isTsBypass = flags.isTs && /\bas\s+any\b|:\s*any\b|@ts-ignore\b/.test(trimmed) && !trimmed.startsWith("//");
-        const isLuauBypass = flags.isLuau && /::\s*any\b|^--!nocheck\b/.test(trimmed);
+        const raw = lines[lineNum - 1] || trimmed;
+        const codeOnly = stripCodeStringsAndComments(raw, flags.isLuau, flags.isPy);
+        const isTsBypass = flags.isTs && (/\bas\s+any\b|:\s*any\b/.test(codeOnly) || /@ts-ignore\b/.test(trimmed));
+        const isLuauBypass = flags.isLuau && (/::\s*any\b/.test(codeOnly) || /^--!nocheck\b/.test(trimmed));
         const isPyBypass = flags.isPy && /#\s*type:\s*ignore\s*$/.test(trimmed);
         if ((isTsBypass || isLuauBypass || isPyBypass) && !hasInlineSuppression(lines, lineNum, "type_bypasses")) {
             issues.push({
@@ -160,60 +169,57 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
     }
 }
 
+function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues) {
+    const blockLines = [];
+    for (let k = i + 1; k < Math.min(lines.length, i + 6); k++) {
+        const bl = lines[k].trim();
+        if (bl.startsWith("}")) break;
+        if (bl && !bl.startsWith("//") && !bl.startsWith("/*") && !bl.startsWith("*")) {
+            blockLines.push(bl);
+        }
+    }
+    if (blockLines.length !== 1 || hasInlineSuppression(lines, lineNum, "silent_catches")) return;
+    if (/^console\.(?:error|warn|log)\(/.test(blockLines[0])) {
+        issues.push({
+            id: mintIssueId("silent_catches", relPath, `log_only_L${lineNum}`),
+            detector: "silent_catches",
+            category: "catches",
+            dimension: "code_quality",
+            tier: "T3",
+            confidence: "medium",
+            severity: "medium",
+            file: relPath,
+            line: lineNum,
+            end_line: lineNum + 2,
+            span: `L${lineNum}-L${lineNum + 2}`,
+            identifier: `log_only_catch_L${lineNum}`,
+            summary: `Log-only \`catch\` block at L${lineNum} logs the error and continues execution without rethrowing or returning a fallback.`,
+            suggestion: `Propagate the error, return an explicit error result, or document why continuing after failure is safe.`,
+        });
+    } else if (/^return\s+(?:\[\]|\{\}|null|undefined)\s*;?$/.test(blockLines[0])) {
+        issues.push({
+            id: mintIssueId("silent_catches", relPath, `empty_return_L${lineNum}`),
+            detector: "silent_catches",
+            category: "catches",
+            dimension: "code_quality",
+            tier: "T3",
+            confidence: "medium",
+            severity: "medium",
+            file: relPath,
+            line: lineNum,
+            end_line: lineNum + 2,
+            span: `L${lineNum}-L${lineNum + 2}`,
+            identifier: `catch_return_empty_L${lineNum}`,
+            summary: `Broad \`catch\` block at L${lineNum} masks exceptions as \`${blockLines[0]}\`.`,
+            suggestion: `Narrow the caught error type or surface the failure explicitly to callers.`,
+        });
+    }
+}
+
 function checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flags, issues) {
     if (!flags.allowCatches) return;
     if (flags.isJsTs && /\bcatch\s*(?:\([^)]*\))?\s*\{/.test(trimmed)) {
-        const blockLines = [];
-        for (let k = i + 1; k < Math.min(lines.length, i + 6); k++) {
-            const bl = lines[k].trim();
-            if (bl.startsWith("}")) break;
-            if (bl && !bl.startsWith("//") && !bl.startsWith("/*") && !bl.startsWith("*")) {
-                blockLines.push(bl);
-            }
-        }
-        if (
-            blockLines.length === 1 &&
-            /^console\.(?:error|warn|log)\(/.test(blockLines[0]) &&
-            !hasInlineSuppression(lines, lineNum, "silent_catches")
-        ) {
-            issues.push({
-                id: mintIssueId("silent_catches", relPath, `log_only_L${lineNum}`),
-                detector: "silent_catches",
-                category: "catches",
-                dimension: "code_quality",
-                tier: "T3",
-                confidence: "medium",
-                severity: "medium",
-                file: relPath,
-                line: lineNum,
-                end_line: lineNum + 2,
-                span: `L${lineNum}-L${lineNum + 2}`,
-                identifier: `log_only_catch_L${lineNum}`,
-                summary: `Log-only \`catch\` block at L${lineNum} logs the error and continues execution without rethrowing or returning a fallback.`,
-                suggestion: `Propagate the error, return an explicit error result, or document why continuing after failure is safe.`,
-            });
-        } else if (
-            blockLines.length === 1 &&
-            /^return\s+(?:\[\]|\{\}|null|undefined)\s*;?$/.test(blockLines[0]) &&
-            !hasInlineSuppression(lines, lineNum, "silent_catches")
-        ) {
-            issues.push({
-                id: mintIssueId("silent_catches", relPath, `empty_return_L${lineNum}`),
-                detector: "silent_catches",
-                category: "catches",
-                dimension: "code_quality",
-                tier: "T3",
-                confidence: "medium",
-                severity: "medium",
-                file: relPath,
-                line: lineNum,
-                end_line: lineNum + 2,
-                span: `L${lineNum}-L${lineNum + 2}`,
-                identifier: `catch_return_empty_L${lineNum}`,
-                summary: `Broad \`catch\` block at L${lineNum} masks exceptions as \`${blockLines[0]}\`.`,
-                suggestion: `Narrow the caught error type or surface the failure explicitly to callers.`,
-            });
-        }
+        checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues);
     } else if (flags.isPy && /^except(?:\s+Exception|\s*:)/.test(trimmed)) {
         const nextLine = (lines[i + 1] || "").trim();
         const afterNext = (lines[i + 2] || "").trim();
@@ -241,7 +247,12 @@ function checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flag
                 suggestion: `Catch only specific expected exception types or re-raise unexpected errors.`,
             });
         }
-    } else if (flags.isLuau && /^\s*pcall\s*\(/.test(raw) && !hasInlineSuppression(lines, lineNum, "silent_catches")) {
+    } else if (
+        flags.isLuau &&
+        /^\s*pcall\s*\(/.test(raw) &&
+        !isLuauContinuationLine(lines, i) &&
+        !hasInlineSuppression(lines, lineNum, "silent_catches")
+    ) {
         issues.push({
             id: mintIssueId("silent_catches", relPath, `luau_pcall_L${lineNum}`),
             detector: "silent_catches",
@@ -261,38 +272,68 @@ function checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flag
     }
 }
 
+const CLIENT_SERVER_SERVICE_ACCESS_RE =
+    /\bgame\s*(?::\s*(?:GetService|FindService)\s*\(\s*["'](ServerScriptService|ServerStorage|DataStoreService|MemoryStoreService|MessagingService)["']\s*\)|\.\s*(ServerScriptService|ServerStorage|DataStoreService|MemoryStoreService|MessagingService)\b(?!\s*=))/;
+
+const CLIENT_SERVER_API_ACCESS_RE =
+    /\b(?:(HttpService\s*:\s*(?:GetAsync|PostAsync|RequestAsync))|(TeleportService\s*:\s*ReserveServer)|(InsertService\s*:\s*LoadAsset)|(BadgeService\s*:\s*AwardBadge))\s*\(|\b(MarketplaceService\.ProcessReceipt)\s*=/;
+
+function isLuauContinuationLine(lines, idx) {
+    for (let k = idx - 1; k >= 0 && k >= idx - 4; k--) {
+        const prevCode = stripCodeStringsAndComments(lines[k] || "", true, false).trim();
+        if (!prevCode) continue;
+        return /(?:[=,{(\[+\-*/%^#]|(?:\.\.)|\b(?:return|and|or|not|in)\b)\s*$/.test(prevCode);
+    }
+    return false;
+}
+
 function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
     if (
         isClientRobloxPath(relPath) &&
-        /\b(?:ServerScriptService|ServerStorage)\b/.test(trimmed) &&
         !trimmed.startsWith("--") &&
         !hasInlineSuppression(lines, lineNum, "roblox_security")
     ) {
-        issues.push({
-            id: mintIssueId("roblox_security", relPath, `client_server_L${lineNum}`),
-            detector: "roblox_security",
-            category: "security",
-            dimension: "security",
-            tier: "T2",
-            confidence: "high",
-            severity: "high",
-            file: relPath,
-            line: lineNum,
-            end_line: lineNum,
-            span: `L${lineNum}-L${lineNum}`,
-            identifier: `client_server_boundary_L${lineNum}`,
-            summary: `Client script/module \`${relPath}\` references server-only container (\`ServerScriptService\` / \`ServerStorage\`) on L${lineNum}.`,
-            suggestion: `Move shared types/constants to \`ReplicatedStorage\` and keep server logic inside \`ServerScriptService\`.`,
-        });
+        const rawLine = lines[i] || trimmed;
+        const noComment = rawLine.replace(/--.*$/, "");
+        const codeOnly = stripCodeStringsAndComments(rawLine, true, false);
+        const svcMatch = /\bgame\b/.test(codeOnly) ? CLIENT_SERVER_SERVICE_ACCESS_RE.exec(noComment) : null;
+        const apiMatch = !svcMatch ? CLIENT_SERVER_API_ACCESS_RE.exec(codeOnly) : null;
+        if (svcMatch || apiMatch) {
+            const targetLabel = svcMatch
+                ? svcMatch[1] || svcMatch[2]
+                : (apiMatch[1] || apiMatch[2] || apiMatch[3] || apiMatch[4] || apiMatch[5] || "server API").replace(
+                      /\s+/g,
+                      "",
+                  );
+            issues.push({
+                id: mintIssueId("roblox_security", relPath, `client_server_L${lineNum}`),
+                detector: "roblox_security",
+                category: "security",
+                dimension: "security",
+                tier: "T2",
+                confidence: "high",
+                severity: "high",
+                file: relPath,
+                line: lineNum,
+                end_line: lineNum,
+                span: `L${lineNum}-L${lineNum}`,
+                identifier: `client_server_boundary_L${lineNum}`,
+                summary: `Client script/module \`${relPath}\` accesses server-only Roblox service/API (\`${targetLabel}\`) on L${lineNum}.`,
+                suggestion: `Keep \`${targetLabel}\` logic inside \`ServerScriptService\` and communicate from the client via validated \`RemoteEvent\` / \`RemoteFunction\` calls.`,
+            });
+        }
     }
 
     const remoteMatch =
-        /\.(?:OnServerEvent:Connect|OnServerInvoke\s*=)\s*\(?\s*function\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*([^)]+)\)/.exec(
+        /\.(?:OnServerEvent:Connect|OnServerInvoke\s*=)\s*\(?\s*function\s*\(\s*[A-Za-z_][A-Za-z0-9_]*(?:\s*:\s*[^,)]+)?\s*,\s*([^)]+)\)/.exec(
             trimmed,
         );
     if (remoteMatch && !hasInlineSuppression(lines, lineNum, "roblox_security")) {
-        const bodyWindow = lines.slice(i + 1, Math.min(lines.length, i + 10)).join("\n");
-        if (!/\b(?:typeof|type|assert| Validate|check|schema)\b/i.test(bodyWindow)) {
+        const bodyWindow = lines
+            .slice(i + 1, Math.min(lines.length, i + 10))
+            .map((l) => stripCodeStringsAndComments(l, true, false))
+            .join("\n");
+        if (!/\b(?:typeof|type|assert|validate|check|schema)\b/i.test(bodyWindow)) {
             issues.push({
                 id: mintIssueId("roblox_security", relPath, `unvalidated_remote_L${lineNum}`),
                 detector: "roblox_security",
@@ -320,7 +361,8 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
     }
 
     if (flags.allowTraps && !trimmed.startsWith("--")) {
-        const schedMatch = /(?:^|[^.\w:])(wait|spawn|delay)\s*\(/.exec(trimmed);
+        const codeOnly = stripCodeStringsAndComments(lines[i] || trimmed, true, false).trim();
+        const schedMatch = /(?:^|[^.\w:])(wait|spawn|delay)\s*\(/.exec(codeOnly);
         if (schedMatch && !hasInlineSuppression(lines, lineNum, "luau_quality")) {
             const fnName = schedMatch[1];
             issues.push({
@@ -362,7 +404,11 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
                 suggestion: `Call \`Instance.new(className)\` with 1 argument, assign all properties first, and set \`.Parent\` last.`,
             });
         }
-        if (/^[A-Za-z0-9_.:[\]]+:Connect\s*\(/.test(trimmed) && !hasInlineSuppression(lines, lineNum, "luau_quality")) {
+        if (
+            /^[A-Za-z0-9_.:[\]]+:Connect\s*\(/.test(codeOnly) &&
+            !isLuauContinuationLine(lines, i) &&
+            !hasInlineSuppression(lines, lineNum, "luau_quality")
+        ) {
             issues.push({
                 id: mintIssueId("luau_quality", relPath, `untracked_connect_L${lineNum}`),
                 detector: "luau_quality",
@@ -594,11 +640,16 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
         return;
     }
 
+    const raw = lines[lineNum - 1] || trimmed;
+    const codeOnly = stripCodeStringsAndComments(raw, flags.isLuau, flags.isPy);
+
     checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues);
 
     if (
-        /\b(?:Math\.random|random\.random|random\.randint|math\.random)\s*\(/.test(trimmed) &&
-        /\b(?:token|secret|nonce|password|salt|auth|session_?id|api_?key|csrf)\b/i.test(trimmed) &&
+        /\b(?:Math\.random|random\.random|random\.randint|math\.random)\s*\(/.test(codeOnly) &&
+        /\b(?:token|secret|nonce|password|salt|auth|session_?id|api_?key|csrf|[A-Za-z0-9_]*(?:token|secret|nonce|password|salt|csrf))\b/i.test(
+            codeOnly,
+        ) &&
         !hasInlineSuppression(lines, lineNum, "security_traps")
     ) {
         issues.push({
@@ -644,10 +695,10 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
 
     if (
         /\b(?:console\.(?:log|info|debug|warn|error)|logger\.(?:info|debug|warning|error)|logging\.(?:info|debug|warning|error)|print)\s*\(/.test(
-            trimmed,
+            codeOnly,
         ) &&
-        /\b[A-Za-z0-9_]*(?:password|passwd|secret_?access_?key|secret_?key|client_?secret|api_?key|access_?token|private_?key|bearer_?token)\b/i.test(
-            trimmed,
+        /\b[A-Za-z0-9_]*(?:password|passwd|secret_?access_?key|secret_?key|client_?secret|api_?key|access_?token|auth_?token|private_?key|bearer_?token|secret|bearer)\b/i.test(
+            codeOnly,
         ) &&
         !trimmed.includes("REDACTED") &&
         !trimmed.includes("***") &&
@@ -672,19 +723,71 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
     }
 }
 
+function checkPyMutableLruCacheTraps(relPath, lines, fileSymbols, issues) {
+    const mutableGlobals = new Set();
+    for (const rawLine of lines) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:\{|\[|dict\(|list\(|set\()/.exec(rawLine);
+        if (m) {
+            const varName = m[1];
+            if (!/^[A-Z0-9_]+$/.test(varName) || /(?:STATE|CACHE|STORE|REGISTRY|MUT|MAP|TABLE)/i.test(varName)) {
+                mutableGlobals.add(varName);
+            }
+        }
+    }
+    if (mutableGlobals.size === 0) return;
+    for (const sym of fileSymbols) {
+        if (sym.kind !== "function") continue;
+        const range = spanRange(sym.span);
+        if (!range) continue;
+        const decoWindow = lines.slice(Math.max(0, range.start - 4), range.start + 1).join("\n");
+        if (!/@(?:functools\.)?(?:lru_cache|cache)\b/.test(decoWindow)) continue;
+        const bodyText = lines.slice(range.start, range.end).join("\n");
+        for (const gName of mutableGlobals) {
+            if (new RegExp(`\\b${gName}\\b`).test(bodyText)) {
+                issues.push({
+                    id: mintIssueId("language_traps", relPath, `lru_cache_global_${sym.name}`),
+                    detector: "language_traps",
+                    category: "traps",
+                    dimension: "code_quality",
+                    tier: "T3",
+                    confidence: "high",
+                    severity: "high",
+                    file: relPath,
+                    line: range.start,
+                    end_line: range.end,
+                    span: sym.span,
+                    identifier: sym.name,
+                    summary: `\`@lru_cache\` function \`${sym.name}\` reads mutable module-level container \`${gName}\`, serving stale cached outputs when \`${gName}\` mutates.`,
+                    suggestion: `Pass state explicitly into \`${sym.name}\`, invalidate the cache on mutation, or remove \`@lru_cache\`.`,
+                });
+                break;
+            }
+        }
+    }
+}
+
 function checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTracker, issues) {
     if (flags.isLuau && flags.allowTraps) {
+        const seenGetServiceLines = new Set();
         for (const sym of fileSymbols) {
+            if (sym.aliasOf) continue;
             if (sym.kind !== "function" && sym.kind !== "method") continue;
             const range = spanRange(sym.span);
             if (!range) continue;
+            const startLineTrim = (lines[range.start - 1] || "").trim();
+            if (/^return\s+function\b/.test(startLineTrim)) continue;
             for (let ln = range.start; ln <= range.end && ln <= lines.length; ln++) {
+                if (seenGetServiceLines.has(ln)) continue;
                 const text = lines[ln - 1] || "";
+                const codeText = stripCodeStringsAndComments(text, true, false);
+                const prevCode = ln >= 2 ? stripCodeStringsAndComments(lines[ln - 2] || "", true, false) : "";
                 if (
-                    /\bgame:GetService\s*\(/.test(text) &&
-                    !text.trim().startsWith("--") &&
+                    /\bgame:GetService\s*\(/.test(codeText) &&
+                    !/\bpcall\s*\(/.test(codeText) &&
+                    !/\bpcall\s*\(/.test(prevCode) &&
                     !hasInlineSuppression(lines, ln, "luau_quality")
                 ) {
+                    seenGetServiceLines.add(ln);
                     issues.push({
                         id: mintIssueId("luau_quality", relPath, `service_in_fn_${sym.name}_L${ln}`),
                         detector: "luau_quality",
@@ -707,47 +810,7 @@ function checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTrac
     }
 
     if (flags.isPy && flags.allowTraps) {
-        const mutableGlobals = new Set();
-        for (const rawLine of lines) {
-            const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:\{|\[|dict\(|list\(|set\()/.exec(rawLine);
-            if (m) {
-                const varName = m[1];
-                if (!varName.isupper?.() || /(?:STATE|CACHE|STORE|REGISTRY|MUT|MAP|TABLE)/i.test(varName)) {
-                    mutableGlobals.add(varName);
-                }
-            }
-        }
-        if (mutableGlobals.size > 0) {
-            for (const sym of fileSymbols) {
-                if (sym.kind !== "function") continue;
-                const range = spanRange(sym.span);
-                if (!range) continue;
-                const decoWindow = lines.slice(Math.max(0, range.start - 4), range.start + 1).join("\n");
-                if (!/@(?:functools\.)?(?:lru_cache|cache)\b/.test(decoWindow)) continue;
-                const bodyText = lines.slice(range.start, range.end).join("\n");
-                for (const gName of mutableGlobals) {
-                    if (new RegExp(`\\b${gName}\\b`).test(bodyText)) {
-                        issues.push({
-                            id: mintIssueId("language_traps", relPath, `lru_cache_global_${sym.name}`),
-                            detector: "language_traps",
-                            category: "traps",
-                            dimension: "code_quality",
-                            tier: "T3",
-                            confidence: "high",
-                            severity: "high",
-                            file: relPath,
-                            line: range.start,
-                            end_line: range.end,
-                            span: sym.span,
-                            identifier: sym.name,
-                            summary: `\`@lru_cache\` function \`${sym.name}\` reads mutable module-level container \`${gName}\`, serving stale cached outputs when \`${gName}\` mutates.`,
-                            suggestion: `Pass state explicitly into \`${sym.name}\`, invalidate the cache on mutation, or remove \`@lru_cache\`.`,
-                        });
-                        break;
-                    }
-                }
-            }
-        }
+        checkPyMutableLruCacheTraps(relPath, lines, fileSymbols, issues);
     }
 
     if (flags.isReact && stateTracker.booleanStateCount >= 5 && flags.wantTraps) {
@@ -771,6 +834,17 @@ function checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTrac
     }
 }
 
+function countNetBracketDelta(line) {
+    const code = line.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, '""');
+    let delta = 0;
+    for (let i = 0; i < code.length; i++) {
+        const c = code[i];
+        if (c === "(" || c === "[" || c === "{") delta += 1;
+        else if (c === ")" || c === "]" || c === "}") delta -= 1;
+    }
+    return delta;
+}
+
 function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues) {
     for (let idx = 1; idx < fnLines.length - 1; idx++) {
         const rawLine = fnLines[idx];
@@ -785,13 +859,27 @@ function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues)
         if (!isTerminator) continue;
 
         const termIndent = rawLine.match(/^\s*/)[0].length;
+        let bracketDepth = Math.max(0, countNetBracketDelta(tLine));
+        let prevTrim = tLine;
         let nextIdx = idx + 1;
+
         while (nextIdx < fnLines.length) {
             const nl = fnLines[nextIdx].trim();
-            if (nl && !nl.startsWith("//") && !nl.startsWith("#") && !nl.startsWith("--") && !nl.startsWith("/*") && !nl.startsWith("*")) {
-                break;
+            if (!nl || nl.startsWith("//") || nl.startsWith("#") || nl.startsWith("--") || nl.startsWith("/*") || nl.startsWith("*")) {
+                nextIdx += 1;
+                continue;
             }
-            nextIdx += 1;
+            const prevContinues =
+                bracketDepth > 0 ||
+                /[+,\-*/|&?:=({\[\\]$|\.\.$|\b(?:and|or)\s*$/.test(prevTrim);
+            const curContinues = /^(?:\.|\?|:|&&|\|\||[)\]}])/.test(nl);
+            if (prevContinues || curContinues) {
+                bracketDepth = Math.max(0, bracketDepth + countNetBracketDelta(nl));
+                prevTrim = nl;
+                nextIdx += 1;
+                continue;
+            }
+            break;
         }
         if (nextIdx >= fnLines.length) break;
         const nextRaw = fnLines[nextIdx];
@@ -866,6 +954,25 @@ function collectTrackedDictKeys(range, fnLines) {
             const td = ensureTracked(gm[1]);
             if (!td.reads.has(gm[2])) td.reads.set(gm[2], ln);
         }
+
+        const dotReadRe = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*(?:=[^=]|\())/g;
+        let dm;
+        while ((dm = dotReadRe.exec(t)) !== null) {
+            if (tracked.has(dm[1])) {
+                const td = ensureTracked(dm[1]);
+                if (!td.reads.has(dm[2])) td.reads.set(dm[2], ln);
+            }
+        }
+
+        const destructMatch = /^(?:const|let|var|local)\s*\{([^}]+)\}\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\b/.exec(t);
+        if (destructMatch && tracked.has(destructMatch[2])) {
+            const td = ensureTracked(destructMatch[2]);
+            for (const rawKey of destructMatch[1].split(",")) {
+                const key = rawKey.split(":")[0].split("=")[0].trim();
+                if (key && !td.reads.has(key)) td.reads.set(key, ln);
+            }
+        }
+
         const inRe = /["']([A-Za-z0-9_.-]+)["']\s+(?:not\s+)?in\s+([A-Za-z_][A-Za-z0-9_]*)\b/g;
         let im;
         while ((im = inRe.exec(t)) !== null) {
@@ -884,7 +991,7 @@ function checkDictKeysInFunction(relPath, lines, sym, range, fnLines, potentials
     for (const [varName, td] of tracked.entries()) {
         if (!td.initLocal || td.writes.size < 2 || td.reads.size < 1) continue;
         const escapedRe = new RegExp(
-            `(?:\\breturn\\b[^;\\n]*\\b${varName}\\b|[A-Za-z0-9_.:]+\\s*\\([^)]*\\b${varName}\\b(?![\\s\\S]*\\[)|\\.\\.\\.${varName}\\b|\\bfor\\b[^\\n]*\\b${varName}\\b)`,
+            `(?:\\breturn\\b[^;\\n]*\\b${varName}\\b(?!\\s*[\\[.])|[A-Za-z0-9_.:]+\\s*\\([^)\\n]*\\b${varName}\\b(?!\\s*[\\[.])|\\.\\.\\.${varName}\\b|\\bfor\\b[^\\n]*\\b${varName}\\b|[=:,\\[]\\s*\\b${varName}\\b(?!\\s*[\\[.])|\\{\\s*\\b${varName}\\b\\s*[,}])`,
         );
         const escapes = escapedRe.test(fullFnText);
 
@@ -1006,13 +1113,12 @@ function checkReactiveSmellsInFile(relPath, lines, flags, potentials, issues) {
 
             if (inComputedStart === 0 && /\b(?:Flux\.)?computed\s*\(\s*function\b/.test(trimmed)) {
                 inComputedStart = lineNum;
-                depth = 1;
+                depth = stepLuauBlockDepth(0, trimmed);
+                if (depth === 0) depth = 1;
                 continue;
             }
             if (inComputedStart > 0) {
-                const opens = (trimmed.match(/\b(?:function|then|do|repeat)\b/g) || []).length;
-                const closes = (trimmed.match(/\b(?:end|until)\b/g) || []).length;
-                depth += opens - closes;
+                depth = stepLuauBlockDepth(depth, trimmed);
                 if (
                     /\b(?::set\s*\(|Instance\.new\s*\(|:Connect\s*\()/.test(trimmed) &&
                     !hasInlineSuppression(lines, lineNum, "reactive_smells")
@@ -1093,8 +1199,13 @@ function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarge
         allowSecurity: enabled.wantSecurity && !ignoreRules.isIgnored(relPath, "security"),
     };
 
-    if (flags.allowTypes) {
+    if (
+        flags.allowSlop &&
+        !ignoreRules.isIgnored(relPath, "stale_deprecations")
+    ) {
         checkStaleDeprecationsInFile(relPath, lines, fileSymbols, incomingByTarget, potentials, issues);
+    }
+    if (flags.allowTypes) {
         if (flags.isTs || flags.isLuau || flags.isPy) potentials.type_bypasses += 1;
     }
     if (flags.allowSlop) {
@@ -1106,10 +1217,8 @@ function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarge
         if (flags.allowSecurity) potentials.roblox_security += 1;
         if (flags.allowTraps) potentials.luau_quality += 1;
     }
-    if ((flags.wantTraps || flags.wantSecurity) && !ignoreRules.isIgnored(relPath, "traps")) {
-        potentials.language_traps += 1;
-        if (flags.wantSecurity) potentials.security_traps += 1;
-    }
+    if (flags.allowTraps) potentials.language_traps += 1;
+    if (flags.allowSecurity && !ignoreRules.isIgnored(relPath, "traps")) potentials.security_traps += 1;
 
     const stateTracker = { booleanStateCount: 0, firstBooleanStateLine: 1 };
     for (let i = 0; i < lines.length; i++) {
@@ -1130,6 +1239,247 @@ function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarge
     checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTracker, issues);
     checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags, potentials, issues);
     checkReactiveSmellsInFile(relPath, lines, flags, potentials, issues);
+}
+
+const ENUM_BYPASS_EXCLUDED_LITERALS = new Set([
+    "string",
+    "number",
+    "boolean",
+    "object",
+    "function",
+    "undefined",
+    "symbol",
+    "bigint",
+    "table",
+    "thread",
+    "userdata",
+    "nil",
+    "none",
+    "null",
+    "true",
+    "false",
+    "file",
+    "method",
+    "class",
+    "struct",
+    "interface",
+    "module",
+    "type",
+    "protocol",
+    "production",
+    "test",
+    "vendor",
+    "generated",
+    "config",
+    "script",
+    "open",
+    "fixed",
+    "wontfix",
+    "deferred",
+    "false_positive",
+    "auto_resolved",
+    "high",
+    "medium",
+    "low",
+    "critical",
+    "json",
+    "text",
+    "yaml",
+    "yml",
+    "markdown",
+    "md",
+    "utf8",
+    "utf-8",
+    "sha1",
+    "sha256",
+    "md5",
+    "hex",
+    "error",
+    "ok",
+    "status",
+    "scan",
+    "next",
+    "plan",
+    "review",
+    "show",
+    "tree",
+    "viz",
+    "list",
+    "add",
+    "remove",
+    "update",
+    "delete",
+    "create",
+    "merge",
+    "export",
+    "import",
+    "reset",
+    "top",
+    "bottom",
+    "up",
+    "down",
+    "before",
+    "after",
+    "item",
+    "detector",
+    "all",
+]);
+
+const ENUM_BYPASS_GENERIC_PROP_NAMES = new Set([
+    "ext",
+    "kind",
+    "status",
+    "action",
+    "sub",
+    "subAction",
+    "fmt",
+    "format",
+    "zone",
+    "stage",
+    "stg",
+    "pos",
+    "mode",
+    "groupMode",
+    "fixerName",
+    "relation",
+    "category",
+    "dimension",
+    "tier",
+    "severity",
+    "confidence",
+    "detector",
+    "type",
+    "key",
+    "text",
+    "code",
+    "name",
+    "id",
+    "tag",
+    "role",
+    "level",
+    "lang",
+    "language",
+    "event",
+    "method",
+    "protocol",
+    "target",
+    "source",
+    "view",
+    "pool",
+    "theme",
+    "tab",
+    "scope",
+    "host",
+]);
+
+function isExcludedEnumComparison(propName, lit) {
+    if (!propName || propName.length < 3) return true;
+    if (ENUM_BYPASS_EXCLUDED_LITERALS.has(lit) || ENUM_BYPASS_EXCLUDED_LITERALS.has(lit.toLowerCase())) {
+        return true;
+    }
+    if (/^E[A-Z0-9]{3,14}$/.test(lit)) return true;
+    const isUpperEnumLiteral = /^[A-Z][A-Z0-9]*_[A-Z0-9_]+$/.test(lit);
+    return !isUpperEnumLiteral && ENUM_BYPASS_GENERIC_PROP_NAMES.has(propName);
+}
+
+function matchesSourceFileFilter(fileFilter, relPath) {
+    if (!fileFilter) return true;
+    if (typeof fileFilter === "function") return Boolean(fileFilter(relPath));
+    if (fileFilter instanceof Set) return fileFilter.has(relPath);
+    if (Array.isArray(fileFilter)) return fileFilter.includes(relPath);
+    return true;
+}
+
+/**
+ * Two-pass detector for scattered magic string-enum comparisons (`enum_bypasses`).
+ * Flags discriminator variables compared against >= 2 distinct string literals across >= 3 files
+ * without a centralized enum/constant table.
+ */
+function checkEnumBypassIssues(scoredFiles, readLines, ignoreRules, potentials, issues) {
+    potentials.enum_bypasses = Math.max(1, scoredFiles.length);
+    const varLiteralMap = new Map();
+
+    for (const relPath of scoredFiles) {
+        if (ignoreRules.isIgnored(relPath, "types") || ignoreRules.isIgnored(relPath, "enum_bypasses")) {
+            continue;
+        }
+        const lines = readLines(relPath) || [];
+        const ext = extname(relPath).toLowerCase();
+        const isLuau = ext === ".luau" || ext === ".lua";
+        const isPy = ext === ".py";
+
+        for (let i = 0; i < lines.length; i++) {
+            const raw = lines[i];
+            const trimmed = raw.trim();
+            if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("--")) {
+                continue;
+            }
+            if (/^(?:type|export\s+type|interface|enum)\b/.test(trimmed)) continue;
+            if (/\btypeof\s*\(/.test(trimmed) || /\btype\s*\(/.test(trimmed)) continue;
+            if (hasInlineSuppression(lines, i + 1, "enum_bypasses")) continue;
+
+            const uncommented = isLuau
+                ? trimmed.replace(/--.*$/, "")
+                : isPy
+                  ? trimmed.replace(/#.*$/, "")
+                  : trimmed.replace(/\/\/.*$/, "");
+            const codeOnly = stripCodeStringsAndComments(raw, isLuau, isPy);
+            if (!/(?:===|!==|==|~=|!=)\s*(?:""|'')/.test(codeOnly)) continue;
+
+            const cmpRe =
+                /\b([A-Za-z_][A-Za-z0-9_.]*)\s*(?:===|!==|==|~=|!=)\s*["']([A-Za-z][A-Za-z0-9_-]{2,28})["']/g;
+            let m;
+            while ((m = cmpRe.exec(uncommented)) !== null) {
+                const rawLhs = m[1];
+                const lit = m[2];
+                const propName = rawLhs.includes(".") ? rawLhs.split(".").pop() : rawLhs;
+                if (isExcludedEnumComparison(propName, lit)) continue;
+                if (!hasWordToken(codeOnly, propName)) continue;
+
+                let entry = varLiteralMap.get(propName);
+                if (!entry) {
+                    entry = { files: new Set(), literals: new Set(), sites: [] };
+                    varLiteralMap.set(propName, entry);
+                }
+                entry.files.add(relPath);
+                entry.literals.add(lit);
+                if (entry.sites.length < 8) {
+                    entry.sites.push({ file: relPath, line: i + 1, literal: lit });
+                }
+            }
+        }
+    }
+
+    for (const [propName, entry] of varLiteralMap.entries()) {
+        if (entry.files.size < 3 || entry.literals.size < 2) continue;
+        const primary = entry.sites[0];
+        const primaryLines = readLines(primary.file) || [];
+        if (hasInlineSuppression(primaryLines, primary.line, "enum_bypasses")) continue;
+        const litPreview = [...entry.literals].slice(0, 5).map((l) => `"${l}"`).join(", ");
+        const filePreview = [...entry.files].slice(0, 4).join(", ");
+
+        issues.push({
+            id: mintIssueId("enum_bypasses", primary.file, `${propName}_string_enum`),
+            detector: "enum_bypasses",
+            category: "types",
+            dimension: "code_quality",
+            tier: "T3",
+            confidence: "medium",
+            severity: entry.files.size >= 5 ? "medium" : "low",
+            file: primary.file,
+            line: primary.line,
+            end_line: primary.line,
+            span: `L${primary.line}-L${primary.line}`,
+            identifier: propName,
+            detail: {
+                discriminator: propName,
+                literals: [...entry.literals],
+                files: [...entry.files],
+            },
+            summary: `Unconsolidated string-enum comparisons on \`${propName}\` (${litPreview}) scattered across ${entry.files.size} files (${filePreview}).`,
+            suggestion: `Define a shared constant/enum object or narrow helper for \`${propName}\` values (${litPreview}) instead of repeating raw string literals across files.`,
+        });
+    }
 }
 
 /**
@@ -1159,16 +1509,7 @@ export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledC
         wantSlop: enabledCategories.has("slop"),
         wantSecurity: enabledCategories.has("security"),
     };
-
-    if (
-        !enabled.wantCatches &&
-        !enabled.wantTypes &&
-        !enabled.wantTraps &&
-        !enabled.wantSlop &&
-        !enabled.wantSecurity
-    ) {
-        return { issues, potentials };
-    }
+    if (!Object.values(enabled).some(Boolean)) return { issues, potentials };
 
     const fileNodes = graph.nodes.filter((n) => n.kind === "file");
     const symbolsByFile = new Map();
@@ -1176,47 +1517,47 @@ export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledC
 
     for (const node of graph.nodes) {
         if (node.kind !== "file") {
-            let arr = symbolsByFile.get(node.path);
-            if (!arr) {
-                arr = [];
-                symbolsByFile.set(node.path, arr);
-            }
-            arr.push(node);
+            if (!symbolsByFile.has(node.path)) symbolsByFile.set(node.path, []);
+            symbolsByFile.get(node.path).push(node);
         }
     }
 
     for (const edge of graph.edges) {
         if (!WALK_RELATIONS.has(edge.relation)) continue;
-        let s = incomingByTarget.get(edge.target);
-        if (!s) {
-            s = new Set();
-            incomingByTarget.set(edge.target, s);
-        }
-        s.add(edge.source);
+        if (!incomingByTarget.has(edge.target)) incomingByTarget.set(edge.target, new Set());
+        incomingByTarget.get(edge.target).add(edge.source);
     }
+
+    const scoredFiles = [];
+    let luauFileCount = 0;
 
     for (const fNode of fileNodes) {
         const relPath = fNode.path;
         const zone = zoneMap.get(relPath) || "production";
-        if (!SCORED_ZONES.has(zone)) continue;
-        if (fileFilter && !fileFilter(relPath)) continue;
+        if (!SCORED_ZONES.has(zone) || !matchesSourceFileFilter(fileFilter, relPath)) continue;
 
         const lines = readLines(relPath);
         if (!lines || lines.length === 0) continue;
+
+        scoredFiles.push(relPath);
+        if (isLuauFile(relPath)) luauFileCount += 1;
 
         const fileSymbols = symbolsByFile.get(relPath) || [];
         scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarget, ignoreRules, enabled, potentials, issues);
     }
 
-    const scoredFileCount = Math.max(
-        1,
-        fileNodes.filter(
-            (f) =>
-                SCORED_ZONES.has(zoneMap.get(f.path) || "production") &&
-                (!fileFilter || fileFilter(f.path)),
-        ).length,
-    );
+    if (enabled.wantTypes && scoredFiles.length > 0) {
+        checkEnumBypassIssues(scoredFiles, readLines, ignoreRules, potentials, issues);
+    }
+
+    const scoredFileCount = Math.max(1, scoredFiles.length);
     for (const k of Object.keys(potentials)) {
+        const cat = DETECTOR_CATEGORY[k];
+        if (cat && !enabledCategories.has(cat)) continue;
+        if (k === "luau_quality" || k === "roblox_security") {
+            if (potentials[k] === 0 && luauFileCount > 0) potentials[k] = luauFileCount;
+            continue;
+        }
         if (potentials[k] === 0) potentials[k] = scoredFileCount;
     }
 

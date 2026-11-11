@@ -3,11 +3,13 @@
  */
 import { resolve } from "node:path";
 import { fileReader, needlesForName, referenceLines, spanRange } from "../util/span.js";
-import { isTestPath } from "../ask/ask.js";
+import { suggestNearTargets } from "../ask/ask.js";
+import { isTestPath } from "../util/paths.js";
+import { loadGraphCached } from "../context/graph-store.js";
 import { contextDirFor } from "../context/node-file.js";
-import { loadGraphCached } from "./load.js";
+import { resolveSymbol } from "../context/symbol-query.js";
 import { linkTestsForGraph } from "./test-links.js";
-import { resolveSymbol, edgeWalk, parseWalkDepth } from "./traverse.js";
+import { edgeWalk, parseWalkDepth } from "./traverse.js";
 
 const ARROW = { in: "←", out: "→" };
 const DEFAULT_DEPTH = 1;
@@ -365,6 +367,14 @@ export function resolveCliDepth(raw, defaultDepth = DEFAULT_DEPTH) {
     return d;
 }
 
+function missingSymbolMessage(graph, q, inPrefix) {
+    const suggestions = suggestNearTargets(graph, q, inPrefix, 3);
+    const tail = suggestions.length
+        ? `did you mean: ${suggestions.join(", ")}?`
+        : "check spelling or run plexer build";
+    return `no symbol "${q}" in the graph — ${tail}`;
+}
+
 function collectCallerMatchesForQueries(graph, root, queries, direction, depth, opts) {
     const allResults = [];
     const seenSymbolIds = new Set();
@@ -388,10 +398,12 @@ function collectCallerMatchesForQueries(graph, root, queries, direction, depth, 
                 }
             }
             if (queries.length === 1) {
-                console.error(`✗ no symbol "${q}" in the graph — check spelling or run plexer build`);
+                console.error(`✗ ${missingSymbolMessage(graph, q, opts.in)}`);
                 process.exit(1);
             }
-            console.error(`⚠ no symbol "${q}" in the graph — skipping`);
+            const suggestions = suggestNearTargets(graph, q, opts.in, 3);
+            const skipTail = suggestions.length ? `did you mean: ${suggestions.join(", ")}? (skipping)` : "skipping";
+            console.error(`⚠ no symbol "${q}" in the graph — ${skipTail}`);
             continue;
         }
         for (const symbol of matches) {
@@ -424,7 +436,7 @@ export function runCallersCommand(queryInput, dir, opts) {
     if (!allResults)
         return;
     if (allResults.length === 0) {
-        console.error(`✗ no symbol "${queries.join(", ")}" in the graph — check spelling or run plexer build`);
+        console.error(`✗ ${missingSymbolMessage(graph, queries.join(", "), opts.in)}`);
         process.exit(1);
     }
     if (opts.json) {

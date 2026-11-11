@@ -1,7 +1,8 @@
-import { WALK_RELATIONS, resolveSymbol, stripNodeOrdinals, stripOrdinals } from "../util/id.js";
+import { WALK_RELATIONS } from "../context/symbol-query.js";
+import { stripNodeOrdinals, stripOrdinals } from "../util/id.js";
 import { pushMap } from "../util/paths.js";
 
-export { resolveSymbol, stripNodeOrdinals, stripOrdinals };
+export { stripNodeOrdinals, stripOrdinals };
 
 /**
  * Parse a walk depth (`number | "all" | "full" | "max" | undefined`) into a positive

@@ -6,7 +6,8 @@
 import { join } from 'node:path';
 import { hooksShim } from '../claude/shim-template.js';
 import { claudeDistDir } from '../claude/paths.js';
-import { dirExists, upsertHookEvents, writeOwned } from './config-write.js';
+import { upsertHookEvents, writeOwned } from '../util/config-write.js';
+import { dirExists } from '../util/fs.js';
 /**
  * The files installing the Codex hook would touch — pure, no writes. Both live
  * under `~/.codex`, so both are scoped 'global': the hook entries fire in every
