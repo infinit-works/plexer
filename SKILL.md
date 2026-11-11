@@ -9,12 +9,13 @@ description: >-
 
 # plexer: Repo Context Graph
 
-- **Use `[plexer]` Turn-0 context first (no duplicate queries):**
-  - **Diagnosis & caller prompts:** When `[plexer] retrieved context` already includes the `L<n>:` lines, helpers, constants, and `call sites` needed to answer the prompt, **answer immediately in 0 tool calls** with exact `file:Lx-Ly` citations. Otherwise query **only** the missing symbol (`plexer read <file:symbol|file:Lx-Ly>` or `plexer callers <symbol> [--depth 2|all]`).
-  - **Code-edit prompts:** Blocks marked `(named in prompt)` contain current source for named definitions; edit from them without re-reading. Use `[plexer]` pointers and `L<n>:` spans to skip repo-wide `grep`/`find`; read only missing spans (`plexer read` or ranged file reads, never whole files); batch all needed reads into **1 turn**, apply all edits across files in **1 turn** with native edit tools, and stop once verification passes (skip reading `test/` files or writing ad-hoc scripts).
+- **Use `[plexer]` Turn-0 context first (never re-query or serialize):**
+  - **Batch every lookup:** Never re-run `plexer ask` on spans already inlined in Turn-0 `[plexer]` context. Pass multiple `<file:symbol|file:Lx-Ly>` or `<symbol>` args in **1** `plexer read` or `plexer callers` call (or 1 parallel tool batch); never serialize 1 query or file read per turn.
+  - **Diagnosis & caller prompts:** When `[plexer] retrieved context` includes the needed `L<n>:` lines, helpers, constants, and `call sites`, **answer in 0 tool calls** with exact `file:Lx-Ly` citations. Otherwise fetch all missing targets in **1** `plexer read <file:symbol|file:Lx-Ly> [...]` or `plexer callers <symbols...> [--depth 2|all]` call.
+  - **Code-edit prompts:** Edit `(named in prompt)` blocks and inlined `L<n>:` spans directly without re-reading. Use `[plexer]` pointers and `// other symbols in <file>: sym(Lx-Ly)` footers to skip repo-wide `grep`/`find`; read all missing spans in **1** `plexer read` call (never whole files `L1-600`), apply all edits in **1** turn with native edit tools (`edit_file`, `replace_file_content`, `multi_replace_file_content`, `Edit`; never `python3`, `node`, or `sed` scripts), and skip unrequested `test/` reads.
 - **CLI (`plexer <cmd>`):**
-  - `plexer read <file:symbol|file:Lx-Ly> [...]`: exact `L<n>:` source for symbols or line ranges (see `// other symbols in <file>: sym(Lx-Ly)` footers).
+  - `plexer read <file:symbol|file:Lx-Ly> [...]`: exact `L<n>:` source for symbols or ranges in 1 call.
   - `plexer ask "<query>" [...] [--in <scope>/]`: rank symbols and inline `L<n>:` source, helpers, types, and `call sites`.
-  - `plexer callers <symbols...> [--depth 2|all] [--direction out]`: trace callers (`[depth 2 via <sym>]`) or callees with inlined source (`plexer blast` for diff impact); prefer over `grep` when given a symbol name.
-  - `plexer skeleton <file> [--all-matches]`: file signatures; `plexer map`: directory hubs & hotspots; `plexer grep <pat> [--fixed] [-i]`: literal search.
-  - `plexer health [scan|next|resolve|suppress|plan|review|status|autofix|move|tree|viz|detect|prompt] [--diff]`: health scanner, 20-dimension review + scorecard (`strict` north star), and execution queue (`next` → fix → `resolve` → `next`).
+  - `plexer callers <symbols...> [--depth 2|all] [--direction out]`: trace callers (`[depth 2 via <sym>]`) or callees in 1 call (`plexer blast` for diff impact); prefer over `grep` for symbols.
+  - `plexer skeleton <files...> [--all-matches]`: file signatures; `plexer map`: directory hubs & hotspots; `plexer grep <pats...> [--fixed] [-i]`: literal/regex search.
+  - `plexer health [scan|next|resolve|suppress|plan|review|status|autofix|move|tree|viz|detect|prompt] [--diff]`: health scanner, 20-dimension review + scorecard (`strict` north star), and execution queue (`next` -> fix -> `resolve` -> `next`).
