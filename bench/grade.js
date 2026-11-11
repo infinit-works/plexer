@@ -59,6 +59,11 @@ function parseClaudeTranscript(filePath, arm) {
     let uncachedInputTokens = 0;
     let cachedInputTokens = 0;
     let cumulativeInputTokens = 0;
+    let turn1ContextTokens = 0;
+    let turn1UncachedTokens = 0;
+    let postTurn1UncachedTokens = 0;
+    let cacheMissTurns = 0;
+    let prevContextTokens = 0;
     let finalContextTokens = 0;
     let streamModelOutputTokens = 0;
     let resultModelOutputTokens = null;
@@ -86,13 +91,30 @@ function parseClaudeTranscript(filePath, arm) {
             if (!seenUsageMsgIds.has(msgId)) {
                 seenUsageMsgIds.add(msgId);
                 const u = step.message.usage || {};
-                const stepUncached = u.input_tokens || 0;
+                const stepUncached = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+                const stepCacheRead = u.cache_read_input_tokens || 0;
+                const stepCtx = stepUncached + stepCacheRead;
+                if (seenUsageMsgIds.size === 1) {
+                    turn1ContextTokens = stepCtx;
+                    turn1UncachedTokens = stepUncached;
+                } else {
+                    if (stepCacheRead === 0 && prevContextTokens > 0 && stepUncached > prevContextTokens * 0.8) {
+                        cacheMissTurns += 1;
+                        postTurn1UncachedTokens += Math.max(0, stepCtx - prevContextTokens);
+                    } else {
+                        postTurn1UncachedTokens += stepUncached;
+                    }
+                }
+                if (stepCtx > 0) {
+                    prevContextTokens = stepCtx;
+                }
+                const rawInp = u.input_tokens || 0;
                 const stepCached = (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
-                uncachedInputTokens += stepUncached;
+                uncachedInputTokens += rawInp;
                 cachedInputTokens += stepCached;
-                cumulativeInputTokens += stepUncached + stepCached;
-                if (stepUncached + stepCached > 0) {
-                    finalContextTokens = stepUncached + stepCached;
+                cumulativeInputTokens += rawInp + stepCached;
+                if (rawInp + stepCached > 0) {
+                    finalContextTokens = rawInp + stepCached;
                 }
                 streamModelOutputTokens += u.output_tokens || 0;
             }
@@ -181,6 +203,8 @@ function parseClaudeTranscript(filePath, arm) {
             ? lastPlannerMs - firstToolTurnMs
             : searchMs);
 
+    const netContextGrowthTokens = Math.max(0, finalContextTokens - turn1ContextTokens);
+
     return {
         conversationId: sessionId,
         calls,
@@ -189,6 +213,11 @@ function parseClaudeTranscript(filePath, arm) {
         uncachedInputTokens,
         cachedInputTokens,
         cumulativeInputTokens,
+        turn1ContextTokens,
+        turn1UncachedTokens,
+        postTurn1UncachedTokens,
+        netContextGrowthTokens,
+        cacheMissTurns,
         finalContextTokens,
         totalModelOutputTokens,
         searchMs,
@@ -266,6 +295,12 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
     let uncachedInputTokens = 0;
     let cachedInputTokens = 0;
     let cumulativeInputTokens = 0;
+    let turn1ContextTokens = 0;
+    let turn1UncachedTokens = 0;
+    let postTurn1UncachedTokens = 0;
+    let cacheMissTurns = 0;
+    let prevContextTokens = 0;
+    let plannerStepCount = 0;
     let finalContextTokens = 0;
     let totalModelOutputTokens = 0;
     let firstUserMs = null;
@@ -290,8 +325,24 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
         if (step.type === "PLANNER_RESPONSE") {
             if (ts !== null)
                 lastPlannerMs = ts;
+            plannerStepCount += 1;
             const stepUncached = step.input_tokens || 0;
             const stepCached = step.cache_read_tokens || 0;
+            const stepCtx = stepUncached + stepCached;
+            if (plannerStepCount === 1) {
+                turn1ContextTokens = stepCtx;
+                turn1UncachedTokens = stepUncached;
+            } else {
+                if (stepCached === 0 && prevContextTokens > 0 && stepUncached > prevContextTokens * 0.8) {
+                    cacheMissTurns += 1;
+                    postTurn1UncachedTokens += Math.max(0, stepCtx - prevContextTokens);
+                } else {
+                    postTurn1UncachedTokens += stepUncached;
+                }
+            }
+            if (stepCtx > 0) {
+                prevContextTokens = stepCtx;
+            }
             uncachedInputTokens += stepUncached;
             cachedInputTokens += stepCached;
             cumulativeInputTokens += stepUncached + stepCached;
@@ -391,6 +442,8 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
             : searchMs;
     const totalMs = streamDurationMs !== null ? Math.max(transcriptTotalMs, streamDurationMs) : transcriptTotalMs;
 
+    const netContextGrowthTokens = Math.max(0, finalContextTokens - turn1ContextTokens);
+
     return {
         conversationId,
         calls,
@@ -399,6 +452,11 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
         uncachedInputTokens,
         cachedInputTokens,
         cumulativeInputTokens,
+        turn1ContextTokens,
+        turn1UncachedTokens,
+        postTurn1UncachedTokens,
+        netContextGrowthTokens,
+        cacheMissTurns,
         finalContextTokens,
         totalModelOutputTokens,
         searchMs,
@@ -554,31 +612,25 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
 
     const totals = rows.reduce(
         (acc, r) => {
-            acc.cold.calls += r.cold.calls;
-            acc.cold.turns += r.cold.turns;
-            acc.cold.toolOutputTokens += r.cold.toolOutputTokens;
-            acc.cold.uncachedInputTokens += r.cold.uncachedInputTokens;
-            acc.cold.cachedInputTokens += r.cold.cachedInputTokens;
-            acc.cold.cumulativeInputTokens += r.cold.cumulativeInputTokens;
-            acc.cold.finalContextTokens += r.cold.finalContextTokens;
-            acc.cold.totalModelOutputTokens += r.cold.totalModelOutputTokens;
-            acc.cold.searchMs += r.cold.searchMs;
-            acc.cold.totalMs += r.cold.totalMs;
-            acc.cold.score += r.cold.score;
-            acc.cold.maxScore += r.cold.maxScore;
-
-            acc.plexer.calls += r.plexer.calls;
-            acc.plexer.turns += r.plexer.turns;
-            acc.plexer.toolOutputTokens += r.plexer.toolOutputTokens;
-            acc.plexer.uncachedInputTokens += r.plexer.uncachedInputTokens;
-            acc.plexer.cachedInputTokens += r.plexer.cachedInputTokens;
-            acc.plexer.cumulativeInputTokens += r.plexer.cumulativeInputTokens;
-            acc.plexer.finalContextTokens += r.plexer.finalContextTokens;
-            acc.plexer.totalModelOutputTokens += r.plexer.totalModelOutputTokens;
-            acc.plexer.searchMs += r.plexer.searchMs;
-            acc.plexer.totalMs += r.plexer.totalMs;
-            acc.plexer.score += r.plexer.score;
-            acc.plexer.maxScore += r.plexer.maxScore;
+            for (const arm of ["cold", "plexer"]) {
+                acc[arm].calls += r[arm].calls;
+                acc[arm].turns += r[arm].turns;
+                acc[arm].toolOutputTokens += r[arm].toolOutputTokens;
+                acc[arm].uncachedInputTokens += r[arm].uncachedInputTokens;
+                acc[arm].cachedInputTokens += r[arm].cachedInputTokens;
+                acc[arm].cumulativeInputTokens += r[arm].cumulativeInputTokens;
+                acc[arm].turn1ContextTokens += r[arm].turn1ContextTokens || 0;
+                acc[arm].turn1UncachedTokens += r[arm].turn1UncachedTokens || 0;
+                acc[arm].postTurn1UncachedTokens += r[arm].postTurn1UncachedTokens || 0;
+                acc[arm].netContextGrowthTokens += r[arm].netContextGrowthTokens || 0;
+                acc[arm].cacheMissTurns += r[arm].cacheMissTurns || 0;
+                acc[arm].finalContextTokens += r[arm].finalContextTokens;
+                acc[arm].totalModelOutputTokens += r[arm].totalModelOutputTokens;
+                acc[arm].searchMs += r[arm].searchMs;
+                acc[arm].totalMs += r[arm].totalMs;
+                acc[arm].score += r[arm].score;
+                acc[arm].maxScore += r[arm].maxScore;
+            }
 
             if (r.plexer.toolOutputTokens < r.cold.toolOutputTokens)
                 acc.tokenWins += 1;
@@ -611,6 +663,11 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 uncachedInputTokens: 0,
                 cachedInputTokens: 0,
                 cumulativeInputTokens: 0,
+                turn1ContextTokens: 0,
+                turn1UncachedTokens: 0,
+                postTurn1UncachedTokens: 0,
+                netContextGrowthTokens: 0,
+                cacheMissTurns: 0,
                 finalContextTokens: 0,
                 totalModelOutputTokens: 0,
                 searchMs: 0,
@@ -625,6 +682,11 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 uncachedInputTokens: 0,
                 cachedInputTokens: 0,
                 cumulativeInputTokens: 0,
+                turn1ContextTokens: 0,
+                turn1UncachedTokens: 0,
+                postTurn1UncachedTokens: 0,
+                netContextGrowthTokens: 0,
+                cacheMissTurns: 0,
                 finalContextTokens: 0,
                 totalModelOutputTokens: 0,
                 searchMs: 0,
@@ -644,7 +706,7 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
         }
     );
 
-    const trailRows = rows.filter((r) => r.trail);
+        const trailRows = rows.filter((r) => r.trail);
     let trailComparison = undefined;
     if (trailRows.length > 0) {
         const emptyArm = () => ({
@@ -654,6 +716,11 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
             uncachedInputTokens: 0,
             cachedInputTokens: 0,
             cumulativeInputTokens: 0,
+            turn1ContextTokens: 0,
+            turn1UncachedTokens: 0,
+            postTurn1UncachedTokens: 0,
+            netContextGrowthTokens: 0,
+            cacheMissTurns: 0,
             finalContextTokens: 0,
             totalModelOutputTokens: 0,
             searchMs: 0,
@@ -670,6 +737,11 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                     acc[arm].uncachedInputTokens += r[arm].uncachedInputTokens;
                     acc[arm].cachedInputTokens += r[arm].cachedInputTokens;
                     acc[arm].cumulativeInputTokens += r[arm].cumulativeInputTokens;
+                    acc[arm].turn1ContextTokens += r[arm].turn1ContextTokens || 0;
+                    acc[arm].turn1UncachedTokens += r[arm].turn1UncachedTokens || 0;
+                    acc[arm].postTurn1UncachedTokens += r[arm].postTurn1UncachedTokens || 0;
+                    acc[arm].netContextGrowthTokens += r[arm].netContextGrowthTokens || 0;
+                    acc[arm].cacheMissTurns += r[arm].cacheMissTurns || 0;
                     acc[arm].finalContextTokens += r[arm].finalContextTokens;
                     acc[arm].totalModelOutputTokens += r[arm].totalModelOutputTokens;
                     acc[arm].searchMs += r[arm].searchMs;
@@ -682,6 +754,28 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
             { taskIds: trailRows.map((r) => r.id), cold: emptyArm(), trail: emptyArm(), plexer: emptyArm() }
         );
     }
+
+    const serializeArm = (a) => ({
+        conversationId: a.conversationId,
+        calls: a.calls,
+        turns: a.turns,
+        toolOutputTokens: a.toolOutputTokens,
+        uncachedInputTokens: a.uncachedInputTokens,
+        cachedInputTokens: a.cachedInputTokens,
+        cumulativeInputTokens: a.cumulativeInputTokens,
+        turn1ContextTokens: a.turn1ContextTokens || 0,
+        turn1UncachedTokens: a.turn1UncachedTokens || 0,
+        postTurn1UncachedTokens: a.postTurn1UncachedTokens || 0,
+        netContextGrowthTokens: a.netContextGrowthTokens || 0,
+        cacheMissTurns: a.cacheMissTurns || 0,
+        finalContextTokens: a.finalContextTokens,
+        totalModelOutputTokens: a.totalModelOutputTokens,
+        searchMs: a.searchMs,
+        totalMs: a.totalMs,
+        score: a.score,
+        maxScore: a.maxScore,
+        checks: a.checks,
+    });
 
     const summary = {
         generatedAt: new Date().toISOString(),
@@ -699,58 +793,9 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
             repo: r.repo,
             holdout: r.holdout,
             title: r.title,
-            cold: {
-                conversationId: r.cold.conversationId,
-                calls: r.cold.calls,
-                turns: r.cold.turns,
-                toolOutputTokens: r.cold.toolOutputTokens,
-                uncachedInputTokens: r.cold.uncachedInputTokens,
-                cachedInputTokens: r.cold.cachedInputTokens,
-                cumulativeInputTokens: r.cold.cumulativeInputTokens,
-                finalContextTokens: r.cold.finalContextTokens,
-                totalModelOutputTokens: r.cold.totalModelOutputTokens,
-                searchMs: r.cold.searchMs,
-                totalMs: r.cold.totalMs,
-                score: r.cold.score,
-                maxScore: r.cold.maxScore,
-                checks: r.cold.checks,
-            },
-            plexer: {
-                conversationId: r.plexer.conversationId,
-                calls: r.plexer.calls,
-                turns: r.plexer.turns,
-                toolOutputTokens: r.plexer.toolOutputTokens,
-                uncachedInputTokens: r.plexer.uncachedInputTokens,
-                cachedInputTokens: r.plexer.cachedInputTokens,
-                cumulativeInputTokens: r.plexer.cumulativeInputTokens,
-                finalContextTokens: r.plexer.finalContextTokens,
-                totalModelOutputTokens: r.plexer.totalModelOutputTokens,
-                searchMs: r.plexer.searchMs,
-                totalMs: r.plexer.totalMs,
-                score: r.plexer.score,
-                maxScore: r.plexer.maxScore,
-                checks: r.plexer.checks,
-            },
-            ...(r.trail
-                ? {
-                      trail: {
-                          conversationId: r.trail.conversationId,
-                          calls: r.trail.calls,
-                          turns: r.trail.turns,
-                          toolOutputTokens: r.trail.toolOutputTokens,
-                          uncachedInputTokens: r.trail.uncachedInputTokens,
-                          cachedInputTokens: r.trail.cachedInputTokens,
-                          cumulativeInputTokens: r.trail.cumulativeInputTokens,
-                          finalContextTokens: r.trail.finalContextTokens,
-                          totalModelOutputTokens: r.trail.totalModelOutputTokens,
-                          searchMs: r.trail.searchMs,
-                          totalMs: r.trail.totalMs,
-                          score: r.trail.score,
-                          maxScore: r.trail.maxScore,
-                          checks: r.trail.checks,
-                      },
-                  }
-                : {}),
+            cold: serializeArm(r.cold),
+            plexer: serializeArm(r.plexer),
+            ...(r.trail ? { trail: serializeArm(r.trail) } : {}),
         })),
     };
 

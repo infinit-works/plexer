@@ -21,6 +21,7 @@ import { ensureFreshGraph } from "../src/graph/refresh.js";
 import { ensureAbBaseRepos } from "./ensure-base.js";
 import {
     buildTrailClaudeSettingsJson,
+    buildTrailMcpConfigJson,
     getTrailEnv,
     getTrailSkillBody,
     prepareTrailWorktreeDir,
@@ -50,7 +51,6 @@ const armsToRun =
           : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
 
 const logDir = `/tmp/plexer-claude-logs/${modelArg}`;
-mkdirSync(logDir, { recursive: true });
 
 const basePrompt = [
     "You are an expert software engineer solving a repository diagnosis, refactoring blast-radius, or code-editing task.",
@@ -60,56 +60,59 @@ const basePrompt = [
 
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-const trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
+let trailSkillBody = "";
 
 const coldSysFile = join(logDir, "cold-system.txt");
 const plexerSysFile = join(logDir, "plexer-system.txt");
 const trailSysFile = join(logDir, "trail-system.txt");
-writeFileSync(coldSysFile, `${basePrompt}\n`, "utf8");
-writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
-if (trailSkillBody) {
-    writeFileSync(trailSysFile, `${basePrompt}\n\n${trailSkillBody}\n`, "utf8");
-}
 
 const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
 const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
-writeFileSync(
-    plexerHooksSettingsFile,
-    JSON.stringify(
-        {
-            hooks: {
-                UserPromptSubmit: [
-                    {
-                        hooks: [
-                            {
-                                type: "command",
-                                command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook prompt`,
-                                timeout: 15,
-                            },
-                        ],
-                    },
-                ],
-                PostToolUse: [
-                    {
-                        matcher: "Write|Edit|MultiEdit",
-                        hooks: [
-                            {
-                                type: "command",
-                                command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook post-edit`,
-                                timeout: 10,
-                            },
-                        ],
-                    },
-                ],
+const trailMcpConfigFile = join(logDir, "trail-mcp-config.json");
+function initRuntimeFiles() {
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(coldSysFile, `${basePrompt}\n`, "utf8");
+    writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
+    writeFileSync(trailSysFile, trailSkillBody ? `${basePrompt}\n\n${trailSkillBody}\n` : `${basePrompt}\n`, "utf8");
+    writeFileSync(trailMcpConfigFile, buildTrailMcpConfigJson(), "utf8");
+    writeFileSync(
+        plexerHooksSettingsFile,
+        JSON.stringify(
+            {
+                hooks: {
+                    UserPromptSubmit: [
+                        {
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook prompt`,
+                                    timeout: 15,
+                                },
+                            ],
+                        },
+                    ],
+                    PostToolUse: [
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook post-edit`,
+                                    timeout: 10,
+                                },
+                            ],
+                        },
+                    ],
+                },
             },
-        },
-        null,
-        2
-    ),
-    "utf8"
-);
-writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
+            null,
+            2
+        ),
+        "utf8"
+    );
+    writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
+}
 
 function resetRepoWorktree(repo, arm) {
     const cloneDir = `/tmp/plexer-ab-${modelArg}-${arm}/${repo}`;
@@ -163,11 +166,15 @@ async function runOne(task, arm) {
             "--setting-sources",
             "",
             ...(settingsFile ? ["--settings", settingsFile] : []),
+            ...(arm === "trail" ? ["--mcp-config", trailMcpConfigFile] : []),
             "--disable-slash-commands",
             "--strict-mcp-config",
             "--dangerously-skip-permissions",
             "--tools",
             "Bash,Read,Edit,Write,Grep,Glob",
+            ...(arm === "trail"
+                ? ["--allowedTools", "Bash,Read,Edit,Write,Grep,Glob,mcp__trail__*"]
+                : []),
             "--append-system-prompt-file",
             sysFile,
             "-p",
@@ -231,69 +238,78 @@ async function runWave(jobs, maxParallel) {
     return results;
 }
 
-const selectedTasks = taskFilterSet ? TASKS.filter((t) => taskFilterSet.has(t.id)) : TASKS;
-const readOnlyTasks = selectedTasks.filter((t) => t.category !== "code-edit");
-const editTasks = selectedTasks.filter((t) => t.category === "code-edit");
+async function main() {
+    trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
+    initRuntimeFiles();
 
-console.log(`Starting Claude (${modelArg}) A/B benchmark: ${selectedTasks.length} tasks × [${armsToRun.join(",")}] (concurrency=${concurrency})...`);
+    const selectedTasks = taskFilterSet ? TASKS.filter((t) => taskFilterSet.has(t.id)) : TASKS;
+    const readOnlyTasks = selectedTasks.filter((t) => t.category !== "code-edit");
+    const editTasks = selectedTasks.filter((t) => t.category === "code-edit");
 
-await ensureAbBaseRepos(new Set(selectedTasks.map((t) => t.repo)));
+    console.log(`Starting Claude (${modelArg}) A/B benchmark: ${selectedTasks.length} tasks × [${armsToRun.join(",")}] (concurrency=${concurrency})...`);
 
-if (readOnlyTasks.length > 0) {
-    const readOnlyRepos = new Set(readOnlyTasks.map((t) => t.repo));
-    for (const repo of readOnlyRepos) {
-        for (const arm of armsToRun) {
-            resetRepoWorktree(repo, arm);
+    await ensureAbBaseRepos(new Set(selectedTasks.map((t) => t.repo)));
+
+    if (readOnlyTasks.length > 0) {
+        const readOnlyRepos = new Set(readOnlyTasks.map((t) => t.repo));
+        for (const repo of readOnlyRepos) {
+            for (const arm of armsToRun) {
+                resetRepoWorktree(repo, arm);
+            }
         }
     }
-}
 
-const readOnlyJobs = [];
-for (const t of readOnlyTasks) {
-    for (const arm of armsToRun) {
-        readOnlyJobs.push(() => runOne(t, arm));
+    const readOnlyJobs = [];
+    for (const t of readOnlyTasks) {
+        for (const arm of armsToRun) {
+            readOnlyJobs.push(() => runOne(t, arm));
+        }
     }
-}
-const editJobs = [];
-for (const t of editTasks) {
-    for (const arm of armsToRun) {
-        editJobs.push(() => runOne(t, arm));
+    const editJobs = [];
+    for (const t of editTasks) {
+        for (const arm of armsToRun) {
+            editJobs.push(() => runOne(t, arm));
+        }
     }
-}
 
-const allRuns = [
-    ...(await runWave(readOnlyJobs, concurrency)),
-    ...(await runWave(editJobs, concurrency)),
-];
+    const allRuns = [
+        ...(await runWave(readOnlyJobs, concurrency)),
+        ...(await runWave(editJobs, concurrency)),
+    ];
 
-const manifestPath = resolve(import.meta.dirname, `manifest-${modelArg}.json`);
-const resultsPath = resolve(import.meta.dirname, `results-${modelArg}.json`);
-const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf8")) : {};
-for (const t of TASKS) {
-    manifest[t.id] = manifest[t.id] || {};
-}
-const validRuns = allRuns.filter((r) => {
-    const p = parseTranscript(r.transcriptPath);
-    if (r.code !== 0 || p.cumulativeInputTokens === 0) {
-        console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${p.cumulativeInputTokens}`);
-        return false;
+    const manifestPath = resolve(import.meta.dirname, `manifest-${modelArg}.json`);
+    const resultsPath = resolve(import.meta.dirname, `results-${modelArg}.json`);
+    const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf8")) : {};
+    for (const t of TASKS) {
+        manifest[t.id] = manifest[t.id] || {};
     }
-    return true;
-});
-if (validRuns.length === 0) {
-    console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing ${manifestPath} and ${resultsPath}.`);
-    process.exit(1);
-}
-for (const r of validRuns) {
-    manifest[r.taskId][r.arm] = {
-        conversationId: r.transcriptPath,
-        cloneDir: r.cloneDir,
-    };
+    const validRuns = allRuns.filter((r) => {
+        const p = parseTranscript(r.transcriptPath);
+        if (r.code !== 0 || p.cumulativeInputTokens === 0) {
+            console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${p.cumulativeInputTokens}`);
+            return false;
+        }
+        return true;
+    });
+    if (validRuns.length === 0) {
+        console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing ${manifestPath} and ${resultsPath}.`);
+        process.exit(1);
+    }
+    for (const r of validRuns) {
+        manifest[r.taskId][r.arm] = {
+            conversationId: r.transcriptPath,
+            cloneDir: r.cloneDir,
+        };
+    }
+
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    gradeManifest(
+        manifestPath,
+        resultsPath,
+        new Set(validRuns.map((r) => `${r.taskId}:${r.arm}`)),
+    );
 }
 
-writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-gradeManifest(
-    manifestPath,
-    resultsPath,
-    new Set(validRuns.map((r) => `${r.taskId}:${r.arm}`)),
-);
+if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {
+    await main();
+}

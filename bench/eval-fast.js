@@ -16,9 +16,10 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { HOOK_BUDGETS, queryPromptContext } from "../src/claude/hooks.js";
 import { formatOrientation, relevantRetrieval } from "../src/claude/format.js";
-import { loadGraphCached } from "../src/graph/load.js";
-import { resolveContextDir } from "../src/util/state.js";
+import { loadGraphCached } from "../src/context/graph-store.js";
+import { contextDirFor } from "../src/util/paths.js";
 import { TASKS } from "./tasks.js";
+import { LARGE_TASKS } from "./large-tasks.js";
 import { needCoverage } from "./needcov.js";
 import { dot, fitFamily, loadRows, ols, predict } from "./cost-model.js";
 
@@ -265,7 +266,7 @@ function evalSuite() {
             : `/tmp/plexer-ab-opus-plexer/${t.repo}`;
         if (!existsSync(repoDir)) continue;
         tCount++;
-        const g = loadGraphCached(resolveContextDir(repoDir));
+        const g = loadGraphCached(contextDirFor(repoDir));
         const orient = g ? formatOrientation(g) : "";
         const promptStr = t.prompt(repoDir);
         const askObj = queryPromptContext(repoDir, promptStr);
@@ -326,7 +327,7 @@ function evalSuite() {
         const repoDir = `/tmp/plexer-swebench-base/indexed/${t.id}`;
         if (!existsSync(repoDir)) continue;
         sCount++;
-        const g = loadGraphCached(resolveContextDir(repoDir));
+        const g = loadGraphCached(contextDirFor(repoDir));
         const orient = g ? formatOrientation(g) : "";
         const instr = t.instruction_md.replace(/\/app\b/g, repoDir).replace(/\/testbed\b/g, repoDir).trim();
         const promptStr = [`Working directory: ${repoDir}`, "", instr].join("\n");
@@ -380,12 +381,76 @@ function evalSuite() {
         console.log(
             `TOTAL S1-S8 : Hook=${(sHookBytesSum / 1000).toFixed(1)}kB | AvgT0Delta=+${Math.round(s0DeltaSum / sCount)} tok | ` +
                 `AvgGoldFileRec=${((sFileRecSum / sCount) * 100).toFixed(1)}% | AvgSymCov=${((sSymCovSum / sCount) * 100).toFixed(1)}% | ` +
-                `TotalEstT0CumTax=+${(sEstTaxSum / 1000).toFixed(1)}k tok`
+                `TotalEstT0CumTax=+${(sEstTaxSum / 1000).toFixed(1)}k tok\n`
+        );
+    }
+
+    console.log("=== Suite 3: Large-Repo & Discriminative Suite L1–L8 (Go, TS, Python, JS) ===");
+    console.log("Task | Lang (Size)     | HookB  | T0DeltaTok | GoldFileRec | TokCov  | Need | Loc  | EstTurns | EstT0CumTax | HitPointers");
+
+    let lHookBytesSum = 0;
+    let l0DeltaSum = 0;
+    let lFileRecSum = 0;
+    let lTokCovSum = 0;
+    let lEstTaxSum = 0;
+    let lCount = 0;
+
+    for (const t of LARGE_TASKS) {
+        const repoDir = `/tmp/plexer-swebench-base/indexed/${t.baseId}`;
+        if (!existsSync(repoDir)) continue;
+        lCount++;
+        const g = loadGraphCached(contextDirFor(repoDir));
+        const orient = g ? formatOrientation(g) : "";
+        const promptStr = t.prompt(repoDir);
+        const askObj = queryPromptContext(repoDir, promptStr);
+        const ctx = askObj ? relevantRetrieval(askObj, {}) || "" : "";
+        const hookBytes = Buffer.byteLength(ctx, "utf8");
+        const orientTok = estimateBpeTokens(orient, false);
+        const hookTok = estimateBpeTokens(ctx, true);
+        const t0DeltaTok = skillTokens + orientTok + hookTok;
+
+        const goldFiles = t.goldFiles || [];
+        const hitFiles = new Set((askObj?.hits || []).map((h) => (h.pointer || "").split(":")[0]));
+        const matchedGold = goldFiles.filter((f) => hitFiles.has(f) || ctx.includes(f));
+        const fileRec = goldFiles.length ? matchedGold.length / goldFiles.length : 1;
+
+        const oracleTokens = t.oracleTokens || [];
+        const matchedToks = oracleTokens.filter((tk) => ctx.toLowerCase().includes(tk.toLowerCase()));
+        const tokCov = oracleTokens.length ? matchedToks.length / oracleTokens.length : 1;
+
+        const nc = recordFeatures(t.id, "L", ctx, g, t0DeltaTok, hookTok, t.category === "code-edit");
+        const missingPenalty = (1 - fileRec) * 2.5 + (1 - tokCov) * 1.5;
+        const estTurns = Math.max(1, Math.round((t.expectedTurns || 2) + missingPenalty));
+        const estTax = t0DeltaTok * estTurns;
+
+        lHookBytesSum += hookBytes;
+        l0DeltaSum += t0DeltaTok;
+        lFileRecSum += fileRec;
+        lTokCovSum += tokCov;
+        lEstTaxSum += estTax;
+
+        const ptrs = (askObj?.hits || [])
+            .map((h) => `${h.pointer}${h.code ? `[${Buffer.byteLength(h.code, "utf8")}B]` : ""}`)
+            .join(", ");
+        const langSize = `${t.language.slice(0, 6)} (${t.sizeBucket[0].toUpperCase()}:${t.repoFiles})`.padEnd(15);
+        console.log(
+            `${t.id.padEnd(4)} | ${langSize} | ${String(hookBytes).padStart(5)}B | ` +
+                `+${String(t0DeltaTok).padStart(5)} tok | ${`${matchedGold.length}/${goldFiles.length}`.padStart(11)} | ` +
+                `${`${matchedToks.length}/${oracleTokens.length}`.padStart(7)} | ${needCols(nc)} | ${String(estTurns).padStart(8)} | ` +
+                `+${(estTax / 1000).toFixed(1).padStart(6)}k | ${ptrs}`
+        );
+    }
+
+    if (lCount > 0) {
+        console.log(
+            `TOTAL L1-L8 : Hook=${(lHookBytesSum / 1000).toFixed(1)}kB | AvgT0Delta=+${Math.round(l0DeltaSum / lCount)} tok | ` +
+                `AvgGoldFileRec=${((lFileRecSum / lCount) * 100).toFixed(1)}% | AvgTokCov=${((lTokCovSum / lCount) * 100).toFixed(1)}% | ` +
+                `TotalEstT0CumTax=+${(lEstTaxSum / 1000).toFixed(1)}k tok`
         );
     }
 
     const elapsedMs = Math.round(performance.now() - t0Start);
-    console.log(`\nCompleted 20-task offline evaluation in ${elapsedMs}ms ($0 API cost).`);
+    console.log(`\nCompleted ${tCount + sCount + lCount}-task offline evaluation in ${elapsedMs}ms ($0 API cost).`);
 }
 
 evalSuite();
@@ -396,8 +461,8 @@ const avg = (suite, k) => {
 const hold = [...FEATURES.values()].filter((f) => HOLDOUT.has(f.id));
 const holdAvg = (k) => hold.reduce((a, f) => a + f[k], 0) / Math.max(1, hold.length);
 console.log(
-    `NeedCov  T=${(avg("T", "needCov") * 100).toFixed(1)}% S=${(avg("S", "needCov") * 100).toFixed(1)}% holdout=${(holdAvg("needCov") * 100).toFixed(1)}% | ` +
-        `LocCov T=${(avg("T", "locCov") * 100).toFixed(1)}% S=${(avg("S", "locCov") * 100).toFixed(1)}% holdout=${(holdAvg("locCov") * 100).toFixed(1)}%`
+    `NeedCov  T=${(avg("T", "needCov") * 100).toFixed(1)}% S=${(avg("S", "needCov") * 100).toFixed(1)}% L=${(avg("L", "needCov") * 100).toFixed(1)}% holdout=${(holdAvg("needCov") * 100).toFixed(1)}% | ` +
+        `LocCov T=${(avg("T", "locCov") * 100).toFixed(1)}% S=${(avg("S", "locCov") * 100).toFixed(1)}% L=${(avg("L", "locCov") * 100).toFixed(1)}% holdout=${(holdAvg("locCov") * 100).toFixed(1)}%`
 );
 if (process.argv.includes("--missing")) {
     for (const f of FEATURES.values()) {

@@ -19,7 +19,12 @@
       "searchMs": 248924,
       "totalMs": 418888,
       "score": 94,
-      "maxScore": 96
+      "maxScore": 96,
+      "turn1ContextTokens": 95302,
+      "turn1UncachedTokens": 26541,
+      "postTurn1UncachedTokens": 130787,
+      "netContextGrowthTokens": 130629,
+      "cacheMissTurns": 0
     },
     "plexer": {
       "calls": 28,
@@ -33,7 +38,12 @@
       "searchMs": 93069,
       "totalMs": 261453,
       "score": 96,
-      "maxScore": 96
+      "maxScore": 96,
+      "turn1ContextTokens": 135197,
+      "turn1UncachedTokens": 64921,
+      "postTurn1UncachedTokens": 42358,
+      "netContextGrowthTokens": 42302,
+      "cacheMissTurns": 0
     },
     "tokenWins": 12,
     "tokenTies": 0,
@@ -91,7 +101,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7915,
+        "turn1UncachedTokens": 3037,
+        "postTurn1UncachedTokens": 10988,
+        "netContextGrowthTokens": 10974,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "050c64e6-4c7e-401b-bc12-f303207daf39",
@@ -132,7 +147,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 11607,
+        "turn1UncachedTokens": 6729,
+        "postTurn1UncachedTokens": 0,
+        "netContextGrowthTokens": 0,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -180,7 +200,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7857,
+        "turn1UncachedTokens": 2979,
+        "postTurn1UncachedTokens": 11124,
+        "netContextGrowthTokens": 11112,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "4237e95a-986e-43c5-9619-86e09d465516",
@@ -221,7 +246,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 12218,
+        "turn1UncachedTokens": 7340,
+        "postTurn1UncachedTokens": 1618,
+        "netContextGrowthTokens": 1614,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -269,7 +299,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7877,
+        "turn1UncachedTokens": 2999,
+        "postTurn1UncachedTokens": 9408,
+        "netContextGrowthTokens": 9396,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "afdcc280-8194-46af-95b0-6abac194a1fa",
@@ -310,7 +345,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 11018,
+        "turn1UncachedTokens": 6140,
+        "postTurn1UncachedTokens": 2569,
+        "netContextGrowthTokens": 2563,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -358,7 +398,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7888,
+        "turn1UncachedTokens": 3010,
+        "postTurn1UncachedTokens": 4472,
+        "netContextGrowthTokens": 4466,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "f2514726-5823-4c8b-a158-499531e5512b",
@@ -399,7 +444,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 10525,
+        "turn1UncachedTokens": 5647,
+        "postTurn1UncachedTokens": 0,
+        "netContextGrowthTokens": 0,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -447,7 +497,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7851,
+        "turn1UncachedTokens": 2973,
+        "postTurn1UncachedTokens": 19996,
+        "netContextGrowthTokens": 19986,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "6521a3c9-0922-4930-a487-85e403d954fe",
@@ -488,7 +543,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 12599,
+        "turn1UncachedTokens": 7721,
+        "postTurn1UncachedTokens": 6836,
+        "netContextGrowthTokens": 6830,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -536,7 +596,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7900,
+        "turn1UncachedTokens": 1315,
+        "postTurn1UncachedTokens": 7963,
+        "netContextGrowthTokens": 7951,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "8d9678f5-2c59-4fcd-b47d-05b1cf82cc9e",
@@ -577,7 +642,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 13177,
+        "turn1UncachedTokens": 5965,
+        "postTurn1UncachedTokens": 1493,
+        "netContextGrowthTokens": 1491,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -625,7 +695,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7903,
+        "turn1UncachedTokens": 1322,
+        "postTurn1UncachedTokens": 6263,
+        "netContextGrowthTokens": 6251,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "a2c84c9c-5c80-4c33-ae7a-1790d789836b",
@@ -666,7 +741,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 11068,
+        "turn1UncachedTokens": 3860,
+        "postTurn1UncachedTokens": 2516,
+        "netContextGrowthTokens": 2514,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -714,7 +794,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 7861,
+        "turn1UncachedTokens": 2983,
+        "postTurn1UncachedTokens": 10031,
+        "netContextGrowthTokens": 10021,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "b8a0b556-73dc-4463-871c-732bc492a1e7",
@@ -755,7 +840,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 11222,
+        "turn1UncachedTokens": 6344,
+        "postTurn1UncachedTokens": 2515,
+        "netContextGrowthTokens": 2513,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -785,7 +875,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8168,
+        "turn1UncachedTokens": 1586,
+        "postTurn1UncachedTokens": 15046,
+        "netContextGrowthTokens": 15024,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "aec83cc8-b5a2-4eaf-85be-b81edb0bc09c",
@@ -808,7 +903,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 12444,
+        "turn1UncachedTokens": 5152,
+        "postTurn1UncachedTokens": 7770,
+        "netContextGrowthTokens": 7756,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -838,7 +938,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8012,
+        "turn1UncachedTokens": 1431,
+        "postTurn1UncachedTokens": 15381,
+        "netContextGrowthTokens": 15365,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "01813226-0165-4ecb-ac34-d0e5162577de",
@@ -861,7 +966,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 9775,
+        "turn1UncachedTokens": 4897,
+        "postTurn1UncachedTokens": 5518,
+        "netContextGrowthTokens": 5510,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -891,7 +1001,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8061,
+        "turn1UncachedTokens": 1480,
+        "postTurn1UncachedTokens": 12987,
+        "netContextGrowthTokens": 12969,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "17fe2e28-fb96-4d2b-b299-2783b35cc4f5",
@@ -914,7 +1029,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 9802,
+        "turn1UncachedTokens": 2594,
+        "postTurn1UncachedTokens": 8212,
+        "netContextGrowthTokens": 8204,
+        "cacheMissTurns": 0
       }
     },
     {
@@ -944,7 +1064,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8009,
+        "turn1UncachedTokens": 1426,
+        "postTurn1UncachedTokens": 7128,
+        "netContextGrowthTokens": 7114,
+        "cacheMissTurns": 0
       },
       "plexer": {
         "conversationId": "2b888c05-4958-46f9-a3c4-0de66a25931a",
@@ -967,7 +1092,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 9742,
+        "turn1UncachedTokens": 2532,
+        "postTurn1UncachedTokens": 3311,
+        "netContextGrowthTokens": 3307,
+        "cacheMissTurns": 0
       }
     }
   ]

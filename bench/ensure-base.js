@@ -19,9 +19,9 @@ const BENCH_REPOS_DIR = process.env.PLEXER_BENCH_REPOS_DIR || join(homedir(), "P
 
 const REPOS = [
     { name: "plexer", src: resolve(import.meta.dirname, ".."), ref: "0362ee2" },
+    { name: "sert", src: join(BENCH_REPOS_DIR, "sert"), ref: "0a928ab" },
     { name: "kohls-admin", src: join(BENCH_REPOS_DIR, "kohls-admin"), ref: "a8b4b465" },
     { name: "flux", src: join(BENCH_REPOS_DIR, "flux"), ref: "75090db" },
-    { name: "sert", src: join(BENCH_REPOS_DIR, "sert"), ref: "0a928ab" },
     { name: "building-tools", src: join(BENCH_REPOS_DIR, "building-tools"), ref: "d910e7b" },
     { name: "z", src: join(BENCH_REPOS_DIR, "z"), ref: "dc76d03" },
 ];
@@ -75,6 +75,12 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
         }
         if (existsSync(join(r.src, ".sert"))) {
             cpSync(join(r.src, ".sert"), join(cleanDir, ".sert"), { recursive: true });
+            const pinnedSertSrc = r.name === "sert" ? join(cleanDir, "src") : join(AB_BASE_DIR, "clean", "sert", "src");
+            const localSertSrc = join(cleanDir, ".sert", "sert", "src");
+            if (existsSync(pinnedSertSrc) && existsSync(join(cleanDir, ".sert", "sert"))) {
+                rmSync(localSertSrc, { recursive: true, force: true });
+                cpSync(pinnedSertSrc, localSertSrc, { recursive: true });
+            }
         }
         execFileSync("git", ["init", "-q"], { cwd: cleanDir });
         execFileSync("git", ["add", "-A"], { cwd: cleanDir });

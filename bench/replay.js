@@ -30,12 +30,14 @@ const argVal = (name, dflt) => {
     const i = argv.indexOf(name);
     return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
 };
+const DEFAULT_SPANS = resolve(import.meta.dirname, "needed-spans.json");
 const ARMS = new Set(argVal("--arms", "cold").split(","));
-const OUT = resolve(argVal("--out", resolve(import.meta.dirname, "needed-spans.json")));
+const OUT = resolve(argVal("--out", DEFAULT_SPANS));
 
-const LOG_ROOTS = [
+export const LOG_ROOTS = [
     { dir: "/tmp/plexer-claude-logs", suite: "T" },
     { dir: "/tmp/plexer-swebench-logs", suite: "S" },
+    { dir: "/tmp/plexer-large-logs", suite: "L" },
 ];
 
 export const TEST_PATH = /(^|\/)(tests?|spec|specs|__tests__|testdata|fixtures)\/|[._-](test|spec)\.[a-z]+$|_test\.go$/i;
@@ -46,7 +48,7 @@ export function normPath(p, cwd) {
     if (!p) return null;
     let s = String(p).replace(/^['"]|['"]$/g, "");
     if (cwd && s.startsWith(cwd + "/")) s = s.slice(cwd.length + 1);
-    s = s.replace(/^\/tmp\/plexer-(?:ab|swebench)-[^/]+\/[^/]+\//, "").replace(/^\/(?:app|testbed)\//, "");
+    s = s.replace(/^\/tmp\/plexer-(?:ab|swebench|large)-[^/]+\/[^/]+\//, "").replace(/^\/(?:app|testbed)\//, "");
     s = s.replace(/^\.\//, "");
     if (s.startsWith("/") || s.includes("*") || s.includes("$")) return null;
     return SRC_EXT.test(s) ? s : null;
@@ -229,7 +231,17 @@ export function goldRanges(patch) {
 }
 
 function main() {
+    const seedPath = existsSync(OUT) ? OUT : existsSync(DEFAULT_SPANS) ? DEFAULT_SPANS : null;
+    let prevTasks = {};
+    if (seedPath) {
+        try {
+            prevTasks = JSON.parse(readFileSync(seedPath, "utf8")).tasks || {};
+        } catch {
+            prevTasks = {};
+        }
+    }
     const fixture = { generated: new Date().toISOString(), arms: [...ARMS], tasks: {} };
+    const minedTaskIds = new Set();
     const add = (id) =>
         (fixture.tasks[id] ??= { runs: [], reads: {}, wholeFiles: {}, hits: {}, gold: {} });
     for (const { dir } of LOG_ROOTS) {
@@ -238,10 +250,11 @@ function main() {
             const mdir = `${dir}/${model}`;
             if (!existsSync(mdir) || !/^(opus|sonnet)$/.test(model)) continue;
             for (const f of readdirSync(mdir)) {
-                const m = /^([TS]\d+)-(cold|plexer)\.jsonl$/.exec(f);
+                const m = /^([TSL]\d+)-(cold|plexer)\.jsonl$/.exec(f);
                 if (!m || !ARMS.has(m[2])) continue;
                 const need = needsFromTranscript(`${mdir}/${f}`);
                 const t = add(m[1]);
+                minedTaskIds.add(m[1]);
                 const run = `${model}/${m[2]}`;
                 t.runs.push(run);
                 // Weight = number of distinct runs; per-run dedupe of identical ranges.
@@ -268,6 +281,20 @@ function main() {
         for (const st of JSON.parse(readFileSync(swePath, "utf8"))) {
             const t = add(st.id);
             for (const g of goldRanges(st.patch)) (t.gold[g.file] ??= []).push([g.a, g.b]);
+        }
+    }
+    // Preserve ground-truth spans from existing needed-spans.json for any suite/task whose /tmp logs aren't present.
+    for (const [id, prevTask] of Object.entries(prevTasks)) {
+        if (minedTaskIds.has(id)) continue;
+        if (!fixture.tasks[id]) {
+            fixture.tasks[id] = prevTask;
+        } else {
+            fixture.tasks[id] = {
+                ...prevTask,
+                gold: Object.keys(fixture.tasks[id].gold || {}).length
+                    ? fixture.tasks[id].gold
+                    : (prevTask.gold || {}),
+            };
         }
     }
     writeFileSync(OUT, JSON.stringify(fixture, null, 1) + "\n");

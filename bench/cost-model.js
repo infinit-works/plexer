@@ -18,9 +18,27 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const RESULT_FILES = {
+export const RESULT_FILES = {
     opus: ["results-opus.json", "results-swebench-opus.json"],
     sonnet: ["results-sonnet.json", "results-swebench-sonnet.json"],
+};
+
+export const OPTIONAL_RESULT_FILES = {
+    "carbon-medium": [
+        "results-carbon-medium.json",
+        "results-swebench-carbon-medium.json",
+        "results-large-carbon-medium.json",
+    ],
+    "argon-medium": [
+        "results-argon-medium.json",
+        "results-swebench-argon-medium.json",
+        "results-large-argon-medium.json",
+    ],
+    "flash-medium": [
+        "results-flash-medium.json",
+        "results-swebench-flash-medium.json",
+        "results-large-flash-medium.json",
+    ],
 };
 
 /** Ordinary least squares via normal equations (Gauss-Jordan). Returns coefficient array. */
@@ -73,11 +91,18 @@ const WARM_PREFIX_TOKENS = {
 /**
  * Load per-task live rows: {family, suite, id, arm, turns, calls, out, ms, apiMs, cum, final, unc, cost}.
  * `t0Tok` is filled in later by the caller (it is an offline quantity).
+ * Default `opus`/`sonnet` rows stay strictly pinned to `RESULT_FILES` for `eval-fast.js` calibration,
+ * while optional families (`carbon-medium`, `argon-medium`, `flash-medium`) are loaded when present.
  */
-export function loadRows(benchDir = import.meta.dirname) {
+export function loadRows(benchDir = import.meta.dirname, options = {}) {
+    const { includeOptional = true, families = null } = options;
+    const fileMap = includeOptional ? { ...RESULT_FILES, ...OPTIONAL_RESULT_FILES } : RESULT_FILES;
+    const selectedFamilies = families ? new Set(families) : null;
     const rows = [];
-    for (const [family, files] of Object.entries(RESULT_FILES)) {
+    for (const [family, files] of Object.entries(fileMap)) {
+        if (selectedFamilies && !selectedFamilies.has(family)) continue;
         const warmPrefix = WARM_PREFIX_TOKENS[family] ?? 6600;
+        const isClaudeDefault = Object.hasOwn(RESULT_FILES, family);
         for (const f of files) {
             const p = resolve(benchDir, f);
             if (!existsSync(p)) continue;
@@ -86,12 +111,15 @@ export function loadRows(benchDir = import.meta.dirname) {
                 for (const arm of ["cold", "plexer"]) {
                     const x = t[arm];
                     if (!x) continue;
-                    const unc = Math.max(0, x.finalContextTokens - warmPrefix + 2 * (x.turns + 1));
+                    const unc =
+                        !isClaudeDefault && (x.uncachedInputTokens || 0) > 1000
+                            ? x.uncachedInputTokens
+                            : Math.max(0, x.finalContextTokens - warmPrefix + 2 * (x.turns + 1));
                     const cacheRead = Math.max(0, x.cumulativeInputTokens - unc);
                     const cost = 1.25 * unc + 0.1 * cacheRead + 5 * x.totalModelOutputTokens;
                     rows.push({
                         family,
-                        suite: f.includes("swebench") ? "S" : "T",
+                        suite: f.includes("swebench") ? "S" : f.includes("large") ? "L" : "T",
                         id: t.id,
                         arm,
                         turns: x.turns,
@@ -145,8 +173,8 @@ export function predict(model, turns, t0Tok) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {
-    const rows = loadRows();
-    for (const family of Object.keys(RESULT_FILES)) {
+    const rows = loadRows(import.meta.dirname, { includeOptional: true });
+    for (const family of [...Object.keys(RESULT_FILES), ...Object.keys(OPTIONAL_RESULT_FILES)]) {
         const R = rows.filter((r) => r.family === family);
         if (!R.length) continue;
         const m = fitFamily(R);

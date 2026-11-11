@@ -39,7 +39,7 @@
       "cloneDir": "/tmp/plexer-ab-opus-agy-trail/plexer"
     },
     "plexer": {
-      "conversationId": "9483a423-5bb3-479e-bf90-d7c539577de6",
+      "conversationId": "/tmp/plexer-agy-logs/opus-agy/T9-plexer.jsonl",
       "cloneDir": "/tmp/plexer-ab-opus-agy-plexer/plexer"
     },
     "cold": {

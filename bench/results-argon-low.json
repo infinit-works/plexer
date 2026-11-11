@@ -17,7 +17,12 @@
       "searchMs": 1017000,
       "totalMs": 1018000,
       "score": 96,
-      "maxScore": 96
+      "maxScore": 96,
+      "turn1ContextTokens": 0,
+      "turn1UncachedTokens": 0,
+      "postTurn1UncachedTokens": 0,
+      "netContextGrowthTokens": 0,
+      "cacheMissTurns": 0
     },
     "plexer": {
       "calls": 80,
@@ -31,7 +36,12 @@
       "searchMs": 961000,
       "totalMs": 963000,
       "score": 96,
-      "maxScore": 96
+      "maxScore": 96,
+      "turn1ContextTokens": 106059,
+      "turn1UncachedTokens": 106059,
+      "postTurn1UncachedTokens": 254001,
+      "netContextGrowthTokens": 193757,
+      "cacheMissTurns": 13
     },
     "tokenWins": 12,
     "tokenTies": 0,
@@ -130,7 +140,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 9204,
+        "turn1UncachedTokens": 9204,
+        "postTurn1UncachedTokens": 887,
+        "netContextGrowthTokens": 887,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -219,7 +234,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8920,
+        "turn1UncachedTokens": 8920,
+        "postTurn1UncachedTokens": 22493,
+        "netContextGrowthTokens": 11999,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -308,7 +328,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8688,
+        "turn1UncachedTokens": 8688,
+        "postTurn1UncachedTokens": 8617,
+        "netContextGrowthTokens": 7899,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -397,7 +422,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8065,
+        "turn1UncachedTokens": 8065,
+        "postTurn1UncachedTokens": 5679,
+        "netContextGrowthTokens": 3630,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -486,7 +516,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8507,
+        "turn1UncachedTokens": 8507,
+        "postTurn1UncachedTokens": 35250,
+        "netContextGrowthTokens": 29110,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -575,7 +610,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 9024,
+        "turn1UncachedTokens": 9024,
+        "postTurn1UncachedTokens": 3282,
+        "netContextGrowthTokens": 3282,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -664,7 +704,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 9132,
+        "turn1UncachedTokens": 9132,
+        "postTurn1UncachedTokens": 16994,
+        "netContextGrowthTokens": 9161,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -753,7 +798,12 @@
             "weight": 2,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 9135,
+        "turn1UncachedTokens": 9135,
+        "postTurn1UncachedTokens": 7656,
+        "netContextGrowthTokens": 1741,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -806,7 +856,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8827,
+        "turn1UncachedTokens": 8827,
+        "postTurn1UncachedTokens": 57573,
+        "netContextGrowthTokens": 47757,
+        "cacheMissTurns": 2
       }
     },
     {
@@ -859,7 +914,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8980,
+        "turn1UncachedTokens": 8980,
+        "postTurn1UncachedTokens": 14555,
+        "netContextGrowthTokens": 9564,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -912,7 +972,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8867,
+        "turn1UncachedTokens": 8867,
+        "postTurn1UncachedTokens": 62369,
+        "netContextGrowthTokens": 54179,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -965,7 +1030,12 @@
             "weight": 8,
             "passed": true
           }
-        ]
+        ],
+        "turn1ContextTokens": 8710,
+        "turn1UncachedTokens": 8710,
+        "postTurn1UncachedTokens": 18646,
+        "netContextGrowthTokens": 14548,
+        "cacheMissTurns": 1
       }
     }
   ]

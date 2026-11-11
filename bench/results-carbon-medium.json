@@ -1,0 +1,1286 @@
+{
+  "generatedAt": "2026-11-10T23:45:49.677Z",
+  "symmetryCheck": {
+    "passed": true,
+    "violations": []
+  },
+  "totals": {
+    "cold": {
+      "calls": 288,
+      "turns": 163,
+      "toolOutputTokens": 333138,
+      "uncachedInputTokens": 848182,
+      "cachedInputTokens": 7686372,
+      "cumulativeInputTokens": 8534554,
+      "turn1ContextTokens": 60966,
+      "turn1UncachedTokens": 60966,
+      "postTurn1UncachedTokens": 787216,
+      "netContextGrowthTokens": 642461,
+      "cacheMissTurns": 0,
+      "finalContextTokens": 703427,
+      "totalModelOutputTokens": 185397,
+      "searchMs": 2321000,
+      "totalMs": 2900304,
+      "score": 96,
+      "maxScore": 96
+    },
+    "plexer": {
+      "calls": 163,
+      "turns": 125,
+      "toolOutputTokens": 167974,
+      "uncachedInputTokens": 602687,
+      "cachedInputTokens": 4509936,
+      "cumulativeInputTokens": 5112623,
+      "turn1ContextTokens": 99612,
+      "turn1UncachedTokens": 99612,
+      "postTurn1UncachedTokens": 454985,
+      "netContextGrowthTokens": 376636,
+      "cacheMissTurns": 1,
+      "finalContextTokens": 476248,
+      "totalModelOutputTokens": 159467,
+      "searchMs": 2298000,
+      "totalMs": 2738186,
+      "score": 94,
+      "maxScore": 96
+    },
+    "tokenWins": 11,
+    "tokenTies": 0,
+    "tokenLosses": 1,
+    "callWins": 12,
+    "callTies": 0,
+    "callLosses": 0,
+    "speedWins": 8,
+    "speedTies": 0,
+    "speedLosses": 4,
+    "trailComparison": {
+      "taskIds": [
+        "T4",
+        "T5",
+        "T9"
+      ],
+      "cold": {
+        "calls": 76,
+        "turns": 34,
+        "toolOutputTokens": 95667,
+        "uncachedInputTokens": 202035,
+        "cachedInputTokens": 1294394,
+        "cumulativeInputTokens": 1496429,
+        "turn1ContextTokens": 15295,
+        "turn1UncachedTokens": 15295,
+        "postTurn1UncachedTokens": 186740,
+        "netContextGrowthTokens": 162788,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 178083,
+        "totalModelOutputTokens": 47017,
+        "searchMs": 527000,
+        "totalMs": 659590,
+        "score": 24,
+        "maxScore": 24
+      },
+      "trail": {
+        "calls": 67,
+        "turns": 39,
+        "toolOutputTokens": 86723,
+        "uncachedInputTokens": 193209,
+        "cachedInputTokens": 1235171,
+        "cumulativeInputTokens": 1428380,
+        "turn1ContextTokens": 18625,
+        "turn1UncachedTokens": 18625,
+        "postTurn1UncachedTokens": 174584,
+        "netContextGrowthTokens": 149639,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 168264,
+        "totalModelOutputTokens": 45436,
+        "searchMs": 627000,
+        "totalMs": 795586,
+        "score": 24,
+        "maxScore": 24
+      },
+      "plexer": {
+        "calls": 49,
+        "turns": 30,
+        "toolOutputTokens": 65669,
+        "uncachedInputTokens": 161417,
+        "cachedInputTokens": 1129652,
+        "cumulativeInputTokens": 1291069,
+        "turn1ContextTokens": 23283,
+        "turn1UncachedTokens": 23283,
+        "postTurn1UncachedTokens": 138134,
+        "netContextGrowthTokens": 127208,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 150491,
+        "totalModelOutputTokens": 43403,
+        "searchMs": 589000,
+        "totalMs": 698523,
+        "score": 22,
+        "maxScore": 24
+      }
+    }
+  },
+  "tasks": [
+    {
+      "id": "T1",
+      "category": "diagnosis",
+      "repo": "kohls-admin",
+      "holdout": false,
+      "title": "Diagnose command target validation & group-role fail-closed behavior",
+      "cold": {
+        "conversationId": "22e3f1be-e3ae-4de0-b68c-15361fb6d0ab",
+        "calls": 11,
+        "turns": 7,
+        "toolOutputTokens": 9893,
+        "uncachedInputTokens": 29225,
+        "cachedInputTokens": 94062,
+        "cumulativeInputTokens": 123287,
+        "turn1ContextTokens": 5064,
+        "turn1UncachedTokens": 5064,
+        "postTurn1UncachedTokens": 24161,
+        "netContextGrowthTokens": 17057,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 22121,
+        "totalModelOutputTokens": 5040,
+        "searchMs": 44000,
+        "totalMs": 80992,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "auth_file_cited",
+            "description": "Cites src/Shared/Auth.luau with line numbers around targetUserArgument and getGroupEntryRank/isPublicRole",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "roles_loaded_attribute",
+            "description": "Identifies the _KRolesLoaded attribute check returning 'Can\\'t target loading user'",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "rank_comparison_fallback",
+            "description": "Explains that when arg.command.rank == 0 it compares against arg.command.fromRank (otherwise arg.command.rank)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "group_fail_closed_and_retry",
+            "description": "Explains that groupEntryRanks sets false while fetching, isPublicRole fails closed (returns true) when entry is nil/false, and retries after 60 seconds via task.delay(60, ...)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "b6984552-f991-4ea7-96aa-4711283dc682",
+        "calls": 3,
+        "turns": 3,
+        "toolOutputTokens": 2103,
+        "uncachedInputTokens": 16984,
+        "cachedInputTokens": 25774,
+        "cumulativeInputTokens": 42758,
+        "turn1ContextTokens": 8649,
+        "turn1UncachedTokens": 8649,
+        "postTurn1UncachedTokens": 8335,
+        "netContextGrowthTokens": 4078,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 12727,
+        "totalModelOutputTokens": 4271,
+        "searchMs": 32000,
+        "totalMs": 66823,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "auth_file_cited",
+            "description": "Cites src/Shared/Auth.luau with line numbers around targetUserArgument and getGroupEntryRank/isPublicRole",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "roles_loaded_attribute",
+            "description": "Identifies the _KRolesLoaded attribute check returning 'Can\\'t target loading user'",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "rank_comparison_fallback",
+            "description": "Explains that when arg.command.rank == 0 it compares against arg.command.fromRank (otherwise arg.command.rank)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "group_fail_closed_and_retry",
+            "description": "Explains that groupEntryRanks sets false while fetching, isPublicRole fails closed (returns true) when entry is nil/false, and retries after 60 seconds via task.delay(60, ...)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T2",
+      "category": "diagnosis",
+      "repo": "flux",
+      "holdout": false,
+      "title": "Diagnose runaway reactive effect loop detection and disposal",
+      "cold": {
+        "conversationId": "0400545a-4360-46f9-be9b-30e62aba8a78",
+        "calls": 9,
+        "turns": 7,
+        "toolOutputTokens": 17363,
+        "uncachedInputTokens": 42815,
+        "cachedInputTokens": 161130,
+        "cumulativeInputTokens": 203945,
+        "turn1ContextTokens": 5021,
+        "turn1UncachedTokens": 5021,
+        "postTurn1UncachedTokens": 37794,
+        "netContextGrowthTokens": 32976,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 37997,
+        "totalModelOutputTokens": 12828,
+        "searchMs": 50000,
+        "totalMs": 158006,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "graph_file_cited",
+            "description": "Cites src/Graph.luau with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "self_write_requeue",
+            "description": "Identifies selfWritten == e / requeue(e) tracking direct self-writes in reruns[e]",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "guard_passes_and_limit",
+            "description": "Identifies GUARD_PASSES = 32 and RERUN_LIMIT = 100 (or > 32 passes and > 100 reruns/cycles)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "runaway_dispose",
+            "description": "Explains that runaway() warns and calls disposeOne(e) to permanently dispose the effect",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "925881a0-c28f-44a1-b2b4-8c7cd9fc50a8",
+        "calls": 8,
+        "turns": 5,
+        "toolOutputTokens": 8732,
+        "uncachedInputTokens": 31836,
+        "cachedInputTokens": 100705,
+        "cumulativeInputTokens": 132541,
+        "turn1ContextTokens": 8931,
+        "turn1UncachedTokens": 8931,
+        "postTurn1UncachedTokens": 22905,
+        "netContextGrowthTokens": 22910,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 31841,
+        "totalModelOutputTokens": 11803,
+        "searchMs": 101000,
+        "totalMs": 150396,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "graph_file_cited",
+            "description": "Cites src/Graph.luau with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "self_write_requeue",
+            "description": "Identifies selfWritten == e / requeue(e) tracking direct self-writes in reruns[e]",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "guard_passes_and_limit",
+            "description": "Identifies GUARD_PASSES = 32 and RERUN_LIMIT = 100 (or > 32 passes and > 100 reruns/cycles)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "runaway_dispose",
+            "description": "Explains that runaway() warns and calls disposeOne(e) to permanently dispose the effect",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T3",
+      "category": "diagnosis",
+      "repo": "sert",
+      "holdout": false,
+      "title": "Diagnose stateful model test command-redraw shrinking stability",
+      "cold": {
+        "conversationId": "64e3ddf0-c3d1-46f6-8a2e-c4caf1e66034",
+        "calls": 5,
+        "turns": 4,
+        "toolOutputTokens": 15614,
+        "uncachedInputTokens": 35269,
+        "cachedInputTokens": 30680,
+        "cumulativeInputTokens": 65949,
+        "turn1ContextTokens": 5036,
+        "turn1UncachedTokens": 5036,
+        "postTurn1UncachedTokens": 30233,
+        "netContextGrowthTokens": 26132,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 31168,
+        "totalModelOutputTokens": 7855,
+        "searchMs": 35000,
+        "totalMs": 110158,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "model_and_prop_cited",
+            "description": "Cites src/model.luau (and optionally src/prop.luau) with line spans",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "precondition_state_shift",
+            "description": "Explains that earlier refused draws depended on the prior model state, so deleting an earlier step changes state and could make an earlier tried command pass or consume different draws",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "prop_mark_and_hint",
+            "description": "Identifies prop.mark(g) (first / pick) and prop.hint(g, first, pick, { drawn[command] })",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "single_draw_replacement",
+            "description": "Explains that [first, pick] is replaced/hinted with the single draw offset { drawn[command] } when pick > first",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "fc610763-4e53-49bc-97bb-a5c104f706c7",
+        "calls": 2,
+        "turns": 2,
+        "toolOutputTokens": 2538,
+        "uncachedInputTokens": 12463,
+        "cachedInputTokens": 17464,
+        "cumulativeInputTokens": 29927,
+        "turn1ContextTokens": 7705,
+        "turn1UncachedTokens": 7705,
+        "postTurn1UncachedTokens": 4758,
+        "netContextGrowthTokens": 4760,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 12465,
+        "totalModelOutputTokens": 5809,
+        "searchMs": 15000,
+        "totalMs": 66167,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "model_and_prop_cited",
+            "description": "Cites src/model.luau (and optionally src/prop.luau) with line spans",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "precondition_state_shift",
+            "description": "Explains that earlier refused draws depended on the prior model state, so deleting an earlier step changes state and could make an earlier tried command pass or consume different draws",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "prop_mark_and_hint",
+            "description": "Identifies prop.mark(g) (first / pick) and prop.hint(g, first, pick, { drawn[command] })",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "single_draw_replacement",
+            "description": "Explains that [first, pick] is replaced/hinted with the single draw offset { drawn[command] } when pick > first",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T4",
+      "category": "diagnosis",
+      "repo": "z",
+      "holdout": true,
+      "title": "Diagnose zero-byte element validation in count-prefixed arrays (Holdout)",
+      "cold": {
+        "conversationId": "82c64900-9380-4832-976a-07b22e5395d6",
+        "calls": 12,
+        "turns": 6,
+        "toolOutputTokens": 18300,
+        "uncachedInputTokens": 34092,
+        "cachedInputTokens": 98580,
+        "cumulativeInputTokens": 132672,
+        "turn1ContextTokens": 5047,
+        "turn1UncachedTokens": 5047,
+        "postTurn1UncachedTokens": 29045,
+        "netContextGrowthTokens": 27620,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 32667,
+        "totalModelOutputTokens": 7381,
+        "searchMs": 45000,
+        "totalMs": 98782,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "resolve_rs_cited",
+            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "zero_size_detection",
+            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "consumes_instance_exception",
+            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "composite_type_rules",
+            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "e4930b72-b3e3-4fdb-a509-b3ecec441d89",
+        "calls": 2,
+        "turns": 2,
+        "toolOutputTokens": 3037,
+        "uncachedInputTokens": 12059,
+        "cachedInputTokens": 16915,
+        "cumulativeInputTokens": 28974,
+        "turn1ContextTokens": 7269,
+        "turn1UncachedTokens": 7269,
+        "postTurn1UncachedTokens": 4790,
+        "netContextGrowthTokens": 4792,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 12061,
+        "totalModelOutputTokens": 5123,
+        "searchMs": 25000,
+        "totalMs": 78353,
+        "score": 6,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "resolve_rs_cited",
+            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "zero_size_detection",
+            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
+            "weight": 2,
+            "passed": false
+          },
+          {
+            "id": "consumes_instance_exception",
+            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "composite_type_rules",
+            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "57aeaed5-07c3-4787-b52f-fc931904f980",
+        "calls": 9,
+        "turns": 5,
+        "toolOutputTokens": 14427,
+        "uncachedInputTokens": 29229,
+        "cachedInputTokens": 79851,
+        "cumulativeInputTokens": 109080,
+        "turn1ContextTokens": 6174,
+        "turn1UncachedTokens": 6174,
+        "postTurn1UncachedTokens": 23055,
+        "netContextGrowthTokens": 21010,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 27184,
+        "totalModelOutputTokens": 5652,
+        "searchMs": 44000,
+        "totalMs": 88943,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "resolve_rs_cited",
+            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "zero_size_detection",
+            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "consumes_instance_exception",
+            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "composite_type_rules",
+            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T5",
+      "category": "blast-radius",
+      "repo": "plexer",
+      "holdout": false,
+      "title": "Blast radius of changing working-tree freshness checking",
+      "cold": {
+        "conversationId": "c476ecb0-4b3a-41e7-99ad-7f05fbe18d3b",
+        "calls": 21,
+        "turns": 8,
+        "toolOutputTokens": 42814,
+        "uncachedInputTokens": 71177,
+        "cachedInputTokens": 284784,
+        "cumulativeInputTokens": 355961,
+        "turn1ContextTokens": 5016,
+        "turn1UncachedTokens": 5016,
+        "postTurn1UncachedTokens": 66161,
+        "netContextGrowthTokens": 60019,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 65035,
+        "totalModelOutputTokens": 12133,
+        "searchMs": 67000,
+        "totalMs": 134183,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "fingerprint_def",
+            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "direct_callers",
+            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "cli_commands_using_ensure",
+            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mcp_freshness",
+            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "4370ed7b-2c4e-4d74-ab45-2b3694222709",
+        "calls": 16,
+        "turns": 13,
+        "toolOutputTokens": 42989,
+        "uncachedInputTokens": 78265,
+        "cachedInputTokens": 606930,
+        "cumulativeInputTokens": 685195,
+        "turn1ContextTokens": 8052,
+        "turn1UncachedTokens": 8052,
+        "postTurn1UncachedTokens": 70213,
+        "netContextGrowthTokens": 69700,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 77752,
+        "totalModelOutputTokens": 13414,
+        "searchMs": 147000,
+        "totalMs": 193228,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "fingerprint_def",
+            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "direct_callers",
+            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "cli_commands_using_ensure",
+            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mcp_freshness",
+            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "a9085392-7719-41e7-96f6-36e870a41e75",
+        "calls": 25,
+        "turns": 17,
+        "toolOutputTokens": 47311,
+        "uncachedInputTokens": 90173,
+        "cachedInputTokens": 520706,
+        "cumulativeInputTokens": 610879,
+        "turn1ContextTokens": 6113,
+        "turn1UncachedTokens": 6113,
+        "postTurn1UncachedTokens": 84060,
+        "netContextGrowthTokens": 69686,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 75799,
+        "totalModelOutputTokens": 16298,
+        "searchMs": 190000,
+        "totalMs": 297241,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "fingerprint_def",
+            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "direct_callers",
+            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "cli_commands_using_ensure",
+            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mcp_freshness",
+            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T6",
+      "category": "blast-radius",
+      "repo": "kohls-admin",
+      "holdout": false,
+      "title": "Blast radius of refactoring user permission flag checks",
+      "cold": {
+        "conversationId": "80f1948d-1a14-4ba9-a9bf-23c85139ad91",
+        "calls": 34,
+        "turns": 10,
+        "toolOutputTokens": 29875,
+        "uncachedInputTokens": 65975,
+        "cachedInputTokens": 335474,
+        "cumulativeInputTokens": 401449,
+        "turn1ContextTokens": 5050,
+        "turn1UncachedTokens": 5050,
+        "postTurn1UncachedTokens": 60925,
+        "netContextGrowthTokens": 54861,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 59911,
+        "totalModelOutputTokens": 11908,
+        "searchMs": 145000,
+        "totalMs": 225198,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "has_permission_def",
+            "description": "Cites Auth.hasPermission in src/Shared/Auth.luau:L541-L567",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "shared_and_auth_callers",
+            "description": "Identifies callers in src/Shared/Auth.luau (banUsers/L82-84, unbanUsers/L148-150, targetUserArgument/L645-648) and src/Shared/Data/init.luau",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "default_commands_and_types_callers",
+            "description": "Identifies callers in DefaultCommands (Administration.luau, Moderation.luau, Utility.luau) and DefaultTypes/Ban.luau",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "client_and_server_callers",
+            "description": "Identifies callers in src/Client/ (Bans.luau, Members.luau, Settings.luau), src/Server/init.luau, and src/init.luau",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "61408f35-0cab-4e32-989b-f52f7b36f545",
+        "calls": 4,
+        "turns": 4,
+        "toolOutputTokens": 8478,
+        "uncachedInputTokens": 22525,
+        "cachedInputTokens": 53984,
+        "cumulativeInputTokens": 76509,
+        "turn1ContextTokens": 7969,
+        "turn1UncachedTokens": 7969,
+        "postTurn1UncachedTokens": 14556,
+        "netContextGrowthTokens": 14560,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 22529,
+        "totalModelOutputTokens": 9253,
+        "searchMs": 41000,
+        "totalMs": 115509,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "has_permission_def",
+            "description": "Cites Auth.hasPermission in src/Shared/Auth.luau:L541-L567",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "shared_and_auth_callers",
+            "description": "Identifies callers in src/Shared/Auth.luau (banUsers/L82-84, unbanUsers/L148-150, targetUserArgument/L645-648) and src/Shared/Data/init.luau",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "default_commands_and_types_callers",
+            "description": "Identifies callers in DefaultCommands (Administration.luau, Moderation.luau, Utility.luau) and DefaultTypes/Ban.luau",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "client_and_server_callers",
+            "description": "Identifies callers in src/Client/ (Bans.luau, Members.luau, Settings.luau), src/Server/init.luau, and src/init.luau",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T7",
+      "category": "blast-radius",
+      "repo": "flux",
+      "holdout": false,
+      "title": "Blast radius of refactoring manual/engine frame step wiring",
+      "cold": {
+        "conversationId": "ad035a01-9ead-44a0-8d7b-dae94a92faa8",
+        "calls": 19,
+        "turns": 13,
+        "toolOutputTokens": 26612,
+        "uncachedInputTokens": 70349,
+        "cachedInputTokens": 495569,
+        "cumulativeInputTokens": 565918,
+        "turn1ContextTokens": 5050,
+        "turn1UncachedTokens": 5050,
+        "postTurn1UncachedTokens": 65299,
+        "netContextGrowthTokens": 50003,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 55053,
+        "totalModelOutputTokens": 10350,
+        "searchMs": 117000,
+        "totalMs": 158455,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "init_and_clock_cited",
+            "description": "Cites src/init.luau and src/Clock.luau (plus src/Compat.luau) with line spans",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "init_frame_wiring",
+            "description": "Explains RunService.PreRender (client) / Heartbeat (server) guarded by not Clock.isManual(), and Clock._internal.setFrame calling Motion.step(dt) + Graph.flush()",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "run_frame_order",
+            "description": "Lists the 5-step order in runFrame(dt) with Clock.drain() called after each phase (timers -> drain -> render -> drain -> frameHook -> drain -> heartbeat -> drain)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "clock_internal_callers",
+            "description": "Identifies Clock._internal.{setFrame, setReport, spawn} and notes src/Compat.luau calling setReport and spawn",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "eae99c4b-8a43-4188-b937-45da1e7bef84",
+        "calls": 5,
+        "turns": 5,
+        "toolOutputTokens": 6277,
+        "uncachedInputTokens": 24960,
+        "cachedInputTokens": 61181,
+        "cumulativeInputTokens": 86141,
+        "turn1ContextTokens": 8656,
+        "turn1UncachedTokens": 8656,
+        "postTurn1UncachedTokens": 16304,
+        "netContextGrowthTokens": 12209,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 20865,
+        "totalModelOutputTokens": 8017,
+        "searchMs": 45000,
+        "totalMs": 86130,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "init_and_clock_cited",
+            "description": "Cites src/init.luau and src/Clock.luau (plus src/Compat.luau) with line spans",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "init_frame_wiring",
+            "description": "Explains RunService.PreRender (client) / Heartbeat (server) guarded by not Clock.isManual(), and Clock._internal.setFrame calling Motion.step(dt) + Graph.flush()",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "run_frame_order",
+            "description": "Lists the 5-step order in runFrame(dt) with Clock.drain() called after each phase (timers -> drain -> render -> drain -> frameHook -> drain -> heartbeat -> drain)",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "clock_internal_callers",
+            "description": "Identifies Clock._internal.{setFrame, setReport, spawn} and notes src/Compat.luau calling setReport and spawn",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T8",
+      "category": "blast-radius",
+      "repo": "building-tools",
+      "holdout": true,
+      "title": "Blast radius of refactoring chunked transport invocation (Holdout)",
+      "cold": {
+        "conversationId": "1521ffcf-2fde-43c6-a5b4-6279345f7865",
+        "calls": 11,
+        "turns": 6,
+        "toolOutputTokens": 14251,
+        "uncachedInputTokens": 35220,
+        "cachedInputTokens": 90237,
+        "cumulativeInputTokens": 125457,
+        "turn1ContextTokens": 5032,
+        "turn1UncachedTokens": 5032,
+        "postTurn1UncachedTokens": 30188,
+        "netContextGrowthTokens": 24828,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 29860,
+        "totalModelOutputTokens": 11774,
+        "searchMs": 114000,
+        "totalMs": 187379,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "history_invoke_chunked_def",
+            "description": "Cites History.invokeChunked in src/Client/State/History.luau:L74-L93",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "partial_failure_behavior",
+            "description": "Explains that invokeChunked continues through all chunks, collects successful steps into steps, and sets complete = false if any chunk reply fails",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "actions_callers",
+            "description": "Identifies setProperties in src/Client/Systems/Actions.luau and its callers rename and setLocked",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "properties_and_tools_callers",
+            "description": "Identifies Properties.invokeChunked / Properties.apply in src/Client/Tools/Shared/Properties.luau and Weld tool callers (breakWelds / weldToLast in src/Client/Tools/Weld/init.luau)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "fa9972d5-bc9c-40a9-ad9f-49662ec86b2c",
+        "calls": 4,
+        "turns": 3,
+        "toolOutputTokens": 9121,
+        "uncachedInputTokens": 26749,
+        "cachedInputTokens": 42522,
+        "cumulativeInputTokens": 69271,
+        "turn1ContextTokens": 8322,
+        "turn1UncachedTokens": 8322,
+        "postTurn1UncachedTokens": 18427,
+        "netContextGrowthTokens": 16380,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 24702,
+        "totalModelOutputTokens": 6462,
+        "searchMs": 29000,
+        "totalMs": 78032,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "history_invoke_chunked_def",
+            "description": "Cites History.invokeChunked in src/Client/State/History.luau:L74-L93",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "partial_failure_behavior",
+            "description": "Explains that invokeChunked continues through all chunks, collects successful steps into steps, and sets complete = false if any chunk reply fails",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "actions_callers",
+            "description": "Identifies setProperties in src/Client/Systems/Actions.luau and its callers rename and setLocked",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "properties_and_tools_callers",
+            "description": "Identifies Properties.invokeChunked / Properties.apply in src/Client/Tools/Shared/Properties.luau and Weld tool callers (breakWelds / weldToLast in src/Client/Tools/Weld/init.luau)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T9",
+      "category": "code-edit",
+      "repo": "plexer",
+      "holdout": false,
+      "title": "Implement multi-file `--all-matches` mode for `plexer skeleton`",
+      "cold": {
+        "conversationId": "0265832d-7bad-4e47-915f-ee2fa416d3a9",
+        "calls": 43,
+        "turns": 20,
+        "toolOutputTokens": 34553,
+        "uncachedInputTokens": 96766,
+        "cachedInputTokens": 911030,
+        "cumulativeInputTokens": 1007796,
+        "turn1ContextTokens": 5232,
+        "turn1UncachedTokens": 5232,
+        "postTurn1UncachedTokens": 91534,
+        "netContextGrowthTokens": 75149,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 80381,
+        "totalModelOutputTokens": 27503,
+        "searchMs": 415000,
+        "totalMs": 426625,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "unit_and_behavioral_tests",
+            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "3865ce70-4b20-403f-a0db-ae73e89719c9",
+        "calls": 31,
+        "turns": 15,
+        "toolOutputTokens": 19643,
+        "uncachedInputTokens": 71093,
+        "cachedInputTokens": 505807,
+        "cumulativeInputTokens": 576900,
+        "turn1ContextTokens": 7962,
+        "turn1UncachedTokens": 7962,
+        "postTurn1UncachedTokens": 63131,
+        "netContextGrowthTokens": 52716,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 60678,
+        "totalModelOutputTokens": 24866,
+        "searchMs": 417000,
+        "totalMs": 426942,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "unit_and_behavioral_tests",
+            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "6dac99bc-df48-47e4-99f6-f44ad998f1a7",
+        "calls": 33,
+        "turns": 17,
+        "toolOutputTokens": 24985,
+        "uncachedInputTokens": 73807,
+        "cachedInputTokens": 634614,
+        "cumulativeInputTokens": 708421,
+        "turn1ContextTokens": 6338,
+        "turn1UncachedTokens": 6338,
+        "postTurn1UncachedTokens": 67469,
+        "netContextGrowthTokens": 58943,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 65281,
+        "totalModelOutputTokens": 23486,
+        "searchMs": 393000,
+        "totalMs": 409402,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "unit_and_behavioral_tests",
+            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T10",
+      "category": "code-edit",
+      "repo": "flux",
+      "holdout": false,
+      "title": "Implement `Store.clear(proxy)` and re-export on `Flux.Store.clear`",
+      "cold": {
+        "conversationId": "11f08dff-d1b0-48d7-9488-23ff7e63ffd5",
+        "calls": 34,
+        "turns": 24,
+        "toolOutputTokens": 44097,
+        "uncachedInputTokens": 128671,
+        "cachedInputTokens": 1783587,
+        "cumulativeInputTokens": 1912258,
+        "turn1ContextTokens": 5125,
+        "turn1UncachedTokens": 5125,
+        "postTurn1UncachedTokens": 123546,
+        "netContextGrowthTokens": 100939,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 106064,
+        "totalModelOutputTokens": 27724,
+        "searchMs": 397000,
+        "totalMs": 407824,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "luau_store_clear_verified",
+            "description": "Existing store unit tests pass AND Flux.Store.clear passes behavioral verification in Luau",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "e4f045f4-bccf-4763-a42a-c67e18ffb256",
+        "calls": 28,
+        "turns": 26,
+        "toolOutputTokens": 24298,
+        "uncachedInputTokens": 138140,
+        "cachedInputTokens": 1037850,
+        "cumulativeInputTokens": 1175990,
+        "turn1ContextTokens": 8681,
+        "turn1UncachedTokens": 8681,
+        "postTurn1UncachedTokens": 81369,
+        "netContextGrowthTokens": 63062,
+        "cacheMissTurns": 1,
+        "finalContextTokens": 71743,
+        "totalModelOutputTokens": 22368,
+        "searchMs": 657000,
+        "totalMs": 667242,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "luau_store_clear_verified",
+            "description": "Existing store unit tests pass AND Flux.Store.clear passes behavioral verification in Luau",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T11",
+      "category": "code-edit",
+      "repo": "sert",
+      "holdout": false,
+      "title": "Add `delay` and `cancel` to simulator `HostHooks`, `server.host`, and `client.host`",
+      "cold": {
+        "conversationId": "0c4dea7f-97b9-4480-b532-f98b485e73e8",
+        "calls": 54,
+        "turns": 34,
+        "toolOutputTokens": 47010,
+        "uncachedInputTokens": 151798,
+        "cachedInputTokens": 2530066,
+        "cumulativeInputTokens": 2681864,
+        "turn1ContextTokens": 5159,
+        "turn1UncachedTokens": 5159,
+        "postTurn1UncachedTokens": 146639,
+        "netContextGrowthTokens": 117537,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 122696,
+        "totalModelOutputTokens": 42967,
+        "searchMs": 631000,
+        "totalMs": 641907,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "luau_sert_host_hooks_verified",
+            "description": "Simulation suite passes AND delay/cancel work on s:host(owner), server.host, and client.host",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "8edcc520-d896-49e1-8de7-494354966386",
+        "calls": 38,
+        "turns": 32,
+        "toolOutputTokens": 30192,
+        "uncachedInputTokens": 118159,
+        "cachedInputTokens": 1731079,
+        "cumulativeInputTokens": 1849238,
+        "turn1ContextTokens": 8967,
+        "turn1UncachedTokens": 8967,
+        "postTurn1UncachedTokens": 109192,
+        "netContextGrowthTokens": 88699,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 97666,
+        "totalModelOutputTokens": 40657,
+        "searchMs": 594000,
+        "totalMs": 606742,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "luau_sert_host_hooks_verified",
+            "description": "Simulation suite passes AND delay/cancel work on s:host(owner), server.host, and client.host",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "T12",
+      "category": "code-edit",
+      "repo": "building-tools",
+      "holdout": true,
+      "title": "Implement `History.clear` and `Actions.clearHistory` (Holdout)",
+      "cold": {
+        "conversationId": "8ea84dce-ee91-4b45-9770-12898ecb3043",
+        "calls": 35,
+        "turns": 24,
+        "toolOutputTokens": 32756,
+        "uncachedInputTokens": 86825,
+        "cachedInputTokens": 871173,
+        "cumulativeInputTokens": 957998,
+        "turn1ContextTokens": 5134,
+        "turn1UncachedTokens": 5134,
+        "postTurn1UncachedTokens": 81691,
+        "netContextGrowthTokens": 55340,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 60474,
+        "totalModelOutputTokens": 7934,
+        "searchMs": 261000,
+        "totalMs": 270795,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "luau_btools_history_clear_verified",
+            "description": "Existing History unit tests pass AND History.clear + Actions.clearHistory pass behavioral verification in Luau",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "b4b9f7de-cd11-48a7-a2dd-4c9b1e75f678",
+        "calls": 22,
+        "turns": 15,
+        "toolOutputTokens": 10566,
+        "uncachedInputTokens": 49454,
+        "cachedInputTokens": 309725,
+        "cumulativeInputTokens": 359179,
+        "turn1ContextTokens": 8449,
+        "turn1UncachedTokens": 8449,
+        "postTurn1UncachedTokens": 41005,
+        "netContextGrowthTokens": 22770,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 31219,
+        "totalModelOutputTokens": 7424,
+        "searchMs": 195000,
+        "totalMs": 202622,
+        "score": 8,
+        "maxScore": 8,
+        "checks": [
+          {
+            "id": "luau_btools_history_clear_verified",
+            "description": "Existing History unit tests pass AND History.clear + Actions.clearHistory pass behavioral verification in Luau",
+            "weight": 8,
+            "passed": true
+          }
+        ]
+      }
+    }
+  ]
+}

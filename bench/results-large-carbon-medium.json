@@ -1,0 +1,1504 @@
+{
+  "generatedAt": "2026-11-11T03:09:03.925Z",
+  "model": "carbon-medium",
+  "totals": {
+    "cold": {
+      "calls": 114,
+      "turns": 62,
+      "toolOutputTokens": 105659,
+      "uncachedInputTokens": 433616,
+      "cachedInputTokens": 1518715,
+      "cumulativeInputTokens": 1952331,
+      "turn1ContextTokens": 41500,
+      "turn1UncachedTokens": 41500,
+      "postTurn1UncachedTokens": 392116,
+      "netContextGrowthTokens": 196094,
+      "cacheMissTurns": 0,
+      "finalContextTokens": 237594,
+      "totalModelOutputTokens": 59690,
+      "searchMs": 838000,
+      "totalMs": 1106222,
+      "score": 64,
+      "maxScore": 64,
+      "resolvedCount": 8,
+      "taskCount": 8
+    },
+    "plexer": {
+      "calls": 68,
+      "turns": 46,
+      "toolOutputTokens": 65159,
+      "uncachedInputTokens": 307672,
+      "cachedInputTokens": 745074,
+      "cumulativeInputTokens": 1052746,
+      "turn1ContextTokens": 63688,
+      "turn1UncachedTokens": 63688,
+      "postTurn1UncachedTokens": 243984,
+      "netContextGrowthTokens": 129714,
+      "cacheMissTurns": 0,
+      "finalContextTokens": 193402,
+      "totalModelOutputTokens": 49509,
+      "searchMs": 766000,
+      "totalMs": 1017996,
+      "score": 64,
+      "maxScore": 64,
+      "resolvedCount": 8,
+      "taskCount": 8
+    },
+    "trail": {
+      "calls": 102,
+      "turns": 54,
+      "toolOutputTokens": 98903,
+      "uncachedInputTokens": 423234,
+      "cachedInputTokens": 1312183,
+      "cumulativeInputTokens": 1735417,
+      "turn1ContextTokens": 50685,
+      "turn1UncachedTokens": 50685,
+      "postTurn1UncachedTokens": 364756,
+      "netContextGrowthTokens": 191780,
+      "cacheMissTurns": 1,
+      "finalContextTokens": 242465,
+      "totalModelOutputTokens": 54904,
+      "searchMs": 853000,
+      "totalMs": 1104797,
+      "score": 64,
+      "maxScore": 64,
+      "resolvedCount": 8,
+      "taskCount": 8
+    }
+  },
+  "tasks": [
+    {
+      "id": "L1",
+      "title": "Trace PocketBase OAuth2 user creation, avatar file fallback, and RecordUpsert validation/dry-submit",
+      "category": "cross-subsystem-trace",
+      "repo": "pocketbase",
+      "language": "Go",
+      "sizeBucket": "medium",
+      "fileCount": 444,
+      "gold_files": [
+        "apis/record_auth_with_oauth2.go",
+        "forms/record_upsert.go"
+      ],
+      "plexer": {
+        "conversationId": "a4ae42b4-be91-4270-b6b0-290fd2d02268",
+        "calls": 6,
+        "turns": 6,
+        "toolOutputTokens": 7486,
+        "uncachedInputTokens": 38712,
+        "cachedInputTokens": 68206,
+        "cumulativeInputTokens": 106918,
+        "turn1ContextTokens": 8123,
+        "turn1UncachedTokens": 8123,
+        "postTurn1UncachedTokens": 30589,
+        "netContextGrowthTokens": 13587,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 21710,
+        "totalModelOutputTokens": 7536,
+        "searchMs": 51000,
+        "totalMs": 111073,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "apis/record_auth_with_oauth2.go",
+          "forms/record_upsert.go"
+        ],
+        "checks": [
+          {
+            "id": "cites_both_subsystems",
+            "description": "Cites both apis/record_auth_with_oauth2.go and forms/record_upsert.go with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "oauth2_superuser_and_avatar",
+            "description": "Identifies CollectionNameSuperusers guard, 15*time.Second NewFileFromURL avatar download for FieldTypeFile, and sendOAuth2RecordCreateRequest internal POST",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "sync_password_fields_conditions",
+            "description": "Explains the two conditions in syncPasswordFields that set disablePasswordValidations = true (v.Plain != '' && v.Plain != form.password, or v.Plain == '' && v.Hash != '' && form.record.IsNew())",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "dry_submit_rollback_branches",
+            "description": "Explains DrySubmit transaction check (app.DB().(*dbx.Tx)) and manualRollback (DeleteWithContext for new records vs Original().FieldsData() + SaveNoValidateWithContext for existing records)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "cold": {
+        "conversationId": "f7699e2f-454e-483d-b3bd-11b1f467f81b",
+        "calls": 10,
+        "turns": 7,
+        "toolOutputTokens": 13120,
+        "uncachedInputTokens": 49966,
+        "cachedInputTokens": 105280,
+        "cumulativeInputTokens": 155246,
+        "turn1ContextTokens": 5180,
+        "turn1UncachedTokens": 5180,
+        "postTurn1UncachedTokens": 44786,
+        "netContextGrowthTokens": 21672,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 26852,
+        "totalModelOutputTokens": 10480,
+        "searchMs": 77000,
+        "totalMs": 170331,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "apis/record_auth_with_oauth2.go",
+          "forms/record_upsert.go"
+        ],
+        "checks": [
+          {
+            "id": "cites_both_subsystems",
+            "description": "Cites both apis/record_auth_with_oauth2.go and forms/record_upsert.go with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "oauth2_superuser_and_avatar",
+            "description": "Identifies CollectionNameSuperusers guard, 15*time.Second NewFileFromURL avatar download for FieldTypeFile, and sendOAuth2RecordCreateRequest internal POST",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "sync_password_fields_conditions",
+            "description": "Explains the two conditions in syncPasswordFields that set disablePasswordValidations = true (v.Plain != '' && v.Plain != form.password, or v.Plain == '' && v.Hash != '' && form.record.IsNew())",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "dry_submit_rollback_branches",
+            "description": "Explains DrySubmit transaction check (app.DB().(*dbx.Tx)) and manualRollback (DeleteWithContext for new records vs Original().FieldsData() + SaveNoValidateWithContext for existing records)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "32126f75-4327-4c56-a7bb-c1b1eae57739",
+        "calls": 10,
+        "turns": 8,
+        "toolOutputTokens": 14165,
+        "uncachedInputTokens": 58534,
+        "cachedInputTokens": 152422,
+        "cumulativeInputTokens": 210956,
+        "turn1ContextTokens": 6359,
+        "turn1UncachedTokens": 6359,
+        "postTurn1UncachedTokens": 52175,
+        "netContextGrowthTokens": 27466,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 33825,
+        "totalModelOutputTokens": 9535,
+        "searchMs": 120000,
+        "totalMs": 170520,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "apis/record_auth_with_oauth2.go",
+          "forms/record_upsert.go"
+        ],
+        "checks": [
+          {
+            "id": "cites_both_subsystems",
+            "description": "Cites both apis/record_auth_with_oauth2.go and forms/record_upsert.go with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "oauth2_superuser_and_avatar",
+            "description": "Identifies CollectionNameSuperusers guard, 15*time.Second NewFileFromURL avatar download for FieldTypeFile, and sendOAuth2RecordCreateRequest internal POST",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "sync_password_fields_conditions",
+            "description": "Explains the two conditions in syncPasswordFields that set disablePasswordValidations = true (v.Plain != '' && v.Plain != form.password, or v.Plain == '' && v.Hash != '' && form.record.IsNew())",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "dry_submit_rollback_branches",
+            "description": "Explains DrySubmit transaction check (app.DB().(*dbx.Tx)) and manualRollback (DeleteWithContext for new records vs Original().FieldsData() + SaveNoValidateWithContext for existing records)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "L2",
+      "title": "Audit Tutanota credentials encryption, key provisioning, and key migration pipeline",
+      "category": "cross-subsystem-trace",
+      "repo": "tutanota",
+      "language": "TypeScript",
+      "sizeBucket": "large",
+      "fileCount": 1350,
+      "gold_files": [
+        "src/misc/credentials/CredentialsProvider.ts",
+        "src/misc/credentials/CredentialsKeyProvider.ts",
+        "src/misc/credentials/NativeCredentialsEncryption.ts",
+        "src/misc/credentials/CredentialsKeyMigrator.ts"
+      ],
+      "cold": {
+        "conversationId": "f88ab21a-814c-48fc-993b-a175f9252221",
+        "calls": 5,
+        "turns": 2,
+        "toolOutputTokens": 4688,
+        "uncachedInputTokens": 13825,
+        "cachedInputTokens": 8654,
+        "cumulativeInputTokens": 22479,
+        "turn1ContextTokens": 5165,
+        "turn1UncachedTokens": 5165,
+        "postTurn1UncachedTokens": 8660,
+        "netContextGrowthTokens": 6607,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 11772,
+        "totalModelOutputTokens": 5275,
+        "searchMs": 28000,
+        "totalMs": 84213,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts",
+          "src/misc/credentials/CredentialsKeyMigrator.ts"
+        ],
+        "checks": [
+          {
+            "id": "cites_all_four_credential_files",
+            "description": "Cites CredentialsProvider.ts, CredentialsKeyProvider.ts, NativeCredentialsEncryption.ts, and CredentialsKeyMigrator.ts",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mode_migration_and_keychain_requests",
+            "description": "Explains setCredentialsEncryptionMode early return, migrateCredentialsKey, and decryptUsingKeychain([oldMode, ...]) followed by encryptUsingKeychain([newMode, ...])",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "key_provider_generation_and_error",
+            "description": "Explains getCredentialsKey() generating a new key via _deviceEncryptionFacade.generateKey() when absent and _getEncryptionMode() throwing 'Encryption mode not set'",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "native_encryption_guard_and_access_token",
+            "description": "Identifies encryptedPassword == null throwing 'Trying to encrypt non-persistent credentials' and encrypting/decrypting credentials.accessToken",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "f88331eb-1896-4334-8958-11de4df3022c",
+        "calls": 2,
+        "turns": 1,
+        "toolOutputTokens": 1429,
+        "uncachedInputTokens": 10303,
+        "cachedInputTokens": 7973,
+        "cumulativeInputTokens": 18276,
+        "turn1ContextTokens": 7972,
+        "turn1UncachedTokens": 7972,
+        "postTurn1UncachedTokens": 2331,
+        "netContextGrowthTokens": 2332,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 10304,
+        "totalModelOutputTokens": 4322,
+        "searchMs": 11000,
+        "totalMs": 54905,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts",
+          "src/misc/credentials/CredentialsKeyMigrator.ts"
+        ],
+        "checks": [
+          {
+            "id": "cites_all_four_credential_files",
+            "description": "Cites CredentialsProvider.ts, CredentialsKeyProvider.ts, NativeCredentialsEncryption.ts, and CredentialsKeyMigrator.ts",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mode_migration_and_keychain_requests",
+            "description": "Explains setCredentialsEncryptionMode early return, migrateCredentialsKey, and decryptUsingKeychain([oldMode, ...]) followed by encryptUsingKeychain([newMode, ...])",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "key_provider_generation_and_error",
+            "description": "Explains getCredentialsKey() generating a new key via _deviceEncryptionFacade.generateKey() when absent and _getEncryptionMode() throwing 'Encryption mode not set'",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "native_encryption_guard_and_access_token",
+            "description": "Identifies encryptedPassword == null throwing 'Trying to encrypt non-persistent credentials' and encrypting/decrypting credentials.accessToken",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "5a71a928-314d-4b9d-a3c7-49142ba66b82",
+        "calls": 5,
+        "turns": 2,
+        "toolOutputTokens": 7110,
+        "uncachedInputTokens": 15287,
+        "cachedInputTokens": 15312,
+        "cumulativeInputTokens": 30599,
+        "turn1ContextTokens": 6323,
+        "turn1UncachedTokens": 6323,
+        "postTurn1UncachedTokens": 8964,
+        "netContextGrowthTokens": 8966,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 15289,
+        "totalModelOutputTokens": 3889,
+        "searchMs": 19000,
+        "totalMs": 67107,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts",
+          "src/misc/credentials/CredentialsKeyMigrator.ts"
+        ],
+        "checks": [
+          {
+            "id": "cites_all_four_credential_files",
+            "description": "Cites CredentialsProvider.ts, CredentialsKeyProvider.ts, NativeCredentialsEncryption.ts, and CredentialsKeyMigrator.ts",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "mode_migration_and_keychain_requests",
+            "description": "Explains setCredentialsEncryptionMode early return, migrateCredentialsKey, and decryptUsingKeychain([oldMode, ...]) followed by encryptUsingKeychain([newMode, ...])",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "key_provider_generation_and_error",
+            "description": "Explains getCredentialsKey() generating a new key via _deviceEncryptionFacade.generateKey() when absent and _getEncryptionMode() throwing 'Encryption mode not set'",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "native_encryption_guard_and_access_token",
+            "description": "Identifies encryptedPassword == null throwing 'Trying to encrypt non-persistent credentials' and encrypting/decrypting credentials.accessToken",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "L3",
+      "title": "Trace check_overflow and GUIProcess cross-subsystem callers in qutebrowser",
+      "category": "caller-blast-radius",
+      "repo": "qutebrowser",
+      "language": "Python",
+      "sizeBucket": "medium",
+      "fileCount": 463,
+      "gold_files": [
+        "qutebrowser/api/cmdutils.py",
+        "qutebrowser/browser/commands.py",
+        "qutebrowser/misc/guiprocess.py",
+        "qutebrowser/misc/editor.py",
+        "qutebrowser/commands/userscripts.py"
+      ],
+      "cold": {
+        "conversationId": "21b672fd-7c94-44e6-ae67-db4f3ff8eb28",
+        "calls": 19,
+        "turns": 7,
+        "toolOutputTokens": 18776,
+        "uncachedInputTokens": 39031,
+        "cachedInputTokens": 164352,
+        "cumulativeInputTokens": 203383,
+        "turn1ContextTokens": 5143,
+        "turn1UncachedTokens": 5143,
+        "postTurn1UncachedTokens": 33888,
+        "netContextGrowthTokens": 28389,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 33532,
+        "totalModelOutputTokens": 6323,
+        "searchMs": 79000,
+        "totalMs": 116837,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "qutebrowser/api/cmdutils.py",
+          "qutebrowser/browser/commands.py",
+          "qutebrowser/misc/guiprocess.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/commands/userscripts.py"
+        ],
+        "checks": [
+          {
+            "id": "cmdutils_and_cntwidget_cited",
+            "description": "Cites qutebrowser/api/cmdutils.py and qutebrowser/browser/commands.py (_cntwidget calling cmdutils.check_overflow(count + 1, 'int'))",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "check_overflow_command_error",
+            "description": "Identifies qtutils.check_overflow(arg, ctype) and raising CommandError on OverflowError",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "guiprocess_signal_wiring",
+            "description": "Cites qutebrowser/misc/guiprocess.py and explains error = pyqtSignal(QProcess.ProcessError) wired via self._proc.errorOccurred",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "both_guiprocess_error_callers",
+            "description": "Identifies both qutebrowser/misc/editor.py (_start_editor -> _on_proc_error) and qutebrowser/commands/userscripts.py (_run_process -> on_proc_error)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "fd07612c-a154-4fa6-8e4a-df3cc31ae7dd",
+        "calls": 10,
+        "turns": 4,
+        "toolOutputTokens": 15086,
+        "uncachedInputTokens": 52441,
+        "cachedInputTokens": 48134,
+        "cumulativeInputTokens": 100575,
+        "turn1ContextTokens": 8126,
+        "turn1UncachedTokens": 8126,
+        "postTurn1UncachedTokens": 44315,
+        "netContextGrowthTokens": 23242,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 31368,
+        "totalModelOutputTokens": 5219,
+        "searchMs": 56000,
+        "totalMs": 90358,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "qutebrowser/api/cmdutils.py",
+          "qutebrowser/browser/commands.py",
+          "qutebrowser/misc/guiprocess.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/commands/userscripts.py"
+        ],
+        "checks": [
+          {
+            "id": "cmdutils_and_cntwidget_cited",
+            "description": "Cites qutebrowser/api/cmdutils.py and qutebrowser/browser/commands.py (_cntwidget calling cmdutils.check_overflow(count + 1, 'int'))",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "check_overflow_command_error",
+            "description": "Identifies qtutils.check_overflow(arg, ctype) and raising CommandError on OverflowError",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "guiprocess_signal_wiring",
+            "description": "Cites qutebrowser/misc/guiprocess.py and explains error = pyqtSignal(QProcess.ProcessError) wired via self._proc.errorOccurred",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "both_guiprocess_error_callers",
+            "description": "Identifies both qutebrowser/misc/editor.py (_start_editor -> _on_proc_error) and qutebrowser/commands/userscripts.py (_run_process -> on_proc_error)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "9f60b5d3-ba64-4e4a-9ba1-5045693667e0",
+        "calls": 17,
+        "turns": 6,
+        "toolOutputTokens": 11398,
+        "uncachedInputTokens": 30526,
+        "cachedInputTokens": 80905,
+        "cumulativeInputTokens": 111431,
+        "turn1ContextTokens": 6296,
+        "turn1UncachedTokens": 6296,
+        "postTurn1UncachedTokens": 24230,
+        "netContextGrowthTokens": 18912,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 25208,
+        "totalModelOutputTokens": 7670,
+        "searchMs": 66000,
+        "totalMs": 116163,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "qutebrowser/api/cmdutils.py",
+          "qutebrowser/browser/commands.py",
+          "qutebrowser/misc/guiprocess.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/commands/userscripts.py"
+        ],
+        "checks": [
+          {
+            "id": "cmdutils_and_cntwidget_cited",
+            "description": "Cites qutebrowser/api/cmdutils.py and qutebrowser/browser/commands.py (_cntwidget calling cmdutils.check_overflow(count + 1, 'int'))",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "check_overflow_command_error",
+            "description": "Identifies qtutils.check_overflow(arg, ctype) and raising CommandError on OverflowError",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "guiprocess_signal_wiring",
+            "description": "Cites qutebrowser/misc/guiprocess.py and explains error = pyqtSignal(QProcess.ProcessError) wired via self._proc.errorOccurred",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "both_guiprocess_error_callers",
+            "description": "Identifies both qutebrowser/misc/editor.py (_start_editor -> _on_proc_error) and qutebrowser/commands/userscripts.py (_run_process -> on_proc_error)",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "L4",
+      "title": "Trace Flipt evaluation v2 Variant/Boolean handlers and SQL rule/constraint aggregation",
+      "category": "cross-subsystem-trace",
+      "repo": "flipt",
+      "language": "Go",
+      "sizeBucket": "medium",
+      "fileCount": 474,
+      "gold_files": [
+        "internal/server/evaluation/evaluation.go",
+        "internal/storage/sql/common/evaluation.go"
+      ],
+      "cold": {
+        "conversationId": "ff3b28a4-285a-44ee-99aa-8849aa709623",
+        "calls": 6,
+        "turns": 4,
+        "toolOutputTokens": 7577,
+        "uncachedInputTokens": 22401,
+        "cachedInputTokens": 52133,
+        "cumulativeInputTokens": 74534,
+        "turn1ContextTokens": 5112,
+        "turn1UncachedTokens": 5112,
+        "postTurn1UncachedTokens": 17289,
+        "netContextGrowthTokens": 13193,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 18305,
+        "totalModelOutputTokens": 5211,
+        "searchMs": 46000,
+        "totalMs": 88103,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "internal/server/evaluation/evaluation.go",
+          "internal/storage/sql/common/evaluation.go"
+        ],
+        "checks": [
+          {
+            "id": "cites_eval_server_and_sql_store",
+            "description": "Cites both internal/server/evaluation/evaluation.go and internal/storage/sql/common/evaluation.go with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "variant_reason_mapping_and_boolean_check",
+            "description": "Identifies MATCH_EVALUATION_REASON, FLAG_DISABLED_EVALUATION_REASON, UNKNOWN_EVALUATION_REASON mapping and FlagType_BOOLEAN_FLAG_TYPE check returning errs.ErrInvalidf",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "sql_two_queries_and_joins",
+            "description": "Explains the first query on rules (id, rank, segment_operator) and second query joining rule_segments, segments, and LeftJoin constraints",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "unique_rules_segment_constraint_aggregation",
+            "description": "Explains how uniqueRules deduplicates EvaluationRule by ID, populates Segments[SegmentKey], and appends EvaluationConstraint when optionalConstraint.Id.Valid",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "8b23af76-9b76-481e-8a20-1ecebd457419",
+        "calls": 6,
+        "turns": 5,
+        "toolOutputTokens": 4706,
+        "uncachedInputTokens": 21488,
+        "cachedInputTokens": 53878,
+        "cumulativeInputTokens": 75366,
+        "turn1ContextTokens": 8315,
+        "turn1UncachedTokens": 8315,
+        "postTurn1UncachedTokens": 13173,
+        "netContextGrowthTokens": 9078,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 17393,
+        "totalModelOutputTokens": 6028,
+        "searchMs": 54000,
+        "totalMs": 97971,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "internal/server/evaluation/evaluation.go",
+          "internal/storage/sql/common/evaluation.go"
+        ],
+        "checks": [
+          {
+            "id": "cites_eval_server_and_sql_store",
+            "description": "Cites both internal/server/evaluation/evaluation.go and internal/storage/sql/common/evaluation.go with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "variant_reason_mapping_and_boolean_check",
+            "description": "Identifies MATCH_EVALUATION_REASON, FLAG_DISABLED_EVALUATION_REASON, UNKNOWN_EVALUATION_REASON mapping and FlagType_BOOLEAN_FLAG_TYPE check returning errs.ErrInvalidf",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "sql_two_queries_and_joins",
+            "description": "Explains the first query on rules (id, rank, segment_operator) and second query joining rule_segments, segments, and LeftJoin constraints",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "unique_rules_segment_constraint_aggregation",
+            "description": "Explains how uniqueRules deduplicates EvaluationRule by ID, populates Segments[SegmentKey], and appends EvaluationConstraint when optionalConstraint.Id.Valid",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "7655e225-5653-401a-80a9-0bea8ce9faee",
+        "calls": 2,
+        "turns": 1,
+        "toolOutputTokens": 6091,
+        "uncachedInputTokens": 16581,
+        "cachedInputTokens": 6271,
+        "cumulativeInputTokens": 22852,
+        "turn1ContextTokens": 6270,
+        "turn1UncachedTokens": 6270,
+        "postTurn1UncachedTokens": 10311,
+        "netContextGrowthTokens": 10312,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 16582,
+        "totalModelOutputTokens": 4600,
+        "searchMs": 8000,
+        "totalMs": 59854,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "goldSourceFiles": [
+          "internal/server/evaluation/evaluation.go",
+          "internal/storage/sql/common/evaluation.go"
+        ],
+        "checks": [
+          {
+            "id": "cites_eval_server_and_sql_store",
+            "description": "Cites both internal/server/evaluation/evaluation.go and internal/storage/sql/common/evaluation.go with line numbers",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "variant_reason_mapping_and_boolean_check",
+            "description": "Identifies MATCH_EVALUATION_REASON, FLAG_DISABLED_EVALUATION_REASON, UNKNOWN_EVALUATION_REASON mapping and FlagType_BOOLEAN_FLAG_TYPE check returning errs.ErrInvalidf",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "sql_two_queries_and_joins",
+            "description": "Explains the first query on rules (id, rank, segment_operator) and second query joining rule_segments, segments, and LeftJoin constraints",
+            "weight": 2,
+            "passed": true
+          },
+          {
+            "id": "unique_rules_segment_constraint_aggregation",
+            "description": "Explains how uniqueRules deduplicates EvaluationRule by ID, populates Segments[SegmentKey], and appends EvaluationConstraint when optionalConstraint.Id.Valid",
+            "weight": 2,
+            "passed": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "L5",
+      "title": "Add WebP thumbnail generation and PNG content-type fallback across PocketBase file API and filesystem",
+      "category": "code-edit",
+      "repo": "pocketbase",
+      "language": "Go",
+      "sizeBucket": "medium",
+      "fileCount": 444,
+      "gold_files": [
+        "apis/file.go",
+        "tools/filesystem/filesystem.go"
+      ],
+      "plexer": {
+        "conversationId": "03d27834-fad6-4d5f-b2a7-3e067778223a",
+        "calls": 17,
+        "turns": 14,
+        "toolOutputTokens": 10808,
+        "uncachedInputTokens": 83577,
+        "cachedInputTokens": 312968,
+        "cumulativeInputTokens": 396545,
+        "turn1ContextTokens": 7870,
+        "turn1UncachedTokens": 7870,
+        "postTurn1UncachedTokens": 75707,
+        "netContextGrowthTokens": 36206,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 44076,
+        "totalModelOutputTokens": 15792,
+        "searchMs": 289000,
+        "totalMs": 303314,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "apis/file.go",
+          "go.mod",
+          "tools/filesystem/filesystem.go"
+        ],
+        "goldSourceFiles": [
+          "apis/file.go",
+          "tools/filesystem/filesystem.go"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_both",
+            "passed": true,
+            "weight": 3,
+            "detail": "Modified gold files: apis/file.go, tools/filesystem/filesystem.go"
+          },
+          {
+            "id": "api_webp_content_type",
+            "passed": true,
+            "weight": 2,
+            "detail": "apis/file.go imageContentTypes includes \"image/webp\""
+          },
+          {
+            "id": "fsys_png_content_type_fallback",
+            "passed": true,
+            "weight": 3,
+            "detail": "tools/filesystem/filesystem.go CreateThumb sets image/png ContentType on PNG fallback"
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "e940692a-cd4b-4146-afc0-dcf2273b4e7f",
+        "calls": 24,
+        "turns": 15,
+        "toolOutputTokens": 25298,
+        "uncachedInputTokens": 138353,
+        "cachedInputTokens": 643121,
+        "cumulativeInputTokens": 781474,
+        "turn1ContextTokens": 6397,
+        "turn1UncachedTokens": 6397,
+        "postTurn1UncachedTokens": 131956,
+        "netContextGrowthTokens": 62272,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 68669,
+        "totalModelOutputTokens": 14001,
+        "searchMs": 289000,
+        "totalMs": 305051,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "apis/file.go",
+          "go.mod",
+          "tools/filesystem/filesystem.go"
+        ],
+        "goldSourceFiles": [
+          "apis/file.go",
+          "tools/filesystem/filesystem.go"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_both",
+            "passed": true,
+            "weight": 3,
+            "detail": "Modified gold files: apis/file.go, tools/filesystem/filesystem.go"
+          },
+          {
+            "id": "api_webp_content_type",
+            "passed": true,
+            "weight": 2,
+            "detail": "apis/file.go imageContentTypes includes \"image/webp\""
+          },
+          {
+            "id": "fsys_png_content_type_fallback",
+            "passed": true,
+            "weight": 3,
+            "detail": "tools/filesystem/filesystem.go CreateThumb sets image/png ContentType on PNG fallback"
+          }
+        ]
+      },
+      "cold": {
+        "conversationId": "33e8d4d8-96f8-4bdb-97b1-e4d767e774df",
+        "calls": 31,
+        "turns": 23,
+        "toolOutputTokens": 27062,
+        "uncachedInputTokens": 149248,
+        "cachedInputTokens": 871192,
+        "cumulativeInputTokens": 1020440,
+        "turn1ContextTokens": 5260,
+        "turn1UncachedTokens": 5260,
+        "postTurn1UncachedTokens": 143988,
+        "netContextGrowthTokens": 66137,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 71397,
+        "totalModelOutputTokens": 18909,
+        "searchMs": 374000,
+        "totalMs": 384488,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "apis/file.go",
+          "go.mod",
+          "tools/filesystem/filesystem.go"
+        ],
+        "goldSourceFiles": [
+          "apis/file.go",
+          "tools/filesystem/filesystem.go"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_both",
+            "passed": true,
+            "weight": 3,
+            "detail": "Modified gold files: apis/file.go, tools/filesystem/filesystem.go"
+          },
+          {
+            "id": "api_webp_content_type",
+            "passed": true,
+            "weight": 2,
+            "detail": "apis/file.go imageContentTypes includes \"image/webp\""
+          },
+          {
+            "id": "fsys_png_content_type_fallback",
+            "passed": true,
+            "weight": 3,
+            "detail": "tools/filesystem/filesystem.go CreateThumb sets image/png ContentType on PNG fallback"
+          }
+        ]
+      }
+    },
+    {
+      "id": "L6",
+      "title": "Propagate admin rate-limit bypass and input normalization across NodeBB password reset modules",
+      "category": "code-edit",
+      "repo": "NodeBB",
+      "language": "JavaScript",
+      "sizeBucket": "large",
+      "fileCount": 727,
+      "gold_files": [
+        "src/user/reset.js",
+        "src/socket.io/user.js",
+        "src/socket.io/admin/user.js"
+      ],
+      "cold": {
+        "conversationId": "35ccc22e-feb2-4921-8135-39dc71478cf4",
+        "calls": 8,
+        "turns": 4,
+        "toolOutputTokens": 2553,
+        "uncachedInputTokens": 21637,
+        "cachedInputTokens": 21501,
+        "cumulativeInputTokens": 43138,
+        "turn1ContextTokens": 5208,
+        "turn1UncachedTokens": 5208,
+        "postTurn1UncachedTokens": 16429,
+        "netContextGrowthTokens": 6926,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 12134,
+        "totalModelOutputTokens": 3020,
+        "searchMs": 44000,
+        "totalMs": 53320,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "src/socket.io/admin/user.js",
+          "src/socket.io/user.js",
+          "src/user/reset.js"
+        ],
+        "goldSourceFiles": [
+          "src/user/reset.js",
+          "src/socket.io/user.js",
+          "src/socket.io/admin/user.js"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_3",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 3/3 gold files (src/user/reset.js, src/socket.io/user.js, src/socket.io/admin/user.js)"
+          },
+          {
+            "id": "reset_validate_and_bypass",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/user/reset.js checks typeof code !== 'string' and supports options.bypassRateLimit"
+          },
+          {
+            "id": "admin_socket_passes_bypass",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/socket.io/admin/user.js passes { bypassRateLimit: true } to user.reset.send"
+          },
+          {
+            "id": "client_socket_trims_email",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/socket.io/user.js trims email before validation and user.reset.send"
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "01bfb2e0-61b8-4df9-97ad-b04576722d96",
+        "calls": 9,
+        "turns": 5,
+        "toolOutputTokens": 3273,
+        "uncachedInputTokens": 26200,
+        "cachedInputTokens": 38930,
+        "cumulativeInputTokens": 65130,
+        "turn1ContextTokens": 6297,
+        "turn1UncachedTokens": 6297,
+        "postTurn1UncachedTokens": 19903,
+        "netContextGrowthTokens": 7953,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 14250,
+        "totalModelOutputTokens": 2907,
+        "searchMs": 65000,
+        "totalMs": 74679,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "src/socket.io/admin/user.js",
+          "src/socket.io/user.js",
+          "src/user/reset.js"
+        ],
+        "goldSourceFiles": [
+          "src/user/reset.js",
+          "src/socket.io/user.js",
+          "src/socket.io/admin/user.js"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_3",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 3/3 gold files (src/user/reset.js, src/socket.io/user.js, src/socket.io/admin/user.js)"
+          },
+          {
+            "id": "reset_validate_and_bypass",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/user/reset.js checks typeof code !== 'string' and supports options.bypassRateLimit"
+          },
+          {
+            "id": "admin_socket_passes_bypass",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/socket.io/admin/user.js passes { bypassRateLimit: true } to user.reset.send"
+          },
+          {
+            "id": "client_socket_trims_email",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/socket.io/user.js trims email before validation and user.reset.send"
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "38defb41-8e04-4bb1-87c8-245dbd27af64",
+        "calls": 6,
+        "turns": 4,
+        "toolOutputTokens": 988,
+        "uncachedInputTokens": 22274,
+        "cachedInputTokens": 27248,
+        "cumulativeInputTokens": 49522,
+        "turn1ContextTokens": 7933,
+        "turn1UncachedTokens": 7933,
+        "postTurn1UncachedTokens": 14341,
+        "netContextGrowthTokens": 3790,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 11723,
+        "totalModelOutputTokens": 2329,
+        "searchMs": 139000,
+        "totalMs": 169815,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "src/socket.io/admin/user.js",
+          "src/socket.io/user.js",
+          "src/user/reset.js"
+        ],
+        "goldSourceFiles": [
+          "src/user/reset.js",
+          "src/socket.io/user.js",
+          "src/socket.io/admin/user.js"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_3",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 3/3 gold files (src/user/reset.js, src/socket.io/user.js, src/socket.io/admin/user.js)"
+          },
+          {
+            "id": "reset_validate_and_bypass",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/user/reset.js checks typeof code !== 'string' and supports options.bypassRateLimit"
+          },
+          {
+            "id": "admin_socket_passes_bypass",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/socket.io/admin/user.js passes { bypassRateLimit: true } to user.reset.send"
+          },
+          {
+            "id": "client_socket_trims_email",
+            "passed": true,
+            "weight": 2,
+            "detail": "src/socket.io/user.js trims email before validation and user.reset.send"
+          }
+        ]
+      }
+    },
+    {
+      "id": "L7",
+      "title": "Rename GUIProcess.error signal to error_occurred across GUIProcess and all production callers",
+      "category": "code-edit",
+      "repo": "qutebrowser",
+      "language": "Python",
+      "sizeBucket": "medium",
+      "fileCount": 463,
+      "gold_files": [
+        "qutebrowser/misc/guiprocess.py",
+        "qutebrowser/misc/editor.py",
+        "qutebrowser/commands/userscripts.py"
+      ],
+      "cold": {
+        "conversationId": "9df93aa1-5d78-40bf-bb39-8a01b71fcda3",
+        "calls": 24,
+        "turns": 11,
+        "toolOutputTokens": 25804,
+        "uncachedInputTokens": 116386,
+        "cachedInputTokens": 253947,
+        "cumulativeInputTokens": 370333,
+        "turn1ContextTokens": 5196,
+        "turn1UncachedTokens": 5196,
+        "postTurn1UncachedTokens": 111190,
+        "netContextGrowthTokens": 41380,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 46576,
+        "totalModelOutputTokens": 6388,
+        "searchMs": 118000,
+        "totalMs": 128368,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "qutebrowser/commands/userscripts.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/misc/guiprocess.py"
+        ],
+        "goldSourceFiles": [
+          "qutebrowser/misc/guiprocess.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/commands/userscripts.py"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_3",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 3/3 gold files (qutebrowser/misc/guiprocess.py, qutebrowser/misc/editor.py, qutebrowser/commands/userscripts.py)"
+          },
+          {
+            "id": "guiprocess_signal_renamed",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/misc/guiprocess.py defines error_occurred and connects self._proc.errorOccurred"
+          },
+          {
+            "id": "editor_caller_updated",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/misc/editor.py connects self._proc.error_occurred.connect(self._on_proc_error)"
+          },
+          {
+            "id": "userscripts_caller_updated",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/commands/userscripts.py connects self.proc.error_occurred.connect(self.on_proc_error)"
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "0b0371f6-1c4f-4665-8f86-e5c557fc77a4",
+        "calls": 14,
+        "turns": 9,
+        "toolOutputTokens": 22157,
+        "uncachedInputTokens": 59458,
+        "cachedInputTokens": 200911,
+        "cumulativeInputTokens": 260369,
+        "turn1ContextTokens": 7356,
+        "turn1UncachedTokens": 7356,
+        "postTurn1UncachedTokens": 52102,
+        "netContextGrowthTokens": 34903,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 42259,
+        "totalModelOutputTokens": 4428,
+        "searchMs": 104000,
+        "totalMs": 112792,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "qutebrowser/commands/userscripts.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/misc/guiprocess.py"
+        ],
+        "goldSourceFiles": [
+          "qutebrowser/misc/guiprocess.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/commands/userscripts.py"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_3",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 3/3 gold files (qutebrowser/misc/guiprocess.py, qutebrowser/misc/editor.py, qutebrowser/commands/userscripts.py)"
+          },
+          {
+            "id": "guiprocess_signal_renamed",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/misc/guiprocess.py defines error_occurred and connects self._proc.errorOccurred"
+          },
+          {
+            "id": "editor_caller_updated",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/misc/editor.py connects self._proc.error_occurred.connect(self._on_proc_error)"
+          },
+          {
+            "id": "userscripts_caller_updated",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/commands/userscripts.py connects self.proc.error_occurred.connect(self.on_proc_error)"
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "04c64ebe-bd63-4a7e-b553-67d04d055d8a",
+        "calls": 24,
+        "turns": 13,
+        "toolOutputTokens": 24533,
+        "uncachedInputTokens": 102574,
+        "cachedInputTokens": 336904,
+        "cumulativeInputTokens": 439478,
+        "turn1ContextTokens": 6352,
+        "turn1UncachedTokens": 6352,
+        "postTurn1UncachedTokens": 88429,
+        "netContextGrowthTokens": 42422,
+        "cacheMissTurns": 1,
+        "finalContextTokens": 48774,
+        "totalModelOutputTokens": 8276,
+        "searchMs": 216000,
+        "totalMs": 226734,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "qutebrowser/commands/userscripts.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/misc/guiprocess.py"
+        ],
+        "goldSourceFiles": [
+          "qutebrowser/misc/guiprocess.py",
+          "qutebrowser/misc/editor.py",
+          "qutebrowser/commands/userscripts.py"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_3",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 3/3 gold files (qutebrowser/misc/guiprocess.py, qutebrowser/misc/editor.py, qutebrowser/commands/userscripts.py)"
+          },
+          {
+            "id": "guiprocess_signal_renamed",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/misc/guiprocess.py defines error_occurred and connects self._proc.errorOccurred"
+          },
+          {
+            "id": "editor_caller_updated",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/misc/editor.py connects self._proc.error_occurred.connect(self._on_proc_error)"
+          },
+          {
+            "id": "userscripts_caller_updated",
+            "passed": true,
+            "weight": 2,
+            "detail": "qutebrowser/commands/userscripts.py connects self.proc.error_occurred.connect(self.on_proc_error)"
+          }
+        ]
+      }
+    },
+    {
+      "id": "L8",
+      "title": "Add supported-mode validation, no-op key migration short-circuit, and key reset across 4 Tutanota credential modules",
+      "category": "code-edit",
+      "repo": "tutanota",
+      "language": "TypeScript",
+      "sizeBucket": "large",
+      "fileCount": 1350,
+      "gold_files": [
+        "src/misc/credentials/CredentialsProvider.ts",
+        "src/misc/credentials/CredentialsKeyProvider.ts",
+        "src/misc/credentials/NativeCredentialsEncryption.ts",
+        "src/misc/credentials/CredentialsKeyMigrator.ts"
+      ],
+      "cold": {
+        "conversationId": "2896b384-71e9-480c-b281-130bca4a7a7e",
+        "calls": 11,
+        "turns": 4,
+        "toolOutputTokens": 6079,
+        "uncachedInputTokens": 21122,
+        "cachedInputTokens": 41656,
+        "cumulativeInputTokens": 62778,
+        "turn1ContextTokens": 5236,
+        "turn1UncachedTokens": 5236,
+        "postTurn1UncachedTokens": 15886,
+        "netContextGrowthTokens": 11790,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 17026,
+        "totalModelOutputTokens": 4084,
+        "searchMs": 72000,
+        "totalMs": 80562,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "src/misc/credentials/CredentialsKeyMigrator.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts"
+        ],
+        "goldSourceFiles": [
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts",
+          "src/misc/credentials/CredentialsKeyMigrator.ts"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_4",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 4/4 gold files (src/misc/credentials/CredentialsProvider.ts, src/misc/credentials/CredentialsKeyProvider.ts, src/misc/credentials/NativeCredentialsEncryption.ts, src/misc/credentials/CredentialsKeyMigrator.ts)"
+          },
+          {
+            "id": "provider_supported_mode_validation",
+            "passed": true,
+            "weight": 2,
+            "detail": "CredentialsProvider validates getSupportedEncryptionModes() and CredentialsKeyProvider implements clearCredentialsKey()"
+          },
+          {
+            "id": "native_decrypt_empty_token_guard",
+            "passed": true,
+            "weight": 2,
+            "detail": "NativeCredentialsEncryption.decrypt throws 'Trying to decrypt empty access token' when accessToken is empty"
+          },
+          {
+            "id": "migrator_same_mode_short_circuit",
+            "passed": true,
+            "weight": 2,
+            "detail": "CredentialsKeyMigrator.migrateCredentialsKey returns oldKeyEncrypted when oldMode === newMode"
+          }
+        ]
+      },
+      "plexer": {
+        "conversationId": "f71a14f8-6b3c-44dd-b7b5-3a55523d740d",
+        "calls": 7,
+        "turns": 3,
+        "toolOutputTokens": 2499,
+        "uncachedInputTokens": 19419,
+        "cachedInputTokens": 25756,
+        "cumulativeInputTokens": 45175,
+        "turn1ContextTokens": 7993,
+        "turn1UncachedTokens": 7993,
+        "postTurn1UncachedTokens": 11426,
+        "netContextGrowthTokens": 6576,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 14569,
+        "totalModelOutputTokens": 3855,
+        "searchMs": 62000,
+        "totalMs": 77768,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "src/misc/credentials/CredentialsKeyMigrator.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts"
+        ],
+        "goldSourceFiles": [
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts",
+          "src/misc/credentials/CredentialsKeyMigrator.ts"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_4",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 4/4 gold files (src/misc/credentials/CredentialsProvider.ts, src/misc/credentials/CredentialsKeyProvider.ts, src/misc/credentials/NativeCredentialsEncryption.ts, src/misc/credentials/CredentialsKeyMigrator.ts)"
+          },
+          {
+            "id": "provider_supported_mode_validation",
+            "passed": true,
+            "weight": 2,
+            "detail": "CredentialsProvider validates getSupportedEncryptionModes() and CredentialsKeyProvider implements clearCredentialsKey()"
+          },
+          {
+            "id": "native_decrypt_empty_token_guard",
+            "passed": true,
+            "weight": 2,
+            "detail": "NativeCredentialsEncryption.decrypt throws 'Trying to decrypt empty access token' when accessToken is empty"
+          },
+          {
+            "id": "migrator_same_mode_short_circuit",
+            "passed": true,
+            "weight": 2,
+            "detail": "CredentialsKeyMigrator.migrateCredentialsKey returns oldKeyEncrypted when oldMode === newMode"
+          }
+        ]
+      },
+      "trail": {
+        "conversationId": "c9b87647-6411-4387-bad9-4a4bd23b81d2",
+        "calls": 11,
+        "turns": 4,
+        "toolOutputTokens": 7035,
+        "uncachedInputTokens": 35179,
+        "cachedInputTokens": 38318,
+        "cumulativeInputTokens": 73497,
+        "turn1ContextTokens": 6391,
+        "turn1UncachedTokens": 6391,
+        "postTurn1UncachedTokens": 28788,
+        "netContextGrowthTokens": 13477,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 19868,
+        "totalModelOutputTokens": 4026,
+        "searchMs": 70000,
+        "totalMs": 84689,
+        "score": 8,
+        "maxScore": 8,
+        "resolved": true,
+        "fileRecall": 1,
+        "modifiedFiles": [
+          "src/misc/credentials/CredentialsKeyMigrator.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts"
+        ],
+        "goldSourceFiles": [
+          "src/misc/credentials/CredentialsProvider.ts",
+          "src/misc/credentials/CredentialsKeyProvider.ts",
+          "src/misc/credentials/NativeCredentialsEncryption.ts",
+          "src/misc/credentials/CredentialsKeyMigrator.ts"
+        ],
+        "checks": [
+          {
+            "id": "file_recall_all_4",
+            "passed": true,
+            "weight": 2,
+            "detail": "Modified 4/4 gold files (src/misc/credentials/CredentialsProvider.ts, src/misc/credentials/CredentialsKeyProvider.ts, src/misc/credentials/NativeCredentialsEncryption.ts, src/misc/credentials/CredentialsKeyMigrator.ts)"
+          },
+          {
+            "id": "provider_supported_mode_validation",
+            "passed": true,
+            "weight": 2,
+            "detail": "CredentialsProvider validates getSupportedEncryptionModes() and CredentialsKeyProvider implements clearCredentialsKey()"
+          },
+          {
+            "id": "native_decrypt_empty_token_guard",
+            "passed": true,
+            "weight": 2,
+            "detail": "NativeCredentialsEncryption.decrypt throws 'Trying to decrypt empty access token' when accessToken is empty"
+          },
+          {
+            "id": "migrator_same_mode_short_circuit",
+            "passed": true,
+            "weight": 2,
+            "detail": "CredentialsKeyMigrator.migrateCredentialsKey returns oldKeyEncrypted when oldMode === newMode"
+          }
+        ]
+      }
+    }
+  ]
+}

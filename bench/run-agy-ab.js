@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Reproducible A/B runner for Antigravity CLI (`agy`) across all 12 tasks (`T1`–`T12`)
- * in `bench/tasks.js` using `gemini-4-argon-low` (`low` effort) or `gemini-4-argon-medium` (`medium` effort).
+ * in `bench/tasks.js` using Gemini 4 Carbon (`carbon-low`, `carbon-medium`, `carbon-high`),
+ * Gemini 4 Argon (`argon-low`, `argon-medium`, `argon-high`), or Gemini 3.8 Flash.
  *
  * Enforces strict symmetry:
  *  - Clean isolated worktrees (`/tmp/plexer-ab-<modelAlias>-{cold,plexer}/<repo>`)
@@ -24,7 +25,7 @@ import {
     prepareTrailWorktreeDir,
 } from "./trail-live-helper.js";
 
-const modelAlias = process.argv[2] || "argon-low"; // "argon-low" | "argon-medium" | "flash-medium"
+const modelAlias = process.argv[2] || "argon-low"; // "carbon-medium" | "argon-low" | "argon-medium" | "flash-medium"
 const concurrency = Number(process.argv[3] || 4);
 const armFilter = process.argv[4] || "both"; // "both" | "all" | "cold" | "plexer" | "trail" | comma-separated
 const taskFilterArg = process.argv[5] || "all";
@@ -36,7 +37,13 @@ const armsToRun =
           ? ["cold", "plexer", "trail"]
           : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
 
-const MODEL_MAP = {
+export const MODEL_MAP = {
+    "carbon-low": { model: "gemini-4-carbon-low", effort: "low" },
+    "carbon-medium": { model: "gemini-4-carbon-medium", effort: "medium" },
+    "carbon-high": { model: "gemini-4-carbon-high", effort: "high" },
+    "gemini-4-carbon-low": { model: "gemini-4-carbon-low", effort: "low" },
+    "gemini-4-carbon-medium": { model: "gemini-4-carbon-medium", effort: "medium" },
+    "gemini-4-carbon-high": { model: "gemini-4-carbon-high", effort: "high" },
     "argon-low": { model: "gemini-4-argon-low", effort: "low" },
     "argon-medium": { model: "gemini-4-argon-medium", effort: "medium" },
     "argon-high": { model: "gemini-4-argon-high", effort: "high" },
@@ -53,7 +60,6 @@ const MODEL_MAP = {
 const modelCfg = MODEL_MAP[modelAlias] || { model: modelAlias, effort: process.argv[6] || "medium" };
 
 const logDir = `/tmp/plexer-agy-logs/${modelAlias}`;
-mkdirSync(logDir, { recursive: true });
 
 const basePrompt = [
     "You are an expert software engineer solving a repository diagnosis, refactoring blast-radius, or code-editing task.",
@@ -64,7 +70,7 @@ const basePrompt = [
 
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-const trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
+let trailSkillBody = "";
 
 function makeAgentMd(name, desc, body, hooksPath = null) {
     return [
@@ -104,7 +110,7 @@ const agyHooksJson = JSON.stringify(
             PreInvocation: [
                 {
                     type: "command",
-                    command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-pre-invocation`,
+                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-pre-invocation`,
                     timeout: 15,
                 },
             ],
@@ -114,7 +120,7 @@ const agyHooksJson = JSON.stringify(
                     hooks: [
                         {
                             type: "command",
-                            command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-post-edit`,
+                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-post-edit`,
                             timeout: 10,
                         },
                     ],
@@ -311,73 +317,82 @@ async function runWave(jobs, maxParallel) {
     return results;
 }
 
-const selectedTasks = taskFilterSet ? TASKS.filter((t) => taskFilterSet.has(t.id)) : TASKS;
-const readOnlyTasks = selectedTasks.filter((t) => t.category !== "code-edit");
-const editTasks = selectedTasks.filter((t) => t.category === "code-edit");
+async function main() {
+    mkdirSync(logDir, { recursive: true });
+    trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
 
-console.log(
-    `Starting Antigravity (${modelAlias}: ${modelCfg.model} @ effort=${modelCfg.effort}) A/B benchmark: ${selectedTasks.length} tasks × [${armsToRun.join(",")}] (concurrency=${concurrency})...`
-);
+    const selectedTasks = taskFilterSet ? TASKS.filter((t) => taskFilterSet.has(t.id)) : TASKS;
+    const readOnlyTasks = selectedTasks.filter((t) => t.category !== "code-edit");
+    const editTasks = selectedTasks.filter((t) => t.category === "code-edit");
 
-const allRepos = new Set(selectedTasks.map((t) => t.repo));
-await ensureAbBaseRepos(allRepos);
-for (const repo of allRepos) {
-    for (const arm of armsToRun) {
-        await resetWorktree(repo, arm);
+    console.log(
+        `Starting Antigravity (${modelAlias}: ${modelCfg.model} @ effort=${modelCfg.effort}) A/B benchmark: ${selectedTasks.length} tasks × [${armsToRun.join(",")}] (concurrency=${concurrency})...`
+    );
+
+    const allRepos = new Set(selectedTasks.map((t) => t.repo));
+    await ensureAbBaseRepos(allRepos);
+    for (const repo of allRepos) {
+        for (const arm of armsToRun) {
+            await resetWorktree(repo, arm);
+        }
     }
-}
 
-const readOnlyJobs = [];
-for (const t of readOnlyTasks) {
-    for (const arm of armsToRun) {
-        readOnlyJobs.push(() => runOne(t, arm));
+    const readOnlyJobs = [];
+    for (const t of readOnlyTasks) {
+        for (const arm of armsToRun) {
+            readOnlyJobs.push(() => runOne(t, arm));
+        }
     }
-}
-const editJobs = [];
-for (const t of editTasks) {
-    for (const arm of armsToRun) {
-        editJobs.push(() => runOne(t, arm));
+    const editJobs = [];
+    for (const t of editTasks) {
+        for (const arm of armsToRun) {
+            editJobs.push(() => runOne(t, arm));
+        }
     }
-}
 
-const allRuns = [
-    ...(await runWave(readOnlyJobs, concurrency)),
-    ...(await runWave(editJobs, concurrency)),
-];
+    const allRuns = [
+        ...(await runWave(readOnlyJobs, concurrency)),
+        ...(await runWave(editJobs, concurrency)),
+    ];
 
-const manifestPath = resolve(import.meta.dirname, `manifest-${modelAlias}.json`);
-const resultsPath = resolve(import.meta.dirname, `results-${modelAlias}.json`);
-const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf8")) : {};
-for (const t of TASKS) {
-    manifest[t.id] = manifest[t.id] || {};
-}
-const validRuns = allRuns.filter((r) => {
-    try {
-        const p = parseTranscript(r.transcriptPath);
-        if (r.code !== 0 || p.cumulativeInputTokens === 0) {
-            console.error(`[${modelAlias}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${p.cumulativeInputTokens}`);
+    const manifestPath = resolve(import.meta.dirname, `manifest-${modelAlias}.json`);
+    const resultsPath = resolve(import.meta.dirname, `results-${modelAlias}.json`);
+    const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf8")) : {};
+    for (const t of TASKS) {
+        manifest[t.id] = manifest[t.id] || {};
+    }
+    const validRuns = allRuns.filter((r) => {
+        try {
+            const p = parseTranscript(r.transcriptPath);
+            if (r.code !== 0 || p.cumulativeInputTokens === 0) {
+                console.error(`[${modelAlias}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${p.cumulativeInputTokens}`);
+                return false;
+            }
+            return true;
+        } catch (err) {
+            console.error(`[${modelAlias}] SKIPPING unreadable run ${r.taskId} (${r.arm}): ${err?.message || err}`);
             return false;
         }
-        return true;
-    } catch (err) {
-        console.error(`[${modelAlias}] SKIPPING unreadable run ${r.taskId} (${r.arm}): ${err?.message || err}`);
-        return false;
+    });
+    if (validRuns.length === 0) {
+        console.error(`[${modelAlias}] All runs failed or returned 0 tokens; preserving existing ${manifestPath} and ${resultsPath}.`);
+        process.exit(1);
     }
-});
-if (validRuns.length === 0) {
-    console.error(`[${modelAlias}] All runs failed or returned 0 tokens; preserving existing ${manifestPath} and ${resultsPath}.`);
-    process.exit(1);
-}
-for (const r of validRuns) {
-    manifest[r.taskId][r.arm] = {
-        conversationId: r.transcriptPath,
-        cloneDir: r.cloneDir,
-    };
+    for (const r of validRuns) {
+        manifest[r.taskId][r.arm] = {
+            conversationId: r.transcriptPath,
+            cloneDir: r.cloneDir,
+        };
+    }
+
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    gradeManifest(
+        manifestPath,
+        resultsPath,
+        new Set(validRuns.map((r) => `${r.taskId}:${r.arm}`))
+    );
 }
 
-writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-gradeManifest(
-    manifestPath,
-    resultsPath,
-    new Set(validRuns.map((r) => `${r.taskId}:${r.arm}`))
-);
+if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {
+    await main();
+}

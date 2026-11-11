@@ -27,7 +27,7 @@ import {
     resolveSymbol,
     skeleton,
 } from "../src/index.js";
-import { loadGraphCached } from "../src/graph/load.js";
+import { loadGraphCached } from "../src/context/graph-store.js";
 
 const BENCH_REPOS_DIR = process.env.PLEXER_BENCH_REPOS_DIR || join(homedir(), "Projects", "roblox", "libraries");
 
@@ -106,7 +106,7 @@ const GOLD_QUERIES = [
     {
         repo: "plexer",
         query: "how are dotted or colon-qualified symbol names matched to graph nodes",
-        goldPath: "src/util/id.js",
+        goldPath: "src/context/symbol-query.js",
     },
     // kohls-admin (Luau)
     {
@@ -425,7 +425,7 @@ async function benchTrailComparison() {
     const tBuildMod = await import(`${trailDist}/graph/build.js`);
     const tCheckMod = await import(`${trailDist}/graph/check.js`);
     const tSkillMod = await import(`${trailDist}/claude/skill-template.js`);
-    const { skillTemplate: plexerSkillTemplate } = await import("../src/hosts/skill-template.js");
+    const { skillTemplate: plexerSkillTemplate } = await import("../src/claude/shim-template.js");
 
     const pRaw = typeof plexerSkillTemplate === "function" ? plexerSkillTemplate() : String(plexerSkillTemplate || "");
     const tRaw = typeof tSkillMod.skillTemplate === "function" ? tSkillMod.skillTemplate() : String(tSkillMod.skillTemplate || "");
@@ -592,14 +592,16 @@ if (process.argv.includes("--json")) {
     console.log("| Repo | Nodes / Edges | `wiring.json` | Warm Refresh | `check` | `ask --source` | `ask` | `grep` | `callers` | `skeleton` | `map` | `ask --source` Tokens (vs `--full` / vs Raw Files) |");
     console.log("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for (const m of repoMetrics) {
-        const vsFull = m.askFullTokens > 0
-            ? Math.round((1 - m.askSourceTokens / m.askFullTokens) * 100)
+        const vsFullDiff = m.askFullTokens > 0
+            ? Math.round(((m.askSourceTokens - m.askFullTokens) / m.askFullTokens) * 100)
             : 0;
-        const vsRaw = m.rawTopFilesTokens > 0
-            ? Math.round((1 - m.askSourceTokens / m.rawTopFilesTokens) * 100)
+        const vsFullStr = vsFullDiff > 0 ? `+${vsFullDiff}%` : `${vsFullDiff}%`;
+        const vsRawDiff = m.rawTopFilesTokens > 0
+            ? Math.round(((m.askSourceTokens - m.rawTopFilesTokens) / m.rawTopFilesTokens) * 100)
             : 0;
+        const vsRawStr = vsRawDiff > 0 ? `+${vsRawDiff}%` : `${vsRawDiff}%`;
         console.log(
-            `| \`${m.name}\` | ${m.nodes.toLocaleString()} / ${m.edges.toLocaleString()} | ${m.wiringKB} KB | ${m.warmBuildMs}ms | ${m.checkMs}ms | **${m.askSourceMs}ms** | ${m.askNoSourceMs}ms | ${m.grepMs}ms | ${m.callersMs}ms | ${m.skeletonMs}ms | ${m.mapMs}ms | **${m.askSourceTokens}** (-${vsFull}% vs ${m.askFullTokens} full, -${vsRaw}% vs ${m.rawTopFilesTokens} raw) |`,
+            `| \`${m.name}\` | ${m.nodes.toLocaleString()} / ${m.edges.toLocaleString()} | ${m.wiringKB} KB | ${m.warmBuildMs}ms | ${m.checkMs}ms | **${m.askSourceMs}ms** | ${m.askNoSourceMs}ms | ${m.grepMs}ms | ${m.callersMs}ms | ${m.skeletonMs}ms | ${m.mapMs}ms | **${m.askSourceTokens}** (${vsFullStr} vs ${m.askFullTokens} full, ${vsRawStr} vs ${m.rawTopFilesTokens} raw) |`,
         );
     }
     console.log("\n## 2. Retrieval Accuracy (24 De-Leaked Intent Queries across 6 Repos)\n");

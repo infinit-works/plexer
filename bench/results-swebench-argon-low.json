@@ -14,7 +14,12 @@
       "searchMs": 2759000,
       "totalMs": 2759000,
       "score": 61,
-      "maxScore": 64
+      "maxScore": 64,
+      "turn1ContextTokens": 0,
+      "turn1UncachedTokens": 0,
+      "postTurn1UncachedTokens": 0,
+      "netContextGrowthTokens": 0,
+      "cacheMissTurns": 0
     },
     "plexer": {
       "calls": 180,
@@ -28,7 +33,12 @@
       "searchMs": 1855000,
       "totalMs": 1861000,
       "score": 61,
-      "maxScore": 64
+      "maxScore": 64,
+      "turn1ContextTokens": 70151,
+      "turn1UncachedTokens": 70151,
+      "postTurn1UncachedTokens": 506459,
+      "netContextGrowthTokens": 376076,
+      "cacheMissTurns": 8
     }
   },
   "tasks": [
@@ -94,7 +104,12 @@
         "goldSourceFiles": [
           "qutebrowser/browser/webkit/network/networkreply.py"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 7706,
+        "turn1UncachedTokens": 7706,
+        "postTurn1UncachedTokens": 13071,
+        "netContextGrowthTokens": 8453,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -139,7 +154,12 @@
           "qutebrowser/keyinput/modeman.py",
           "qutebrowser/utils/qtutils.py"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 9730,
+        "turn1UncachedTokens": 9730,
+        "postTurn1UncachedTokens": 104397,
+        "netContextGrowthTokens": 90065,
+        "cacheMissTurns": 1
       },
       "cold": {
         "conversationId": "319a049f-cfdc-4c00-b6dc-8b7213064c03",
@@ -214,7 +234,12 @@
           "internal/cmd/authn.go",
           "internal/config/authentication.go"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 9646,
+        "turn1UncachedTokens": 9646,
+        "postTurn1UncachedTokens": 78028,
+        "netContextGrowthTokens": 56505,
+        "cacheMissTurns": 1
       },
       "cold": {
         "conversationId": "b8d1f8ec-a467-4aea-9737-64da88a6c4a3",
@@ -315,7 +340,12 @@
           "internal/storage/cache/cache.go",
           "internal/storage/storage.go"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 8747,
+        "turn1UncachedTokens": 8747,
+        "postTurn1UncachedTokens": 47364,
+        "netContextGrowthTokens": 38170,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -359,7 +389,12 @@
           "src/user/profile.js",
           "src/user/reset.js"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 8937,
+        "turn1UncachedTokens": 8937,
+        "postTurn1UncachedTokens": 47309,
+        "netContextGrowthTokens": 26309,
+        "cacheMissTurns": 1
       },
       "cold": {
         "conversationId": "c1fe4ff5-c91f-4e89-affc-3f90f003619d",
@@ -431,7 +466,12 @@
           "src/posts/queue.js",
           "src/topics/merge.js"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 8811,
+        "turn1UncachedTokens": 8811,
+        "postTurn1UncachedTokens": 17199,
+        "netContextGrowthTokens": 15152,
+        "cacheMissTurns": 1
       },
       "cold": {
         "conversationId": "d9cca5d6-80d4-4717-9765-e40a342ca329",
@@ -530,7 +570,12 @@
           "src/desktop/DesktopDownloadManager.ts",
           "src/desktop/DesktopNetworkClient.ts"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 9072,
+        "turn1UncachedTokens": 9072,
+        "postTurn1UncachedTokens": 135645,
+        "netContextGrowthTokens": 102173,
+        "cacheMissTurns": 1
       }
     },
     {
@@ -600,7 +645,12 @@
           "src/api/worker/facades/DeviceEncryptionFacade.ts",
           "src/misc/credentials/NativeCredentialsEncryption.ts"
         ],
-        "dockerPassed": null
+        "dockerPassed": null,
+        "turn1ContextTokens": 7502,
+        "turn1UncachedTokens": 7502,
+        "postTurn1UncachedTokens": 63446,
+        "netContextGrowthTokens": 39249,
+        "cacheMissTurns": 1
       }
     }
   ]

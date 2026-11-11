@@ -10672,6 +10672,258 @@
      ]
     ]
    }
+  },
+  "L1": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "apis/record_auth_with_oauth2.go": [
+     [
+      227,
+      365,
+      "oracle/cold"
+     ]
+    ],
+    "forms/record_upsert.go": [
+     [
+      128,
+      316,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
+  },
+  "L2": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "src/misc/credentials/CredentialsProvider.ts": [
+     [
+      208,
+      245,
+      "oracle/cold"
+     ]
+    ],
+    "src/misc/credentials/CredentialsKeyProvider.ts": [
+     [
+      31,
+      60,
+      "oracle/cold"
+     ]
+    ],
+    "src/misc/credentials/NativeCredentialsEncryption.ts": [
+     [
+      25,
+      62,
+      "oracle/cold"
+     ]
+    ],
+    "src/misc/credentials/CredentialsKeyMigrator.ts": [
+     [
+      31,
+      40,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
+  },
+  "L3": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "qutebrowser/api/cmdutils.py": [
+     [
+      80,
+      91,
+      "oracle/cold"
+     ]
+    ],
+    "qutebrowser/browser/commands.py": [
+     [
+      141,
+      158,
+      "oracle/cold"
+     ]
+    ],
+    "qutebrowser/misc/guiprocess.py": [
+     [
+      150,
+      210,
+      "oracle/cold"
+     ]
+    ],
+    "qutebrowser/misc/editor.py": [
+     [
+      176,
+      199,
+      "oracle/cold"
+     ]
+    ],
+    "qutebrowser/commands/userscripts.py": [
+     [
+      140,
+      162,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
+  },
+  "L4": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "internal/server/evaluation/evaluation.go": [
+     [
+      22,
+      123,
+      "oracle/cold"
+     ]
+    ],
+    "internal/storage/sql/common/evaluation.go": [
+     [
+      13,
+      165,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
+  },
+  "L5": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "apis/file.go": [
+     [
+      20,
+      30,
+      "oracle/cold"
+     ],
+     [
+      148,
+      227,
+      "oracle/cold"
+     ]
+    ],
+    "tools/filesystem/filesystem.go": [
+     [
+      436,
+      511,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
+  },
+  "L6": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "src/user/reset.js": [
+     [
+      20,
+      66,
+      "oracle/cold"
+     ]
+    ],
+    "src/socket.io/user.js": [
+     [
+      58,
+      88,
+      "oracle/cold"
+     ]
+    ],
+    "src/socket.io/admin/user.js": [
+     [
+      101,
+      116,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
+  },
+  "L7": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "qutebrowser/misc/guiprocess.py": [
+     [
+      150,
+      210,
+      "oracle/cold"
+     ]
+    ],
+    "qutebrowser/misc/editor.py": [
+     [
+      176,
+      199,
+      "oracle/cold"
+     ]
+    ],
+    "qutebrowser/commands/userscripts.py": [
+     [
+      140,
+      162,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
+  },
+  "L8": {
+   "runs": [
+    "oracle/cold"
+   ],
+   "reads": {
+    "src/misc/credentials/CredentialsProvider.ts": [
+     [
+      208,
+      233,
+      "oracle/cold"
+     ]
+    ],
+    "src/misc/credentials/CredentialsKeyProvider.ts": [
+     [
+      12,
+      50,
+      "oracle/cold"
+     ]
+    ],
+    "src/misc/credentials/NativeCredentialsEncryption.ts": [
+     [
+      47,
+      58,
+      "oracle/cold"
+     ]
+    ],
+    "src/misc/credentials/CredentialsKeyMigrator.ts": [
+     [
+      31,
+      40,
+      "oracle/cold"
+     ]
+    ]
+   },
+   "wholeFiles": {},
+   "hits": {}
   }
  }
 }
