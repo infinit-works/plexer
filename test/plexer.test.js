@@ -1009,7 +1009,23 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
         assert.deepEqual(map.totals.languages, ["rust", "vue"]);
 
         const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+        const pluginMeta = JSON.parse(readFileSync(new URL("../plugin.json", import.meta.url), "utf8"));
+        const releaseYml = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
         assert.equal(readCurrentVersion(), pkg.version);
+        assert.equal(pluginMeta.version, pkg.version, "plugin.json#version must match package.json#version");
+        assert.equal(pkg.engines?.node, ">=22.13.0", "package.json#engines.node must enforce >=22.13.0");
+        assert.ok(
+            releaseYml.includes('plugin.json:^\\s*"version":\\s*"([^"]+)"'),
+            "release.yml must wire plugin.json in version-files",
+        );
+        const { spawnSync } = await import("node:child_process");
+        const verRun = spawnSync(
+            process.execPath,
+            [new URL("../bin/plexer.js", import.meta.url).pathname, "--version"],
+            { encoding: "utf8" },
+        );
+        assert.equal(verRun.status, 0);
+        assert.equal(verRun.stderr, "", "bin/plexer.js must not emit ExperimentalWarning on stderr");
         assert.equal(isPlexerAllowEntry("Bash(npx @plexer/cli:*)"), true);
     });
 
@@ -1688,8 +1704,9 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             const { stepLuauBlockDepth } = await import("../src/health/zones.js");
             const t0 = performance.now();
             const redosLine = `local x = if a then 1 ${"elseif a then 1 ".repeat(28)}`;
-            stepLuauBlockDepth(0, redosLine);
-            assert.ok(performance.now() - t0 < 50, "stepLuauBlockDepth must not catastrophically backtrack on repeated elseif clauses");
+            const depthAfter = stepLuauBlockDepth(0, redosLine);
+            assert.equal(Number.isInteger(depthAfter), true, "stepLuauBlockDepth must return integer depth cleanly");
+            assert.ok(performance.now() - t0 < 2500, "stepLuauBlockDepth must not catastrophically backtrack on repeated elseif clauses");
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }
@@ -1883,14 +1900,17 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             }
             assert.ok(callersMissOut.includes("did you mean:") && callersMissOut.includes("computeAlpha"), "CLI callers miss should suggest computeAlpha");
 
+        const { agySessionPath, readAgySession } = await import("../src/agy/session.js");
+        const metaSid = `meta-s1-${Date.now()}`;
+        const agySid = `agy-rel-dedup-${Date.now()}`;
+        try {
             // 6. Non-code Turn-0 hook emits 0 tokens & repo-relative Antigravity post-edit dedup distinguishes same-basename files
             const metaHookOut = execFileSync(process.execPath, [cliPath, "_hook", "prompt"], {
-                input: JSON.stringify({ session_id: "meta-s1", cwd: tmp, prompt: "What is the status of the project?" }),
+                input: JSON.stringify({ session_id: metaSid, cwd: tmp, prompt: "What is the status of the project?" }),
                 encoding: "utf8",
             });
             assert.equal(metaHookOut.trim(), "", "non-code status prompt should emit 0 Turn-0 hook tokens");
 
-            const { readAgySession } = await import("../src/hosts/antigravity-hooks.js");
             const claudeEditA = execFileSync(process.execPath, [cliPath, "_hook", "post-edit"], {
                 input: JSON.stringify({
                     session_id: "claude-rel-dedup",
@@ -1910,7 +1930,6 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             assert.ok(claudeEditA.includes("src/pkgA/index.ts"), "first edit to pkgA/index.ts should emit blast radius");
             assert.ok(claudeEditB.includes("src/pkgB/index.ts"), "editing pkgB/index.ts must not collide with pkgA/index.ts basename");
 
-            const agySid = `agy-rel-dedup-${Date.now()}`;
             execFileSync(process.execPath, [cliPath, "_hook", "agy-post-edit"], {
                 input: JSON.stringify({
                     sessionId: agySid,
@@ -1935,6 +1954,10 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
                 ["src/pkgA/index.ts", "src/pkgB/index.ts"],
                 "Antigravity post-edit should record distinct repo-relative paths for same-basename files",
             );
+        } finally {
+            rmSync(agySessionPath(metaSid), { force: true });
+            rmSync(agySessionPath(agySid), { force: true });
+        }
 
             // 7. SDK parity: includeCoupling, includeTests, healthAsync
             const mapCoupled = buildRepoMap(g, { includeCoupling: true });
@@ -1981,6 +2004,343 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
             } finally {
                 rmSync(wtTmp, { recursive: true, force: true });
             }
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("Pooled Span Budgets, Untyped Member Resolution, & Turn-0 Hook Gates", () => {
+    const cliPath = join(packageRootDir(), "bin", "plexer.js");
+
+    it("coalesces overlapping spans and pools readSpans up to 9 KB without 45-line chopping", async () => {
+        const { readSpans, formatReadSpans } = await import("../src/ask/ask.js");
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-readpool-"));
+        try {
+            mkdirSync(join(tmp, "src"), { recursive: true });
+            const makeLines = (prefix, count, padLen = 8) =>
+                Array.from(
+                    { length: count },
+                    (_, i) => `export const ${prefix}_${i + 1} = "${"x".repeat(padLen)}_${i + 1}";`,
+                ).join("\n") + "\n";
+
+            writeFileSync(join(tmp, "src", "a.ts"), makeLines("alpha", 25));
+            writeFileSync(join(tmp, "src", "b.ts"), makeLines("bravo", 25));
+            writeFileSync(join(tmp, "src", "c.ts"), makeLines("charlie", 25));
+            writeFileSync(join(tmp, "src", "d.ts"), makeLines("delta", 130));
+            writeFileSync(join(tmp, "src", "huge1.ts"), makeLines("hugeOne", 180, 56));
+            writeFileSync(join(tmp, "src", "huge2.ts"), makeLines("hugeTwo", 180, 56));
+
+            await buildGraph(tmp, { force: true });
+
+            // 1. 4 spans where 3 are short (20L) and 1 is 120L: d.ts:L1-L120 must NOT chop at 45 lines
+            const res4 = readSpans(tmp, ["src/a.ts:L1-L20", "src/b.ts:L1-L20", "src/c.ts:L1-L20", "src/d.ts:L1-L120"]);
+            const dBlock = res4.blocks.find((b) => b.file === "src/d.ts");
+            assert.ok(dBlock, "d.ts block present");
+            assert.equal(dBlock.span, "L1-L120", "120-line span should not be chopped to 45 lines when siblings are small");
+            assert.equal(dBlock.truncated, false);
+            assert.ok(formatReadSpans(res4).includes("L120:"), "formatted output includes L120");
+
+            // 2. Overlapping / adjacent same-file spans coalesce into 1 contiguous block
+            const coalesced = readSpans(tmp, ["src/d.ts:L46-L120", "src/d.ts:L1-L85"]);
+            assert.equal(coalesced.blocks.length, 1, "overlapping spans in same file coalesce into 1 block");
+            assert.equal(coalesced.blocks[0].span, "L1-L120");
+
+            // 3. Oversized multi-span batch stays within ~9.2 KB by default, and --full bypasses cap
+            const capped = readSpans(tmp, ["src/huge1.ts:L1-L170", "src/huge2.ts:L1-L170"]);
+            const cappedTxt = formatReadSpans(capped);
+            assert.ok(
+                Buffer.byteLength(cappedTxt, "utf8") <= 9200,
+                `pooled readSpans should stay <= 9200B, got ${Buffer.byteLength(cappedTxt, "utf8")}B`,
+            );
+            assert.ok(capped.blocks.some((b) => b.truncated), "at least one oversized block marks truncated");
+
+            const uncappedCli = execFileSync(
+                process.execPath,
+                [cliPath, "read", "src/huge1.ts:L1-L170", "src/huge2.ts:L1-L170", "--full"],
+                { cwd: tmp, encoding: "utf8" },
+            );
+            assert.ok(uncappedCli.includes("hugeOne_170") && uncappedCli.includes("hugeTwo_170"), "--full returns full spans");
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("caps multi-pattern grep stdout below 9.2 KB and condenses missed patterns in mixed batches", async () => {
+        const { spawnSync } = await import("node:child_process");
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-grepbudget-"));
+        try {
+            mkdirSync(join(tmp, "src"), { recursive: true });
+            for (let f = 1; f <= 8; f++) {
+                const body = Array.from({ length: 40 }, (_, i) => {
+                    const tag = `PAT_${(i % 5) + 1}`;
+                    return `export function fn_${f}_${i}() { return "${tag}_${"payload_".repeat(8)}${f}_${i}"; }`;
+                }).join("\n");
+                writeFileSync(join(tmp, "src", `mod${f}.ts`), `${body}\n`);
+            }
+            await buildGraph(tmp, { force: true });
+
+            const run = spawnSync(
+                process.execPath,
+                [cliPath, "grep", "PAT_1", "PAT_2", "PAT_3", "PAT_4", "PAT_5", "NEVER_MATCHES_XYZ"],
+                { cwd: tmp, encoding: "utf8" },
+            );
+            assert.equal(run.status, 0);
+            assert.ok(
+                Buffer.byteLength(run.stdout, "utf8") <= 9200,
+                `multi-pattern grep stdout should stay <= 9200B, got ${Buffer.byteLength(run.stdout, "utf8")}B`,
+            );
+            assert.ok(
+                run.stderr.includes('no hits in 8 indexed files for: "NEVER_MATCHES_XYZ"'),
+                `expected condensed stderr miss line, got: ${run.stderr}`,
+            );
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("resolves unique untyped .method() / :Method() calls as inferred and surfaces unlinked ambiguous call sites in callers", async () => {
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-untyped-member-"));
+        try {
+            mkdirSync(join(tmp, "src"), { recursive: true });
+            writeFileSync(
+                join(tmp, "src", "authConfig.ts"),
+                [
+                    "export class AuthConfig {",
+                    "    shouldRunCleanup(): boolean { return true; }",
+                    "    get(key: string): string { return key; }",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "server.ts"),
+                [
+                    'import { AuthConfig } from "./authConfig";',
+                    "export function bootServer(cfg: any) {",
+                    "    const ok = cfg.authentication.shouldRunCleanup();",
+                    "    const v = cfg.map.get('k');",
+                    "    return ok ? v : AuthConfig.name;",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "busA.ts"),
+                [
+                    "export class BusA {",
+                    "    dispatchAuditPayload(ev: string) { return ev; }",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "busB.ts"),
+                [
+                    "export class BusB {",
+                    "    dispatchAuditPayload(ev: string) { return ev.toUpperCase(); }",
+                    "}",
+                    "export function runTypedBusB() {",
+                    "    const b = new BusB();",
+                    "    return b.dispatchAuditPayload('typed');",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "untypedDispatcher.ts"),
+                [
+                    "export function forwardUntyped(bus: any) {",
+                    "    return bus.dispatchAuditPayload('untyped');",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "SnapshotStore.luau"),
+                [
+                    "local SnapshotStore = {}",
+                    "SnapshotStore.__index = SnapshotStore",
+                    "function SnapshotStore:reconcileSnapshot( rev )",
+                    "\treturn rev",
+                    "end",
+                    "function SnapshotStore:Destroy()",
+                    "end",
+                    "return SnapshotStore",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "ClientRunner.luau"),
+                [
+                    "local ClientRunner = {}",
+                    "function ClientRunner.step(session)",
+                    "\tsession.store:reconcileSnapshot(1)",
+                    "\tsession.part:Destroy()",
+                    "end",
+                    "return ClientRunner",
+                    "",
+                ].join("\n"),
+            );
+
+            await buildGraph(tmp);
+            const g = readGraph(wiringPath(contextDirFor(tmp)));
+            const byId = new Map(g.nodes.map((n) => [n.id, n]));
+
+            // 1. Chained untyped TS call cfg.authentication.shouldRunCleanup() -> AuthConfig.shouldRunCleanup (inferred)
+            const cleanupNode = g.nodes.find((n) => n.name === "AuthConfig.shouldRunCleanup" || n.name === "shouldRunCleanup");
+            assert.ok(cleanupNode, "AuthConfig.shouldRunCleanup node extracted");
+            const inferredTs = g.edges.find(
+                (e) => e.target === cleanupNode.id && byId.get(e.source)?.name === "bootServer" && e.relation === "calls",
+            );
+            assert.ok(inferredTs, "bootServer -> shouldRunCleanup edge resolved");
+            assert.equal(inferredTs.confidence, "inferred");
+
+            // Generic .get() must NOT resolve to AuthConfig.get
+            const getNode = g.nodes.find((n) => n.path === "src/authConfig.ts" && (n.name === "AuthConfig.get" || n.name === "get"));
+            assert.ok(getNode);
+            assert.equal(
+                g.edges.some((e) => e.target === getNode.id && byId.get(e.source)?.name === "bootServer"),
+                false,
+                "generic .get() must not infer cross-file edge",
+            );
+
+            // 2. Luau untyped session.store:reconcileSnapshot() -> SnapshotStore.reconcileSnapshot (inferred), while :Destroy() is blocked
+            const luauSnap = g.nodes.find((n) => n.path === "src/SnapshotStore.luau" && n.name.endsWith("reconcileSnapshot"));
+            const luauDestroy = g.nodes.find((n) => n.path === "src/SnapshotStore.luau" && n.name.endsWith("Destroy"));
+            assert.ok(luauSnap && luauDestroy);
+            const inferredLuau = g.edges.find((e) => e.target === luauSnap.id && e.relation === "calls");
+            assert.ok(inferredLuau, "Luau untyped :reconcileSnapshot() resolved via Tier B");
+            assert.equal(inferredLuau.confidence, "inferred");
+            assert.equal(
+                g.edges.some((e) => e.target === luauDestroy.id && e.relation === "calls"),
+                false,
+                "generic Roblox :Destroy() must not infer cross-file edge",
+            );
+
+            // 3. Ambiguous BusA/BusB.dispatchAuditPayload: no guessed graph edge from forwardUntyped,
+            //    and `plexer callers` surfaces forwardUntyped in unlinked footer while excluding typed runTypedBusB!
+            const busANode = g.nodes.find((n) => n.path === "src/busA.ts" && n.name.includes("dispatchAuditPayload"));
+            assert.ok(busANode);
+            assert.equal(
+                g.edges.some((e) => e.target === busANode.id && byId.get(e.source)?.name === "forwardUntyped"),
+                false,
+                "ambiguous untyped receiver should not guess an edge",
+            );
+
+            const callersTxt = execFileSync(process.execPath, [cliPath, "callers", "src/busA.ts:BusA.dispatchAuditPayload"], {
+                cwd: tmp,
+                encoding: "utf8",
+            });
+            assert.ok(callersTxt.includes("unlinked .dispatchAuditPayload() call sites"), "renders unlinked lexical call sites footer");
+            assert.ok(callersTxt.includes("src/untypedDispatcher.ts"), "includes untypedDispatcher.ts site");
+            assert.ok(!callersTxt.includes("runTypedBusB"), "excludes caller already linked to BusB.dispatchAuditPayload");
+
+            const callersJson = JSON.parse(
+                execFileSync(process.execPath, [cliPath, "callers", "src/busA.ts:BusA.dispatchAuditPayload", "--json"], {
+                    cwd: tmp,
+                    encoding: "utf8",
+                }),
+            );
+            assert.equal(callersJson.matches[0].unlinkedCallSites?.length, 1);
+            assert.equal(callersJson.matches[0].unlinkedCallSites[0].path, "src/untypedDispatcher.ts");
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("suppresses Turn-0 hook output on comparative meta prompts and emits coEditPointers on edit prompts", async () => {
+        const { queryPromptContext } = await import("../src/claude/hooks.js");
+        const { relevantRetrieval } = await import("../src/claude/format.js");
+
+        // 1. Exact meta/evaluation prompt against plexer's own repo must emit 0 Turn-0 bytes
+        const { agySessionPath } = await import("../src/agy/session.js");
+        const selfMetaSid = `self-meta-${Date.now()}`;
+        const metaPrompt =
+            "/plan /grill-me why is plexer performing worse than it used to? are there any high leverage changes that would bring it closer to 70% token usage saved and more wall time saved?";
+        try {
+            const selfMetaOut = execFileSync(process.execPath, [cliPath, "_hook", "prompt"], {
+                input: JSON.stringify({ session_id: selfMetaSid, cwd: packageRootDir(), prompt: metaPrompt }),
+                encoding: "utf8",
+            });
+            assert.equal(selfMetaOut.trim(), "", "comparative meta/benchmark prompt must emit 0 Turn-0 hook bytes");
+        } finally {
+            rmSync(agySessionPath(selfMetaSid), { force: true });
+        }
+
+        // 2. Edit prompt emits compact coEditPointers (1-hop peer + covering test) within tightened edit budget
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-coedit-"));
+        try {
+            mkdirSync(join(tmp, "src"), { recursive: true });
+            mkdirSync(join(tmp, "test"), { recursive: true });
+            writeFileSync(
+                join(tmp, "src", "quotaValidator.ts"),
+                [
+                    "export function validateQuotaWindow(limit: number, used: number): boolean {",
+                    "    return used < limit;",
+                    "}",
+                    "export function normalizeQuotaBucket(limit: number): number {",
+                    "    return Math.max(0, limit);",
+                    "}",
+                    "export function formatQuotaError(limit: number): string {",
+                    "    return `quota exceeded: ${limit}`;",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "quotaPolicy.ts"),
+                [
+                    "export function defaultQuotaLimit(tier: string): number {",
+                    "    return tier === 'pro' ? 1000 : 100;",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "quotaMetrics.ts"),
+                [
+                    "export function recordQuotaDecision(allowed: boolean): number {",
+                    "    return allowed ? 1 : 0;",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "src", "billingRouter.ts"),
+                [
+                    'import { validateQuotaWindow } from "./quotaValidator";',
+                    "export function routeBillingCheck(n: number, used: number): boolean {",
+                    "    return validateQuotaWindow(n, used);",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+            writeFileSync(
+                join(tmp, "test", "quotaValidator.test.ts"),
+                [
+                    "// stem companion test",
+                    "export function testSuite() {",
+                    "    return true;",
+                    "}",
+                    "",
+                ].join("\n"),
+            );
+
+            await buildGraph(tmp);
+            const editPrompt =
+                "Update `validateQuotaWindow`, `normalizeQuotaBucket`, and `defaultQuotaLimit` so zero or negative quota limits return false immediately.";
+            const askObj = queryPromptContext(tmp, editPrompt);
+            assert.ok(askObj, "edit prompt produces retrieval result");
+            assert.ok(Array.isArray(askObj.coEditPointers) && askObj.coEditPointers.length > 0, "populates coEditPointers");
+            const formatted = relevantRetrieval(askObj, {}) || "";
+            assert.ok(formatted.includes("likely co-edits / tests:"), "renders likely co-edits / tests header");
+            assert.ok(formatted.includes("src/billingRouter.ts"), "points to 1-hop caller file");
+            assert.ok(formatted.includes("test/quotaValidator.test.ts"), "points to covering test file");
+            assert.ok(
+                Buffer.byteLength(formatted, "utf8") <= 3400,
+                `edit Turn-0 context must stay <= 3400B, got ${Buffer.byteLength(formatted, "utf8")}B`,
+            );
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }

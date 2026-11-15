@@ -13,6 +13,7 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { TASKS } from "./tasks.js";
 import { gradeManifest, parseTranscript } from "./grade.js";
@@ -59,7 +60,10 @@ export const MODEL_MAP = {
 };
 const modelCfg = MODEL_MAP[modelAlias] || { model: modelAlias, effort: process.argv[6] || "medium" };
 
-const logDir = `/tmp/plexer-agy-logs/${modelAlias}`;
+const logDir = process.env.PLEXER_BENCH_LOG_DIR
+    ? resolve(process.env.PLEXER_BENCH_LOG_DIR)
+    : `/tmp/plexer-agy-logs/${modelAlias}`;
+const benchDaemonSock = `/tmp/plexer-agy-bench-${process.pid}.sock`;
 
 const basePrompt = [
     "You are an expert software engineer solving a repository diagnosis, refactoring blast-radius, or code-editing task.",
@@ -68,8 +72,7 @@ const basePrompt = [
     "When running shell commands with `run_command`, always set `WaitMsBeforeAsync: 10000` so commands complete synchronously.",
 ].join("\n");
 
-const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
-const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+const agyRuleBody = readFileSync(resolve(import.meta.dirname, "../rules/AGENTS.md"), "utf8").trim();
 let trailSkillBody = "";
 
 function makeAgentMd(name, desc, body, hooksPath = null) {
@@ -103,27 +106,46 @@ const coldAgentMd = makeAgentMd(
     `${basePrompt}\n\nIMPORTANT: Do NOT read or use any external skill files under ~/.gemini/ or ~/.agents/ or run \`plexer\` or \`trail\` commands; use standard repository tools only.`
 );
 
-const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
+const plexerHookClient = resolve(import.meta.dirname, "../bin/plexer-hook-client.cjs");
 const agyHooksJson = JSON.stringify(
     {
         "plexer-hooks": {
             PreInvocation: [
                 {
                     type: "command",
-                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-pre-invocation`,
+                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-invocation`,
                     timeout: 15,
+                },
+            ],
+            PreToolUse: [
+                {
+                    matcher: "read_file|view_file|run_command",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-tool`,
+                            timeout: 10,
+                        },
+                    ],
                 },
             ],
             PostToolUse: [
                 {
-                    matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file",
+                    matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file",
                     hooks: [
                         {
                             type: "command",
-                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-post-edit`,
+                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-post-tool`,
                             timeout: 10,
                         },
                     ],
+                },
+            ],
+            Stop: [
+                {
+                    type: "command",
+                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-stop`,
+                    timeout: 10,
                 },
             ],
         },
@@ -158,7 +180,7 @@ function ensureWorktree(repo, arm) {
         makeAgentMd(
             "bench-plexer",
             "Plexer-equipped software engineering agent for A/B benchmarking (with plexer skill).",
-            `${basePrompt}\n\n${skillBody}`,
+            `${basePrompt}\n\nIMPORTANT: Do NOT read external skill files under ~/.gemini/ or ~/.agents/; your plexer instructions are already loaded below.\n\n${agyRuleBody}`,
             hooksPath
         ),
         "utf8"
@@ -264,14 +286,21 @@ async function runOne(task, arm) {
                 ? getTrailEnv()
                 : {
                       ...process.env,
-                      PLEXER_ENABLE_BENCH_HOOKS: arm === "plexer" ? "1" : "0",
+                      PLEXER_DAEMON_SOCK: benchDaemonSock,
+                      ...(arm === "plexer"
+                          ? {}
+                          : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_DISABLE_HOOKS: "1", PLEXER_BENCH_HIDE_CLI: "1" }),
                       GIT_CONFIG_COUNT: "2",
                       GIT_CONFIG_KEY_0: "commit.gpgsign",
                       GIT_CONFIG_VALUE_0: "false",
                       GIT_CONFIG_KEY_1: "tag.gpgsign",
                       GIT_CONFIG_VALUE_1: "false",
                   };
-        delete env.PLEXER_DISABLE_HOOKS;
+        if (arm === "plexer") {
+            delete env.PLEXER_ENABLE_BENCH_HOOKS;
+            delete env.PLEXER_DISABLE_HOOKS;
+            delete env.PLEXER_BENCH_HIDE_CLI;
+        }
         delete env.PLEXER_DIR;
         const child = spawn("agy", args, {
             cwd: cloneDir,
@@ -317,6 +346,31 @@ async function runWave(jobs, maxParallel) {
     return results;
 }
 
+async function shutdownBenchDaemon(sockPath) {
+    await new Promise((resolveDone) => {
+        if (!existsSync(sockPath)) {
+            resolveDone();
+            return;
+        }
+        const sock = createConnection(sockPath);
+        const timer = setTimeout(() => {
+            sock.destroy();
+            resolveDone();
+        }, 200);
+        sock.on("connect", () => {
+            sock.write(`${JSON.stringify({ id: 1, type: "shutdown" })}\n`);
+            clearTimeout(timer);
+            sock.end();
+            resolveDone();
+        });
+        sock.on("error", () => {
+            clearTimeout(timer);
+            resolveDone();
+        });
+    });
+    rmSync(sockPath, { force: true });
+}
+
 async function main() {
     mkdirSync(logDir, { recursive: true });
     trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
@@ -350,13 +404,22 @@ async function main() {
         }
     }
 
-    const allRuns = [
-        ...(await runWave(readOnlyJobs, concurrency)),
-        ...(await runWave(editJobs, concurrency)),
-    ];
+    let allRuns;
+    try {
+        allRuns = [
+            ...(await runWave(readOnlyJobs, concurrency)),
+            ...(await runWave(editJobs, concurrency)),
+        ];
+    } finally {
+        await shutdownBenchDaemon(benchDaemonSock);
+    }
 
-    const manifestPath = resolve(import.meta.dirname, `manifest-${modelAlias}.json`);
-    const resultsPath = resolve(import.meta.dirname, `results-${modelAlias}.json`);
+    const manifestPath = process.env.PLEXER_BENCH_MANIFEST
+        ? resolve(process.env.PLEXER_BENCH_MANIFEST)
+        : resolve(import.meta.dirname, `manifest-${modelAlias}.json`);
+    const resultsPath = process.env.PLEXER_BENCH_OUT
+        ? resolve(process.env.PLEXER_BENCH_OUT)
+        : resolve(import.meta.dirname, `results-${modelAlias}.json`);
     const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf8")) : {};
     for (const t of TASKS) {
         manifest[t.id] = manifest[t.id] || {};

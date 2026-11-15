@@ -12,9 +12,11 @@ import { callTool } from "../src/mcp/tools.js";
 import { classifyStemConvention } from "../src/health/concerns.js";
 import { SUBJECTIVE_DIMENSIONS } from "../src/health/constants.js";
 import { computeCognitiveComplexity } from "../src/health/graph-checks.js";
+import { computeScoreSnapshot } from "../src/health/scoring.js";
+import { managePlanCluster } from "../src/health/queue.js";
 import { formatHealthText } from "../src/health/render.js";
 import { emptyHealthConfig, healthDir, mintIssueId } from "../src/health/state.js";
-import { classifyZone, hasInlineSuppression, loadIgnoreRules } from "../src/health/zones.js";
+import { classifyZone, hasInlineSuppression, loadIgnoreRules, stripCodeStringsAndComments } from "../src/health/zones.js";
 import { buildVizHealthPayload } from "../src/viz/serve.js";
 
 describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity upgrades)", () => {
@@ -246,13 +248,23 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             });
             assert.equal(triageDone.triage.completed, true);
 
-            // 4. Expanded Autofixers (`luau-task-scheduler`, `luau-instance-new-parent`, `luau-hoist-getservice`, `debug-logs`, `unused-imports`)
+            // 4. Expanded Autofixers (`luau-task-scheduler`, `luau-instance-new-parent`, `debug-logs`, `unused-imports`, explicit `luau-hoist-getservice`)
             const fixDry = px.health(tmp, { action: "autofix", fixer: "all", dryRun: true });
-            assert.ok(fixDry.total_edits >= 4);
+            assert.ok(fixDry.total_edits >= 3);
             const fixApply = px.health(tmp, { action: "autofix", fixer: "all", dryRun: false });
             assert.equal(fixApply.files_changed, 1);
             px.health(tmp, { action: "autofix", fixer: "unused-imports", dryRun: false });
 
+            const beforeExplicitHoist = readFileSync(
+                join(tmp, "src", "Server", "CombatService.server.luau"),
+                "utf8",
+            );
+            assert.ok(
+                !beforeExplicitHoist.startsWith('local Players = game:GetService("Players")'),
+                "autofix all must not implicitly hoist GetService",
+            );
+
+            px.health(tmp, { action: "autofix", fixer: "luau-hoist-getservice", dryRun: false });
             const updatedServer = readFileSync(
                 join(tmp, "src", "Server", "CombatService.server.luau"),
                 "utf8",
@@ -265,7 +277,7 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             );
             assert.ok(
                 updatedServer.startsWith('local Players = game:GetService("Players")'),
-                "game:GetService('Players') should be hoisted to module top",
+                "explicit luau-hoist-getservice should hoist game:GetService('Players') to module top",
             );
             assert.ok(!updatedServer.includes("UnusedDep"), "unused local require should be removed");
             assert.ok(!updatedServer.includes("print('DEBUG hit'"), "DEBUG print should be removed");
@@ -1421,7 +1433,7 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tmp, stdio: "pipe" });
             execFileSync("git", ["config", "user.name", "Test"], { cwd: tmp, stdio: "pipe" });
             execFileSync("git", ["add", "."], { cwd: tmp, stdio: "pipe" });
-            execFileSync("git", ["commit", "-m", "initial"], { cwd: tmp, stdio: "pipe" });
+            execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "initial"], { cwd: tmp, stdio: "pipe" });
 
             for (let c = 1; c <= 3; c++) {
                 writeFileSync(
@@ -1435,13 +1447,13 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
                     "utf8",
                 );
                 execFileSync("git", ["add", "."], { cwd: tmp, stdio: "pipe" });
-                execFileSync("git", ["commit", "-m", `clone co-change ${c}`], { cwd: tmp, stdio: "pipe" });
+                execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", `clone co-change ${c}`], { cwd: tmp, stdio: "pipe" });
             }
             for (let c = 1; c <= 4; c++) {
                 const engTxt = readFileSync(join(tmp, "src", "core", "engine.ts"), "utf8");
                 writeFileSync(join(tmp, "src", "core", "engine.ts"), `${engTxt}\n// churn ${c}`, "utf8");
                 execFileSync("git", ["add", "."], { cwd: tmp, stdio: "pipe" });
-                execFileSync("git", ["commit", "-m", `engine churn ${c}`], { cwd: tmp, stdio: "pipe" });
+                execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", `engine churn ${c}`], { cwd: tmp, stdio: "pipe" });
             }
 
             const px = new Plexer();
@@ -1554,7 +1566,7 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             });
             assert.equal(gateBlocked.status, "scan_gate_blocked", "wildcard resolve exceeding 10 issues must be blocked pre-loop");
 
-            // (c) `false_positive` requires valid `--attest` and counts against `strict`
+            // (c) `false_positive` requires valid `--attest` or `--reason` and is exempt from `strict` penalty
             const fpRejected = px.health(tmp, {
                 action: "plan",
                 subAction: "skip",
@@ -1562,7 +1574,7 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
                 patterns: [allItems[1].id],
                 confirm: true,
             });
-            assert.equal(fpRejected.status, "attestation_invalid", "false_positive without --attest must be rejected");
+            assert.equal(fpRejected.status, "attestation_invalid", "false_positive without --attest or --reason must be rejected");
 
             const fpAccepted = px.health(tmp, {
                 action: "plan",
@@ -1574,10 +1586,9 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             });
             assert.equal(fpAccepted.status, "false_positive");
             assert.equal(fpAccepted.scores.false_positive_count, 1);
-            assert.equal(
-                fpAccepted.scores.strict,
-                strictBeforeResolve,
-                "false_positive must still count as failing in strict score",
+            assert.ok(
+                fpAccepted.scores.strict > strictBeforeResolve,
+                `attested false_positive should be exempt from strict penalty (${fpAccepted.scores.strict} > ${strictBeforeResolve})`,
             );
 
             // (d) Inline suppression transitions an existing open issue to `wontfix` + `suppressed: true` (not `fixed`)
@@ -1832,6 +1843,47 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
             });
             assert.ok(moveClusterRes.cluster.issue_ids.includes(targetDemoteId));
 
+            // `managePlanCluster` path-jail errors: reject out-of-repo export `--output`, hidden `.dot` output, and out-of-repo `import`
+            const fakeState = { issues: {} };
+            const fakePlan = { clusters: { cleanup_wave: { name: "cleanup_wave", issue_ids: [targetDemoteId], depends_on: [], steps: [] } } };
+            assert.throws(
+                () => managePlanCluster(fakeState, fakePlan, "export", "cleanup_wave", [], { rootDir: tmp, output: "../escape.json" }),
+                /within repository root/i,
+            );
+            assert.throws(
+                () => managePlanCluster(fakeState, fakePlan, "export", "cleanup_wave", [], { rootDir: tmp, output: ".hidden/escape.json" }),
+                /hidden\/dot/i,
+            );
+            assert.throws(
+                () => managePlanCluster(fakeState, fakePlan, "import", "../outside-cluster.json", [], { rootDir: tmp }),
+                /within repository root/i,
+            );
+
+            // Calibrated `scoring.js`: upper-median file-based potential + strictly monotone multi-issue concave responsiveness + verified:false gating
+            const calibIssues = {};
+            for (let k = 0; k < 6; k++) {
+                const det = k % 2 === 0 ? "unused_imports" : "unreferenced_exports";
+                const iid = `${det}::src/mod.ts::sym_${k}`;
+                calibIssues[iid] = { id: iid, detector: det, dimension: "code_quality", file: "src/mod.ts", tier: "T3", confidence: "high", status: "open" };
+            }
+            const calibPotentials = { unused_imports: 20, unreferenced_exports: 30, dead_symbols: 15, orphaned_files: 12, facade_modules: 18 };
+            const snapBefore = computeScoreSnapshot({ issues: calibIssues, potentials: calibPotentials });
+            assert.equal(snapBefore.dimensions.code_quality.potential, 36, "file-based potential uses upper-median detector surface * 2 (18 * 2 = 36)");
+            const calibIssuesFixedOne = {
+                ...calibIssues,
+                [Object.keys(calibIssues)[0]]: { ...Object.values(calibIssues)[0], status: "fixed", verified: true },
+            };
+            const snapAfterVerified = computeScoreSnapshot({ issues: calibIssuesFixedOne, potentials: calibPotentials });
+            assert.ok(snapAfterVerified.strict > snapBefore.strict, "fixing 1 of 6 issues in same file must strictly lift score");
+            const calibIssuesUnverified = {
+                ...calibIssues,
+                [Object.keys(calibIssues)[0]]: { ...Object.values(calibIssues)[0], status: "fixed", verified: false },
+            };
+            const snapUnverified = computeScoreSnapshot({ issues: calibIssuesUnverified, potentials: calibPotentials });
+            assert.equal(snapUnverified.strict, snapBefore.strict, "unverified mechanical fix must NOT lift strict");
+            assert.equal(snapUnverified.verified, snapBefore.verified, "unverified mechanical fix must NOT lift verified");
+            assert.ok(snapUnverified.overall > snapBefore.overall, "unverified fix only lifts lenient overall");
+
             // (k) Luau inline `if ... then ... else` expressions do not inflate cognitive complexity
             const luauInlineIfComplexity = computeCognitiveComplexity(
                 [
@@ -2063,6 +2115,385 @@ describe("plexer health (living plan loop, 20-dim review, Luau/Roblox & parity u
                 pyTrapRes.items.some((i) => i.id.includes("lru_cache_global_get_session_item")),
                 "lowercase mutable global session_items inside @lru_cache must trigger lru_cache_global",
             );
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("plexer health generated-file and data-module guards", () => {
+    it("never suggests inlining data-only modules, @generated files, or CI-written files", async () => {
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-health-gen-"));
+        try {
+            const dir = join(tmp, "src", "Explorer");
+            mkdirSync(dir, { recursive: true });
+            mkdirSync(join(tmp, ".github", "workflows"), { recursive: true });
+            writeFileSync(
+                join(tmp, ".github", "workflows", "regen.yml"),
+                [
+                    "jobs:",
+                    "  update:",
+                    "    steps:",
+                    "      - uses: stefanzweifel/git-auto-commit-action@v7",
+                    "        with:",
+                    '          file_pattern: "src/Explorer/Wf.luau"',
+                ].join("\n"),
+            );
+            const fnModule = (name) => `local function ${name}()\n\treturn 1\nend\nreturn { ${name} = ${name} }\n`;
+            writeFileSync(join(dir, "Order.luau"), "--stylua: ignore\nreturn {Accessory=30,Actor=10,Folder=10}\n");
+            writeFileSync(join(dir, "Helper.luau"), fnModule("helper"));
+            writeFileSync(join(dir, "Hdr.luau"), `-- @generated by tools/gen.py. Do not edit.\n${fnModule("hdr")}`);
+            writeFileSync(join(dir, "Wf.luau"), fnModule("wf"));
+            writeFileSync(
+                join(dir, "init.luau"),
+                [
+                    'local Order = require(script:WaitForChild("Order"))',
+                    'local Helper = require(script:WaitForChild("Helper"))',
+                    'local Hdr = require(script:WaitForChild("Hdr"))',
+                    'local Wf = require(script:WaitForChild("Wf"))',
+                    "return function(name)",
+                    "\treturn Order[name], Helper.helper(), Hdr.hdr(), Wf.wf()",
+                    "end",
+                ].join("\n"),
+            );
+
+            assert.equal(classifyZone("src/Explorer/Hdr.luau", {}, tmp), "generated");
+            assert.equal(classifyZone("src/Explorer/Wf.luau", {}, tmp), "generated");
+            assert.equal(classifyZone("src/Explorer/Helper.luau", {}, tmp), "production");
+
+            const px = new Plexer();
+            await px.graph(tmp);
+            const res = px.health(tmp, { action: "detect", detector: "single_importer_files" });
+            const flagged = res.items.map((i) => i.identifier).sort();
+            assert.deepEqual(flagged, ["Helper.luau"], `only the 1-function micro-module should be flagged, got ${flagged}`);
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    it("supports --false-positive --reason dismissal, abuse warning, safe autofix ordering, and precision checks across detectors", async () => {
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-health-precision-"));
+        try {
+            mkdirSync(join(tmp, "src", "Main", "Commands"), { recursive: true });
+            mkdirSync(join(tmp, "src", "Client"), { recursive: true });
+            mkdirSync(join(tmp, "src", "Web"), { recursive: true });
+            mkdirSync(join(tmp, "tests"), { recursive: true });
+
+            // 1. Dynamic loader + Command child (must NOT trigger orphaned_files / unreferenced_exports)
+            writeFileSync(
+                join(tmp, "src", "Main", "init.luau"),
+                [
+                    "local Main = {}",
+                    "function Main.load()",
+                    "    for _, mod in script.Commands:GetChildren() do",
+                    "        if mod:IsA('ModuleScript') then",
+                    "            require(mod)",
+                    "        end",
+                    "    end",
+                    "end",
+                    "return Main",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "Main", "Commands", "Kick.luau"),
+                [
+                    "local Kick = {}",
+                    "function Kick.Run(ctx, target)",
+                    "    return tostring(target)",
+                    "end",
+                    "return Kick",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // 2. Autofix target: header comments + guarded GetService + Instance.new 2-arg with prop assignments + JSX React
+            writeFileSync(
+                join(tmp, "src", "Main", "BuildUi.luau"),
+                [
+                    "--!strict",
+                    "--[=[",
+                    "Header block comment",
+                    "]=]",
+                    "local M = {}",
+                    "function M.build(cond: boolean)",
+                    "    if cond then",
+                    "        local TweenService = game:GetService('TweenService')",
+                    "        print(TweenService)",
+                    "    end",
+                    "    local Players = game:GetService('Players')",
+                    "    local frame = Instance.new('Frame', workspace)",
+                    "    frame.Name = 'Panel'",
+                    "    frame.Visible = false",
+                    "    return Players, frame",
+                    "end",
+                    "return M",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "Web", "Widget.jsx"),
+                [
+                    'import React from "react";',
+                    "export function Widget() {",
+                    "    try {",
+                    "        return <span>ok</span>;",
+                    "    } catch {",
+                    "        return null;",
+                    "    }",
+                    "}",
+                    "export function brokenFallback() {",
+                    "    try {",
+                    "        return 1;",
+                    "    } catch {",
+                    "        return undefined;",
+                    "    }",
+                    "}",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // 3. Disjoint-API small functions (must NOT trigger duplicates)
+            writeFileSync(
+                join(tmp, "src", "Main", "DisjointA.luau"),
+                [
+                    "local A = {}",
+                    "function A.compute(items)",
+                    "    local out = {}",
+                    "    for i, v in ipairs(items) do",
+                    "        local norm = Players:GetPlayerByUserId(v)",
+                    "        if norm then",
+                    "            out[i] = HttpService:JSONEncode(norm)",
+                    "        else",
+                    "            out[i] = utf8.char(65)",
+                    "        end",
+                    "    end",
+                    "    return ContentProvider:PreloadAsync(out)",
+                    "end",
+                    "return A",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "Main", "DisjointB.luau"),
+                [
+                    "local B = {}",
+                    "function B.format(items)",
+                    "    local res = {}",
+                    "    for idx, entry in pairs(items) do",
+                    "        local val = CollectionService:GetTagged(entry)",
+                    "        if val then",
+                    "            res[idx] = Workspace:FindFirstChild(val)",
+                    "        else",
+                    "            res[idx] = TweenService:Create(entry)",
+                    "        end",
+                    "    end",
+                    "    return SoundService:PlayLocalSound(res)",
+                    "end",
+                    "return B",
+                ].join("\n"),
+                "utf8",
+            );
+
+            // 4. Deceptive queries + Luau precision + Client FindService + Runner vs Spec tests
+            writeFileSync(
+                join(tmp, "src", "Main", "Queries.luau"),
+                [
+                    "local Queries = {}",
+                    "function Queries.getOrCreateCache(store)",
+                    "    store:SetAsync('k', 1)",
+                    "    return store",
+                    "end",
+                    "function Queries.getMeasuredBounds()",
+                    "    local temp = Instance.new('Part')",
+                    "    local sz = temp.Size",
+                    "    temp:Destroy()",
+                    "    return sz",
+                    "end",
+                    "function Queries.getWithExternalDestroy(target)",
+                    "    target:Destroy()",
+                    "    return true",
+                    "end",
+                    "return Queries",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "Main", "LuauTraps.server.luau"),
+                [
+                    "local function wait(n)",
+                    "    return task.wait(n)",
+                    "end",
+                    "local Sig = workspace.ChildAdded",
+                    "Sig:Connect(function() end)",
+                    "local Re = workspace.RemoteEvent",
+                    "Re.OnServerEvent:Connect(function(_player, _unused)",
+                    "    return",
+                    "end)",
+                    "local function leakyInFn()",
+                    "    wait(0.2)",
+                    "    local _ = Sig:Connect(function() end)",
+                    "    local _ = pcall(error, 'boom')",
+                    "    pcall(function() workspace:ClearAllChildren() end)",
+                    "end",
+                    "return leakyInFn",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "src", "Client", "Probe.client.luau"),
+                [
+                    "local s = game:FindService('ServerScriptService')",
+                    "print(s)",
+                ].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "tests", "runTests.server.luau"),
+                ["local runner = require(script.Parent)", "runner.run()"].join("\n"),
+                "utf8",
+            );
+            writeFileSync(
+                join(tmp, "tests", "widget.spec.luau"),
+                ["return function()", "    local x = 1 + 1", "    local y = x + 2", "    local z = y + 3", "    return z", "end"].join("\n"),
+                "utf8",
+            );
+
+            // Apostrophe in Luau comment must not break quotes on the same line
+            const stripped = stripCodeStringsAndComments('-- don\'t break "keep"', true, false);
+            assert.equal(stripped.trim(), "");
+
+            const px = new Plexer();
+            await px.graph(tmp);
+            const scan = px.health(tmp, { action: "scan" });
+            const items = scan.queue.all_items;
+
+            // Dynamic loader children exempt
+            assert.ok(
+                !items.some((i) => i.file === "src/Main/Commands/Kick.luau" && (i.detector === "orphaned_files" || i.detector === "unreferenced_exports")),
+                "dynamic loader child Kick.luau must not be flagged as orphaned or unreferenced_exports",
+            );
+            // Disjoint small functions not duplicates
+            assert.ok(
+                !items.some((i) => i.detector === "duplicates" && (i.file.includes("DisjointA") || i.file.includes("DisjointB"))),
+                "functions calling disjoint external APIs must not trigger duplicates",
+            );
+            // getOrCreate & local temp:Destroy() exempt; external target:Destroy() caught
+            assert.ok(
+                !items.some((i) => i.detector === "deceptive_queries" && (i.identifier.includes("getOrCreateCache") || i.identifier.includes("getMeasuredBounds"))),
+                "getOrCreate* and local temp:Destroy() must be exempt from deceptive_queries",
+            );
+            assert.ok(
+                items.some((i) => i.detector === "deceptive_queries" && i.identifier.includes("getWithExternalDestroy")),
+                "deceptive_queries must still flag external target:Destroy()",
+            );
+            // Runner script skipped by hollow_tests while .spec.luau without assertions is flagged
+            assert.ok(
+                !items.some((i) => i.detector === "hollow_tests" && i.file.includes("runTests.server.luau")),
+                "test runner bootstrap should be skipped by hollow_tests",
+            );
+            assert.ok(
+                items.some((i) => i.detector === "hollow_tests" && i.file.includes("widget.spec.luau")),
+                "hollow widget.spec.luau should be flagged by hollow_tests",
+            );
+            // Luau source checks precision
+            assert.ok(
+                !items.some((i) => i.detector === "luau_quality" && i.file.includes("LuauTraps") && i.identifier.startsWith("wait_")),
+                "shadowed local wait() must not trigger legacy wait()",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "luau_quality" && i.file.includes("LuauTraps") && i.identifier === "Connect_L5"),
+                "top-level Sig:Connect must not trigger untracked_connect",
+            );
+            assert.ok(
+                items.some((i) => i.detector === "luau_quality" && i.file.includes("LuauTraps") && i.identifier === "Connect_L12"),
+                "function-scoped `local _ = Sig:Connect(...)` must still trigger untracked_connect",
+            );
+            assert.ok(
+                items.some((i) => i.detector === "silent_catches" && i.file.includes("LuauTraps") && i.line === 13),
+                "`local _ = pcall(...)` must still trigger silent_catches",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "silent_catches" && i.file.includes("LuauTraps") && i.line === 14),
+                "cleanup pcall(ClearAllChildren) must be exempt from silent_catches",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "roblox_security" && i.file.includes("Probe.client.luau")),
+                "game:FindService probe on client must be exempt from roblox_security",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "roblox_security" && i.file.includes("LuauTraps") && i.line === 7),
+                "remote handler with _unused payload param must be exempt",
+            );
+            assert.ok(
+                !items.some((i) => i.detector === "silent_catches" && i.file.includes("Widget.jsx") && i.line === 5),
+                "JS 1-line fallback `catch { return null; }` must be exempt",
+            );
+            assert.ok(
+                items.some((i) => i.detector === "silent_catches" && i.file.includes("Widget.jsx") && i.line === 12),
+                "JS `catch { return undefined; }` must still be flagged",
+            );
+
+            // Autofix safety checks
+            px.health(tmp, { action: "autofix", fixer: "luau-instance-new-parent", dryRun: false });
+            px.health(tmp, { action: "autofix", fixer: "luau-hoist-getservice", dryRun: false });
+            px.health(tmp, { action: "autofix", fixer: "unused-imports", dryRun: false });
+
+            const fixedBuildUi = readFileSync(join(tmp, "src", "Main", "BuildUi.luau"), "utf8");
+            const buildUiLines = fixedBuildUi.split("\n");
+            assert.equal(buildUiLines[0], "--!strict", "hoisted service must stay below --!strict");
+            assert.ok(
+                buildUiLines.indexOf("]=]") < buildUiLines.indexOf('local Players = game:GetService("Players")'),
+                "hoisted service must insert below leading block comment",
+            );
+            assert.ok(
+                fixedBuildUi.includes("local TweenService = game:GetService('TweenService')"),
+                "guarded GetService inside `if` block must not be hoisted",
+            );
+            assert.ok(
+                fixedBuildUi.indexOf("frame.Visible = false") < fixedBuildUi.indexOf("frame.Parent = workspace"),
+                ".Parent assignment must be emitted AFTER contiguous frame.<Prop> = ... assignments",
+            );
+            const fixedJsx = readFileSync(join(tmp, "src", "Web", "Widget.jsx"), "utf8");
+            assert.ok(fixedJsx.includes('import React from "react"'), "classic JSX must preserve React import");
+
+            // --false-positive --reason dismissal & abuse warning (>10% & >=3 FPs)
+            const strictStart = scan.scores.strict;
+            const openIds = items.filter((i) => i.status === "open").map((i) => i.id);
+            assert.ok(openIds.length >= 3, `expected >= 3 open issues for FP test, got ${openIds.length}`);
+
+            const badReason = px.health(tmp, {
+                action: "suppress",
+                pattern: openIds[0],
+                falsePositive: true,
+                reason: "false positive",
+            });
+            assert.equal(badReason.status, "attestation_invalid", "boilerplate --reason must be rejected");
+
+            const fp1 = px.health(tmp, {
+                action: "suppress",
+                pattern: openIds[0],
+                falsePositive: true,
+                reason: "Intentional fixture test pattern verified in harness",
+            });
+            assert.equal(fp1.status, "suppressed");
+            assert.equal(fp1.kind, "false_positive");
+            assert.ok(fp1.scores.strict > strictStart, "false_positive suppress must lift strict score");
+
+            px.health(tmp, {
+                action: "plan",
+                subAction: "skip",
+                patterns: [openIds[1]],
+                falsePositive: true,
+                reason: "Dynamic dispatch makes static detection inapplicable here",
+            });
+            const fp3 = px.health(tmp, {
+                action: "suppress",
+                pattern: openIds[2],
+                falsePositive: true,
+                reason: "Intentional second false positive to exercise warning threshold",
+            });
+            assert.equal(fp3.scores.ignore_integrity.false_positive_abuse_warning, true);
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }

@@ -41,13 +41,32 @@ const STRIP = [
     "plexer",
 ];
 
-export async function ensureAbBaseRepos(onlyRepos = null) {
+async function buildIndexedFromClean(cleanDir, idxDir, buildOpts) {
+    rmSync(idxDir, { recursive: true, force: true });
+    mkdirSync(join(idxDir, ".."), { recursive: true });
+    cpSync(cleanDir, idxDir, { recursive: true });
+    const prevNoGitignore = process.env.PLEXER_NO_GITIGNORE;
+    const prevNoIgnore = process.env.PLEXER_NO_IGNORE;
+    process.env.PLEXER_NO_GITIGNORE = "1";
+    process.env.PLEXER_NO_IGNORE = "1";
+    try {
+        await buildGraph(idxDir, { ...buildOpts, force: true });
+    } finally {
+        if (prevNoGitignore === undefined) delete process.env.PLEXER_NO_GITIGNORE;
+        else process.env.PLEXER_NO_GITIGNORE = prevNoGitignore;
+        if (prevNoIgnore === undefined) delete process.env.PLEXER_NO_IGNORE;
+        else process.env.PLEXER_NO_IGNORE = prevNoIgnore;
+    }
+}
+
+export async function ensureAbBaseRepos(onlyRepos = null, opts = {}) {
+    const forceReindex = Boolean(opts?.reindex || opts?.force);
     for (const r of REPOS) {
         if (onlyRepos && !onlyRepos.has(r.name)) continue;
         const cleanDir = join(AB_BASE_DIR, "clean", r.name);
         const idxDir = join(AB_BASE_DIR, "indexed", r.name);
         let ref = "HEAD";
-        if (r.ref) {
+        if (r.ref && existsSync(r.src)) {
             try {
                 execFileSync("git", ["-C", r.src, "cat-file", "-e", `${r.ref}^{commit}`], { stdio: "ignore" });
                 ref = r.ref;
@@ -55,9 +74,21 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
         }
         const pinStampPath = join(idxDir, "plexer", ".pinned_ref");
         const currentPin = existsSync(pinStampPath) ? readFileSync(pinStampPath, "utf8").trim() : "";
-        if (existsSync(join(idxDir, "plexer", ".graph", "wiring.json")) && existsSync(cleanDir) && currentPin === ref) {
+        if (!forceReindex && existsSync(join(idxDir, "plexer", ".graph", "wiring.json")) && existsSync(cleanDir) && currentPin === ref) {
             continue;
         }
+        if (forceReindex && existsSync(cleanDir)) {
+            await buildIndexedFromClean(cleanDir, idxDir, { graphOnly: false });
+            writeFileSync(pinStampPath, `${currentPin || ref}\n`, "utf8");
+            continue;
+        }
+        if (forceReindex && existsSync(idxDir)) {
+            rmSync(join(idxDir, "plexer"), { recursive: true, force: true });
+            await buildGraph(idxDir, { graphOnly: false, force: true });
+            writeFileSync(pinStampPath, `${currentPin || ref}\n`, "utf8");
+            continue;
+        }
+        if (!existsSync(r.src)) continue;
         rmSync(cleanDir, { recursive: true, force: true });
         rmSync(idxDir, { recursive: true, force: true });
         mkdirSync(cleanDir, { recursive: true });
@@ -97,7 +128,7 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
         process.env.PLEXER_NO_GITIGNORE = "1";
         process.env.PLEXER_NO_IGNORE = "1";
         try {
-            await buildGraph(idxDir, { graphOnly: false });
+            await buildGraph(idxDir, { graphOnly: false, force: true });
             writeFileSync(pinStampPath, `${ref}\n`, "utf8");
         } finally {
             if (prevNoGitignore === undefined) delete process.env.PLEXER_NO_GITIGNORE;
@@ -108,15 +139,29 @@ export async function ensureAbBaseRepos(onlyRepos = null) {
     }
 }
 
-export async function ensureSwebenchBaseRepos(onlyIds = null) {
+export async function ensureSwebenchBaseRepos(onlyIds = null, opts = {}) {
+    const forceReindex = Boolean(opts?.reindex || opts?.force);
     const swePath = resolve(import.meta.dirname, "swebench/tasks.json");
-    if (!existsSync(swePath)) return;
-    const tasks = JSON.parse(readFileSync(swePath, "utf8"));
+    const extraRepos = [
+        {
+            id: "pocketbase",
+            repo: "pocketbase/pocketbase",
+            base_commit: "a2b89d73444fe7775812bcb35b5cad3b741e1b29",
+        },
+    ];
+    const sweTasks = existsSync(swePath) ? JSON.parse(readFileSync(swePath, "utf8")) : [];
+    const tasks = [...sweTasks, ...extraRepos];
     for (const task of tasks) {
         if (onlyIds && !onlyIds.has(task.id)) continue;
         const cleanDir = join(SWEBENCH_BASE_DIR, "clean", task.id);
         const indexedDir = join(SWEBENCH_BASE_DIR, "indexed", task.id);
         if (!existsSync(cleanDir)) {
+            if (forceReindex && existsSync(indexedDir)) {
+                rmSync(join(indexedDir, "plexer"), { recursive: true, force: true });
+                await buildGraph(indexedDir, { force: true });
+                continue;
+            }
+            if (forceReindex) continue;
             mkdirSync(cleanDir, { recursive: true });
             execFileSync("git", ["init", "-q"], { cwd: cleanDir });
             execFileSync("git", ["remote", "add", "origin", `https://github.com/${task.repo}.git`], { cwd: cleanDir });
@@ -126,7 +171,7 @@ export async function ensureSwebenchBaseRepos(onlyIds = null) {
             });
             execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: cleanDir });
         }
-        if (!existsSync(join(indexedDir, "plexer", ".graph", "wiring.json"))) {
+        if (forceReindex || !existsSync(join(indexedDir, "plexer", ".graph", "wiring.json"))) {
             rmSync(indexedDir, { recursive: true, force: true });
             mkdirSync(join(SWEBENCH_BASE_DIR, "indexed"), { recursive: true });
             cpSync(cleanDir, indexedDir, { recursive: true });

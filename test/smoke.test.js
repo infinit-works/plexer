@@ -10,6 +10,7 @@ import { mergePlexerHooks } from "../src/claude/settings-merge.js";
 import { runRetract } from "../src/hosts/retract.js";
 import { runGlobalSetup } from "../src/hosts/setup.js";
 import { buildGraph } from "../src/index.js";
+import { agySessionPath } from "../src/agy/session.js";
 import { readStats } from "../src/util/state.js";
 
 const HOOKS_PATH = new URL("../src/claude/hooks.js", import.meta.url).pathname;
@@ -27,31 +28,38 @@ function runHookEvent(event, stdinObj, extraEnv = {}) {
 }
 
 describe("Antigravity Hooks, Retraction & Global Setup", () => {
-    it("installs Antigravity skill + hooks.json preserving foreign keys and retracts cleanly", () => {
+    it("installs Antigravity plugin, migrates legacy plexer-hooks preserving foreign keys, and retracts cleanly", () => {
         const home = mkdtempSync(join(tmpdir(), "plexer-agy-home-"));
         const repo = mkdtempSync(join(tmpdir(), "plexer-agy-repo-"));
         try {
             const hooksJson = join(home, ".gemini", "config", "hooks.json");
-            mkdirSync(join(home, ".gemini", "config"), { recursive: true });
-            writeFileSync(hooksJson, JSON.stringify({ "other-plugin": { Stop: [] } }, null, 2));
+            const legacyShim = join(home, ".gemini", "config", "helpers", "plexer-hooks.cjs");
+            mkdirSync(join(home, ".gemini", "config", "helpers"), { recursive: true });
+            writeFileSync(legacyShim, "// legacy\n");
+            writeFileSync(hooksJson, JSON.stringify({
+                "other-plugin": { Stop: [] },
+                "plexer-hooks": { Stop: [{ type: "command", command: "node legacy" }] },
+            }, null, 2));
 
             const res = installAntigravitySkill(home);
-            assert.equal(res.length, 3);
-            assert.ok(existsSync(join(home, ".gemini", "skills", "plexer", "SKILL.md")));
-            assert.ok(existsSync(join(home, ".gemini", "config", "helpers", "plexer-hooks.cjs")));
+            assert.ok(res.some((r) => r.id === "antigravity-plugin"));
+            assert.equal(existsSync(join(home, ".gemini", "skills", "plexer", "SKILL.md")), false, "Antigravity plugin install must not create redundant ~/.gemini/skills/plexer when Gemini CLI is absent");
 
-            const merged = JSON.parse(readFileSync(hooksJson, "utf8"));
-            assert.ok(merged["other-plugin"], "foreign top-level key preserved");
-            assert.ok(merged["plexer-hooks"], "plexer-hooks added");
-            assert.ok(Array.isArray(merged["plexer-hooks"].PreInvocation));
-            assert.ok(Array.isArray(merged["plexer-hooks"].PostToolUse));
-            assert.ok(Array.isArray(merged["plexer-hooks"].Stop));
+            const pluginDir = join(home, ".gemini", "config", "plugins", "plexer");
+            assert.ok(lstatSync(pluginDir).isSymbolicLink(), "Antigravity plugin directory symlink created");
+            assert.ok(existsSync(join(pluginDir, "plugin.json")), "plugin.json present inside linked plugin");
+            assert.ok(existsSync(join(pluginDir, "hooks.json")), "hooks.json present inside linked plugin");
+            assert.equal(existsSync(legacyShim), false, "legacy plexer-hooks.cjs shim removed");
+
+            const afterInstall = JSON.parse(readFileSync(hooksJson, "utf8"));
+            assert.ok(afterInstall["other-plugin"], "foreign top-level key preserved");
+            assert.equal(afterInstall["plexer-hooks"], undefined, "legacy plexer-hooks stripped on migration");
 
             runRetract(repo, { home, apply: true });
-            assert.ok(!existsSync(join(home, ".gemini", "config", "helpers", "plexer-hooks.cjs")));
+            assert.equal(existsSync(pluginDir), false, "Antigravity plugin symlink retracted");
             const afterRetract = JSON.parse(readFileSync(hooksJson, "utf8"));
             assert.ok(afterRetract["other-plugin"], "foreign key still present after retract");
-            assert.equal(afterRetract["plexer-hooks"], undefined, "plexer-hooks removed");
+            assert.equal(afterRetract["plexer-hooks"], undefined, "plexer-hooks remains removed");
         } finally {
             rmSync(home, { recursive: true, force: true });
             rmSync(repo, { recursive: true, force: true });
@@ -154,7 +162,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             assert.equal(stopOut.decision, "allow");
         } finally {
             rmSync(repo, { recursive: true, force: true });
-            rmSync(join(tmpdir(), `plexer-agy-${sessionId}.json`), { force: true });
+            rmSync(agySessionPath(sessionId), { force: true });
         }
     });
 
@@ -171,10 +179,15 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             assert.ok(lstatSync(join(binDir, "plexer")).isSymbolicLink());
             assert.ok(lstatSync(join(home, ".agents", "skills", "plexer")).isSymbolicLink());
             assert.ok(lstatSync(join(home, ".claude", "skills", "plexer")).isSymbolicLink());
-            assert.ok(lstatSync(join(home, ".gemini", "skills", "plexer")).isSymbolicLink());
-            assert.ok(existsSync(join(home, ".gemini", "config", "hooks.json")));
+            assert.equal(existsSync(join(home, ".gemini", "skills", "plexer")), false, "runGlobalSetup must not create ~/.gemini/skills/plexer without Gemini CLI or explicit agents: ['gemini']");
+            assert.ok(lstatSync(join(home, ".gemini", "config", "plugins", "plexer")).isSymbolicLink());
+            assert.equal(existsSync(join(home, ".gemini", "config", "hooks.json")), false);
             assert.equal(existsSync(join(home, ".gemini", "config", "mcp_config.json")), false, "MCP must be opt-in by default on CLI/skill hosts");
             assert.equal(existsSync(join(home, ".claude.json")), false, "Claude global MCP must be opt-in by default");
+
+            const resGemini = runGlobalSetup({ home, binDir, agents: ["gemini"] });
+            assert.ok(resGemini.skills.some((s) => s.id === "gemini-skill"));
+            assert.ok(lstatSync(join(home, ".gemini", "skills", "plexer")).isSymbolicLink(), "setup({ agents: ['gemini'] }) must install ~/.gemini/skills/plexer");
 
             const resOptIn = runGlobalSetup({ home, binDir, mcp: true });
             assert.ok(resOptIn.mcp.length >= 2);
@@ -187,7 +200,8 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
     });
 
     it("scopes runGlobalSetup to opts.agents, retracts global symlinks, and preserves unclosed fenced sections", async () => {
-        const { parseAgyTranscript, emptyAgySession } = await import("../src/hosts/antigravity-hooks.js");
+        const { parseAgyTranscript } = await import("../src/hosts/engine/agy-transcript.js");
+        const { emptyAgySession } = await import("../src/agy/session.js");
         const home = mkdtempSync(join(tmpdir(), "plexer-scoped-home-"));
         const repo = mkdtempSync(join(tmpdir(), "plexer-scoped-repo-"));
         try {
@@ -225,7 +239,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
 
             // resolveAgyRepoDir must prioritize lastTouchedPath / cwd over workspacePaths[0]
             // even when lastTouchedPath is an unindexed git repo and workspacePaths[0] has plexer/INDEX.md
-            const { resolveAgyRepoDir } = await import("../src/hosts/antigravity-hooks.js");
+            const { resolveAgyRepoDir } = await import("../src/hosts/engine/agy-context.js");
             const indexedWs = mkdtempSync(join(tmpdir(), "plexer-ws-indexed-"));
             const unindexedRepo = mkdtempSync(join(tmpdir(), "plexer-repo-cold-"));
             try {
@@ -275,7 +289,6 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
 
             // Cold/unindexed git repo auto-builds plexer/ on Turn 1 in handleAgyPreInvocation & callTool,
             // prefers transcript_full.jsonl over truncated transcript.jsonl, and strips slash commands
-            const { agySessionPath } = await import("../src/hosts/antigravity-hooks.js");
             const { callTool } = await import("../src/mcp/tools.js");
             const coldRepo = mkdtempSync(join(tmpdir(), "plexer-agy-lifecycle-cold-"));
             const logsDir = join(coldRepo, ".logs");

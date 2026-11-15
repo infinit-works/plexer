@@ -10,7 +10,7 @@
  *     (4 queries per repository, including holdout repos `building-tools` and `z`).
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
@@ -30,8 +30,9 @@ import {
 import { loadGraphCached } from "../src/context/graph-store.js";
 
 const BENCH_REPOS_DIR = process.env.PLEXER_BENCH_REPOS_DIR || join(homedir(), "Projects", "roblox", "libraries");
+const FIXTURES_DIR = resolve(import.meta.dirname, "fixtures");
 
-const REPOS = [
+const LOCAL_REPOS = [
     {
         name: "plexer",
         dir: resolve(import.meta.dirname, ".."),
@@ -82,11 +83,68 @@ const REPOS = [
     },
 ];
 
+const FIXTURE_REPOS = [
+    {
+        name: "ts-service",
+        fixture: true,
+        dir: join(FIXTURES_DIR, "ts-service"),
+        query: "how are JSON web token signatures verified with key rotation",
+        grep: "TenantRateLimiter",
+        sym: "TokenVerifier",
+        file: "src/auth/token-verifier.ts",
+    },
+    {
+        name: "py-worker",
+        fixture: true,
+        dir: join(FIXTURES_DIR, "py-worker"),
+        query: "how are scheduled cron tasks ordered and dispatched by a priority heap",
+        grep: "CheckpointStore",
+        sym: "JobScheduler",
+        file: "worker/scheduler.py",
+    },
+    {
+        name: "go-engine",
+        fixture: true,
+        dir: join(FIXTURES_DIR, "go-engine"),
+        query: "how are write ahead log records framed and validated against checksums",
+        grep: "SegmentWriter",
+        sym: "NewSegmentWriter",
+        file: "internal/wal/segment.go",
+    },
+    {
+        name: "luau-reactive",
+        fixture: true,
+        dir: join(FIXTURES_DIR, "luau-reactive"),
+        query: "how do reactive signals derived values and effect listeners propagate updates",
+        grep: "SessionLock",
+        sym: "Graph.signal",
+        file: "src/Graph.luau",
+    },
+    {
+        name: "rust-compiler",
+        fixture: true,
+        dir: join(FIXTURES_DIR, "rust-compiler"),
+        query: "where are schema type references checked for cycles and field bitwidths",
+        grep: "SchemaDecl",
+        sym: "parse_schema",
+        file: "src/resolve.rs",
+    },
+    {
+        name: "docs-polyglot",
+        fixture: true,
+        dir: join(FIXTURES_DIR, "docs-polyglot"),
+        query: "how are dependency cycles detected and threshold health penalties evaluated",
+        grep: "PipeCodec",
+        sym: "SdkClient",
+        file: "cli/health.js",
+    },
+];
+
 /**
  * 24 natural-language developer intent queries (4 per repository across all 6
  * repositories) without leaked camelCase function names.
  */
-const GOLD_QUERIES = [
+const LOCAL_GOLD_QUERIES = [
     // plexer (JS/ESM)
     {
         repo: "plexer",
@@ -215,6 +273,156 @@ const GOLD_QUERIES = [
     },
 ];
 
+const FIXTURE_GOLD_QUERIES = [
+    // ts-service (TypeScript + JS + docs)
+    {
+        repo: "ts-service",
+        query: "how are JSON web token signatures verified with key rotation and clock skew tolerance",
+        goldPath: "src/auth/token-verifier.ts",
+    },
+    {
+        repo: "ts-service",
+        query: "where are webhook delivery failures retried using exponential backoff and jitter",
+        goldPath: "src/billing/retry-queue.js",
+    },
+    {
+        repo: "ts-service",
+        query: "how is per tenant request throttling enforced using a sliding token bucket",
+        goldPath: "src/http/rate-limiter.ts",
+    },
+    {
+        repo: "ts-service",
+        query: "where does the runbook explain idempotency keys and circuit breaker fallback behavior",
+        goldPath: "docs/architecture.md",
+    },
+    // py-worker (Python + README)
+    {
+        repo: "py-worker",
+        query: "how are scheduled cron tasks ordered and dispatched by a priority heap",
+        goldPath: "worker/scheduler.py",
+    },
+    {
+        repo: "py-worker",
+        query: "how are crash recovery checkpoints flushed atomically using temporary file replacement",
+        goldPath: "worker/checkpoint.py",
+    },
+    {
+        repo: "py-worker",
+        query: "where are duplicate incoming payloads filtered out via hash digests and expiration",
+        goldPath: "worker/dedupe.py",
+    },
+    {
+        repo: "py-worker",
+        query: "how are percentile latency buckets aggregated across completed tasks",
+        goldPath: "worker/metrics.py",
+    },
+    // go-engine (Go)
+    {
+        repo: "go-engine",
+        query: "how are write ahead log records framed and validated against corruption checksums",
+        goldPath: "internal/wal/segment.go",
+    },
+    {
+        repo: "go-engine",
+        query: "where are obsolete tombstone entries reclaimed during storage compaction",
+        goldPath: "internal/wal/compact.go",
+    },
+    {
+        repo: "go-engine",
+        query: "how are randomized leader election timeouts and vote quorums tracked",
+        goldPath: "internal/raft/election.go",
+    },
+    {
+        repo: "go-engine",
+        query: "how does probabilistic set membership avoid unnecessary disk table lookups",
+        goldPath: "internal/index/bloom.go",
+    },
+    // luau-reactive (Luau)
+    {
+        repo: "luau-reactive",
+        query: "how do reactive signals derived values and effect listeners propagate dependency updates",
+        goldPath: "src/Graph.luau",
+    },
+    {
+        repo: "luau-reactive",
+        query: "where is harmonic spring velocity and damping step interpolation computed",
+        goldPath: "src/Spring.luau",
+    },
+    {
+        repo: "luau-reactive",
+        query: "how are reversible canvas edits pushed onto undo and redo history stacks",
+        goldPath: "src/History.luau",
+    },
+    {
+        repo: "luau-reactive",
+        query: "how are distributed session leases acquired and renewed against datastore conflicts",
+        goldPath: "src/SessionLock.luau",
+    },
+    // rust-compiler (Rust + docs)
+    {
+        repo: "rust-compiler",
+        query: "how are raw source characters scanned into lexical tokens and line spans",
+        goldPath: "src/lexer.rs",
+    },
+    {
+        repo: "rust-compiler",
+        query: "how does the recursive descent pass assemble struct and union syntax trees",
+        goldPath: "src/parser.rs",
+    },
+    {
+        repo: "rust-compiler",
+        query: "where are schema type references checked for cycles and field bitwidths computed",
+        goldPath: "src/resolve.rs",
+    },
+    {
+        repo: "rust-compiler",
+        query: "how does code generation produce binary serialization pack and unpack routines",
+        goldPath: "src/emit.rs",
+    },
+    // docs-polyglot (TS + Python + JS + docs)
+    {
+        repo: "docs-polyglot",
+        query: "how does the client manage persistent connection pooling and structured error mapping",
+        goldPath: "sdk/client.ts",
+    },
+    {
+        repo: "docs-polyglot",
+        query: "where are length prefixed JSON messages framed and decoded over IPC pipes",
+        goldPath: "bridge/codec.py",
+    },
+    {
+        repo: "docs-polyglot",
+        query: "how are dependency cycles detected and threshold health penalties evaluated",
+        goldPath: "cli/health.js",
+    },
+    {
+        repo: "docs-polyglot",
+        query: "what does the troubleshooting playbook advise for pipe EOF errors and stale locks",
+        goldPath: "docs/troubleshooting.md",
+    },
+];
+
+function hasValidLocalCorpus() {
+    const repoMap = new Map(LOCAL_REPOS.map((r) => [r.name, r]));
+    for (const r of LOCAL_REPOS) {
+        if (!existsSync(r.dir) || !existsSync(join(r.dir, r.file)))
+            return false;
+    }
+    for (const q of LOCAL_GOLD_QUERIES) {
+        const r = repoMap.get(q.repo);
+        if (!r || !existsSync(join(r.dir, q.goldPath)))
+            return false;
+    }
+    return true;
+}
+
+const forceFixtures = process.argv.includes("--fixtures") || process.env.PLEXER_BENCH_FIXTURES === "1";
+const forceLocal = process.argv.includes("--local") || process.env.PLEXER_BENCH_LOCAL === "1";
+const useLocalCorpus = !forceFixtures && (forceLocal || hasValidLocalCorpus());
+const corpusKind = useLocalCorpus ? "local" : "fixtures";
+const REPOS = useLocalCorpus ? LOCAL_REPOS : FIXTURE_REPOS;
+const GOLD_QUERIES = useLocalCorpus ? LOCAL_GOLD_QUERIES : FIXTURE_GOLD_QUERIES;
+
 const estTokens = (s) => Math.ceil((s || "").length / 4);
 
 function rawFilesTokensForHits(repoDir, hits, topN = 3) {
@@ -234,9 +442,9 @@ function rawFilesTokensForHits(repoDir, hits, topN = 3) {
     return Math.ceil(totalChars / 4);
 }
 
-import { tmpdir } from "node:os";
-
 function repoContextDir(r) {
+    if (r.fixture)
+        return join(tmpdir(), "plexer-bench-cache", "fixtures", r.name, "plexer");
     const inTree = join(r.dir, "plexer");
     if (existsSync(inTree))
         return inTree;
@@ -414,6 +622,8 @@ for (const r of REPOS) {
 const retrieval = evaluateRetrieval();
 
 async function benchTrailComparison() {
+    if (corpusKind !== "local")
+        return null;
     const trailDist = "/tmp/trail-eval/node_modules/@trailhq/trail-code/dist";
     if (!existsSync(trailDist))
         return null;
@@ -583,11 +793,33 @@ async function benchTrailComparison() {
 }
 
 const trailComparison = await benchTrailComparison();
+const askGateMs = Number(process.env.PLEXER_BENCH_MAX_ASK_MS || 25);
+const maxAskSourceMs = repoMetrics.length > 0 ? Math.max(...repoMetrics.map((m) => m.askSourceMs)) : Infinity;
+const gateEnforced = corpusKind === "fixtures" || process.argv.includes("--gate");
+const gatePassed =
+    repoMetrics.length === REPOS.length &&
+    retrieval.total === GOLD_QUERIES.length &&
+    retrieval.recallAt1 === 1 &&
+    retrieval.mrr === 1 &&
+    maxAskSourceMs < askGateMs;
+const gate = {
+    corpus: corpusKind,
+    enforced: gateEnforced,
+    passed: gatePassed,
+    maxAskSourceMs: +maxAskSourceMs.toFixed(2),
+    askGateMs,
+    recallAt1: retrieval.recallAt1,
+    mrr: retrieval.mrr,
+};
+
+if (gateEnforced && !gatePassed) {
+    process.exitCode = 1;
+}
 
 if (process.argv.includes("--json")) {
-    console.log(JSON.stringify({ repoMetrics, retrieval, trailComparison }, null, 2));
+    console.log(JSON.stringify({ corpus: corpusKind, repoMetrics, retrieval, gate, trailComparison }, null, 2));
 } else {
-    console.log("# Plexer Engine Benchmark\n");
+    console.log(`# Plexer Engine Benchmark (corpus: ${corpusKind})\n`);
     console.log("## 1. Latency & Token Budgets by Repository\n");
     console.log("| Repo | Nodes / Edges | `wiring.json` | Warm Refresh | `check` | `ask --source` | `ask` | `grep` | `callers` | `skeleton` | `map` | `ask --source` Tokens (vs `--full` / vs Raw Files) |");
     console.log("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
@@ -604,11 +836,12 @@ if (process.argv.includes("--json")) {
             `| \`${m.name}\` | ${m.nodes.toLocaleString()} / ${m.edges.toLocaleString()} | ${m.wiringKB} KB | ${m.warmBuildMs}ms | ${m.checkMs}ms | **${m.askSourceMs}ms** | ${m.askNoSourceMs}ms | ${m.grepMs}ms | ${m.callersMs}ms | ${m.skeletonMs}ms | ${m.mapMs}ms | **${m.askSourceTokens}** (${vsFullStr} vs ${m.askFullTokens} full, ${vsRawStr} vs ${m.rawTopFilesTokens} raw) |`,
         );
     }
-    console.log("\n## 2. Retrieval Accuracy (24 De-Leaked Intent Queries across 6 Repos)\n");
+    console.log(`\n## 2. Retrieval Accuracy (${retrieval.total} De-Leaked Intent Queries across ${repoMetrics.length} Repos)\n`);
     console.log(`- **Recall@1**: ${(retrieval.recallAt1 * 100).toFixed(1)}% (${retrieval.details.filter((d) => d.rank === 1).length}/${retrieval.total})`);
     console.log(`- **Recall@3**: ${(retrieval.recallAt3 * 100).toFixed(1)}% (${retrieval.details.filter((d) => d.rank > 0 && d.rank <= 3).length}/${retrieval.total})`);
     console.log(`- **Recall@5**: ${(retrieval.recallAt5 * 100).toFixed(1)}% (${retrieval.details.filter((d) => d.rank > 0 && d.rank <= 5).length}/${retrieval.total})`);
     console.log(`- **MRR**: ${retrieval.mrr.toFixed(3)}`);
+    console.log(`- **Gate**: ${gatePassed ? "PASS" : "FAIL"} (corpus=${corpusKind}, max \`ask --source\`=${gate.maxAskSourceMs}ms < ${askGateMs}ms, Recall@1=${(retrieval.recallAt1 * 100).toFixed(1)}%, MRR=${retrieval.mrr.toFixed(3)})`);
     const misses = retrieval.details.filter((d) => d.rank !== 1);
     if (misses.length > 0) {
         console.log("\n### Non-Rank-1 Queries:");

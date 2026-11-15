@@ -237,8 +237,8 @@ export const LARGE_TASKS = [
         prompt: (repoDir) =>
             `Working directory: ${repoDir}\n\n` +
             `Trace two cross-subsystem call chains in qutebrowser and answer concisely with exact \`file:Lx-Ly\` line citations:\n` +
-            `1. How does \`cmdutils.check_overflow\` (\`qutebrowser/api/cmdutils.py\`) wrap \`qtutils.check_overflow\` and what exception does it raise on \`OverflowError\`? Which method in \`CommandDispatcher\` (\`qutebrowser/browser/commands.py\`) calls \`cmdutils.check_overflow\`, and what exact arguments does it pass when given a 1-based tab \`count\`?\n` +
-            `2. In \`GUIProcess\` (\`qutebrowser/misc/guiprocess.py\`), how is the \`error\` signal declared and wired to \`self._proc\` in \`__init__\`? Across the non-test codebase, which two callers connect a handler directly to \`GUIProcess.error\` (name the exact files, enclosing methods, and connected handler callbacks)?`,
+            `1. How does \`cmdutils.check_overflow\` wrap \`qtutils.check_overflow\` and what exception does it raise on \`OverflowError\`? Which method in \`CommandDispatcher\` calls \`cmdutils.check_overflow\`, and what exact arguments does it pass when given a 1-based tab \`count\`?\n` +
+            `2. In \`GUIProcess\`, how is the \`error\` signal declared and wired to \`self._proc\` in \`__init__\`? Across the non-test codebase, which two callers connect a handler directly to \`GUIProcess.error\` (name the exact files, enclosing methods, and connected handler callbacks)?`,
         rubric: [
             {
                 id: "cmdutils_and_cntwidget_cited",
@@ -318,8 +318,8 @@ export const LARGE_TASKS = [
         prompt: (repoDir) =>
             `Working directory: ${repoDir}\n\n` +
             `Trace the v2 flag evaluation handlers and SQL evaluation rule loader in Flipt. Answer concisely with exact \`file:Lx-Ly\` line citations:\n` +
-            `1. In the evaluation server (\`Variant\`, \`variant\`, and \`Boolean\` in \`internal/server/evaluation/evaluation.go\`), how does \`variant\` map \`flipt.EvaluationReason\` constants to \`rpcevaluation.EvaluationReason\`, and what validation check does \`Boolean\` perform on \`flag.Type\` before calling \`s.boolean\`?\n` +
-            `2. In \`Store.GetEvaluationRules\` (\`internal/storage/sql/common/evaluation.go\`), what two SQL queries are executed against the database, and how does the row scan loop deduplicate rules via \`uniqueRules\` while attaching \`EvaluationSegment\` and \`EvaluationConstraint\` entries?`,
+            `1. In the v2 evaluation RPC server (\`Variant\`, \`variant\`, and \`Boolean\`), how does \`variant\` map \`flipt.EvaluationReason\` constants to \`rpcevaluation.EvaluationReason\`, and what validation check does \`Boolean\` perform on \`flag.Type\` before calling \`s.boolean\`?\n` +
+            `2. In the common SQL \`Store.GetEvaluationRules\` implementation, what two SQL queries are executed against the database, and how does the row scan loop deduplicate rules via \`uniqueRules\` while attaching \`EvaluationSegment\` and \`EvaluationConstraint\` entries?`,
         rubric: [
             {
                 id: "cites_eval_server_and_sql_store",
@@ -631,7 +631,7 @@ export const LARGE_TASKS = [
         expectedTurns: 4,
         prompt: (repoDir) =>
             `Working directory: ${repoDir}\n\n` +
-            `Harden the device credentials encryption subsystem across \`CredentialsProvider\`, \`CredentialsKeyProvider\`, \`NativeCredentialsEncryption\`, and \`CredentialsKeyMigrator\` (4 TypeScript files in \`src/misc/credentials/\`):\n` +
+            `Harden the device credentials encryption subsystem across \`CredentialsProvider\`, \`CredentialsKeyProvider\`, \`NativeCredentialsEncryption\`, and \`CredentialsKeyMigrator\`:\n` +
             `1. In \`CredentialsProvider.setCredentialsEncryptionMode(encryptionMode: CredentialEncryptionMode)\`, after the early return when \`encryptionMode === this.getCredentialsEncryptionMode()\`, verify that \`await this.getSupportedEncryptionModes()\` includes \`encryptionMode\`, throwing \`new Error(\`Unsupported encryption mode: \${encryptionMode}\`)\` if it is not supported.\n` +
             `2. In \`ICredentialsKeyProvider\` and \`CredentialsKeyProvider\`, add a \`clearCredentialsKey(): void\` method that resets the stored key via \`this._credentialsStorage.setCredentialsEncryptionKey(null)\`.\n` +
             `3. In \`NativeCredentialsEncryption.decrypt(encryptedCredentials: PersistentCredentials)\`, validate at the start of the method that \`encryptedCredentials.accessToken\` is non-empty, throwing \`new Error("Trying to decrypt empty access token")\` if \`!encryptedCredentials.accessToken\`.\n` +

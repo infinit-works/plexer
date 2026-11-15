@@ -24,6 +24,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22.13", "24"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,12 +35,15 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24"
+          node-version: ${{ matrix.node-version }}
 
       - name: Conventional Commits and CHANGELOG.md check
         uses: kohltastrophe/release@v1
         with:
           mode: check
+          version-files: |
+            plugin.json:^\s*"version":\s*"([^"]+)"
+            README.md:@plexer/cli@([0-9]+\.[0-9]+\.[0-9]+)
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
@@ -49,11 +56,49 @@ jobs:
           set -euo pipefail
           tarball="$(npm pack --ignore-scripts | tail -n1)"
           smoke="$(mktemp -d)"
+          trap 'rm -rf "$smoke" "$tarball"' EXIT
           tar -xzf "$tarball" -C "$smoke"
           pkg="$smoke/package"
           npm install --omit=dev --ignore-scripts --no-audit --no-fund --prefix "$pkg"
           node "$pkg/bin/plexer.js" --version
-          rm -f "$tarball"
+
+          mkdir -p "$smoke/repo/src" "$smoke/home"
+          git -C "$smoke/repo" init -q
+          git -C "$smoke/repo" config user.name "Smoke Test"
+          git -C "$smoke/repo" config user.email "smoke@example.com"
+          cat <<'EOF' > "$smoke/repo/src/hello.js"
+          export function hello(name = "world") {
+            return `hello ${name}`;
+          }
+          EOF
+          git -C "$smoke/repo" add .
+          git -C "$smoke/repo" -c commit.gpgsign=false commit -q -m "init"
+
+          HOME="$smoke/home" node "$pkg/bin/plexer.js" init --no-agents "$smoke/repo"
+          ask_out="$(node "$pkg/bin/plexer.js" ask "hello" "$smoke/repo" --source --dir "$smoke/repo/plexer")"
+          echo "$ask_out"
+          grep -q "hello" <<<"$ask_out"
+          node "$pkg/bin/plexer.js" health scan "$smoke/repo"
+
+          mcp_out="$(
+            printf '%s\n%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0.0"}}}' \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | node "$pkg/bin/plexer.js" mcp "$smoke/repo"
+          )"
+          node --input-type=module -e '
+            const lines = process.argv[1].trim().split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+            const initResp = lines.find((m) => m.id === 1);
+            const toolsResp = lines.find((m) => m.id === 2);
+            if (!initResp?.result?.serverInfo?.name) {
+              throw new Error("MCP initialize failed");
+            }
+            const tools = toolsResp?.result?.tools ?? [];
+            if (tools.length !== 9) {
+              throw new Error(`Expected 9 MCP tools, got ${tools.length}: ${tools.map((t) => t.name).join(", ")}`);
+            }
+            console.log(`MCP smoke OK (${tools.length} tools): ${tools.map((t) => t.name).join(", ")}`);
+          ' "$mcp_out"
 
   publish:
     needs: test
@@ -73,6 +118,10 @@ jobs:
       - name: Release PR or Release
         id: release
         uses: kohltastrophe/release@v1
+        with:
+          version-files: |
+            plugin.json:^\s*"version":\s*"([^"]+)"
+            README.md:@plexer/cli@([0-9]+\.[0-9]+\.[0-9]+)
 
       - name: Ensure npm >= 11.5.1 for OIDC Trusted Publishing
         if: steps.release.outputs.should_release == 'true'
@@ -99,3 +148,6 @@ jobs:
         uses: kohltastrophe/release@v1
         with:
           mode: publish
+          version-files: |
+            plugin.json:^\s*"version":\s*"([^"]+)"
+            README.md:@plexer/cli@([0-9]+\.[0-9]+\.[0-9]+)

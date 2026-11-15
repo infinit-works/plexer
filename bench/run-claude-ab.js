@@ -195,8 +195,12 @@ async function runOne(task, arm) {
                 : {
                       ...process.env,
                       PLEXER_DISABLE_HOOKS: arm === "plexer" ? "0" : "1",
-                      ...(arm === "plexer" ? { PLEXER_ENABLE_BENCH_HOOKS: "1" } : {}),
+                      ...(arm === "plexer"
+                          ? { PLEXER_ENABLE_BENCH_HOOKS: "1" }
+                          : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_BENCH_HIDE_CLI: "1" }),
                   };
+        if (arm === "plexer")
+            delete env.PLEXER_BENCH_HIDE_CLI;
         const child = spawn("claude", args, {
             cwd: cloneDir,
             env,

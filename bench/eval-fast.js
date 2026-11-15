@@ -22,6 +22,7 @@ import { TASKS } from "./tasks.js";
 import { LARGE_TASKS } from "./large-tasks.js";
 import { needCoverage } from "./needcov.js";
 import { dot, fitFamily, loadRows, ols, predict } from "./cost-model.js";
+import { ensureAbBaseRepos, ensureSwebenchBaseRepos } from "./ensure-base.js";
 
 const SWEBENCH_TASKS = JSON.parse(
     readFileSync(resolve(import.meta.dirname, "swebench/tasks.json"), "utf8")
@@ -451,6 +452,13 @@ function evalSuite() {
 
     const elapsedMs = Math.round(performance.now() - t0Start);
     console.log(`\nCompleted ${tCount + sCount + lCount}-task offline evaluation in ${elapsedMs}ms ($0 API cost).`);
+}
+
+if (process.argv.includes("--reindex")) {
+    const abRepos = new Set(TASKS.map((t) => t.repo));
+    const sweIds = new Set([...SWEBENCH_TASKS.map((t) => t.id), ...LARGE_TASKS.map((t) => t.baseId)]);
+    await ensureAbBaseRepos(abRepos, { reindex: true });
+    await ensureSwebenchBaseRepos(sweIds, { reindex: true });
 }
 
 evalSuite();

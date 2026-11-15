@@ -20,8 +20,10 @@
  *   node bench/run-swebench-ab.js <model> [concurrency=4] [arm=both] [taskFilter=all]
  */
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { cpSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { parseTranscript } from "./grade.js";
 import { buildGraph } from "../src/graph/build.js";
 import { ensureFreshGraph } from "../src/graph/refresh.js";
@@ -38,7 +40,8 @@ const SWEBENCH_TASKS = JSON.parse(
     readFileSync(resolve(import.meta.dirname, "swebench/tasks.json"), "utf8")
 );
 
-const rawModelArg = process.argv[2] || "sonnet"; // "carbon-medium" | "argon-low" | "argon-medium" | "flash-medium" | "sonnet" | "opus"
+const positionals = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const rawModelArg = positionals[0] || "sonnet"; // "carbon-medium" | "argon-low" | "argon-medium" | "flash-medium" | "sonnet" | "opus"
 export const CLAUDE_MODELS = {
     sonnet: "claude-sonnet-5-5",
     "sonnet-5-5": "claude-sonnet-5-5",
@@ -58,9 +61,10 @@ export function normalizeModelArg(raw = "sonnet") {
 }
 const modelArg = normalizeModelArg(rawModelArg);
 const resolvedClaudeModel = CLAUDE_MODELS[rawModelArg] || rawModelArg;
-const concurrency = Number(process.argv[3] || 4);
-const armFilter = process.argv[4] || "both";
-const taskFilterArg = process.argv[5] || "all";
+const concurrency = Number(positionals[1] || 4);
+const armFilter = positionals[2] || "both";
+const taskFilterArg = positionals[3] || "all";
+const REINDEX = process.argv.includes("--reindex");
 const taskFilterSet = taskFilterArg === "all" ? null : new Set(taskFilterArg.split(",").map((s) => s.trim()));
 const armsToRun =
     armFilter === "both"
@@ -110,7 +114,10 @@ export const AGY_MODELS = {
 };
 
 const BASE_CACHE_DIR = "/tmp/plexer-swebench-base";
-const logDir = `/tmp/plexer-swebench-logs/${modelArg}`;
+const logDir = process.env.PLEXER_BENCH_LOG_DIR
+    ? resolve(process.env.PLEXER_BENCH_LOG_DIR)
+    : `/tmp/plexer-swebench-logs/${modelArg}`;
+const benchDaemonSock = `/tmp/plexer-swe-bench-${process.pid}.sock`;
 
 const basePrompt = [
     "You are an expert software engineer solving a multi-file repository engineering task.",
@@ -121,6 +128,7 @@ const basePrompt = [
 
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+const agyRuleBody = readFileSync(resolve(import.meta.dirname, "../rules/AGENTS.md"), "utf8").trim();
 let trailSkillBody = "";
 
 const coldSysFile = join(logDir, "cold-system.txt");
@@ -128,6 +136,7 @@ const plexerSysFile = join(logDir, "plexer-system.txt");
 const trailSysFile = join(logDir, "trail-system.txt");
 
 const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
+const plexerHookClient = resolve(import.meta.dirname, "../bin/plexer-hook-client.cjs");
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
 const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
 const trailMcpConfigFile = join(logDir, "trail-mcp-config.json");
@@ -180,20 +189,39 @@ const agyHooksJson = JSON.stringify(
             PreInvocation: [
                 {
                     type: "command",
-                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-pre-invocation`,
+                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-invocation`,
                     timeout: 15,
+                },
+            ],
+            PreToolUse: [
+                {
+                    matcher: "read_file|view_file|run_command",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-tool`,
+                            timeout: 10,
+                        },
+                    ],
                 },
             ],
             PostToolUse: [
                 {
-                    matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file",
+                    matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file",
                     hooks: [
                         {
                             type: "command",
-                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-post-edit`,
+                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-post-tool`,
                             timeout: 10,
                         },
                     ],
+                },
+            ],
+            Stop: [
+                {
+                    type: "command",
+                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-stop`,
+                    timeout: 10,
                 },
             ],
         },
@@ -238,13 +266,13 @@ const coldAgyMd = makeAgyAgentMd(
 /**
  * Ensure a clean base checkout and a plexer-indexed base checkout exist for `task`.
  */
-async function ensureBaseTaskRepo(task) {
+async function ensureBaseTaskRepo(task, forceReindex = false) {
     const repoCacheSlug = task.repo.replace("/", "__");
     const bareMirror = join(BASE_CACHE_DIR, "mirrors", `${repoCacheSlug}.git`);
     const cleanDir = join(BASE_CACHE_DIR, "clean", task.id);
     const indexedDir = join(BASE_CACHE_DIR, "indexed", task.id);
 
-    if (!existsSync(cleanDir)) {
+    if (!existsSync(cleanDir) && !(forceReindex && existsSync(indexedDir))) {
         mkdirSync(join(BASE_CACHE_DIR, "mirrors"), { recursive: true });
         mkdirSync(cleanDir, { recursive: true });
         console.log(`[swebench] cloning ${task.repo} @ ${task.base_commit.slice(0, 8)} for ${task.id}...`);
@@ -257,9 +285,14 @@ async function ensureBaseTaskRepo(task) {
         execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: cleanDir });
     }
 
-    if (!existsSync(indexedDir)) {
-        mkdirSync(join(BASE_CACHE_DIR, "indexed"), { recursive: true });
-        cpSync(cleanDir, indexedDir, { recursive: true });
+    if (forceReindex || !existsSync(indexedDir)) {
+        if (existsSync(cleanDir)) {
+            rmSync(indexedDir, { recursive: true, force: true });
+            mkdirSync(join(BASE_CACHE_DIR, "indexed"), { recursive: true });
+            cpSync(cleanDir, indexedDir, { recursive: true });
+        } else {
+            rmSync(join(indexedDir, "plexer"), { recursive: true, force: true });
+        }
         console.log(`[swebench] building plexer index for ${task.id} (${task.repo})...`);
         await buildGraph(indexedDir, { force: true });
     }
@@ -308,7 +341,7 @@ async function prepareWorktree(task, arm) {
             makeAgyAgentMd(
                 "bench-plexer",
                 "Plexer-equipped software engineering agent for SWE-bench Pro A/B benchmarking.",
-                `${basePrompt}\n\n${skillBody}`,
+                `${basePrompt}\n\nIMPORTANT: Do NOT read external skill files under ~/.gemini/ or ~/.agents/; your plexer instructions are already loaded below.\n\n${agyRuleBody}`,
                 hooksPath
             ),
             "utf8"
@@ -377,15 +410,56 @@ function extractPatchSymbols(patchText) {
  *  2. Gold modified symbols / hunks
  *  3. Official Docker container verifier (`ghcr.io/scaleapi/swe-bench_pro-v2:<instance_id>`) when Docker image is available or `--docker` is enabled.
  */
-export function gradeSweTask(task, workDir, parsed, useDocker = false) {
-    const agentPatch = execFileSync(
-        "git",
-        ["diff", "--no-prefix", "--ignore-submodules", "HEAD", "--", ".", ":(exclude).gitignore"],
-        {
-            cwd: workDir,
-            encoding: "utf8",
+function resolveModifiedContentsFromPatch(matchedFiles, relevantAgentPatch, opts = {}) {
+    if (typeof opts.modifiedContents === "string")
+        return opts.modifiedContents;
+    if (opts.workDir && existsSync(opts.workDir)) {
+        return matchedFiles
+            .filter((f) => existsSync(join(opts.workDir, f)))
+            .map((f) => readFileSync(join(opts.workDir, f), "utf8"))
+            .join("\n");
+    }
+    if (opts.baseDir && existsSync(opts.baseDir) && relevantAgentPatch.trim().length > 0) {
+        const scratch = mkdtempSync(join(tmpdir(), "plexer-regrade-"));
+        try {
+            const copied = [];
+            for (const rel of matchedFiles) {
+                const src = join(opts.baseDir, rel);
+                if (!existsSync(src)) continue;
+                const dst = join(scratch, rel);
+                mkdirSync(dirname(dst), { recursive: true });
+                cpSync(src, dst);
+                copied.push(rel);
+            }
+            if (copied.length > 0) {
+                execFileSync("git", ["apply", "-p0", "--whitespace=nowarn", "-"], {
+                    cwd: scratch,
+                    input: relevantAgentPatch,
+                    stdio: ["pipe", "ignore", "pipe"],
+                });
+                return copied.map((rel) => readFileSync(join(scratch, rel), "utf8")).join("\n");
+            }
+        } catch {
+            // Fall back to hunk context/added lines if clean base snapshot is absent or patch doesn't apply cleanly.
+        } finally {
+            rmSync(scratch, { recursive: true, force: true });
         }
-    );
+    }
+    const lines = [];
+    for (const line of relevantAgentPatch.split("\n")) {
+        const hh = line.match(/^@@[^@]+@@\s*(.+)$/);
+        if (hh) {
+            lines.push(hh[1]);
+        } else if ((line.startsWith("+") && !line.startsWith("+++")) || line.startsWith(" ")) {
+            lines.push(line.slice(1));
+        }
+    }
+    return lines.join("\n");
+}
+
+export function gradeSwePatch(task, agentPatch = "", opts = {}) {
+    const parsed = opts.parsed || {};
+    const useDocker = Boolean(opts.useDocker);
     const modifiedFiles = [...agentPatch.matchAll(/^diff --git (\S+) (\S+)/gm)]
         .map((m) => m[2].replace(/^[abciw]\//, ""))
         .filter(
@@ -433,10 +507,7 @@ export function gradeSweTask(task, workDir, parsed, useDocker = false) {
                 return goldSet.has(f);
             })
             .join("\n");
-    const modifiedContents = matchedFiles
-        .filter((f) => existsSync(join(workDir, f)))
-        .map((f) => readFileSync(join(workDir, f), "utf8"))
-        .join("\n");
+    const modifiedContents = resolveModifiedContentsFromPatch(matchedFiles, relevantAgentPatch, opts);
 
     const { all: goldSyms, headerSyms } = extractPatchSymbols(relevantPatch);
     const matchedSyms = goldSyms.filter(
@@ -549,9 +620,22 @@ export function gradeSweTask(task, workDir, parsed, useDocker = false) {
         tokenRecall: Number(tokenRecall.toFixed(3)),
         modifiedFiles,
         goldSourceFiles,
+        patch: agentPatch,
         dockerPassed,
         ...(dockerDetail ? { dockerDetail } : {}),
     };
+}
+
+export function gradeSweTask(task, workDir, parsed, useDocker = false) {
+    const agentPatch = execFileSync(
+        "git",
+        ["diff", "--no-prefix", "--ignore-submodules", "HEAD", "--", ".", ":(exclude).gitignore"],
+        {
+            cwd: workDir,
+            encoding: "utf8",
+        }
+    );
+    return gradeSwePatch(task, agentPatch, { workDir, parsed, useDocker });
 }
 
 async function runOne(task, arm) {
@@ -619,14 +703,22 @@ async function runOne(task, arm) {
                 ? getTrailEnv()
                 : {
                       ...process.env,
-                      PLEXER_ENABLE_BENCH_HOOKS: arm === "plexer" ? "1" : "0",
+                      ...(isAgy ? { PLEXER_DAEMON_SOCK: benchDaemonSock } : {}),
+                      ...(arm === "plexer"
+                          ? (isAgy ? {} : { PLEXER_ENABLE_BENCH_HOOKS: "1" })
+                          : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_DISABLE_HOOKS: "1", PLEXER_BENCH_HIDE_CLI: "1" }),
                       GIT_CONFIG_COUNT: "2",
                       GIT_CONFIG_KEY_0: "commit.gpgsign",
                       GIT_CONFIG_VALUE_0: "false",
                       GIT_CONFIG_KEY_1: "tag.gpgsign",
                       GIT_CONFIG_VALUE_1: "false",
                   };
-        delete env.PLEXER_DISABLE_HOOKS;
+        if (arm === "plexer") {
+            if (isAgy)
+                delete env.PLEXER_ENABLE_BENCH_HOOKS;
+            delete env.PLEXER_DISABLE_HOOKS;
+            delete env.PLEXER_BENCH_HIDE_CLI;
+        }
         delete env.PLEXER_DIR;
         const child = spawn(cmd, args, {
             cwd: workDir,
@@ -682,6 +774,31 @@ async function runWave(jobs, maxParallel) {
     return results;
 }
 
+async function shutdownBenchDaemon(sockPath) {
+    await new Promise((resolveDone) => {
+        if (!existsSync(sockPath)) {
+            resolveDone();
+            return;
+        }
+        const sock = createConnection(sockPath);
+        const timer = setTimeout(() => {
+            sock.destroy();
+            resolveDone();
+        }, 200);
+        sock.on("connect", () => {
+            sock.write(`${JSON.stringify({ id: 1, type: "shutdown" })}\n`);
+            clearTimeout(timer);
+            sock.end();
+            resolveDone();
+        });
+        sock.on("error", () => {
+            clearTimeout(timer);
+            resolveDone();
+        });
+    });
+    rmSync(sockPath, { force: true });
+}
+
 async function main() {
     trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
     initRuntimeFiles();
@@ -692,24 +809,49 @@ async function main() {
         `${regradeOnly ? "Regrading" : "Starting"} SWE-bench Pro V2 (${modelArg}) A/B benchmark: ${selectedTasks.length} tasks × [${armsToRun.join(",")}] (concurrency=${concurrency})...`
     );
 
+    const resultsPath = process.env.PLEXER_BENCH_OUT
+        ? resolve(process.env.PLEXER_BENCH_OUT)
+        : resolve(import.meta.dirname, `results-swebench-${modelArg}.json`);
+    const prev = existsSync(resultsPath) ? JSON.parse(readFileSync(resultsPath, "utf8")) : { tasks: [] };
+    const byId = new Map((prev.tasks || []).map((t) => [t.id, t]));
+
     let runs = [];
     if (regradeOnly) {
+        const regradeArms = positionals.length >= 3
+            ? armsToRun
+            : ["cold", "plexer", "trail"];
         for (const t of selectedTasks) {
-            for (const arm of armsToRun) {
+            const prevRow = byId.get(t.id);
+            for (const arm of regradeArms) {
                 const workDir = `/tmp/plexer-swebench-${modelArg}-${arm}/${t.id}`;
                 const outJsonl = join(logDir, `${t.id}-${arm}.jsonl`);
-                if (!existsSync(outJsonl) || !existsSync(workDir)) continue;
-                const parsed = parseTranscript(outJsonl, arm);
-                const grade = gradeSweTask(t, workDir, parsed, process.env.SWEBENCH_DOCKER === "1");
-                console.log(
-                    `[${modelArg}] ${t.id} (${arm}) calls=${parsed.calls} (${parsed.turns}t) toolTok=${parsed.toolOutputTokens} search=${(parsed.searchMs / 1000).toFixed(1)}s score=${grade.score}/8 fileRecall=${grade.fileRecall}`
-                );
-                runs.push({ taskId: t.id, arm, workDir, transcriptPath: outJsonl, parsed, grade, code: 0 });
+                if (existsSync(outJsonl) && existsSync(workDir)) {
+                    const parsed = parseTranscript(outJsonl, arm);
+                    const grade = gradeSweTask(t, workDir, parsed, process.env.SWEBENCH_DOCKER === "1");
+                    console.log(
+                        `[${modelArg}] ${t.id} (${arm}) calls=${parsed.calls} (${parsed.turns}t) toolTok=${parsed.toolOutputTokens} search=${(parsed.searchMs / 1000).toFixed(1)}s score=${grade.score}/8 fileRecall=${grade.fileRecall}`
+                    );
+                    runs.push({ taskId: t.id, arm, workDir, transcriptPath: outJsonl, parsed, grade, code: 0 });
+                    continue;
+                }
+                const savedArm = prevRow?.[arm];
+                if (savedArm && typeof savedArm.patch === "string") {
+                    const cleanDir = join(BASE_CACHE_DIR, "clean", t.id);
+                    const grade = gradeSwePatch(t, savedArm.patch, {
+                        baseDir: existsSync(cleanDir) ? cleanDir : null,
+                        parsed: { didModifyFile: Boolean(savedArm.patch.trim() || savedArm.modifiedFiles?.length) },
+                        useDocker: false,
+                    });
+                    console.log(
+                        `[${modelArg}] ${t.id} (${arm}) [offline-patch] score=${grade.score}/8 (was ${savedArm.score}/8) resolved=${grade.resolved} fileRecall=${grade.fileRecall}`
+                    );
+                    runs.push({ taskId: t.id, arm, savedArm, grade, code: 0 });
+                }
             }
         }
     } else {
         for (const t of selectedTasks) {
-            await ensureBaseTaskRepo(t);
+            await ensureBaseTaskRepo(t, REINDEX);
         }
 
         const jobs = [];
@@ -719,22 +861,23 @@ async function main() {
             }
         }
 
-        runs = (await runWave(jobs, concurrency)).filter((r) => {
-            if (r.code !== 0 || r.parsed.cumulativeInputTokens === 0) {
-                console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${r.parsed.cumulativeInputTokens}`);
-                return false;
-            }
-            return true;
-        });
+        try {
+            runs = (await runWave(jobs, concurrency)).filter((r) => {
+                if (r.code !== 0 || r.parsed.cumulativeInputTokens === 0) {
+                    console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${r.parsed.cumulativeInputTokens}`);
+                    return false;
+                }
+                return true;
+            });
+        } finally {
+            if (isAgy)
+                await shutdownBenchDaemon(benchDaemonSock);
+        }
         if (runs.length === 0) {
             console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing results.`);
             process.exit(1);
         }
     }
-
-    const resultsPath = resolve(import.meta.dirname, `results-swebench-${modelArg}.json`);
-    const prev = existsSync(resultsPath) ? JSON.parse(readFileSync(resultsPath, "utf8")) : { tasks: [] };
-    const byId = new Map((prev.tasks || []).map((t) => [t.id, t]));
 
     for (const t of SWEBENCH_TASKS) {
         const existing = byId.get(t.id) || {
@@ -745,25 +888,31 @@ async function main() {
             gold_files: t.gold_files,
         };
         for (const r of runs.filter((x) => x.taskId === t.id)) {
+            const baseMetrics = r.parsed
+                ? {
+                      conversationId: r.parsed.conversationId,
+                      calls: r.parsed.calls,
+                      turns: r.parsed.turns,
+                      toolNames: r.parsed.toolNames,
+                      toolOutputTokens: r.parsed.toolOutputTokens,
+                      uncachedInputTokens: r.parsed.uncachedInputTokens,
+                      cachedInputTokens: r.parsed.cachedInputTokens,
+                      cumulativeInputTokens: r.parsed.cumulativeInputTokens,
+                      turn1ContextTokens: r.parsed.turn1ContextTokens || 0,
+                      turn1UncachedTokens: r.parsed.turn1UncachedTokens || 0,
+                      postTurn1UncachedTokens: r.parsed.postTurn1UncachedTokens || 0,
+                      netContextGrowthTokens: r.parsed.netContextGrowthTokens || 0,
+                      cacheMissTurns: r.parsed.cacheMissTurns || 0,
+                      finalContextTokens: r.parsed.finalContextTokens,
+                      totalModelOutputTokens: r.parsed.totalModelOutputTokens,
+                      searchMs: r.parsed.searchMs,
+                      totalMs: r.parsed.totalMs,
+                  }
+                : { ...r.savedArm };
             const prevDocker = existing[r.arm]?.dockerPassed;
             const prevDockerDetail = existing[r.arm]?.dockerDetail;
             existing[r.arm] = {
-                conversationId: r.parsed.conversationId,
-                calls: r.parsed.calls,
-                turns: r.parsed.turns,
-                toolOutputTokens: r.parsed.toolOutputTokens,
-                uncachedInputTokens: r.parsed.uncachedInputTokens,
-                cachedInputTokens: r.parsed.cachedInputTokens,
-                cumulativeInputTokens: r.parsed.cumulativeInputTokens,
-                turn1ContextTokens: r.parsed.turn1ContextTokens || 0,
-                turn1UncachedTokens: r.parsed.turn1UncachedTokens || 0,
-                postTurn1UncachedTokens: r.parsed.postTurn1UncachedTokens || 0,
-                netContextGrowthTokens: r.parsed.netContextGrowthTokens || 0,
-                cacheMissTurns: r.parsed.cacheMissTurns || 0,
-                finalContextTokens: r.parsed.finalContextTokens,
-                totalModelOutputTokens: r.parsed.totalModelOutputTokens,
-                searchMs: r.parsed.searchMs,
-                totalMs: r.parsed.totalMs,
+                ...baseMetrics,
                 ...r.grade,
                 ...(r.grade.dockerPassed === null && prevDocker !== undefined && prevDocker !== null
                     ? { dockerPassed: prevDocker, ...(prevDockerDetail ? { dockerDetail: prevDockerDetail } : {}) }

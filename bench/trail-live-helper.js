@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 export const TRAIL_EVAL_ROOT = "/tmp/trail-eval";
+export const TRAIL_SHIM_DIR = join(TRAIL_EVAL_ROOT, "shims");
 export const TRAIL_BIN_DIR = "/tmp/trail-eval/node_modules/.bin";
 export const TRAIL_BIN = "/tmp/trail-eval/node_modules/.bin/trail";
 export const TRAIL_HOME = "/tmp/trail-eval/home";
@@ -22,15 +23,9 @@ const HELPER_PATH = resolve(import.meta.dirname, "trail-live-helper.js");
 let shimExitHookRegistered = false;
 
 export function removeTrailBinShims() {
-    const localBin = join(homedir(), ".local", "bin");
-    for (const target of [join(localBin, "trail"), join(localBin, "graft")]) {
+    for (const target of [join(TRAIL_SHIM_DIR, "trail"), join(TRAIL_SHIM_DIR, "graft")]) {
         try {
-            if (existsSync(target)) {
-                const content = readFileSync(target, "utf8");
-                if (content.includes("/tmp/trail-eval/")) {
-                    rmSync(target, { force: true });
-                }
-            }
+            rmSync(target, { force: true });
         } catch {
             // ignore
         }
@@ -55,12 +50,11 @@ export function ensureTrailBinShims() {
         'await import("/tmp/trail-eval/node_modules/@trailhq/trail-code/dist/bin/trail.js");',
         "",
     ].join("\n");
-    const localBin = join(homedir(), ".local", "bin");
-    mkdirSync(localBin, { recursive: true });
+    mkdirSync(TRAIL_SHIM_DIR, { recursive: true });
     for (const target of [
-        join(localBin, "trail"),
-        join(localBin, "graft"),
-        join(TRAIL_BIN_DIR, "graft"),
+        join(TRAIL_SHIM_DIR, "trail"),
+        join(TRAIL_SHIM_DIR, "graft"),
+        ...(existsSync(TRAIL_BIN_DIR) ? [join(TRAIL_BIN_DIR, "graft")] : []),
     ]) {
         try {
             rmSync(target, { force: true });
@@ -80,6 +74,7 @@ export function ensureTrailBinShims() {
             });
         }
     }
+    return TRAIL_SHIM_DIR;
 }
 
 export async function getTrailSkillBody() {
@@ -96,10 +91,11 @@ export async function getTrailSkillBody() {
 }
 
 export function getTrailEnv(extra = {}) {
+    ensureTrailBinShims();
     const curPath = process.env.PATH || "";
     const env = {
         ...process.env,
-        PATH: `${TRAIL_BIN_DIR}:${curPath}`,
+        PATH: `${TRAIL_SHIM_DIR}:${TRAIL_BIN_DIR}:${curPath}`,
         TRAIL_INVOKED_AS: "trail",
         TRAIL_HOME,
         TRAIL_TELEMETRY: "0",
@@ -107,6 +103,8 @@ export function getTrailEnv(extra = {}) {
         DO_NOT_TRACK: "1",
         GRAFT_NO_STATUSLINE: "1",
         PLEXER_ENABLE_BENCH_HOOKS: "0",
+        PLEXER_DISABLE_HOOKS: "1",
+        PLEXER_BENCH_HIDE_CLI: "1",
         GIT_CONFIG_COUNT: "2",
         GIT_CONFIG_KEY_0: "commit.gpgsign",
         GIT_CONFIG_VALUE_0: "false",
@@ -114,7 +112,6 @@ export function getTrailEnv(extra = {}) {
         GIT_CONFIG_VALUE_1: "false",
         ...extra,
     };
-    delete env.PLEXER_DISABLE_HOOKS;
     delete env.PLEXER_DIR;
     return env;
 }
@@ -458,7 +455,7 @@ function extractAgyPromptAndStepFromTranscript(input) {
         if (existsSync(full)) tp = full;
     }
     if ((!tp || !existsSync(tp)) && input?.conversationId) {
-        const realHome = process.env.SUDO_USER ? `/home/${process.env.SUDO_USER}` : homedir();
+        const realHome = homedir();
         for (const base of [realHome]) {
             const cands = [
                 join(base, ".gemini", "antigravity-cli", "brain", input.conversationId, ".system_generated", "logs", "transcript_full.jsonl"),
@@ -629,7 +626,7 @@ async function handleAgyPostEdit() {
         }
     }
     if ((!file || typeof file !== "string") && input?.conversationId) {
-        const realHome = process.env.SUDO_USER ? `/home/${process.env.SUDO_USER}` : homedir();
+        const realHome = homedir();
         for (const base of [realHome]) {
             for (const sub of ["antigravity-cli", "antigravity"]) {
                 const tp = join(base, ".gemini", sub, "brain", input.conversationId, ".system_generated", "logs", "transcript.jsonl");

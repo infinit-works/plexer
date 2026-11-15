@@ -759,6 +759,7 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
         conversationId: a.conversationId,
         calls: a.calls,
         turns: a.turns,
+        toolNames: a.toolNames,
         toolOutputTokens: a.toolOutputTokens,
         uncachedInputTokens: a.uncachedInputTokens,
         cachedInputTokens: a.cachedInputTokens,

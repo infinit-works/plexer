@@ -64,7 +64,7 @@ The suite spans **6 repositories** (`plexer`, `kohls-admin`, `flux`, `sert`, and
 3. **Uncached and Cached Cumulative Input Tokens (`uncachedInputTokens` + `cachedInputTokens` = `cumulativeInputTokens`):**
    - Every LLM turn re-sends the conversation history to that point, so `cumulativeInputTokens` scales as $\mathcal{O}(\text{turns} \times \text{context})$.
    - **Claude Code** caches the system prompt and tool definitions after Turn 1 (`99.98%` of input tokens are `cachedInputTokens` at `0.1x` cost, with only ~8–15 `uncachedInputTokens` per turn) and finishes in 21–79 turns across 12 tasks.
-   - **Antigravity (`carbon-medium`, `argon-low`, and `argon-medium`)** makes more granular line-range `view_file` calls (44–163 turns across 12 tasks) and bills ~10–20% of each turn's prompt as `uncachedInputTokens`. Because `plexer` cuts both tool output per turn and total turns, it reduces Antigravity's cumulative input tokens by **40–72%** on `T1`–`T12` and **25–44%** on `SWE-bench Pro V2`.
+   - **Antigravity (`carbon-medium`, `argon-low`, and `argon-medium`)** makes more granular line-range `view_file` calls (44–168 turns across 12 tasks) and bills ~10–20% of each turn's prompt as `uncachedInputTokens`. Because `plexer` cuts both tool output per turn and total turns, it reduces Antigravity's cumulative input tokens by **47–72%** on `T1`–`T12` and **25–44%** on `SWE-bench Pro V2`.
 4. **Model Output Tokens (`totalModelOutputTokens`):** Total generated tokens including assistant text, tool-call arguments, and thinking tokens. On Claude Code, this is read from the top-level `result` event's `usage.output_tokens`.
 
 ---
@@ -81,19 +81,19 @@ node bench/run-claude-ab.js opus 4 both all medium
 
 | Model & Effort (12 Tasks Each) | Symmetry | Correctness (`cold` → `plexer`) | Tool Calls (`cold` → `plexer`) | Tool Output Tokens (`cold` → `plexer`) | Final Context Tokens (`cold` → `plexer`) | Cumulative Input Tokens (`cold` → `plexer`) | Search Wall Time (`cold` → `plexer`) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Antigravity `carbon-medium`** (`--effort medium`) | `PASSED (0)` | 96/96 → **94/96** (97.9%) | 288 → **163 (-43.4%)** (**`12W/0T/0L`**) | 333,138 → **167,974 (-49.6%)** (`11W/0T/1L`) | 703.4k → **476.3k (-32.3%)** | 8.53M → **5.11M (-40.1%)** | 2,321.0s → **2,298.0s (-1.0%)** (`8W/0T/4L`) |
+| **Antigravity `carbon-medium`** (`--effort medium`) | `PASSED (0)` | 96/96 → **94/96** (97.9%) | 292 → **175 (-40.1%)** (`11W/0T/1L`) | 323,826 → **177,056 (-45.3%)** (`11W/0T/1L`) | 699.7k → **476.6k (-31.9%)** | 8.71M → **4.65M (-46.6%)** | 2,602.0s → **2,005.0s (-22.9%)** (`9W/0T/3L`) |
 | **Antigravity `argon-low`** (`--effort low`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 146 → **80 (-45.2%)** (`9W/2T/1L`) | 263,482 → **108,332 (-58.9%)** (**`12W/0T/0L`**) | 511.5k → **299.8k (-41.4%)** | 3.19M → **1.70M (-46.6%)** | 1,017.0s → **961.0s (-5.5%)** (`8W/0T/4L`) |
 | **Antigravity `argon-medium`** (`--effort medium`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 146 → **62 (-57.5%)** (`11W/0T/1L`) | 253,993 → **89,853 (-64.6%)** (**`12W/0T/0L`**) | 534.7k → **279.4k (-47.7%)** | 4.28M → **1.20M (-72.0%)** | 1,417.0s → **759.0s (-46.4%)** (`10W/0T/2L`) |
 | **Claude Opus 5.5** (`--effort medium`) | `PASSED (0)` | 94/96 → **96/96 (+2.1%)** | 81 → **28 (-65.4%)** (**`12W/0T/0L`**) | 63,696 → **18,287 (-71.3%)** (**`12W/0T/0L`**) | 225.9k → **177.5k (-21.4%)** | 1.29M → **0.57M (-55.7%)** | 248.9s → **93.1s (-62.6%)** (**`12W/0T/0L`**) |
 | **Claude Sonnet 5.5** (`--effort medium`) | `PASSED (0)` | 94/96 → **96/96 (+2.1%)** | 76 → **25 (-67.1%)** (**`10W/2T/0L`**) | 45,198 → **12,368 (-72.6%)** (**`12W/0T/0L`**) | 187.9k → **161.2k (-14.2%)** | 0.65M → **0.41M (-36.7%)** | 96.7s → **62.0s (-35.9%)** (`11W/0T/1L`) |
-| **5-Model Total (`60` Task-Model Pairs)** | `PASSED (0)` | 476/480 → **478/480 (99.6%)** | 737 → **358 (-51.4%)** (`54W/4T/2L`) | 959,507 → **396,814 (-58.6%)** (`59W/0T/1L`) | 2,163.4k → **1,394.2k (-35.6%)** | 17.95M → **9.00M (-49.8%)** | 5,100.7s → **4,173.1s (-18.2%)** (`49W/0T/11L`) |
+| **5-Model Total (`60` Task-Model Pairs)** | `PASSED (0)` | 476/480 → **478/480 (99.6%)** | 741 → **370 (-50.1%)** (`53W/4T/3L`) | 950,195 → **405,896 (-57.3%)** (`59W/0T/1L`) | 2,159.7k → **1,394.6k (-35.4%)** | 18.12M → **8.54M (-52.9%)** | 5,381.7s → **3,880.1s (-27.9%)** (`50W/0T/10L`) |
 
 #### Separated Token Accounting (`T1`–`T12` Totals)
 
 | Model Configuration | Arm | Turns | Tool Output Tok | Final Context Tok | Uncached Input Tok | Cached Input Tok | Cumulative Input Tok | Model Output Tok |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Antigravity `carbon-medium`** (`medium`) | `cold` | 163 | 333,138 | 703,402 | 848,181 | 7,686,374 | 8,534,555 | 248,681 |
-| **Antigravity `carbon-medium`** (`medium`) | **`plexer`** | **125 (-23.3%)** | **167,974 (-49.6%)** | **476,277 (-32.3%)** | **602,684 (-28.9%)** | **4,509,945 (-41.3%)** | **5,112,629 (-40.1%)** | **214,335 (-13.8%)** |
+| **Antigravity `carbon-medium`** (`medium`) | `cold` | 168 | 323,826 | 699,692 | 839,204 | 7,869,433 | 8,708,637 | 193,833 |
+| **Antigravity `carbon-medium`** (`medium`) | **`plexer`** | **113 (-32.7%)** | **177,056 (-45.3%)** | **476,629 (-31.9%)** | **552,236 (-34.2%)** | **4,096,584 (-47.9%)** | **4,648,820 (-46.6%)** | **152,814 (-21.2%)** |
 | **Antigravity `argon-low`** (`low`) | `cold` | 90 | 263,482 | 511,458 | 629,271 | 2,561,528 | 3,190,799 | 51,417 |
 | **Antigravity `argon-low`** (`low`) | **`plexer`** | **61 (-32.2%)** | **108,332 (-58.9%)** | **299,816 (-41.4%)** | **495,021 (-21.3%)** | **1,209,349 (-52.8%)** | **1,704,370 (-46.6%)** | 67,801 |
 | **Antigravity `argon-medium`** (`medium`) | `cold` | 97 | 253,993 | 534,716 | 649,842 | 3,628,859 | 4,278,701 | 95,735 |
@@ -107,7 +107,7 @@ node bench/run-claude-ab.js opus 4 both all medium
 
 ### Tier 1: Antigravity `carbon-medium` (`gemini-4-carbon-medium --effort medium`)
 
-Cuts tool output tokens by `-49.6%` (`11W/0T/1L`), final context by `-32.3%`, tool calls by `-43.4%` (`12W/0T/0L`), cumulative input by `-40.1%`, and total latency by `-5.6%` (`2,900.3s → 2,738.2s`).
+Cuts tool output tokens by `-45.3%` (`11W/0T/1L`), final context by `-31.9%`, tool calls by `-40.1%` (`11W/0T/1L`), cumulative input by `-46.6%`, and total latency by `-23.3%` (`3,228.9s → 2,478.0s`).
 
 | Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -115,15 +115,15 @@ Cuts tool output tokens by `-49.6%` (`11W/0T/1L`), final context by `-32.3%`, to
 | **T2** Diagnose runaway reactive effect loop detection and disposal | `diagnosis` | `flux` | 9 (7) | **8 (5)** (-11%) | 17,363 | **8,732** (-50%) | 50.0s (158.0s) | 101.0s (**150.4s**) (+102%) | 8/8 | **8/8** |
 | **T3** Diagnose stateful model test command-redraw shrinking stability | `diagnosis` | `sert` | 5 (4) | **2 (2)** (-60%) | 15,614 | **2,538** (-84%) | 35.0s (110.2s) | **15.0s** (66.2s) (-57%) | 8/8 | **8/8** |
 | **T4** Diagnose zero-byte element validation in count-prefixed arrays *(holdout)* | `diagnosis` | `z` | 12 (6) | **2 (2)** (-83%) | 18,300 | **3,037** (-83%) | 45.0s (98.8s) | **25.0s** (78.4s) (-44%) | 8/8 | 6/8 |
-| **T5** Blast radius of changing working-tree freshness checking | `blast-radius` | `plexer` | 21 (8) | **16 (13)** (-24%) | 42,814 | 42,989 (+0.4%) | 67.0s (134.2s) | 147.0s (193.2s) (+119%) | 8/8 | **8/8** |
+| **T5** Blast radius of changing working-tree freshness checking | `blast-radius` | `plexer` | 21 (12) | 23 (**8**) (+10%) | 41,423 | 44,832 (+8%) | 126.0s (242.1s) | **96.0s** (**175.9s**) (-24%) | 8/8 | **8/8** |
 | **T6** Blast radius of refactoring user permission flag checks | `blast-radius` | `kohls-admin` | 34 (10) | **4 (4)** (-88%) | 29,875 | **8,478** (-72%) | 145.0s (225.2s) | **41.0s** (115.5s) (-72%) | 8/8 | **8/8** |
 | **T7** Blast radius of refactoring manual/engine frame step wiring | `blast-radius` | `flux` | 19 (13) | **5 (5)** (-74%) | 26,612 | **6,277** (-76%) | 117.0s (158.5s) | **45.0s** (86.1s) (-62%) | 8/8 | **8/8** |
 | **T8** Blast radius of refactoring chunked transport invocation *(holdout)* | `blast-radius` | `building-tools` | 11 (6) | **4 (3)** (-64%) | 14,251 | **9,121** (-36%) | 114.0s (187.4s) | **29.0s** (78.0s) (-75%) | 8/8 | **8/8** |
 | **T9** Implement multi-file `--all-matches` mode for `plexer skeleton` | `code-edit` | `plexer` | 43 (20) | **31 (15)** (-28%) | 34,553 | **19,643** (-43%) | 415.0s (426.6s) | 417.0s (426.9s) (+0.5%) | 8/8 | **8/8** |
-| **T10** Implement `Store.clear(proxy)` and re-export on `Flux.Store.clear` | `code-edit` | `flux` | 34 (24) | **28 (26)** (-18%) | 44,097 | **24,298** (-45%) | 397.0s (407.8s) | 657.0s (667.2s) (+65%) | 8/8 | **8/8** |
-| **T11** Add `delay` and `cancel` to simulator `HostHooks`, `server.host`, and `client.host` | `code-edit` | `sert` | 54 (34) | **38 (32)** (-30%) | 47,010 | **30,192** (-36%) | 631.0s (641.9s) | **594.0s** (606.7s) (-6%) | 8/8 | **8/8** |
+| **T10** Implement `Store.clear(proxy)` and re-export on `Flux.Store.clear` | `code-edit` | `flux` | 46 (32) | **29 (20)** (-37%) | 50,405 | **32,784** (-35%) | 734.0s (745.4s) | **431.0s** (**439.9s**) (-41%) | 8/8 | **8/8** |
+| **T11** Add `delay` and `cancel` to simulator `HostHooks`, `server.host`, and `client.host` | `code-edit` | `sert` | 46 (27) | **42** (31) (-9%) | 32,781 | **28,945** (-12%) | 516.0s (525.1s) | 578.0s (591.2s) (+12%) | 8/8 | **8/8** |
 | **T12** Implement `History.clear` and `Actions.clearHistory` *(holdout)* | `code-edit` | `building-tools` | 35 (24) | **22 (15)** (-37%) | 32,756 | **10,566** (-68%) | 261.0s (270.8s) | **195.0s** (202.6s) (-25%) | 8/8 | **8/8** |
-| **Total (`T1`–`T12`)** | - | **6 repos** | **288 (163)** | **163 (125) (-43.4%)** | **333,138** | **167,974 (-49.6%)** | **2321.0s (2900.3s)** | **2298.0s (2738.2s) (-1.0%)** | **96/96** | **94/96** |
+| **Total (`T1`–`T12`)** | - | **6 repos** | **292 (168)** | **175 (113) (-40.1%)** | **323,826** | **177,056 (-45.3%)** | **2602.0s (3228.9s)** | **2005.0s (2478.0s) (-22.9%)** | **96/96** | **94/96** |
 
 ---
 
@@ -236,12 +236,12 @@ node bench/run-swebench-ab.js opus 4 both all
 
 | Model & Effort (8 Tasks Each) | Patch Score (`cold` → `plexer`) | Tool Calls (`cold` → `plexer`) | Tool Output Tokens (`cold` → `plexer`) | Final Context Tokens (`cold` → `plexer`) | Cumulative Input Tokens (`cold` → `plexer`) | Model Output Tokens (`cold` → `plexer`) | Search Wall Time (`cold` → `plexer`) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Antigravity `carbon-medium`** (`--effort medium`) | **64/64 → 64/64** (`100%` file recall) | 459 → **312 (-32.0%)** (`7W/1T/0L`) | 398,433 → **264,565 (-33.6%)** (**`8W/0T/0L`**) | 987.4k → **775.9k (-21.4%)** | 21.33M → **13.81M (-35.3%)** | 381,982 → **315,744 (-17.3%)** | 5,410.0s → **4,347.0s (-19.6%)** (`7W/0T/1L`) |
+| **Antigravity `carbon-medium`** (`--effort medium`) | **64/64 → 64/64** (`100%` file recall) | 457 → **333 (-27.1%)** (`7W/0T/1L`) | 380,361 → **298,880 (-21.4%)** (`5W/0T/3L`) | 965.9k → **842.1k (-12.8%)** | 20.07M → **15.01M (-25.2%)** | 339,673 → **315,515 (-7.1%)** | 5,681.0s → **4,397.0s (-22.6%)** (**`8W/0T/0L`**) |
 | **Antigravity `argon-low`** (`--effort low`) | **61/64 → 61/64** (`100%` file recall) | 239 → **180 (-24.7%)** | 233,849 → **183,048 (-21.7%)** (`6W/0T/2L`) | 498.5k → **446.2k (-10.5%)** | 7.70M → **5.77M (-25.1%)** | 95,451 → 114,880 (+20.4%) | 2,759.0s → **1,855.0s (-32.8%)** (`6W/0T/2L`) |
 | **Antigravity `argon-medium`** (`--effort medium`) | 64/64 → **63/64** (`100%` file recall) | 273 → **190 (-30.4%)** (`6W/0T/2L`) | 295,513 → **151,484 (-48.7%)** (`7W/0T/1L`) | 704.6k → **559.8k (-20.5%)** | 11.32M → **6.33M (-44.0%)** | 207,280 → **189,450 (-8.6%)** | 3,013.0s → **2,528.0s (-16.1%)** (`5W/0T/3L`) |
 | **Claude Sonnet 5.5** (`--effort medium`) | 55/64 → **57/64 (+3.6%)** (`100%` file recall) | 65 → **29 (-55.4%)** (**`8W/0T/0L`**) | 19,344 → **12,040 (-37.8%)** (**`8W/0T/0L`**) | 125.2k → **117.7k (-6.0%)** | 637.0k → **444.7k (-30.2%)** | 21,386 → **13,742 (-35.7%)** | 120.1s → **81.5s (-32.1%)** (`7W/0T/1L`) |
 | **Claude Opus 5.5** (`--effort medium`) | **58/64 → 58/64** (`100%` file recall) | 39 → **34 (-12.8%)** (`5W/1T/2L`) | 24,253 → **16,638 (-31.4%)** (`7W/0T/1L`) | 133.0k → 133.6k (+0.5%) | 645.6k → **623.6k (-3.4%)** | 23,373 → **21,420 (-8.4%)** | 193.1s → **155.4s (-19.5%)** (`6W/0T/2L`) |
-| **5-Model Total (`40` Task-Model Pairs)** | 302/320 → **303/320** (`100%` file recall) | 1,075 → **745 (-30.7%)** | 971,392 → **627,775 (-35.4%)** (`36W/0T/4L`) | 2,448.7k → **2,033.2k (-17.0%)** | 41.63M → **26.98M (-35.2%)** | 729,472 → **655,236 (-10.2%)** | 11,495.2s → **8,966.9s (-22.0%)** (`31W/0T/9L`) |
+| **5-Model Total (`40` Task-Model Pairs)** | 302/320 → **303/320** (`100%` file recall) | 1,073 → **766 (-28.6%)** | 953,320 → **662,090 (-30.5%)** (`33W/0T/7L`) | 2,427.1k → **2,099.4k (-13.5%)** | 40.37M → **28.18M (-30.2%)** | 687,163 → **655,007 (-4.7%)** | 11,766.2s → **9,016.9s (-23.4%)** (`32W/0T/8L`) |
 
 ---
 
@@ -257,30 +257,30 @@ node bench/run-swebench-ab.js opus 4 both all
 | **Claude Code Sonnet (`S1`–`S8`)** | 8 | 15.7k | 17.0k | **14.7k** | 6.8k | 5.0k | **4.1k** | 80k | 62k | **56k** | 8.1 | 3.8 | **3.6** | 55/64 | 62/64 | **57/64** |
 | **AGY Opus (`T4, T5, T9`)** | 3 | 43.5k | 32.7k | **18.1k** | 33.7k | 16.5k | **6.9k** | 372k | 137k | **66k** | 14.3 | 7.3 | **4.7** | 24/24 | 24/24 | **24/24** |
 | **AGY Sonnet (`T4, T5, T9`)** | 3 | 28.4k | 27.6k | **14.6k** | 18.6k | 12.7k | **3.8k** | 157k | 83k | **27k** | 8.7 | 4.0 | **2.3** | 24/24 | 24/24 | **24/24** |
-| **AGY Carbon (`T4, T5, T9`)** | 3 | 67.3k | 64.4k | **53.8k** | 62.2k | 58.2k | **46.0k** | 499k | 476k | **430k** | 25.3 | 22.3 | **16.3** | 24/24 | 24/24 | 22/24 |
+| **AGY Carbon (`T4, T5, T9`)** | 3 | 66.4k | 64.4k | **52.5k** | 61.3k | 58.2k | **44.7k** | 567k | 476k | **356k** | 25.3 | 22.3 | **18.7** | 24/24 | 24/24 | 22/24 |
 | **AGY Argon (`T4, T5, T9`)** | 3 | 49.8k | 44.2k | **20.7k** | 39.2k | 33.0k | **12.6k** | 184k | 255k | **84k** | 12.0 | 14.3 | **4.3** | 24/24 | 24/24 | **24/24** |
 | **AGY Flash (`T4, T5, T9`)** | 3 | 199.7k | 192.1k | **117.8k** | 125.9k | 109.9k | **81.2k** | 1,364k | 1,176k | **813k** | 30.7 | 29.7 | **20.3** | 24/24 | 24/24 | **24/24** |
 | **AGY Opus (`S1`–`S8`)** | 8 | 37.7k | 33.3k | **25.0k** | 28.7k | 18.2k | **15.1k** | 269k | 152k | **147k** | 13.3 | **6.9** | 11.0 | 60/64 | 61/64 | **62/64** |
 | **AGY Sonnet (`S1`–`S8`)** | 8 | 26.5k | 27.9k | **18.5k** | 17.5k | 12.8k | **8.6k** | 138k | 97k | **66k** | 10.3 | **4.9** | 7.5 | 60/64 | 63/64 | **62/64** |
-| **AGY Carbon (`S1`–`S8`)** | 8 | 216.8k | 180.4k | **137.0k** | 192.8k | 173.5k | **110.8k** | 2,666k | 2,563k | **1,726k** | 57.4 | 57.3 | **39.0** | 64/64 | 64/64 | **64/64** |
+| **AGY Carbon (`S1`–`S8`)** | 8 | 215.4k | 180.4k | **146.0k** | 191.4k | 173.5k | **117.7k** | 2,509k | 2,563k | **1,876k** | 57.1 | 57.3 | **41.6** | 64/64 | 64/64 | **64/64** |
 | **AGY Argon (`S1`–`S8`)** | 8 | 117.9k | 102.5k | **67.8k** | 99.2k | 91.0k | **59.6k** | 1,414k | 1,401k | **792k** | 34.1 | 33.8 | **23.8** | 64/64 | 63/64 | 63/64 |
 | **AGY Flash (`S1`–`S8`)** | 8 | 368.7k | 312.6k | **296.6k** | 274.1k | 237.7k | **204.0k** | 3,934k | 3,158k | **2,614k** | 63.8 | 53.9 | **49.0** | 61/64 | 61/64 | 60/64 |
-| **Claude Code Opus (`L1`–`L8`)** | 8 | 13.2k | 16.1k | 15.0k | 4.8k | 4.7k | **2.8k** | 44k | 54k | 47k | 3.1 | **2.9** | 3.4 | 64/64 | 64/64 | **64/64** |
+| **Claude Code Opus (`L1`–`L8`)** | 8 | 13.3k | 16.1k | 14.9k | 4.9k | 4.7k | **2.6k** | 45k | 54k | 50k | 3.1 | **2.9** | 3.5 | 64/64 | 64/64 | **64/64** |
 | **Claude Code Sonnet (`L1`–`L8`)** | 8 | 13.2k | 17.2k | 14.6k | 4.9k | 5.9k | **2.5k** | 39k | 49k | 42k | 5.1 | **3.8** | 4.0 | 60/64 | 62/64 | **64/64** |
 | **AGY Carbon (`L1`–`L8`)** | 8 | 54.2k | 52.9k | **38.5k** | 49.0k | 45.6k | **30.5k** | 244k | 217k | **132k** | 14.3 | 12.8 | **8.5** | 64/64 | 64/64 | **64/64** |
 | **AGY Argon (`L1`–`L8`)** | 8 | 28.3k | 20.1k | **15.0k** | 21.4k | 13.8k | **7.0k** | 127k | 66k | **36k** | 9.1 | 7.5 | **4.1** | 64/64 | 64/64 | **64/64** |
 | **AGY Flash (`L1`–`L8`)** | 8 | 141.1k | 112.7k | **109.2k** | 50.1k | 35.7k | **26.2k** | 323k | 246k | **201k** | 17.8 | 13.4 | **11.5** | 64/64 | 64/64 | **64/64** |
-| **TOTAL (`111 tasks/arm`)** | **111** | **9,564k** | **8,380k (-12.4%)** | **6,824k (-28.6%)** | **6,896k** | **5,900k (-14.4%)** | **4,268k (-38.1%)** | **82,610k** | **71,852k (-13.0%)** | **51,752k (-37.4%)** | **2,202** | **1,887 (-14.3%)** | **1,501 (-31.8%)** | **858/888 (96.6%)** | **874/888 (98.4%)** | **864/888 (97.3%)** |
+| **TOTAL (`111 tasks/arm`)** | **111** | **9,550k** | **8,380k (-12.3%)** | **6,892k (-27.8%)** | **6,882k** | **5,900k (-14.3%)** | **4,317k (-37.3%)** | **81,561k** | **71,852k (-11.9%)** | **52,753k (-35.3%)** | **2,200** | **1,887 (-14.2%)** | **1,530 (-30.5%)** | **858/888 (96.6%)** | **874/888 (98.4%)** | **864/888 (97.3%)** |
 
-On the Large-Repo & Discriminative Suite (`L1`–`L8`, 40 3-arm sessions across all 5 models), `plexer` resolves **`40/40` (`100.0%`)** strict multi-file tasks (`8/8` on Opus, Sonnet, Carbon, Argon, and Flash) compared to `39/40` for `trail` and `38/40` for `cold`, while cutting tool output tokens by **`-53.2%` vs. `cold` (`287.2k → 134.5k`)** and **`-44.9%` vs. `trail` (`243.9k → 134.5k`)**.
+On the Large-Repo & Discriminative Suite (`L1`–`L8`, 40 3-arm sessions across all 5 models), `plexer` resolves **`40/40` (`100.0%`)** strict multi-file tasks (`8/8` on Opus, Sonnet, Carbon, Argon, and Flash) compared to `39/40` for `trail` and `38/40` for `cold`, while cutting tool output tokens by **`-53.4%` vs. `cold` (`287.4k → 133.8k`)** and **`-45.2%` vs. `trail` (`243.9k → 133.8k`)**.
 
 #### Repo-Size Scaling Breakdown (`Cold` vs. `Trail` vs. `plexer`)
 
 | Repo Size Bucket | Tasks/Arm | Cold Post-T1 Unc | Trail Post-T1 Unc | `plexer` Post-T1 Unc | Cold Cumul | Trail Cumul | `plexer` Cumul | Cold Calls | Trail Calls | `plexer` Calls | Cold File Recall | Trail File Recall | `plexer` File Recall |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Small (`<250 files`)** | 15 | 55.9k | 46.0k (-17.7%) | **30.1k (-46.2%)** | 515k | 426k (-17.4%) | **284k (-44.9%)** | 18.2 | 15.5 | **9.6** | 15/15 (100%) | 15/15 (100%) | **15/15 (100%)** |
-| **Medium (`350–750 files`)** | 53 | 54.2k | 50.5k (-6.8%) | **32.5k (-40.1%)** | 683k | 635k (-7.0%) | **369k (-45.9%)** | 17.9 | 15.9 | **12.1** | 50/53 (94%) | 52/53 (98%) | **53/53 (100%)** |
-| **Large (`700–1350+ files`)** | 43 | 74.0k | 58.9k (-20.5%) | **48.8k (-34.2%)** | 900k | 740k (-17.8%) | **649k (-27.9%)** | 22.8 | 18.8 | **16.7** | 41/43 (95%) | 43/43 (100%) | **43/43 (100%)** |
+| **Small (`<250 files`)** | 15 | 55.7k | 46.0k (-17.4%) | **29.8k (-46.5%)** | 529k | 426k (-19.5%) | **269k (-49.1%)** | 18.2 | 15.5 | **10.1** | 15/15 (100%) | 15/15 (100%) | **15/15 (100%)** |
+| **Medium (`350–750 files`)** | 53 | 53.6k | 50.5k (-5.7%) | **32.8k (-38.8%)** | 655k | 635k (-3.0%) | **365k (-44.3%)** | 17.8 | 15.9 | **12.2** | 50/53 (94%) | 52/53 (98%) | **53/53 (100%)** |
+| **Large (`700–1350+ files`)** | 43 | 74.5k | 58.9k (-21.0%) | **49.5k (-33.5%)** | 905k | 740k (-18.3%) | **683k (-24.5%)** | 22.8 | 18.8 | **17.0** | 41/43 (95%) | 43/43 (100%) | **43/43 (100%)** |
 
 ### Trail-Comparable Metric Table (`node bench/trail-table.js`)
 
@@ -298,14 +298,14 @@ node bench/trail-table.js --suite 3arm
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Opus 5.5: Q&A (`T1`–`T8`)** | 5.8 → **1.4 (-76%)** | 12,608 → **8,412 (-33%)** | 11,331 → **6,665 (-41%)** | 10,031 → **2,193 (-78%)** | 86,533 → **31,790 (-63%)** | 35,377 → **21,579 (-39%)** | 13.4s → **2.9s (-78%)** |
 | **Sonnet 5.5: Q&A (`T1`–`T8`)** | 4.8 → **1.3 (-74%)** | 9,655 → **6,747 (-30%)** | 8,377 → **5,786 (-31%)** | 7,235 → **1,572 (-78%)** | 46,218 → **24,649 (-47%)** | 24,615 → **16,343 (-34%)** | 4.6s → **1.7s (-63%)** |
-| **Carbon Medium: Q&A (`T1`–`T8`)** | 15.3 → **5.5 (-64%)** | 48,015 → **28,230 (-41%)** | 35,144 → **20,279 (-42%)** | 42,976 → **20,036 (-53%)** | 246,830 → **143,915 (-42%)** | 117,440 → **79,894 (-32%)** | 77.1s → **54.4s (-29%)** |
+| **Carbon Medium: Q&A (`T1`–`T8`)** | 15.3 → **6.4 (-58%)** | 47,653 → **27,743 (-42%)** | 35,039 → **19,599 (-44%)** | 42,615 → **19,535 (-54%)** | 272,494 → **116,050 (-57%)** | 119,524 → **75,687 (-37%)** | 84.5s → **48.0s (-43%)** |
 | **Opus 5.5: All (`T1`–`T12`)** | 6.8 → **2.3 (-65%)** | 13,111 → **8,940 (-32%)** | 12,260 → **7,588 (-38%)** | 10,899 → **3,530 (-68%)** | 107,313 → **47,521 (-56%)** | 40,034 → **24,961 (-38%)** | 20.7s → **7.8s (-63%)** |
 | **Sonnet 5.5: All (`T1`–`T12`)** | 6.3 → **2.1 (-67%)** | 9,950 → **6,510 (-35%)** | 8,956 → **6,102 (-32%)** | 7,750 → **2,460 (-68%)** | 54,530 → **34,545 (-37%)** | 26,953 → **17,953 (-33%)** | 8.1s → **5.2s (-36%)** |
-| **Carbon Medium: All (`T1`–`T12`)** | 24.0 → **13.6 (-43%)** | 70,682 → **50,224 (-29%)** | 52,048 → **33,110 (-36%)** | 65,601 → **37,915 (-42%)** | 711,213 → **426,052 (-40%)** | 211,984 → **154,251 (-27%)** | 193.4s → **191.5s (-1%)** |
+| **Carbon Medium: All (`T1`–`T12`)** | 24.3 → **14.6 (-40%)** | 69,934 → **46,020 (-34%)** | 51,738 → **33,140 (-36%)** | 64,859 → **37,689 (-42%)** | 725,720 → **387,402 (-47%)** | 216,276 → **143,830 (-33%)** | 216.8s → **167.1s (-23%)** |
 | **Opus 5.5: SWE-bench (`S1`–`S8`)** | 4.9 → **4.3 (-13%, `-31%` vs `trail`)** | 11,751 → **10,111 (-14%, `-23%` vs `trail`)** | 10,048 → **9,507 (-5%, `-22%` vs `trail`)** | 7,740 → **5,859 (-24%, `-19%` vs `trail`)** | 80,703 → **77,954 (-3%, `-34%` vs `trail`)** | 36,189 → **32,808 (-9%, `-23%` vs `trail`)** | 24.1s → **19.4s (-20%, `-18%` vs `trail`)** |
 | **Sonnet 5.5: SWE-bench (`S1`–`S8`)** | 8.1 → **3.6 (-55%, `-3%` vs `trail`)** | 10,653 → **9,713 (-9%, `-9%` vs `trail`)** | 8,948 → **7,381 (-18%, `-24%` vs `trail`)** | 6,795 → **4,123 (-39%, `-17%` vs `trail`)** | 79,626 → **55,584 (-30%, `-11%` vs `trail`)** | 33,577 → **25,315 (-25%, `-6%` vs `trail`)** | 15.0s → **10.2s (-32%, `-13%` vs `trail`)** |
-| **Carbon Medium: SWE-bench (`S1`–`S8`)** | 57.4 → **39.0 (-32%, `-32%` vs `trail`)** | 216,773 → **136,997 (-37%, `-24%` vs `trail`)** | 116,848 → **90,393 (-23%, `-20%` vs `trail`)** | 192,827 → **110,795 (-43%, `-36%` vs `trail`)** | 2,666k → **1,726k (-35%, `-33%` vs `trail`)** | 670,590 → **484,831 (-28%, `-21%` vs `trail`)** | 676.3s → **543.4s (-20%, `-19%` vs `trail`)** |
-| **Opus 5.5: Large (`L1`–`L8`)** | 3.1 → 3.4 | 8,154 → 9,975 (**`-32%` vs `trail`**) | 6,605 → 7,799 (**`-14%` vs `trail`**) | 4,804 → **2,817 (-41%, `-40%` vs `trail`)** | 44,477 → 47,231 (**`-12%` vs `trail`**) | 23,217 → 25,288 (**`-20%` vs `trail`**) | 7.1s → **6.0s (-15%, `-12%` vs `trail`)** |
+| **Carbon Medium: SWE-bench (`S1`–`S8`)** | 57.1 → **41.6 (-27%, `-27%` vs `trail`)** | 215,371 → **146,044 (-32%, `-19%` vs `trail`)** | 114,209 → **98,714 (-14%, `-12%` vs `trail`)** | 191,431 → **117,666 (-39%, `-32%` vs `trail`)** | 2,509k → **1,876k (-25%, `-27%` vs `trail`)** | 657,039 → **516,260 (-21%, `-16%` vs `trail`)** | 710.1s → **549.6s (-23%, `-18%` vs `trail`)** |
+| **Opus 5.5: Large (`L1`–`L8`)** | 3.1 → 3.5 | 8,236 → 9,859 (**`-32%` vs `trail`**) | 6,687 → 7,683 (**`-15%` vs `trail`**) | 4,861 → **2,561 (-47%, `-46%` vs `trail`)** | 45,052 → 49,816 (**`-7%` vs `trail`**) | 23,484 → 25,204 (**`-20%` vs `trail`**) | 7.3s → **6.0s (-19%, `-13%` vs `trail`)** |
 | **Sonnet 5.5: Large (`L1`–`L8`)** | 5.1 → **4.0 (-22%)** | 8,010 → 9,431 (**`-40%` vs `trail`**) | 6,459 → 7,253 (**`-27%` vs `trail`**) | 4,893 → **2,505 (-49%, `-58%` vs `trail`)** | 39,286 → 41,634 (**`-15%` vs `trail`**) | 22,081 → 22,984 (**`-27%` vs `trail`**) | 5.1s → **3.4s (-34%, `-50%` vs `trail`)** |
 | **Carbon Medium: Large (`L1`–`L8`)** | 14.3 → **8.5 (-40%, `-33%` vs `trail`)** | 54,202 → **38,459 (-29%, `-27%` vs `trail`)** | 23,117 → **17,589 (-24%, `-26%` vs `trail`)** | 49,015 → **30,498 (-38%, `-33%` vs `trail`)** | 244,041 → **131,593 (-46%, `-39%` vs `trail`)** | 110,492 → **78,716 (-29%, `-24%` vs `trail`)** | 104.8s → **95.8s (-9%, `-10%` vs `trail`)** |
 

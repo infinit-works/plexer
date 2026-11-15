@@ -15,10 +15,11 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { LARGE_TASKS } from "./large-tasks.js";
+import { ensureSwebenchBaseRepos } from "./ensure-base.js";
 import { gradeTaskArm, parseTranscript } from "./grade.js";
-import { buildGraph } from "../src/graph/build.js";
 import {
     buildTrailAgyHooksJson,
     buildTrailClaudeSettingsJson,
@@ -28,7 +29,8 @@ import {
     prepareTrailWorktreeDir,
 } from "./trail-live-helper.js";
 
-const rawModelArg = process.argv[2] || "sonnet";
+const positionals = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const rawModelArg = positionals[0] || "sonnet";
 export const CLAUDE_MODELS = {
     sonnet: "claude-sonnet-5-5",
     "sonnet-5-5": "claude-sonnet-5-5",
@@ -48,11 +50,12 @@ export function normalizeModelArg(raw = "sonnet") {
 }
 const modelArg = normalizeModelArg(rawModelArg);
 const resolvedClaudeModel = CLAUDE_MODELS[rawModelArg] || rawModelArg;
-const concurrency = Number(process.argv[3] || 4);
-const armFilter = process.argv[4] || "all";
-const taskFilterArg = process.argv[5] || "all";
+const concurrency = Number(positionals[1] || 4);
+const armFilter = positionals[2] || "all";
+const taskFilterArg = positionals[3] || "all";
+const REINDEX = process.argv.includes("--reindex");
 const taskFilterSet =
-    taskFilterArg === "all" || taskFilterArg.startsWith("--")
+    taskFilterArg === "all"
         ? null
         : new Set(taskFilterArg.split(",").map((s) => s.trim()));
 const armsToRun =
@@ -104,6 +107,7 @@ export const AGY_MODELS = {
 
 const BASE_CACHE_DIR = "/tmp/plexer-swebench-base";
 const logDir = `/tmp/plexer-large-logs/${modelArg}`;
+const benchDaemonSock = `/tmp/plexer-large-bench-${process.pid}.sock`;
 
 const basePrompt = [
     "You are an expert software engineer solving a repository engineering task.",
@@ -115,6 +119,7 @@ const basePrompt = [
 
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+const agyRuleBody = readFileSync(resolve(import.meta.dirname, "../rules/AGENTS.md"), "utf8").trim();
 let trailSkillBody = "";
 
 const coldSysFile = join(logDir, "cold-system.txt");
@@ -122,6 +127,7 @@ const plexerSysFile = join(logDir, "plexer-system.txt");
 const trailSysFile = join(logDir, "trail-system.txt");
 
 const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
+const plexerHookClient = resolve(import.meta.dirname, "../bin/plexer-hook-client.cjs");
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
 const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
 const trailMcpConfigFile = join(logDir, "trail-mcp-config.json");
@@ -175,20 +181,39 @@ const agyHooksJson = JSON.stringify(
             PreInvocation: [
                 {
                     type: "command",
-                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-pre-invocation`,
+                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-invocation`,
                     timeout: 15,
+                },
+            ],
+            PreToolUse: [
+                {
+                    matcher: "read_file|view_file|run_command",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-tool`,
+                            timeout: 10,
+                        },
+                    ],
                 },
             ],
             PostToolUse: [
                 {
-                    matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file",
+                    matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file",
                     hooks: [
                         {
                             type: "command",
-                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerBin)} _hook agy-post-edit`,
+                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-post-tool`,
                             timeout: 10,
                         },
                     ],
+                },
+            ],
+            Stop: [
+                {
+                    type: "command",
+                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-stop`,
+                    timeout: 10,
                 },
             ],
         },
@@ -230,15 +255,16 @@ const coldAgyMd = makeAgyAgentMd(
     `${basePrompt}\n\nIMPORTANT: Do NOT read or use any external skill files under ~/.gemini/ or ~/.agents/ or run \`plexer\` or \`trail\` commands; use standard repository tools only.`
 );
 
-async function ensureBaseLargeRepo(task) {
+const reindexedBaseIds = new Set();
+
+async function ensureBaseLargeRepo(task, forceReindex = false) {
     const cleanDir = join(BASE_CACHE_DIR, "clean", task.baseId);
     const indexedDir = join(BASE_CACHE_DIR, "indexed", task.baseId);
+    const shouldReindex = forceReindex && !reindexedBaseIds.has(task.baseId);
 
-    if (!existsSync(indexedDir)) {
-        mkdirSync(join(BASE_CACHE_DIR, "indexed"), { recursive: true });
-        cpSync(cleanDir, indexedDir, { recursive: true });
-        console.log(`[large-ab] building plexer index for ${task.baseId} (${task.repo})...`);
-        await buildGraph(indexedDir, { force: true });
+    if (shouldReindex || !existsSync(cleanDir) || !existsSync(join(indexedDir, "plexer", ".graph", "wiring.json"))) {
+        await ensureSwebenchBaseRepos(new Set([task.baseId]), { reindex: shouldReindex });
+        reindexedBaseIds.add(task.baseId);
     }
 
     return { cleanDir, indexedDir };
@@ -296,7 +322,7 @@ export async function prepareWorktree(task, arm) {
             makeAgyAgentMd(
                 "bench-plexer",
                 "Plexer-equipped software engineering agent for Large-Repo A/B benchmarking.",
-                `${basePrompt}\n\n${skillBody}`,
+                `${basePrompt}\n\nIMPORTANT: Do NOT read external skill files under ~/.gemini/ or ~/.agents/; your plexer instructions are already loaded below.\n\n${agyRuleBody}`,
                 hooksPath
             ),
             "utf8"
@@ -420,14 +446,22 @@ async function runOne(task, arm) {
                 ? getTrailEnv()
                 : {
                       ...process.env,
-                      PLEXER_ENABLE_BENCH_HOOKS: arm === "plexer" ? "1" : "0",
+                      ...(isAgy ? { PLEXER_DAEMON_SOCK: benchDaemonSock } : {}),
+                      ...(arm === "plexer"
+                          ? (isAgy ? {} : { PLEXER_ENABLE_BENCH_HOOKS: "1" })
+                          : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_DISABLE_HOOKS: "1", PLEXER_BENCH_HIDE_CLI: "1" }),
                       GIT_CONFIG_COUNT: "2",
                       GIT_CONFIG_KEY_0: "commit.gpgsign",
                       GIT_CONFIG_VALUE_0: "false",
                       GIT_CONFIG_KEY_1: "tag.gpgsign",
                       GIT_CONFIG_VALUE_1: "false",
                   };
-        delete env.PLEXER_DISABLE_HOOKS;
+        if (arm === "plexer") {
+            if (isAgy)
+                delete env.PLEXER_ENABLE_BENCH_HOOKS;
+            delete env.PLEXER_DISABLE_HOOKS;
+            delete env.PLEXER_BENCH_HIDE_CLI;
+        }
         delete env.PLEXER_DIR;
         const child = spawn(cmd, args, {
             cwd: workDir,
@@ -483,6 +517,31 @@ async function runWave(jobs, maxParallel) {
     return results;
 }
 
+async function shutdownBenchDaemon(sockPath) {
+    await new Promise((resolveDone) => {
+        if (!existsSync(sockPath)) {
+            resolveDone();
+            return;
+        }
+        const sock = createConnection(sockPath);
+        const timer = setTimeout(() => {
+            sock.destroy();
+            resolveDone();
+        }, 200);
+        sock.on("connect", () => {
+            sock.write(`${JSON.stringify({ id: 1, type: "shutdown" })}\n`);
+            clearTimeout(timer);
+            sock.end();
+            resolveDone();
+        });
+        sock.on("error", () => {
+            clearTimeout(timer);
+            resolveDone();
+        });
+    });
+    rmSync(sockPath, { force: true });
+}
+
 async function main() {
     trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
     initRuntimeFiles();
@@ -510,7 +569,7 @@ async function main() {
         }
     } else {
         for (const t of selectedTasks) {
-            await ensureBaseLargeRepo(t);
+            await ensureBaseLargeRepo(t, REINDEX);
         }
 
         const jobs = [];
@@ -520,13 +579,18 @@ async function main() {
             }
         }
 
-        runs = (await runWave(jobs, concurrency)).filter((r) => {
-            if (r.code !== 0 || r.parsed.cumulativeInputTokens === 0) {
-                console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${r.parsed.cumulativeInputTokens}`);
-                return false;
-            }
-            return true;
-        });
+        try {
+            runs = (await runWave(jobs, concurrency)).filter((r) => {
+                if (r.code !== 0 || r.parsed.cumulativeInputTokens === 0) {
+                    console.error(`[${modelArg}] SKIPPING failed/empty run ${r.taskId} (${r.arm}) exit=${r.code} cumIn=${r.parsed.cumulativeInputTokens}`);
+                    return false;
+                }
+                return true;
+            });
+        } finally {
+            if (isAgy)
+                await shutdownBenchDaemon(benchDaemonSock);
+        }
         if (runs.length === 0) {
             console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing results.`);
             process.exit(1);
@@ -553,6 +617,7 @@ async function main() {
                 conversationId: r.parsed.conversationId,
                 calls: r.parsed.calls,
                 turns: r.parsed.turns,
+                toolNames: r.parsed.toolNames,
                 toolOutputTokens: r.parsed.toolOutputTokens,
                 uncachedInputTokens: r.parsed.uncachedInputTokens,
                 cachedInputTokens: r.parsed.cachedInputTokens,
