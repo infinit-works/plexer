@@ -18,14 +18,16 @@
  * degrade safely: no fingerprint → "unknown, rebuild"; no parse cache → the
  * rebuild is just cold.
  */
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { collectMarkdownDocFiles } from "../ask/index-file.js";
 import { CACHE_DIR } from "../context/node-file.js";
+import { openSqliteStore, prepareStmt } from "../storage/sqlite-store.js";
 import { shouldSkipDir } from "../util/fs.js";
 import { contentHash } from "../util/id.js";
-import { relPosix } from "../util/paths.js";
+import { relPosix, toPosixPath } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
-import { readJson, readWalkConfig, writeJsonAtomic } from "../util/state.js";
+import { readJson, readWalkConfig, resolveGitExcludePath, writeJsonAtomic } from "../util/state.js";
 import { extractorStamp, pruneSidecars } from "./extract-cache.js";
 import { listSourceStats } from "./source-files.js";
 export const FINGERPRINT_PREFIX = "fingerprint";
@@ -52,12 +54,213 @@ export function readFingerprint(outDir) {
         return null; // different extractor — re-extract, don't trust these prints
     return f;
 }
+const ROOT_DOT_RESOLVER_CONFIGS = [
+    ".luaurc",
+    ".jsconfig",
+    "tsconfig.json",
+    "tsconfig.base.json",
+    "tsconfig.app.json",
+    "jsconfig.json",
+    "package.json",
+    "go.mod",
+    "Cargo.toml",
+    "wally.toml",
+    "pesde.toml",
+    "default.project.json",
+];
+
+export function isResolverConfigFilename(b) {
+    return (
+        b === ".luaurc" ||
+        b === ".jsconfig" ||
+        b.endsWith(".project.json") ||
+        /^(?:ts|js)config(?:\..+)?\.json$/i.test(b) ||
+        b === "package.json" ||
+        b === "go.mod" ||
+        b === "Cargo.toml" ||
+        b === "wally.toml" ||
+        b === "pesde.toml"
+    );
+}
+
+/** Collect absolute paths to all resolver configs (including root/scope dotfiles & manifests). */
+export function collectResolverConfigPaths(root, walkedFiles = [], scopes = []) {
+    const absSet = new Set();
+    for (const name of ROOT_DOT_RESOLVER_CONFIGS) {
+        const p = join(root, name);
+        if (existsSync(p))
+            absSet.add(resolve(p));
+    }
+    for (const s of scopes) {
+        if (!s?.prefix)
+            continue;
+        for (const name of [".luaurc", ".jsconfig"]) {
+            const p = join(root, s.prefix, name);
+            if (existsSync(p))
+                absSet.add(resolve(p));
+        }
+    }
+    for (const f of walkedFiles) {
+        if (isResolverConfigFilename(basename(f))) {
+            absSet.add(resolve(f));
+        }
+    }
+    return [...absSet].sort();
+}
+
+/**
+ * Resolve `<gitdir>/index` for both normal checkouts (`.git/` directory) and
+ * linked worktrees (`.git` file with `gitdir: ...`), without spawning `git`.
+ */
+export function resolveGitIndexPath(absRoot) {
+    const dotGit = join(absRoot, ".git");
+    try {
+        const st = lstatSync(dotGit);
+        if (st.isDirectory()) {
+            const idx = join(dotGit, "index");
+            return existsSync(idx) ? idx : null;
+        }
+        if (st.isFile()) {
+            const line = readFileSync(dotGit, "utf8").split(/\r?\n/).find((l) => l.startsWith("gitdir:"));
+            if (!line)
+                return null;
+            const target = line.slice("gitdir:".length).trim();
+            if (!target)
+                return null;
+            const gitdir = isAbsolute(target) ? target : resolve(absRoot, target);
+            const idx = join(gitdir, "index");
+            return existsSync(idx) ? idx : null;
+        }
+    }
+    catch {
+        /* absent or unreadable .git */
+    }
+    return null;
+}
+
+function globToRegexSrc(glob) {
+    let out = "";
+    for (let i = 0; i < glob.length; i++) {
+        const ch = glob[i];
+        if (ch === "*") {
+            if (glob[i + 1] === "*") {
+                if (glob[i + 2] === "/") {
+                    out += "(?:.*/)?";
+                    i += 2;
+                }
+                else {
+                    out += ".*";
+                    i += 1;
+                }
+            }
+            else {
+                out += "[^/]*";
+            }
+        }
+        else if (ch === "?") {
+            out += "[^/]";
+        }
+        else if ("\\^$.|+()[]{}".includes(ch)) {
+            out += `\\${ch}`;
+        }
+        else {
+            out += ch;
+        }
+    }
+    return out;
+}
+
+function parseGitignoreText(text, baseRel) {
+    const rules = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.replace(/(?<!\\)[ \t]+$/, "");
+        if (!line)
+            continue;
+        if (line.startsWith("#"))
+            continue;
+        let body = line;
+        let negated = false;
+        if (body.startsWith("!")) {
+            negated = true;
+            body = body.slice(1);
+        }
+        else if (body.startsWith("\\#") || body.startsWith("\\!")) {
+            body = body.slice(1);
+        }
+        body = body.replace(/^\\ /, " ").trim();
+        if (!body)
+            continue;
+        if (body.endsWith("/")) {
+            body = body.slice(0, -1);
+            if (!body)
+                continue;
+        }
+        const anchored = body.startsWith("/");
+        if (anchored)
+            body = body.slice(1);
+        const hasSlash = anchored || body.includes("/");
+        if (!body)
+            continue;
+        try {
+            const re = new RegExp(`^${globToRegexSrc(body)}$`);
+            rules.push({ baseRel, negated, hasSlash, re });
+        }
+        catch {
+            /* skip invalid glob line */
+        }
+    }
+    return rules;
+}
+
+function readGitignoreRulesForDir(absDir, baseRel) {
+    try {
+        const p = join(absDir, ".gitignore");
+        if (!existsSync(p))
+            return [];
+        return parseGitignoreText(readFileSync(p, "utf8"), baseRel);
+    }
+    catch {
+        return [];
+    }
+}
+
+function isDirIgnoredByRules(relPosixPath, name, rules) {
+    let ignored = false;
+    for (const r of rules) {
+        let localRel = relPosixPath;
+        if (r.baseRel) {
+            const prefix = `${r.baseRel}/`;
+            if (!relPosixPath.startsWith(prefix))
+                continue;
+            localRel = relPosixPath.slice(prefix.length);
+        }
+        const matched = r.hasSlash ? r.re.test(localRel) : r.re.test(name);
+        if (matched)
+            ignored = !r.negated;
+    }
+    return ignored;
+}
+
 export function collectWalkedDirs(rootDir, outDir) {
     const absRoot = resolve(rootDir);
     const absOut = outDir ? resolve(outDir) : null;
     const includeDirs = readWalkConfig(absRoot, outDir).includeDirs;
     const dirSet = new Set(["."]);
-    const walk = (absDir) => {
+
+    const rootRules = [];
+    const excludePath = resolveGitExcludePath(absRoot);
+    if (excludePath) {
+        try {
+            rootRules.push(...parseGitignoreText(readFileSync(excludePath, "utf8"), ""));
+        }
+        catch {
+            /* ignore unreadable exclude */
+        }
+    }
+
+    const walk = (absDir, relDir, inheritedRules) => {
+        const localRules = readGitignoreRulesForDir(absDir, relDir);
+        const rules = localRules.length > 0 ? [...inheritedRules, ...localRules] : inheritedRules;
         let items;
         try {
             items = readdirSync(absDir, { withFileTypes: true });
@@ -74,13 +277,15 @@ export function collectWalkedDirs(rootDir, outDir) {
             if (absOut && full === absOut)
                 continue;
             const rel = relPosix(absRoot, full);
-            if (rel && rel !== "." && !rel.startsWith("..")) {
-                dirSet.add(rel);
-                walk(full);
-            }
+            if (!rel || rel === "." || rel.startsWith(".."))
+                continue;
+            if (rules.length > 0 && isDirIgnoredByRules(toPosixPath(rel), item.name, rules))
+                continue;
+            dirSet.add(rel);
+            walk(full, toPosixPath(rel), rules);
         }
     };
-    walk(absRoot);
+    walk(absRoot, "", rootRules);
     return dirSet;
 }
 export function snapshotDirMtimes(rootDir, outDir) {
@@ -94,8 +299,8 @@ export function snapshotDirMtimes(rootDir, outDir) {
             /* ignore unreadable dir */
         }
     }
-    const gitIdx = join(absRoot, ".git", "index");
-    if (existsSync(gitIdx)) {
+    const gitIdx = resolveGitIndexPath(absRoot);
+    if (gitIdx) {
         try {
             dirs[".git/index"] = statSync(gitIdx).mtimeMs;
         }
@@ -105,13 +310,104 @@ export function snapshotDirMtimes(rootDir, outDir) {
     }
     return dirs;
 }
+
+function collectResolverConfigSnapshots(absRoot, configPaths) {
+    const configs = {};
+    for (const absPath of configPaths) {
+        const rel = relPosix(absRoot, absPath);
+        if (!rel || rel.startsWith(".."))
+            continue;
+        try {
+            const st = statSync(absPath);
+            if (!st.isFile())
+                continue;
+            const raw = readFileSync(absPath, "utf8");
+            configs[rel] = [st.size, st.mtimeMs, contentHash(raw)];
+        }
+        catch {
+            /* ignore absent/unreadable config */
+        }
+    }
+    return configs;
+}
+
+function findResolverConfigsInDirs(absRoot, walkedDirs) {
+    const absPaths = new Set(collectResolverConfigPaths(absRoot));
+    for (const relDir of walkedDirs) {
+        const absDir = relDir === "." ? absRoot : join(absRoot, relDir);
+        let items;
+        try {
+            items = readdirSync(absDir, { withFileTypes: true });
+        }
+        catch {
+            continue;
+        }
+        for (const item of items) {
+            if (!item.isFile())
+                continue;
+            if (isResolverConfigFilename(item.name)) {
+                absPaths.add(resolve(absDir, item.name));
+            }
+        }
+    }
+    return [...absPaths].sort();
+}
+
+function loadEntriesFromSqlite(outDir) {
+    const store = openSqliteStore(outDir, { create: false });
+    if (!store)
+        return {};
+    const out = {};
+    try {
+        const rows = prepareStmt(store, "SELECT path, size, mtime_ms, content_hash FROM files").all();
+        for (const r of rows) {
+            out[r.path] = {
+                size: Number(r.size),
+                mtimeMs: Number(r.mtime_ms),
+                hash: String(r.content_hash),
+            };
+        }
+    }
+    catch {
+        return {};
+    }
+    return out;
+}
+
 /** Project the extraction cache's entries into the probe sidecar. Best-effort:
  * the graph is already on disk when this runs, so a failed write costs the next
  * probe its fast path and nothing more. */
-export function writeFingerprint(outDir, entries, onlyDirs, rootDir, extensions, preWalkDirMtimes) {
+function collectFingerprintDirMtimes(dirSet, rootDir, outDir, preWalkDirMtimes) {
+    if (!preWalkDirMtimes && !rootDir) return {};
+    if (preWalkDirMtimes && typeof preWalkDirMtimes === "object") {
+        const dirs = { ...preWalkDirMtimes };
+        if (rootDir) {
+            const absRoot = resolve(rootDir);
+            for (const relDir of dirSet) {
+                if (relDir in dirs) continue;
+                try { dirs[relDir] = statSync(relDir === "." ? absRoot : join(absRoot, relDir)).mtimeMs; } catch {}
+            }
+        }
+        return dirs;
+    }
+    const dirs = {};
+    const absRoot = resolve(rootDir);
+    for (const relDir of collectWalkedDirs(absRoot, outDir)) dirSet.add(relDir);
+    for (const relDir of dirSet) {
+        try { dirs[relDir] = statSync(relDir === "." ? absRoot : join(absRoot, relDir)).mtimeMs; } catch {}
+    }
+    const gitIdx = resolveGitIndexPath(absRoot);
+    if (gitIdx) {
+        try { dirs[".git/index"] = statSync(gitIdx).mtimeMs; } catch {}
+    }
+    return dirs;
+}
+
+export function writeFingerprint(outDir, entries, onlyDirs, rootDir, extensions, preWalkDirMtimes, configOpts) {
+    const sourceEntries = entries && typeof entries === "object" ? entries : loadEntriesFromSqlite(outDir);
     const files = {};
     const dirSet = new Set(["."]);
-    for (const [rel, e] of Object.entries(entries)) {
+    for (const [rel, e] of Object.entries(sourceEntries)) {
         files[rel] = [e.size, e.mtimeMs, e.hash];
         let d = dirname(rel);
         while (d && d !== "." && !dirSet.has(d)) {
@@ -119,59 +415,29 @@ export function writeFingerprint(outDir, entries, onlyDirs, rootDir, extensions,
             d = dirname(d);
         }
     }
-    let dirs = {};
-    if (preWalkDirMtimes && typeof preWalkDirMtimes === "object") {
-        dirs = { ...preWalkDirMtimes };
-        if (rootDir) {
-            const absRoot = resolve(rootDir);
-            for (const relDir of dirSet) {
-                if (relDir in dirs)
-                    continue;
-                try {
-                    dirs[relDir] = statSync(relDir === "." ? absRoot : join(absRoot, relDir)).mtimeMs;
-                }
-                catch {
-                    /* ignore unreadable dir */
-                }
-            }
-        }
-    }
-    else if (rootDir) {
+    const dirs = collectFingerprintDirMtimes(dirSet, rootDir, outDir, preWalkDirMtimes);
+    let configs = {};
+    let docs;
+    if (rootDir) {
         const absRoot = resolve(rootDir);
-        for (const relDir of collectWalkedDirs(absRoot, outDir)) {
-            dirSet.add(relDir);
-        }
-        for (const relDir of dirSet) {
-            try {
-                dirs[relDir] = statSync(relDir === "." ? absRoot : join(absRoot, relDir)).mtimeMs;
-            }
-            catch {
-                /* ignore unreadable dir */
-            }
-        }
-        const gitIdx = join(absRoot, ".git", "index");
-        if (existsSync(gitIdx)) {
-            try {
-                dirs[".git/index"] = statSync(gitIdx).mtimeMs;
-            }
-            catch {
-                /* ignore */
-            }
-        }
+        const cfgPaths = Array.isArray(configOpts?.configFiles)
+            ? configOpts.configFiles
+            : findResolverConfigsInDirs(absRoot, Object.keys(dirs).length ? Object.keys(dirs) : dirSet);
+        configs = collectResolverConfigSnapshots(absRoot, cfgPaths);
+        docs = collectResolverConfigSnapshots(absRoot, collectMarkdownDocFiles(absRoot).map((d) => d.absPath));
     }
     try {
         const record = { version: FINGERPRINT_VERSION, extractor: stamp(), files };
-        if (Object.keys(dirs).length > 0)
-            record.dirs = dirs;
-        if (onlyDirs && onlyDirs.length > 0)
-            record.onlyDirs = onlyDirs;
-        if (extensions && extensions.length > 0)
-            record.extensions = extensions;
+        if (Object.keys(dirs).length > 0) record.dirs = dirs;
+        if (onlyDirs?.length > 0) record.onlyDirs = onlyDirs;
+        if (extensions?.length > 0) record.extensions = extensions;
+        if (Object.keys(configs).length > 0) record.configs = configs;
+        if (docs !== undefined) record.docs = docs;
+        if (configOpts?.configHash) record.configHash = configOpts.configHash;
         writeJsonAtomic(fingerprintPath(outDir), record, true);
         pruneSidecars(join(outDir, CACHE_DIR), FINGERPRINT_PREFIX);
         return true;
-    }
-    catch {
+    } catch {
         return false;
     }
 }
@@ -215,92 +481,147 @@ export function driftCount(d) {
  * `PLEXER_REFRESH=hash` skips the stat fast path and hashes every file, for the
  * rare tooling that rewrites content while preserving size and mtime.
  */
-export function probeDrift(root, outDir) {
-    const fp = readFingerprint(outDir);
-    if (!fp)
-        return null;
-    const absRoot = resolve(root);
-    if (!alwaysHash() && fp.dirs && typeof fp.dirs === "object") {
-        let dirsClean = true;
-        for (const [relDir, expectedMtime] of Object.entries(fp.dirs)) {
-            try {
-                const st = statSync(relDir === "." ? absRoot : join(absRoot, relDir));
-                if (st.mtimeMs !== expectedMtime) {
-                    dirsClean = false;
-                    break;
-                }
-            }
-            catch {
-                dirsClean = false;
-                break;
+function checkConfigSnapshots(absRoot, fpConfigs, drift, seenDrift) {
+    if (!fpConfigs || typeof fpConfigs !== "object")
+        return true;
+    let allClean = true;
+    for (const [rel, print] of Object.entries(fpConfigs)) {
+        const [size, mtimeMs, hash] = print;
+        const abs = join(absRoot, rel);
+        try {
+            const st = statSync(abs);
+            if (!alwaysHash() && st.size === size && st.mtimeMs === mtimeMs)
+                continue;
+            const now = contentHash(readFileSync(abs, "utf8"));
+            if (now === hash)
+                continue;
+            allClean = false;
+            if (drift && !seenDrift.has(`c:${rel}`)) {
+                seenDrift.add(`c:${rel}`);
+                drift.changed.push(rel);
             }
         }
-        if (dirsClean) {
-            let filesClean = true;
-            for (const [rel, print] of Object.entries(fp.files)) {
-                const [size, mtimeMs, hash] = print;
-                if (!hash) {
-                    filesClean = false;
-                    break;
-                }
-                try {
-                    const st = statSync(join(absRoot, rel));
-                    if (st.size !== size || st.mtimeMs !== mtimeMs) {
-                        filesClean = false;
-                        break;
-                    }
-                }
-                catch {
-                    filesClean = false;
-                    break;
-                }
-            }
-            if (filesClean) {
-                return { changed: [], added: [], removed: [] };
+        catch {
+            allClean = false;
+            if (drift && !seenDrift.has(`r:${rel}`)) {
+                seenDrift.add(`r:${rel}`);
+                drift.removed.push(rel);
             }
         }
     }
+    return allClean;
+}
+
+function probeFastDirsClean(absRoot, dirs) {
+    for (const [relDir, expectedMtime] of Object.entries(dirs)) {
+        try {
+            const target = relDir === "." ? absRoot : relDir === ".git/index" ? resolveGitIndexPath(absRoot) : join(absRoot, relDir);
+            if (!target || statSync(target).mtimeMs !== expectedMtime) return false;
+        } catch {
+            return false;
+        }
+    }
+    return true;
+}
+
+function probeFastFilesClean(absRoot, files) {
+    for (const [rel, [size, mtimeMs, hash]] of Object.entries(files)) {
+        if (!hash) return false;
+        try {
+            const st = statSync(join(absRoot, rel));
+            if (st.size !== size || st.mtimeMs !== mtimeMs) return false;
+        } catch {
+            return false;
+        }
+    }
+    return true;
+}
+
+function recordEntryDrift(f, fp, drift, seenDrift) {
+    const print = fp.files[f.rel];
+    if (!print) {
+        seenDrift.add(`a:${f.rel}`);
+        drift.added.push(f.rel);
+        return;
+    }
+    const [size, mtimeMs, hash] = print;
+    if (statUnchanged({ size, mtimeMs, hash }, f)) return;
+    // Confirm suspected changes by bytes so touch/checkout restores stay free.
+    let now;
+    try {
+        const source = readSourceFile(f.abs);
+        if (source === null) {
+            if (hash) {
+                seenDrift.add(`c:${f.rel}`);
+                drift.changed.push(f.rel);
+            }
+            return;
+        }
+        now = contentHash(source);
+    } catch {
+        return;
+    }
+    if (now !== hash) {
+        seenDrift.add(`c:${f.rel}`);
+        drift.changed.push(f.rel);
+    }
+}
+
+function appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seenDrift) {
+    if (fp.configs && typeof fp.configs === "object") {
+        checkConfigSnapshots(absRoot, fp.configs, drift, seenDrift);
+        const walkedDirs = collectWalkedDirs(absRoot, outDir);
+        for (const absCfg of findResolverConfigsInDirs(absRoot, walkedDirs)) {
+            const relCfg = relPosix(absRoot, absCfg);
+            if (!relCfg || relCfg.startsWith("..") || relCfg in fp.configs) continue;
+            if (!seen.has(relCfg) && !seenDrift.has(`a:${relCfg}`)) {
+                seenDrift.add(`a:${relCfg}`);
+                drift.added.push(relCfg);
+            }
+        }
+    }
+    if (fp.docs && typeof fp.docs === "object") {
+        checkConfigSnapshots(absRoot, fp.docs, drift, seenDrift);
+        for (const { relPath } of collectMarkdownDocFiles(absRoot)) {
+            if (relPath in fp.docs) continue;
+            if (!seen.has(relPath) && !seenDrift.has(`a:${relPath}`)) {
+                seenDrift.add(`a:${relPath}`);
+                drift.added.push(relPath);
+            }
+        }
+    }
+}
+
+export function probeDrift(root, outDir) {
+    const fp = readFingerprint(outDir);
+    if (!fp) return null;
+    const absRoot = resolve(root);
+    const fastClean =
+        !alwaysHash() &&
+        fp.dirs &&
+        typeof fp.dirs === "object" &&
+        probeFastDirsClean(absRoot, fp.dirs) &&
+        probeFastFilesClean(absRoot, fp.files) &&
+        checkConfigSnapshots(absRoot, fp.configs, null, null) &&
+        checkConfigSnapshots(absRoot, fp.docs, null, null);
+    if (fastClean) return { changed: [], added: [], removed: [] };
+
     const drift = { changed: [], added: [], removed: [] };
     const seen = new Set();
+    const seenDrift = new Set();
     const onlyDirs = fp.onlyDirs && fp.onlyDirs.length > 0 ? new Set(fp.onlyDirs) : undefined;
     const extensions = Array.isArray(fp.extensions) && fp.extensions.length > 0 ? fp.extensions : undefined;
     for (const f of listSourceStats(root, outDir, undefined, onlyDirs, extensions)) {
         seen.add(f.rel);
-        const print = fp.files[f.rel];
-        if (!print) {
-            drift.added.push(f.rel);
-            continue;
-        }
-        const [size, mtimeMs, hash] = print;
-        if (statUnchanged({ size, mtimeMs, hash }, f))
-            continue;
-        // Suspect: confirm by bytes, so a touch (or a checkout that restores the
-        // same content) doesn't cost a rebuild. An entry with an empty hash lands
-        // here every time by design — that's a file the last build couldn't read, and
-        // the only way to learn it's readable again is to try.
-        let now;
-        try {
-            const source = readSourceFile(f.abs);
-            if (source === null) {
-                // A previously indexed file becoming undecodable is real drift: rebuild
-                // once to remove its stale nodes. Empty-hash entries were already skipped
-                // by the last build, so they remain clean and avoid rebuild churn.
-                if (hash)
-                    drift.changed.push(f.rel);
-                continue;
-            }
-            now = contentHash(source);
-        }
-        catch {
-            continue; // unreadable right now — leave it to the next probe
-        }
-        if (now !== hash)
-            drift.changed.push(f.rel);
+        recordEntryDrift(f, fp, drift, seenDrift);
     }
     for (const rel of Object.keys(fp.files)) {
-        if (!seen.has(rel))
+        if (!seen.has(rel)) {
+            seenDrift.add(`r:${rel}`);
             drift.removed.push(rel);
+        }
     }
+    appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seenDrift);
     drift.changed.sort();
     drift.added.sort();
     drift.removed.sort();

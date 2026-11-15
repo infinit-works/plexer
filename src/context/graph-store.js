@@ -2,6 +2,7 @@
  * In-memory mtime/size-keyed store for `wiring.json` with prebuilt adjacency and path indices.
  */
 import { statSync } from "node:fs";
+import { stripNodeOrdinals } from "../util/id.js";
 import { readGraph, wiringPath } from "./node-file.js";
 
 const graphCache = new Map();
@@ -45,15 +46,35 @@ export function loadGraphCached(outDir) {
         if (g && Array.isArray(g.nodes)) {
             const byId = new Map();
             const nodesByPath = new Map();
+            const byName = new Map();
+            const byBareName = new Map();
+            const pushBucket = (map, key, node) => {
+                if (!key)
+                    return;
+                let list = map.get(key);
+                if (!list) {
+                    list = [];
+                    map.set(key, list);
+                }
+                list.push(node);
+            };
             for (const n of g.nodes) {
                 byId.set(n.id, n);
                 if (n.path) {
-                    let list = nodesByPath.get(n.path);
-                    if (!list) {
-                        list = [];
-                        nodesByPath.set(n.path, list);
+                    pushBucket(nodesByPath, n.path, n);
+                }
+                if (n.kind !== "file" && n.name) {
+                    const lowerName = n.name.toLowerCase();
+                    pushBucket(byName, lowerName, n);
+                    const nameBareIdx = Math.max(lowerName.lastIndexOf("."), lowerName.lastIndexOf(":"), lowerName.lastIndexOf("#"));
+                    const nameBare = nameBareIdx >= 0 ? lowerName.slice(nameBareIdx + 1) : lowerName;
+                    pushBucket(byBareName, nameBare, n);
+                    const strippedId = stripNodeOrdinals(n);
+                    const idBareIdx = Math.max(strippedId.lastIndexOf("."), strippedId.lastIndexOf("#"));
+                    const idBare = idBareIdx >= 0 ? strippedId.slice(idBareIdx + 1) : "";
+                    if (idBare && idBare !== nameBare) {
+                        pushBucket(byBareName, idBare, n);
                     }
-                    list.push(n);
                 }
             }
             const inEdges = new Map();
@@ -77,6 +98,8 @@ export function loadGraphCached(outDir) {
                 _nodesByPath: { value: nodesByPath, enumerable: false, configurable: true },
                 _inEdges: { value: inEdges, enumerable: false, configurable: true },
                 _outEdges: { value: outEdges, enumerable: false, configurable: true },
+                byName: { value: byName, enumerable: false, configurable: true },
+                byBareName: { value: byBareName, enumerable: false, configurable: true },
             });
         }
         return g;
@@ -84,7 +107,12 @@ export function loadGraphCached(outDir) {
 }
 
 export function invalidateGraphCaches(outDir) {
-    graphCache.delete(wiringPath(outDir));
+    if (outDir !== undefined && outDir !== null) {
+        graphCache.delete(wiringPath(outDir));
+    }
+    else {
+        graphCache.clear();
+    }
     for (const clear of extraCacheClearers) {
         clear(outDir);
     }

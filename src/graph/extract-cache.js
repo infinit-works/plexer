@@ -29,9 +29,18 @@ import { fileURLToPath } from "node:url";
 import { dirname, extname, join } from "node:path";
 import { readPackageVersion } from "../util/cli-meta.js";
 import { CACHE_DIR } from "../context/node-file.js";
+import {
+    checkpointSqliteStore,
+    getSqliteMeta,
+    openSqliteStore,
+    prepareStmt,
+    setSqliteMeta,
+    stripNodeBodyText,
+    withSqliteTransaction,
+} from "../storage/sqlite-store.js";
 import { contentHash } from "../util/id.js";
 import { readSourceFile } from "../util/source.js";
-import { readJson, writeJsonAtomic } from "../util/state.js";
+import { readJson } from "../util/state.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
 import { extractFile, languageLabelOf, languageOf, warmDepthGrammars } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
@@ -163,37 +172,301 @@ function stampDir(dir, ext, version = "") {
     catch {
         /* no queries/ subdir */
     }
+    try {
+        const extractDir = join(dir, "extract");
+        const extractFiles = readdirSync(extractDir)
+            .filter((f) => f.endsWith(".js") || (ext && f.endsWith(ext)))
+            .sort();
+        for (const ef of extractFiles) {
+            h.update(`extract/${ef}`);
+            h.update(readFileSync(join(extractDir, ef)));
+        }
+    }
+    catch {
+        /* no extract/ subdir */
+    }
+    try {
+        const grammarsDir = join(dir, "..", "..", "grammars");
+        const wasmFiles = readdirSync(grammarsDir).filter((f) => f.endsWith(".wasm")).sort();
+        for (const wf of wasmFiles) {
+            h.update(`grammars/${wf}`);
+            h.update(readFileSync(join(grammarsDir, wf)));
+        }
+    }
+    catch {
+        /* no grammars/ subdir */
+    }
+    try {
+        const idPath = join(dir, "..", "util", ext && ext !== ".js" ? `id${ext}` : "id.js");
+        h.update("util/id.js");
+        h.update(readFileSync(idPath));
+    }
+    catch {
+        /* id.js missing in bundled build */
+    }
     return h.digest("hex").slice(0, 16);
 }
 export function emptyExtractCache() {
     return { version: CACHE_VERSION, extractor: extractorStamp() ?? "", files: {} };
 }
-/** The cache for `outDir`, or an empty one when it's absent, unparseable, written by
- * a different cache version, or when this plexer has no identity to key on (then
- * every build is cold, which is slow but never wrong). The stamp is in the filename,
- * so the `extractor` field is a second check rather than the only one. */
-export function readExtractCache(outDir) {
-    const path = extractCachePath(outDir);
+
+function unlinkLegacyExtractFiles(outDir) {
+    const cacheDir = join(outDir, CACHE_DIR);
+    try {
+        for (const f of readdirSync(cacheDir)) {
+            if (f === "extract.json" || (f.startsWith(`${EXTRACT_CACHE_PREFIX}.`) && f.endsWith(".json"))) {
+                rmSync(join(cacheDir, f), { force: true });
+            }
+        }
+    }
+    catch {
+        /* ignore if cacheDir absent */
+    }
+}
+
+/**
+ * Lightweight SQLite stat/hash index reader (`files` metadata only, zero `nodes_json` parsing).
+ * Falls back to legacy `.cache/extract.<stamp>.json` when `index.sqlite` isn't populated yet.
+ */
+export function readExtractCacheStats(outDir) {
     const stamp = extractorStamp();
+    if (stamp === null) {
+        return { source: "none", extractor: "", stats: new Map(), cache: emptyExtractCache() };
+    }
+    const store = openSqliteStore(outDir, { create: false });
+    if (store) {
+        try {
+            const dbStamp = getSqliteMeta(store, "extractor_stamp");
+            if (dbStamp === stamp) {
+                const rows = prepareStmt(
+                    store,
+                    "SELECT path, mtime_ms, size, content_hash FROM files"
+                ).all();
+                const stats = new Map();
+                for (const r of rows) {
+                    stats.set(r.path, {
+                        mtimeMs: Number(r.mtime_ms),
+                        size: Number(r.size),
+                        hash: String(r.content_hash),
+                    });
+                }
+                if (stats.size > 0 || extractCachePath(outDir) === null || !readdirLegacyExtractExists(outDir)) {
+                    return { source: "sqlite", extractor: stamp, stats, cache: null };
+                }
+            }
+        }
+        catch {
+            /* fall back to legacy cache */
+        }
+    }
+    const legacy = readLegacyExtractCache(outDir, stamp);
+    if (legacy) {
+        return { source: "legacy", extractor: stamp, stats: null, cache: legacy };
+    }
+    return { source: "none", extractor: stamp, stats: new Map(), cache: emptyExtractCache() };
+}
+
+function readdirLegacyExtractExists(outDir) {
+    const p = extractCachePath(outDir);
+    if (!p)
+        return false;
+    try {
+        statSync(p);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+
+function readLegacyExtractCache(outDir, stamp) {
+    const path = extractCachePath(outDir);
     if (path === null || stamp === null)
-        return emptyExtractCache();
+        return null;
     const c = readJson(path);
     if (!c || c.version !== CACHE_VERSION || c.extractor !== stamp || typeof c.files !== "object") {
-        return emptyExtractCache();
+        return null;
     }
     return { version: c.version, extractor: c.extractor, files: c.files ?? {} };
 }
-/** Best-effort write — a full graph is already on disk by the time this runs, so an
- * unwritable cache dir must never fail the build (it only costs the next build its
- * reuse). Returns false when nothing was written, including the deliberate case of
- * having no extractor identity: a parse we can't attribute must never be replayed. */
-export function writeExtractCache(outDir, cache) {
-    const path = extractCachePath(outDir);
-    if (path === null)
+
+/**
+ * Load parsed `nodes` and `rawEdges` from SQLite `files` for only the requested relative paths.
+ */
+export function loadExtractCacheFiles(outDir, paths) {
+    const out = new Map();
+    const list = Array.isArray(paths) ? paths : [...paths];
+    if (list.length === 0)
+        return out;
+    const store = openSqliteStore(outDir, { create: false });
+    if (!store)
+        return out;
+    const CHUNK = 250;
+    for (let off = 0; off < list.length; off += CHUNK) {
+        const slice = list.slice(off, off + CHUNK);
+        const placeholders = slice.map(() => "?").join(",");
+        const rows = store.db
+            .prepare(
+                `SELECT path, mtime_ms, size, content_hash, nodes_json, raw_edges_json
+                 FROM files WHERE path IN (${placeholders})`
+            )
+            .all(...slice);
+        for (const r of rows) {
+            try {
+                out.set(r.path, {
+                    size: Number(r.size),
+                    mtimeMs: Number(r.mtime_ms),
+                    hash: String(r.content_hash),
+                    nodes: JSON.parse(r.nodes_json),
+                    rawEdges: JSON.parse(r.raw_edges_json),
+                });
+            }
+            catch {
+                /* skip corrupt row */
+            }
+        }
+    }
+    return out;
+}
+
+/**
+ * The cache for `outDir`, backed by `<outDir>/.cache/index.sqlite` (or an empty one
+ * when absent, written by a different extractor stamp, or lacking an identity).
+ */
+export function readExtractCache(outDir) {
+    const stamp = extractorStamp();
+    if (stamp === null)
+        return emptyExtractCache();
+    const store = openSqliteStore(outDir, { create: false });
+    if (store) {
+        try {
+            const dbStamp = getSqliteMeta(store, "extractor_stamp");
+            if (dbStamp === stamp) {
+                const rows = prepareStmt(
+                    store,
+                    "SELECT path, mtime_ms, size, content_hash, nodes_json, raw_edges_json FROM files"
+                ).all();
+                const files = {};
+                for (const r of rows) {
+                    try {
+                        files[r.path] = {
+                            size: Number(r.size),
+                            mtimeMs: Number(r.mtime_ms),
+                            hash: String(r.content_hash),
+                            nodes: JSON.parse(r.nodes_json),
+                            rawEdges: JSON.parse(r.raw_edges_json),
+                        };
+                    }
+                    catch {
+                        /* skip corrupt row */
+                    }
+                }
+                if (rows.length > 0 || !readdirLegacyExtractExists(outDir)) {
+                    return { version: CACHE_VERSION, extractor: stamp, files };
+                }
+            }
+        }
+        catch {
+            /* fall back to legacy JSON */
+        }
+    }
+    return readLegacyExtractCache(outDir, stamp) ?? emptyExtractCache();
+}
+
+/**
+ * Apply incremental `files` table mutations (`upsertEntries`, `updateStats`, `deletePaths`)
+ * inside SQLite in one atomic transaction (stripping `body_text` from persisted nodes).
+ */
+export function writeExtractCacheIncremental(outDir, delta = {}) {
+    const stamp = extractorStamp();
+    if (stamp === null)
         return false;
     try {
-        writeJsonAtomic(path, cache, true);
-        pruneSidecars(join(outDir, CACHE_DIR), EXTRACT_CACHE_PREFIX);
+        const store = openSqliteStore(outDir, { create: true });
+        withSqliteTransaction(store, () => {
+            setSqliteMeta(store, "extractor_stamp", stamp);
+            const delStmt = prepareStmt(store, "DELETE FROM files WHERE path = ?");
+            for (const rel of delta.deletePaths ?? []) {
+                delStmt.run(rel);
+            }
+            const statStmt = prepareStmt(
+                store,
+                "UPDATE files SET mtime_ms = ?, size = ?, content_hash = ? WHERE path = ?"
+            );
+            for (const u of delta.updateStats ?? []) {
+                statStmt.run(u.mtimeMs ?? 0, u.size ?? 0, u.hash ?? "", u.rel);
+            }
+            const upsertStmt = prepareStmt(
+                store,
+                `INSERT OR REPLACE INTO files(
+                    path, mtime_ms, size, content_hash, nodes_json, raw_edges_json
+                ) VALUES (?, ?, ?, ?, ?, ?)`
+            );
+            const entries = delta.upsertEntries ?? {};
+            for (const [rel, entry] of Object.entries(entries)) {
+                if (!entry)
+                    continue;
+                const compactNodes = (entry.nodes ?? []).map(stripNodeBodyText);
+                upsertStmt.run(
+                    rel,
+                    entry.mtimeMs ?? 0,
+                    entry.size ?? 0,
+                    entry.hash ?? "",
+                    JSON.stringify(compactNodes),
+                    JSON.stringify(entry.rawEdges ?? [])
+                );
+            }
+        });
+        if (store.txDepth === 0) {
+            checkpointSqliteStore(outDir, "PASSIVE");
+        }
+        unlinkLegacyExtractFiles(outDir);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+
+/**
+ * Persist extracted file caches into `<outDir>/.cache/index.sqlite` (stripping `body_text`
+ * from `nodes_json` to keep disk storage compact and below V8's 512MB JSON limit) and
+ * unlink any legacy `.cache/extract.*.json` files.
+ */
+export function writeExtractCache(outDir, cache) {
+    const stamp = extractorStamp();
+    if (stamp === null)
+        return false;
+    try {
+        const store = openSqliteStore(outDir, { create: true });
+        const entries = cache?.files ?? {};
+        withSqliteTransaction(store, () => {
+            setSqliteMeta(store, "extractor_stamp", stamp);
+            store.db.exec("DELETE FROM files");
+            const upsertStmt = prepareStmt(
+                store,
+                `INSERT INTO files(
+                    path, mtime_ms, size, content_hash, nodes_json, raw_edges_json
+                ) VALUES (?, ?, ?, ?, ?, ?)`
+            );
+            for (const [rel, entry] of Object.entries(entries)) {
+                if (!entry)
+                    continue;
+                const compactNodes = (entry.nodes ?? []).map(stripNodeBodyText);
+                upsertStmt.run(
+                    rel,
+                    entry.mtimeMs ?? 0,
+                    entry.size ?? 0,
+                    entry.hash ?? "",
+                    JSON.stringify(compactNodes),
+                    JSON.stringify(entry.rawEdges ?? [])
+                );
+            }
+        });
+        if (store.txDepth === 0) {
+            checkpointSqliteStore(outDir, "PASSIVE");
+        }
+        unlinkLegacyExtractFiles(outDir);
         return true;
     }
     catch {
@@ -330,4 +603,118 @@ export async function extractSourceFiles(files, prevCache, opts = {}) {
     await parseQueuedSourceFiles(state);
     const { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty } = state;
     return { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty };
+}
+
+/**
+ * Metadata-first incremental extractor backed by SQLite `files`.
+ * Only reads & parses modified/added files (`dirtyPaths`), deferring AST deserialization of
+ * unchanged files unless downstream callers request specific `loadExtractCacheFiles` paths.
+ */
+export async function extractSourceFilesIncremental(files, outDir, opts = {}) {
+    const useCache = opts.reuse !== false;
+    const statsInfo = useCache ? readExtractCacheStats(outDir) : { source: "none", stats: new Map(), cache: emptyExtractCache() };
+    if (statsInfo.source !== "sqlite") {
+        const prevCache = statsInfo.source === "legacy" ? statsInfo.cache : emptyExtractCache();
+        const full = await extractSourceFiles(files, prevCache, opts);
+        return {
+            mode: "full",
+            ...full,
+            dirtyPaths: new Set(files.map((f) => f.rel)),
+            deletedPaths: [],
+            cleanPaths: new Set(),
+            mtimeUpdates: [],
+        };
+    }
+
+    const trustStat = (opts.trustStat ?? true) && process.env.PLEXER_REFRESH !== "hash";
+    const statsMap = statsInfo.stats;
+    const seenPaths = new Set();
+    const cleanPaths = new Set();
+    const dirtyPaths = new Set();
+    const mtimeUpdates = [];
+
+    const state = {
+        nodes: [],
+        rawEdges: [],
+        langs: new Set(),
+        errors: [],
+        entries: {},
+        toParse: [],
+        parsed: 0,
+        reused: 0,
+        mtimeDirty: false,
+    };
+
+    for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const rel = f.rel;
+        seenPaths.add(rel);
+        opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
+        const classified = classifySourceFile(rel);
+        const st = statsMap.get(rel);
+
+        if (trustStat && st && st.hash && st.size === f.size && st.mtimeMs === f.mtimeMs) {
+            state.reused++;
+            cleanPaths.add(rel);
+            state.langs.add(classified.label);
+            continue;
+        }
+
+        let source;
+        try {
+            source = readSourceFile(f.abs);
+        }
+        catch (err) {
+            const message = `${rel}: ${err instanceof Error ? err.message : String(err)}`;
+            state.errors.push(message);
+            state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
+            dirtyPaths.add(rel);
+            state.mtimeDirty = true;
+            continue;
+        }
+        if (source === null) {
+            state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+            dirtyPaths.add(rel);
+            state.mtimeDirty = true;
+            continue;
+        }
+
+        const hash = contentHash(source);
+        if (st && st.hash && hash === st.hash) {
+            mtimeUpdates.push({ rel, size: f.size, mtimeMs: f.mtimeMs, hash });
+            state.mtimeDirty = true;
+            state.reused++;
+            cleanPaths.add(rel);
+            state.langs.add(classified.label);
+            continue;
+        }
+
+        dirtyPaths.add(rel);
+        state.toParse.push({ f, rel, source, hash, ...classified });
+    }
+
+    const deletedPaths = [];
+    for (const oldPath of statsMap.keys()) {
+        if (!seenPaths.has(oldPath)) {
+            deletedPaths.push(oldPath);
+        }
+    }
+
+    await parseQueuedSourceFiles(state);
+
+    return {
+        mode: "sqlite",
+        nodes: state.nodes,
+        rawEdges: state.rawEdges,
+        langs: state.langs,
+        errors: state.errors,
+        entries: state.entries,
+        parsed: state.parsed,
+        reused: state.reused,
+        mtimeDirty: state.mtimeDirty,
+        dirtyPaths,
+        deletedPaths,
+        cleanPaths,
+        mtimeUpdates,
+    };
 }

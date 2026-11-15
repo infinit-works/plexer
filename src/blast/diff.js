@@ -7,27 +7,15 @@
  * this feeds already has git — and `--unified=0` gives exactly the post-image
  * line ranges we need, with no context lines to subtract back out.
  */
-import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
-const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+import { git } from "../util/git.js";
+export { git };
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 /** Text kept per hunk, and per file. A regenerated lockfile is one hunk of 40,000
  * lines: the ranges still matter (they seed the graph), the text does not, and it
  * would otherwise ride along in `--format json` and in every exported page. */
 const MAX_HUNK_LINES = 24;
 const MAX_FILE_LINES = 200;
-/** Run git in `root`, or return null when git fails (not a repo, unknown ref). */
-export function git(root, args) {
-    const res = spawnSync("git", ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", ...args], {
-        cwd: root,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        maxBuffer: 64 * 1024 * 1024,
-        timeout: 30_000,
-    });
-    if (res.error || res.status !== 0 || typeof res.stdout !== "string")
-        return null;
-    return res.stdout;
-}
 /** True when `ref` names something git can resolve — checked before diffing so
  * an unknown `--base` fails with a caller-facing message, not a git stack. */
 export function refExists(root, ref) {
@@ -48,25 +36,44 @@ export function refExists(root, ref) {
  * tree is clean — so the command answers something useful when run by hand,
  * and CI passes `--base` for the real PR range.
  */
+/** Resolve the merge-base commit (or direct ref) used as pre-image for `git show`. */
+export function resolveBaseRef(root, base) {
+    if (base === undefined || !base || base.startsWith("-"))
+        return null;
+    const dir = resolve(root);
+    return git(dir, ["merge-base", "--end-of-options", base, "HEAD"])?.trim() || base;
+}
+
+/** Read a file's pre-image contents at `baseRef` via `git show <base>:<path>`, returning null if absent. */
+export function readPreImageFile(root, baseRef, filePath) {
+    if (!root || !baseRef || baseRef.startsWith("-") || !filePath || filePath.startsWith("-"))
+        return null;
+    const normPath = filePath.replace(/^\/+/, "");
+    if (!normPath || normPath.split("/").includes(".."))
+        return null;
+    return git(resolve(root), ["show", "--end-of-options", `${baseRef}:${normPath}`]);
+}
+
 export function changedFiles(root, base) {
     const dir = resolve(root);
     if (base !== undefined) {
         if (!base || base.startsWith("-"))
             return null;
         const basis = `${base}...HEAD`;
+        const baseRef = resolveBaseRef(dir, base);
         const args = [basis];
         const files = diffFiles(dir, args);
-        return files === null ? null : { basis, files };
+        return files === null ? null : { basis, baseRef, files };
     }
     const working = diffFiles(dir, ["HEAD"]);
     if (working === null)
         return null;
     if (working.length > 0)
-        return { basis: "working tree vs HEAD", files: working };
+        return { basis: "working tree vs HEAD", baseRef: "HEAD", files: working };
     const last = diffFiles(dir, ["HEAD~1...HEAD"]);
     if (last === null)
-        return { basis: "working tree vs HEAD", files: [] };
-    return { basis: "HEAD~1...HEAD", files: last };
+        return { basis: "working tree vs HEAD", baseRef: "HEAD", files: [] };
+    return { basis: "HEAD~1...HEAD", baseRef: "HEAD~1", files: last };
 }
 /** Both git passes for one range: name-status (statuses, renames) then hunks. */
 function diffFiles(dir, range) {
@@ -110,75 +117,70 @@ function parseNameStatus(out) {
             const path = fields[i++];
             if (path === undefined)
                 break;
-            files.push({ path, status: "renamed", oldPath, ranges: [], hunks: [] });
+            files.push({ path, status: "renamed", oldPath, ranges: [], oldRanges: [], hunks: [] });
             continue;
         }
         const path = fields[i++];
         if (path === undefined)
             break;
         if (code.startsWith("A"))
-            files.push({ path, status: "added", ranges: [], hunks: [] });
+            files.push({ path, status: "added", ranges: [], oldRanges: [], hunks: [] });
         else if (code.startsWith("D"))
-            files.push({ path, status: "deleted", ranges: [], hunks: [] });
+            files.push({ path, status: "deleted", ranges: [], oldRanges: [], hunks: [] });
         else
-            files.push({ path, status: "modified", ranges: [], hunks: [] });
+            files.push({ path, status: "modified", ranges: [], oldRanges: [], hunks: [] });
     }
     return files;
 }
-/** Attach each hunk's post-image range — and its text — to its file. */
+function openDiffHunk(line, current) {
+    if (!current) return null;
+    const m = HUNK_RE.exec(line);
+    if (!m) return null;
+    const oldStart = Number(m[1]);
+    const oldCount = m[2] === undefined ? 1 : Number(m[2]);
+    const start = Number(m[3]);
+    // Pure deletions (+N,0) anchor at the single preceding line so functions remain attributable.
+    const count = m[4] === undefined ? 1 : Number(m[4]);
+    const range = count === 0 ? { start, end: start } : { start, end: start + count - 1 };
+    if (oldCount > 0) {
+        current.oldRanges ??= [];
+        current.oldRanges.push({ start: oldStart, end: oldStart + oldCount - 1 });
+    }
+    const hunk = { ...range, lines: [], dropped: 0 };
+    if (current.status !== "deleted") current.ranges.push(range);
+    current.hunks.push(hunk);
+    return { hunk, next: start };
+}
+
+/** Attach each hunk's post-image & pre-image ranges — and its text — to its file. */
 export function applyHunks(files, patch) {
     const byPath = new Map(files.map((f) => [f.path, f]));
+    const byOldPath = new Map(files.map((f) => [f.oldPath ?? f.path, f]));
     let current;
+    let prevMinusPath;
     let hunk;
-    /** Post-image number for the next `+` line of the open hunk. */
     let next = 0;
     let kept = 0;
     for (const line of patch.split("\n")) {
-        // Every file starts with this, and a content line cannot: a deleted one begins
-        // with `-`. Closing the open hunk here is what stops the NEXT file's `--- a/x`
-        // header being absorbed as a deleted line of the previous hunk.
         if (line.startsWith("diff --git ")) {
             current = undefined;
+            prevMinusPath = undefined;
             hunk = undefined;
-            continue;
-        }
-        if (!hunk && line.startsWith("+++ ")) {
+        } else if (!hunk && line.startsWith("--- ")) {
             const raw = line.slice(4);
-            current = raw === "/dev/null" ? undefined : byPath.get(stripPrefix(raw));
+            prevMinusPath = raw === "/dev/null" ? undefined : stripPrefix(raw);
+        } else if (!hunk && line.startsWith("+++ ")) {
+            const raw = line.slice(4);
+            current = raw === "/dev/null" ? (prevMinusPath ? byOldPath.get(prevMinusPath) : undefined) : byPath.get(stripPrefix(raw));
             hunk = undefined;
             kept = 0;
-            continue;
-        }
-        if (line.startsWith("@@")) {
-            hunk = undefined;
-            if (!current)
-                continue;
-            const m = HUNK_RE.exec(line);
-            if (!m)
-                continue;
-            const start = Number(m[1]);
-            // `+N,0` is a pure deletion: nothing survives in the post-image, and git
-            // reports the line BEFORE the gap. Recording that single line is what keeps
-            // "the body of foo() lost 10 lines" attributable to foo() at all.
-            const count = m[2] === undefined ? 1 : Number(m[2]);
-            const range = count === 0 ? { start, end: start } : { start, end: start + count - 1 };
-            hunk = { ...range, lines: [], dropped: 0 };
-            current.ranges.push(range);
-            current.hunks.push(hunk);
-            next = start;
-            continue;
-        }
-        if (!hunk)
-            continue;
-        // With `--unified=0` every line inside a hunk is an edit, so there is no
-        // context to skip. `+++`/`---` headers are already consumed above; a bare
-        // `--- a/x` for the next file arrives before its `+++`, and the `!hunk`
-        // guard on a fresh file keeps it out.
-        if (line.startsWith("+")) {
-            pushLine(hunk, { n: next, sign: "+", text: line.slice(1) }, kept++ < MAX_FILE_LINES);
-            next += 1;
-        }
-        else if (line.startsWith("-")) {
+        } else if (line.startsWith("@@")) {
+            const opened = openDiffHunk(line, current);
+            hunk = opened?.hunk;
+            if (opened) next = opened.next;
+        } else if (hunk && line.startsWith("+")) {
+            pushLine(hunk, { n: next++, sign: "+", text: line.slice(1) }, kept++ < MAX_FILE_LINES);
+        } else if (hunk && line.startsWith("-")) {
             pushLine(hunk, { n: null, sign: "-", text: line.slice(1) }, kept++ < MAX_FILE_LINES);
         }
     }

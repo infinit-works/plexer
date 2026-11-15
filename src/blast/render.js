@@ -316,86 +316,81 @@ function ownerSection(r) {
  * inside a details block without it, and `<strong>` rather than `**` because it
  * processes no emphasis inside `<summary>` either.
  */
+function appendDependentSymbolsSection(out, r, symbols, evidence) {
+    if (symbols <= 0) return;
+    out.push("<details>");
+    out.push(`<summary><strong>All ${plural(symbols, "dependent symbol")}</strong>, grouped by area</summary>`);
+    out.push("");
+    let listed = 0;
+    for (const mod of r.modules) {
+        out.push(`**${mod.label}** — ${plural(mod.symbols.length, "symbol")} in ${plural(mod.files.length, "file")}`);
+        out.push("");
+        for (const s of mod.symbols) {
+            if (listed++ >= MAX_SYMBOLS_LISTED) break;
+            const relLabel = s.typeOnly ? `${s.relation} (type-only)` : s.relation;
+            out.push(`- \`${s.path}:${s.span}\` — ${s.name} (${relLabel}, depth ${s.depth})`);
+            const [line] = evidence?.(s)?.lines ?? [];
+            if (line) out.push(`  \`\`\`${line.n}: ${line.text.trim()}\`\`\``);
+        }
+        out.push("");
+        if (listed >= MAX_SYMBOLS_LISTED) {
+            out.push(`…${plural(symbols - listed, "further symbol")} not listed.`);
+            out.push("");
+            break;
+        }
+    }
+    out.push("</details>");
+}
+
+function appendTestSignalSection(out, r) {
+    if (r.areas.length === 0) return;
+    const states = ["changed", "stale", "none", "na"]
+        .map((s) => {
+            const n = r.areas.filter((a) => a.tests === s).length;
+            return n > 0 ? `${n} ${TEST_GLYPH[s]}` : "";
+        })
+        .filter(Boolean)
+        .join(" · ");
+    out.push("<details>");
+    out.push(`<summary><strong>Test signal</strong> per changed area — ${states}</summary>`);
+    out.push("");
+    out.push("_Reached = a node under a test path has a resolved edge into the changed symbol. It undercounts anything called indirectly — through a CLI, a spawned process or a dynamic import — so read a low ratio as “look here”, never as a coverage gate._");
+    out.push("");
+    for (const a of r.areas) {
+        const bits = a.behavioural > 0 ? [`${a.reached} of ${a.behavioural} reached`] : [];
+        if (a.changedTestFiles.length > 0) bits.push(`${plural(a.changedTestFiles.length, "test file")} changed here: ${a.changedTestFiles.map((f) => `\`${f}\``).join(", ")}`);
+        else if (a.testFiles.length > 0) bits.push(`${plural(a.testFiles.length, "test file")} ${a.testFiles.length === 1 ? "reaches" : "reach"} it, none changed here`);
+        else if (a.behavioural > 0) bits.push("no test file reaches it");
+        else bits.push("no function, method or class changed here");
+        out.push(`- ${TEST_GLYPH[a.tests]} **${a.label}** — ${bits.join(" · ")}`);
+        if (a.unreached.length > 0) {
+            out.push(`  - not reached: ${a.unreached.slice(0, 8).map((n) => `\`${n}\``).join(", ")}${a.unreached.length > 8 ? `, …${a.unreached.length - 8} more` : ""}`);
+        }
+    }
+    out.push("");
+    out.push("</details>");
+}
+
+function appendTestModulesSection(out, r) {
+    if (r.testModules.length === 0) return;
+    const symbolCount = r.testModules.reduce((n, m) => n + m.symbols.length, 0);
+    const files = new Set(r.testModules.flatMap((m) => m.files));
+    out.push("<details>");
+    out.push(`<summary>${plural(files.size, "test suite")} also ${files.size === 1 ? "references" : "reference"} this code</summary>`);
+    out.push("");
+    out.push(`${plural(symbolCount, "symbol")}, kept out of the diagram and the table so they cannot crowd out the areas a reviewer has to look at.`);
+    out.push("");
+    for (const f of [...files].sort().slice(0, 20)) out.push(`- \`${f}\``);
+    if (files.size > 20) out.push(`- …${files.size - 20} more`);
+    out.push("");
+    out.push("</details>");
+}
+
 function detailSections(r, symbols, evidence) {
     const out = [];
-    if (symbols > 0) {
-        out.push("<details>");
-        out.push(`<summary><strong>All ${plural(symbols, "dependent symbol")}</strong>, grouped by area</summary>`);
-        out.push("");
-        let listed = 0;
-        for (const mod of r.modules) {
-            out.push(`**${mod.label}** — ${plural(mod.symbols.length, "symbol")} in ${plural(mod.files.length, "file")}`);
-            out.push("");
-            for (const s of mod.symbols) {
-                if (listed++ >= MAX_SYMBOLS_LISTED)
-                    break;
-                const relLabel = s.typeOnly ? `${s.relation} (type-only)` : s.relation;
-                out.push(`- \`${s.path}:${s.span}\` — ${s.name} (${relLabel}, depth ${s.depth})`);
-                // The line that reaches the diff, quoted from the same helper the hosted
-                // panel uses — a comment that disagreed with the page it links to would be
-                // worse than one that said less. Collapsed, so the comment stays short.
-                const [line] = evidence?.(s)?.lines ?? [];
-                if (line)
-                    out.push(`  \`\`\`${line.n}: ${line.text.trim()}\`\`\``);
-            }
-            out.push("");
-            if (listed >= MAX_SYMBOLS_LISTED) {
-                out.push(`…${plural(symbols - listed, "further symbol")} not listed.`);
-                out.push("");
-                break;
-            }
-        }
-        out.push("</details>");
-    }
-    if (r.areas.length > 0) {
-        const states = ["changed", "stale", "none", "na"]
-            .map((s) => {
-                const n = r.areas.filter((a) => a.tests === s).length;
-                return n > 0 ? `${n} ${TEST_GLYPH[s]}` : "";
-            })
-            .filter(Boolean)
-            .join(" · ");
-        out.push("<details>");
-        out.push(`<summary><strong>Test signal</strong> per changed area — ${states}</summary>`);
-        out.push("");
-        // The caveat leads, because the ratios below invite being read as coverage: a
-        // test that drives the CLI in a subprocess produces no edge at all, so a
-        // well-tested area can honestly report 1 of 25.
-        out.push("_Reached = a node under a test path has a resolved edge into the changed symbol. It undercounts anything called indirectly — through a CLI, a spawned process or a dynamic import — so read a low ratio as “look here”, never as a coverage gate._");
-        out.push("");
-        for (const a of r.areas) {
-            const bits = a.behavioural > 0 ? [`${a.reached} of ${a.behavioural} reached`] : [];
-            if (a.changedTestFiles.length > 0)
-                bits.push(`${plural(a.changedTestFiles.length, "test file")} changed here: ${a.changedTestFiles.map((f) => `\`${f}\``).join(", ")}`);
-            else if (a.testFiles.length > 0)
-                bits.push(`${plural(a.testFiles.length, "test file")} ${a.testFiles.length === 1 ? "reaches" : "reach"} it, none changed here`);
-            else if (a.behavioural > 0)
-                bits.push("no test file reaches it");
-            else
-                bits.push("no function, method or class changed here");
-            out.push(`- ${TEST_GLYPH[a.tests]} **${a.label}** — ${bits.join(" · ")}`);
-            if (a.unreached.length > 0) {
-                out.push(`  - not reached: ${a.unreached.slice(0, 8).map((n) => `\`${n}\``).join(", ")}${a.unreached.length > 8 ? `, …${a.unreached.length - 8} more` : ""}`);
-            }
-        }
-        out.push("");
-        out.push("</details>");
-    }
-    if (r.testModules.length > 0) {
-        const symbolCount = r.testModules.reduce((n, m) => n + m.symbols.length, 0);
-        const files = new Set(r.testModules.flatMap((m) => m.files));
-        out.push("<details>");
-        out.push(`<summary>${plural(files.size, "test suite")} also ${files.size === 1 ? "references" : "reference"} this code</summary>`);
-        out.push("");
-        out.push(`${plural(symbolCount, "symbol")}, kept out of the diagram and the table so they cannot crowd out the areas a reviewer has to look at.`);
-        out.push("");
-        for (const f of [...files].sort().slice(0, 20))
-            out.push(`- \`${f}\``);
-        if (files.size > 20)
-            out.push(`- …${files.size - 20} more`);
-        out.push("");
-        out.push("</details>");
-    }
+    appendDependentSymbolsSection(out, r, symbols, evidence);
+    appendTestSignalSection(out, r);
+    appendTestModulesSection(out, r);
     return out;
 }
 /**
@@ -416,14 +411,7 @@ function caveatLines(r) {
     return out;
 }
 /** Terminal report: same content, no markdown scaffolding. */
-export function textReport(r) {
-    const symbols = r.modules.reduce((n, m) => n + m.symbols.length, 0);
-    const lines = [
-        `blast radius — ${r.basis} (${depthLabel(r.depth)})`,
-        `  changed: ${plural(r.changed.length, "file")} in ${plural(r.areas.length, "area")}, ${plural(r.seeds.length, "seed symbol")}`,
-        `  impacted: ${plural(symbols, "symbol")} in ${plural(r.modules.length, "area")}`,
-        "",
-    ];
+function appendBlastModules(lines, r, symbols) {
     for (const a of r.areas) {
         lines.push(`${TEST_GLYPH[a.tests]} ${a.label} — ${plural(a.files.length, "changed file")}, ${a.reached}/${a.behavioural} reached by a test`);
     }
@@ -446,6 +434,9 @@ export function textReport(r) {
         const files = new Set(r.testModules.flatMap((m) => m.files));
         lines.push(`${plural(files.size, "test suite")} also ${files.size === 1 ? "references" : "reference"} this code (not listed)`, "");
     }
+}
+
+function appendBlastReviewersAndCoChanges(lines, r) {
     if (r.reviewers !== undefined && r.reviewers.length > 0) {
         const now = Date.now();
         lines.push("who to tag");
@@ -466,6 +457,9 @@ export function textReport(r) {
         }
         lines.push("");
     }
+}
+
+function appendBlastLayersAndHotspots(lines, r) {
     if (Array.isArray(r.layerViolations) && r.layerViolations.length > 0) {
         lines.push(`Layer boundary violations (${plural(r.layerViolations.length, "violation")})`);
         for (const v of r.layerViolations) {
@@ -482,5 +476,18 @@ export function textReport(r) {
         }
         lines.push("");
     }
+}
+
+export function textReport(r) {
+    const symbols = r.modules.reduce((n, m) => n + m.symbols.length, 0);
+    const lines = [
+        `blast radius — ${r.basis} (${depthLabel(r.depth)})`,
+        `  changed: ${plural(r.changed.length, "file")} in ${plural(r.areas.length, "area")}, ${plural(r.seeds.length, "seed symbol")}`,
+        `  impacted: ${plural(symbols, "symbol")} in ${plural(r.modules.length, "area")}`,
+        "",
+    ];
+    appendBlastModules(lines, r, symbols);
+    appendBlastReviewersAndCoChanges(lines, r);
+    appendBlastLayersAndHotspots(lines, r);
     return lines.join("\n").replace(/\n+$/, "\n");
 }

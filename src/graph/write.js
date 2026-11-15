@@ -35,7 +35,7 @@ function stripBodyText(node) {
     const { body_text: _body_text, ...rest } = node;
     return rest;
 }
-function edgeOrder(a, b) {
+export function edgeOrder(a, b) {
     return (a.source.localeCompare(b.source) ||
         a.relation.localeCompare(b.relation) ||
         a.target.localeCompare(b.target));

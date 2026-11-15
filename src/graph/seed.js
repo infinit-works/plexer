@@ -36,9 +36,9 @@
  */
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { ASK_INDEX_FILE } from "../ask/index-file.js";
+import { fileURLToPath } from "node:url";
 import { CACHE_DIR, GRAPH_DIR, contextDirFor, envTruthy, wiringPath } from "../context/node-file.js";
-import { EXTRACT_CACHE_PREFIX } from "./extract-cache.js";
+import { DatabaseSync, SQLITE_FILE, closeSqliteStores } from "../storage/sqlite-store.js";
 import { FINGERPRINT_PREFIX } from "./fingerprint.js";
 /** The one line a linked worktree's `.git` file carries. */
 const GITDIR_KEY = "gitdir:";
@@ -100,6 +100,194 @@ export function mainWorktreeRoot(root) {
         return notWorktree;
     }
 }
+
+function isRemoteGitUrl(rawUrl) {
+    return /^(?:https?|ssh|git):\/\//i.test(rawUrl) || /^[^/\\]+@[^:]+:/i.test(rawUrl);
+}
+
+function resolveCandidateCheckout(rawPath, baseDir, cloneRoot) {
+    if (!rawPath || typeof rawPath !== "string")
+        return null;
+    const trimmed = rawPath.trim();
+    if (!trimmed || isRemoteGitUrl(trimmed))
+        return null;
+    let candidate = trimmed;
+    if (/^file:\/\//i.test(candidate)) {
+        try {
+            candidate = fileURLToPath(candidate);
+        }
+        catch {
+            return null;
+        }
+    }
+    const resolved = isAbsolute(candidate) ? resolve(candidate) : resolve(baseDir, candidate);
+    if (!existsSync(resolved))
+        return null;
+    const checkout = basename(resolved) === ".git" ? dirname(resolved) : resolved;
+    const absCheckout = resolve(checkout);
+    if (absCheckout === resolve(cloneRoot))
+        return null;
+    try {
+        if (realpathSync(absCheckout) === realpathSync(cloneRoot))
+            return null;
+    }
+    catch {
+        return null;
+    }
+    if (!existsSync(join(absCheckout, ".git")))
+        return null;
+    if (!existsSync(wiringPath(contextDirFor(absCheckout))))
+        return null;
+    return absCheckout;
+}
+
+function stripGitConfigComment(rawLine) {
+    let inQuotes = false;
+    let out = "";
+    for (let i = 0; i < rawLine.length; i++) {
+        const ch = rawLine[i];
+        if (ch === "\\" && inQuotes && i + 1 < rawLine.length) {
+            out += ch + rawLine[i + 1];
+            i++;
+            continue;
+        }
+        if (ch === '"') {
+            inQuotes = !inQuotes;
+            out += ch;
+            continue;
+        }
+        if (!inQuotes && (ch === "#" || ch === ";")) {
+            break;
+        }
+        out += ch;
+    }
+    return out.trim();
+}
+
+function unquoteGitConfigValue(val) {
+    if (val.length >= 2 && val.startsWith('"') && val.endsWith('"')) {
+        return val.slice(1, -1).replace(/\\(.)/g, "$1");
+    }
+    return val;
+}
+
+function parseOriginUrlFromGitConfig(configText) {
+    let inOrigin = false;
+    for (const rawLine of configText.split(/\r?\n/)) {
+        const line = stripGitConfigComment(rawLine);
+        if (!line)
+            continue;
+        if (line.startsWith("[")) {
+            inOrigin = /^\[remote\s+"origin"\]$/i.test(line);
+            continue;
+        }
+        if (inOrigin) {
+            const eq = line.indexOf("=");
+            if (eq !== -1 && line.slice(0, eq).trim().toLowerCase() === "url") {
+                return unquoteGitConfigValue(line.slice(eq + 1).trim());
+            }
+        }
+    }
+    return null;
+}
+
+function resolveGitDirs(root) {
+    const dot = join(root, ".git");
+    if (lstatSync(dot).isSymbolicLink())
+        return null;
+    if (statSync(dot).isDirectory()) {
+        return { gitdir: dot, commonDir: dot };
+    }
+    const line = readFileSync(dot, "utf8").split(/\r?\n/).find((l) => l.startsWith(GITDIR_KEY));
+    if (!line)
+        return null;
+    const target = line.slice(GITDIR_KEY.length).trim();
+    if (!target)
+        return null;
+    const gitdir = isAbsolute(target) ? resolve(target) : resolve(root, target);
+    let commonDir = gitdir;
+    const commondirFile = join(gitdir, "commondir");
+    if (existsSync(commondirFile)) {
+        const rel = readFileSync(commondirFile, "utf8").trim();
+        if (rel) {
+            commonDir = isAbsolute(rel) ? resolve(rel) : resolve(gitdir, rel);
+        }
+    }
+    return { gitdir, commonDir };
+}
+
+function checkoutFromObjectsDir(objDir, cloneRoot, root) {
+    const gitParent = dirname(objDir);
+    if (basename(objDir) !== "objects")
+        return null;
+    if (basename(gitParent) === ".git") {
+        return resolveCandidateCheckout(dirname(gitParent), cloneRoot, root);
+    }
+    if (basename(dirname(gitParent)) === "worktrees" || existsSync(join(gitParent, "commondir"))) {
+        const commondirFile = join(gitParent, "commondir");
+        if (existsSync(commondirFile)) {
+            const rel = readFileSync(commondirFile, "utf8").trim();
+            const common = rel ? (isAbsolute(rel) ? resolve(rel) : resolve(gitParent, rel)) : gitParent;
+            if (basename(common) === ".git") {
+                return resolveCandidateCheckout(dirname(common), cloneRoot, root);
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * The local parent checkout `root` was cloned from (e.g. `workspace: "branch"`
+ * subagent/swarm clones), or null when `root` is a primary checkout or remote clone.
+ * Filesystem-only: reads `.git` (directory or linked-worktree pointer), `objects/info/alternates`,
+ * and `[remote "origin"].url`.
+ */
+export function localCloneOriginRoot(root) {
+    try {
+        const dirs = resolveGitDirs(root);
+        if (!dirs)
+            return null;
+        const altCandidates = [join(dirs.gitdir, "objects", "info", "alternates")];
+        const commonAlt = join(dirs.commonDir, "objects", "info", "alternates");
+        if (commonAlt !== altCandidates[0])
+            altCandidates.push(commonAlt);
+
+        for (const altPath of altCandidates) {
+            if (!existsSync(altPath))
+                continue;
+            const objectsBase = dirname(dirname(altPath));
+            const altLines = readFileSync(altPath, "utf8").split(/\r?\n/);
+            for (const raw of altLines) {
+                const line = raw.trim();
+                if (!line || line.startsWith("#"))
+                    continue;
+                const objDir = isAbsolute(line) ? resolve(line) : resolve(objectsBase, line);
+                const hit = checkoutFromObjectsDir(objDir, root, root);
+                if (hit)
+                    return hit;
+            }
+        }
+        const cfgCandidates = [join(dirs.commonDir, "config"), join(dirs.gitdir, "config")];
+        for (const cfgPath of cfgCandidates) {
+            if (!existsSync(cfgPath))
+                continue;
+            const originUrl = parseOriginUrlFromGitConfig(readFileSync(cfgPath, "utf8"));
+            if (originUrl) {
+                const hit = resolveCandidateCheckout(originUrl, dirname(join(root, ".git")), root);
+                if (hit)
+                    return hit;
+            }
+        }
+        return null;
+    }
+    catch {
+        return null;
+    }
+}
+
+function seedSourceRoot(root) {
+    return mainWorktreeRoot(root) ?? localCloneOriginRoot(root);
+}
 const NOT_SEEDED = { seeded: false };
 /**
  * An allowlist, not a skip list: is this repo-relative path (posix) one of the few
@@ -123,16 +311,88 @@ const NOT_SEEDED = { seeded: false };
  * `stats.json` (this checkout earns its own savings and dirty flag).
  */
 function seedable(rel) {
-    // The dirs themselves, or cpSync would never look inside them.
+    // The dirs themselves, or copyTree would never look inside them.
     if (rel === "" || rel === GRAPH_DIR || rel === CACHE_DIR)
         return true;
     if (!rel.startsWith(`${CACHE_DIR}/`))
         return false; // incl. the graph: `installGraph` places it
     const name = rel.slice(CACHE_DIR.length + 1);
-    return (name === ASK_INDEX_FILE ||
-        name.startsWith(`${EXTRACT_CACHE_PREFIX}.`) ||
-        name.startsWith(`${FINGERPRINT_PREFIX}.`));
+    return (
+        name === "config.json" ||
+        name === "git-history.json" ||
+        name === `${FINGERPRINT_PREFIX}.json` ||
+        name.startsWith(`${FINGERPRINT_PREFIX}.`) ||
+        name === SQLITE_FILE
+    );
 }
+
+/**
+ * Copy `<srcDir>/.cache/index.sqlite` into `<outDir>/.cache/index.sqlite` without ever
+ * mutating the parent directory. When parent has uncheckpointed WAL frames, snapshot via
+ * read-only `VACUUM INTO` so destination starts cleanly self-contained without `-wal`.
+ */
+function copySqliteFileSafe(srcSqlite, destSqlite) {
+    const tmp = `${destSqlite}.seed.${process.pid}`;
+    const walPath = `${srcSqlite}-wal`;
+    let hasWal = false;
+    try {
+        hasWal = existsSync(walPath) && statSync(walPath).size > 0;
+    }
+    catch {
+        hasWal = false;
+    }
+    try {
+        rmSync(tmp, { force: true });
+        if (hasWal) {
+            let copied = false;
+            let srcDb = null;
+            try {
+                srcDb = new DatabaseSync(srcSqlite, { readOnly: true });
+                srcDb.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+                copied = true;
+            }
+            catch {
+                rmSync(tmp, { force: true });
+            }
+            finally {
+                try {
+                    srcDb?.close();
+                }
+                catch { /* ignore close */ }
+            }
+            if (!copied) {
+                copyFileSync(srcSqlite, tmp);
+                if (existsSync(walPath))
+                    copyFileSync(walPath, `${tmp}-wal`);
+                const shmPath = `${srcSqlite}-shm`;
+                if (existsSync(shmPath))
+                    copyFileSync(shmPath, `${tmp}-shm`);
+                let tmpDb = null;
+                try {
+                    tmpDb = new DatabaseSync(tmp);
+                    tmpDb.exec("PRAGMA journal_mode = WAL; PRAGMA wal_checkpoint(TRUNCATE);");
+                }
+                finally {
+                    try {
+                        tmpDb?.close();
+                    }
+                    catch { /* ignore close */ }
+                    rmSync(`${tmp}-wal`, { force: true });
+                    rmSync(`${tmp}-shm`, { force: true });
+                }
+            }
+        }
+        else {
+            copyFileSync(srcSqlite, tmp);
+        }
+        renameSync(tmp, destSqlite);
+    }
+    catch (err) {
+        rmSync(tmp, { force: true });
+        throw err;
+    }
+}
+
 /**
  * Copy `srcDir` into `outDir`, keeping only what {@link seedable} allows.
  *
@@ -151,6 +411,7 @@ function seedable(rel) {
  * symlink, and nothing in the allowlist is one.
  */
 function copyTree(srcDir, outDir) {
+    closeSqliteStores(outDir);
     const copyRelDir = (rel) => {
         const from = rel ? join(srcDir, rel) : srcDir;
         mkdirSync(rel ? join(outDir, rel) : outDir, { recursive: true });
@@ -158,10 +419,19 @@ function copyTree(srcDir, outDir) {
             const childRel = rel ? `${rel}/${entry.name}` : entry.name;
             if (!seedable(childRel))
                 continue;
-            if (entry.isDirectory())
+            if (entry.isDirectory()) {
                 copyRelDir(childRel);
-            else if (entry.isFile())
-                copyFileSync(join(from, entry.name), join(outDir, childRel));
+            }
+            else if (entry.isFile()) {
+                const srcFile = join(from, entry.name);
+                const destFile = join(outDir, childRel);
+                if (childRel === `${CACHE_DIR}/${SQLITE_FILE}`) {
+                    copySqliteFileSafe(srcFile, destFile);
+                }
+                else {
+                    copyFileSync(srcFile, destFile);
+                }
+            }
         }
     };
     copyRelDir("");
@@ -189,7 +459,7 @@ function installGraph(srcGraph, destGraph) {
         throw err;
     }
 }
-/** True when `root` is a linked git worktree with no local graph whose main checkout has one. */
+/** True when `root` is a linked git worktree or local clone with no local graph whose parent checkout has one. */
 export function canSeedGraph(root, opts = {}) {
     if (opts.contextDir || envTruthy("PLEXER_NO_SEED"))
         return false;
@@ -198,7 +468,7 @@ export function canSeedGraph(root, opts = {}) {
         const outDir = contextDirFor(dir);
         if (existsSync(wiringPath(outDir)))
             return false;
-        const main = mainWorktreeRoot(dir);
+        const main = seedSourceRoot(dir);
         if (!main)
             return false;
         return existsSync(wiringPath(contextDirFor(main)));
@@ -209,12 +479,8 @@ export function canSeedGraph(root, opts = {}) {
 }
 /**
  * Copy the parent checkout's graph into `root`'s own `plexer/`, if all of this holds:
- * `root` is a linked worktree, it has no graph yet, the parent has one, and no `--dir`
- * override is in play (a custom output dir can't be mapped to a sibling checkout —
- * the same conservatism `ensureGitignored` applies).
- *
- * Best-effort by contract: the caller's fallback is the behaviour that existed before
- * this function did, so every failure returns `{ seeded: false }` rather than raising.
+ * `root` is a linked worktree or local clone, it has no graph yet, the parent has one,
+ * and no `--dir` override is in play.
  */
 export function seedGraph(root, opts = {}) {
     if (!canSeedGraph(root, opts))
@@ -222,7 +488,7 @@ export function seedGraph(root, opts = {}) {
     try {
         const dir = resolve(root);
         const outDir = contextDirFor(dir);
-        const main = mainWorktreeRoot(dir);
+        const main = seedSourceRoot(dir);
         if (!main)
             return NOT_SEEDED;
         const srcDir = contextDirFor(main);

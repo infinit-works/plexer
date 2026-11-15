@@ -3,11 +3,35 @@
  */
 
 /** TS/JS: a definition is exported if an enclosing statement is `export_statement`. */
-export function tsExported(node) {
+function tsExported(node) {
+    let cur = node;
     let p = node?.parent;
     while (p) {
         if (p.type === "export_statement")
             return true;
+        if (p.type === "assignment_expression" && p.childForFieldName("right")?.id === cur?.id) {
+            const left = p.childForFieldName("left");
+            if (left?.type === "member_expression") {
+                const obj = left.childForFieldName("object")?.text;
+                const lt = left.text ?? "";
+                if (obj === "exports" || lt === "module.exports" || lt.startsWith("module.exports."))
+                    return true;
+            }
+        }
+        if (p.type === "statement_block" && p.parent?.type !== "internal_module" && p.parent?.type !== "module")
+            return false;
+        cur = p;
+        p = p.parent;
+    }
+    return false;
+}
+
+/** TS/JS: true when an enclosing `export_statement` carries the `default` modifier. */
+export function tsDefaultExported(node) {
+    let p = node?.parent;
+    while (p) {
+        if (p.type === "export_statement")
+            return p.children.some((c) => c.type === "default");
         if (p.type === "statement_block" && p.parent?.type !== "internal_module" && p.parent?.type !== "module")
             return false;
         p = p.parent;
@@ -16,14 +40,14 @@ export function tsExported(node) {
 }
 
 /** Go: exported iff the unqualified identifier starts with an uppercase letter. */
-export function goExported(name) {
+function goExported(name) {
     const own = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : name;
     const first = own[0] ?? "";
     return first !== first.toLowerCase() && first === first.toUpperCase();
 }
 
 /** Roxygen `#' @export` check: true if tagged, false if roxygen block lacks `@export`, null if undocumented. */
-export function rRoxygenExported(node) {
+function rRoxygenExported(node) {
     let sib = node?.previousNamedSibling;
     let sawRoxygen = false;
     let exported = false;
@@ -40,7 +64,7 @@ export function rRoxygenExported(node) {
 }
 
 /** R: R6 section access first, then roxygen `@export`, then leading-dot convention. */
-export function rExported(name, ctx, node) {
+function rExported(name, ctx, node) {
     if (ctx && ctx.rR6Access !== undefined && ctx.rR6Access !== null)
         return ctx.rR6Access !== "private";
     const roxygen = rRoxygenExported(node);
@@ -50,7 +74,7 @@ export function rExported(name, ctx, node) {
 }
 
 /** Java: `public` or `protected` in `modifiers`. */
-export function javaExported(node) {
+function javaExported(node) {
     const mods = node?.namedChildren?.find((c) => c.type === "modifiers");
     if (!mods)
         return false;
@@ -58,7 +82,7 @@ export function javaExported(node) {
 }
 
 /** Kotlin: public by default unless `visibility_modifier` is non-`public`. */
-export function kotlinExported(node) {
+function kotlinExported(node) {
     const mods = node?.namedChildren?.find((c) => c.type === "modifiers");
     if (!mods)
         return true;
@@ -67,14 +91,14 @@ export function kotlinExported(node) {
 }
 
 /** Swift: internal-by-default is module-visible; only `private` and `fileprivate` hide symbols. */
-export function swiftExported(node) {
+function swiftExported(node) {
     const mods = node?.namedChildren?.find((c) => c.type === "modifiers");
     const vis = mods?.namedChildren?.find((c) => c.type === "visibility_modifier");
     return !vis || (vis.text !== "private" && vis.text !== "fileprivate");
 }
 
 /** PHP: visible unless explicitly `private` or `protected`. */
-export function phpExported(node) {
+function phpExported(node) {
     const vis = node?.namedChildren?.find((c) => c.type === "visibility_modifier");
     return vis ? vis.text === "public" : true;
 }

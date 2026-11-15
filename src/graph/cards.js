@@ -14,11 +14,11 @@ import { CACHE_DIR, GRAPH_DIR } from "../context/node-file.js";
 import { isSensitiveOrDotPath, spanStart } from "../util/span.js";
 import { buildRepoMap, formatRepoMap } from "./map.js";
 const INDEX_FILE = "INDEX.md";
-/** The card path for a source path: mirror the tree, swap the extension for .md. */
-function cardPathFor(outDir, sourcePath) {
+/** The card path for a source path: mirror the tree, swap the extension for .md (keep extension on sibling collision). */
+function cardPathFor(outDir, sourcePath, keepExt = false) {
     if (typeof sourcePath !== "string" || !sourcePath || isSensitiveOrDotPath(sourcePath))
         return null;
-    const md = sourcePath.replace(/\.[^./]+$/, "") + ".md";
+    const md = (keepExt ? sourcePath : sourcePath.replace(/\.[^./]+$/, "")) + ".md";
     const absOut = resolve(outDir);
     const target = resolve(absOut, md);
     const rel = relPosix(absOut, target);
@@ -104,15 +104,21 @@ export function writeCards(graph, outDir) {
         throw new Error(`refusing to write cards into symlinked directory: ${outDir}`);
     }
     const byPath = new Map();
+    const stemCounts = new Map();
     for (const n of graph.nodes) {
         if (!n || typeof n.path !== "string" || !n.path)
             continue;
+        if (!byPath.has(n.path)) {
+            const stem = n.path.replace(/\.[^./]+$/, "");
+            stemCounts.set(stem, (stemCounts.get(stem) ?? 0) + 1);
+        }
         pushMap(byPath, n.path, n);
     }
     const written = new Set();
     const files = [];
     for (const [sourcePath, group] of byPath) {
-        const cardPath = cardPathFor(outDir, sourcePath);
+        const stem = sourcePath.replace(/\.[^./]+$/, "");
+        const cardPath = cardPathFor(outDir, sourcePath, (stemCounts.get(stem) ?? 0) > 1);
         if (!cardPath)
             continue;
         const fileNode = group.find((n) => n.kind === "file");

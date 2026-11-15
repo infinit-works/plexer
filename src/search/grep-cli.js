@@ -40,7 +40,7 @@ function formatGroup(g, allowContext = true) {
     return lines.join("\n");
 }
 /** `"<pattern>" — N hits in M symbols across K files (searched T indexed files)` */
-export function formatGrepHeader(result) {
+function formatGrepHeader(result) {
     const filesHit = new Set(result.groups.map((g) => g.path)).size;
     return `"${result.pattern}" — ${result.totalHits} hits in ${result.groups.length} symbols across ${filesHit} files (searched ${result.filesSearched} indexed files)`;
 }
@@ -58,7 +58,9 @@ function truncationNote(result) {
 }
 /** Full human report: header, blank line, then one block per group (header +
  * indented hit lines), each block separated by a blank line. */
-export function formatGrepResult(result) {
+export function formatGrepResult(result, opts = {}) {
+    const maxBytes = opts.maxBytes ?? 4800;
+    const contextCapBytes = opts.contextCapBytes ?? Math.min(3600, Math.floor(maxBytes * 0.75));
     const note = truncationNote(result);
     const head = note ? `${formatGrepHeader(result)}\n${note}` : formatGrepHeader(result);
     const hasContext = result.groups.some((g) => g.contextBlocks && g.contextBlocks.length > 0);
@@ -68,11 +70,14 @@ export function formatGrepResult(result) {
     let totalBytes = Buffer.byteLength(head, "utf8");
     for (let idx = 0; idx < shown.length; idx++) {
         const g = shown[idx];
-        const allowContext = idx < 10 && totalBytes < 3600;
+        const allowContext = idx < 10 && totalBytes < contextCapBytes;
         const formatted = formatGroup(g, allowContext) + "\n";
-        totalBytes += Buffer.byteLength(formatted, "utf8");
+        const fb = Buffer.byteLength(formatted, "utf8");
+        if (idx > 0 && totalBytes + fb > maxBytes)
+            break;
+        totalBytes += fb;
         blocks.push(formatted);
-        if (totalBytes >= 4800)
+        if (totalBytes >= maxBytes)
             break;
     }
     const renderedGroups = blocks.length - 2;
@@ -142,15 +147,21 @@ export function runGrepCommand(patternInput, dir, opts) {
         console.log(JSON.stringify(results.length === 1 ? results[0] : results, null, 2));
         return;
     }
-    const outBlocks = [];
-    for (const result of results) {
-        if (result.totalHits === 0) {
-            console.error(zeroHitNote(result));
-            continue;
+    const hitResults = results.filter((r) => r.totalHits > 0);
+    const missResults = results.filter((r) => r.totalHits === 0);
+    if (missResults.length > 0) {
+        if (patterns.length >= 2 && hitResults.length > 0) {
+            const labels = missResults.map((r) => `"${r.pattern}"`).join(", ");
+            console.error(`no hits in ${missResults[0].filesSearched} indexed files for: ${labels}`);
         }
-        outBlocks.push(formatGrepResult(result).trimEnd());
+        else {
+            for (const r of missResults)
+                console.error(zeroHitNote(r));
+        }
     }
-    if (outBlocks.length > 0) {
+    if (hitResults.length > 0) {
+        const perPatternBudget = hitResults.length >= 2 ? Math.max(950, Math.floor(8600 / hitResults.length)) : 4800;
+        const outBlocks = hitResults.map((r) => formatGrepResult(r, { maxBytes: perPatternBudget }).trimEnd());
         process.stdout.write(`${outBlocks.join("\n\n")}\n`);
     }
 }

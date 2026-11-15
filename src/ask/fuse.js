@@ -217,95 +217,79 @@ export function combineComparableScopes(docs) {
  * per-scope normalization had made vacuous. `federateAsk` still normalizes per
  * child repo, so it still gates on strength; see `src/graph/workspace.js`.
  */
-export function rankScopesAndFuse(scopes, ops, graphWeight, rescueFloor) {
-    // Pass 1: lexical scoring only, per scope.
-    const lexByScope = new Map();
+function collectScopeLexMeta(scopes, ops) {
+    const meta = new Map();
     for (const scope of scopes) {
         const lex = ops.lex(scope);
         if (lex.size === 0)
             continue;
-        lexByScope.set(scope, lex);
-    }
-    const alsoMatched = [];
-    const candidatesWithComponents = [];
-    // Per-scope raw best, plus the best raw score anywhere in the repo. That
-    // repo-wide maximum is the shared denominator every scope normalizes by.
-    const meta = new Map();
-    let globalMaxLex = 0;
-    for (const [scope, lex] of lexByScope) {
-        let maxLex = 0, bestId = "";
-        for (const [id, v] of lex)
+        let maxLex = 0;
+        let bestId = "";
+        for (const [id, v] of lex) {
             if (v > maxLex || (v === maxLex && id < bestId)) {
                 maxLex = v;
                 bestId = id;
             }
-        if (maxLex <= 0)
-            continue;
-        meta.set(scope, { lex, maxLex, bestId });
+        }
+        if (maxLex > 0)
+            meta.set(scope, { lex, maxLex, bestId });
+    }
+    return meta;
+}
+
+function suppressBodyOnlyScopes(meta, ops, alsoMatched) {
+    if (!ops.hasIdentifierMatch)
+        return;
+    const named = new Map();
+    for (const scope of meta.keys())
+        named.set(scope, ops.hasIdentifierMatch(scope));
+    if (![...named.values()].some(Boolean))
+        return;
+    for (const [scope, ok] of named) {
+        if (!ok) {
+            alsoMatched.push({ scope, bestId: meta.get(scope).bestId });
+            meta.delete(scope);
+        }
+    }
+}
+
+function appendScopeBlendedCandidates(scope, entry, globalMaxLex, ops, graphWeight, rescueFloor, out) {
+    const { lex, maxLex } = entry;
+    const pr = ops.walk(scope, lex);
+    const scopeScale = globalMaxLex > 0 ? maxLex / globalMaxLex : 0;
+    const candidates = new Set(lex.keys());
+    for (const [id, p] of pr) {
+        if (p * scopeScale >= rescueFloor)
+            candidates.add(id);
+    }
+    for (const id of candidates) {
+        const lexN = globalMaxLex > 0 ? (lex.get(id) ?? 0) / globalMaxLex : 0;
+        const graph = (pr.get(id) ?? 0) * scopeScale;
+        const rankFactor = ops.rankFactor?.(scope, id) ?? 1;
+        const blended = (lexN + graphWeight * graph) * rankFactor;
+        if (blended > 0)
+            out.push({ id, scope, score: blended, lexical: lexN, graph, rankFactor });
+    }
+}
+
+export function rankScopesAndFuse(scopes, ops, graphWeight, rescueFloor) {
+    const meta = collectScopeLexMeta(scopes, ops);
+    const alsoMatched = [];
+    // Body-only suppression: exclude scopes with zero identifier matches when another scope has one.
+    suppressBodyOnlyScopes(meta, ops, alsoMatched);
+    // Normalize using only scopes that survive suppression.
+    let globalMaxLex = 0;
+    for (const { maxLex } of meta.values()) {
         if (maxLex > globalMaxLex)
             globalMaxLex = maxLex;
     }
-    // Body-only suppression. With a shared denominator a weak scope simply
-    // scores low, so participation is decided on score in
-    // `combineComparableScopes` — no scope is excluded on a share threshold any
-    // more. The single exception is a scope in which NO doc matched a query term
-    // in a name or path while some other scope did: that is the comment-banner
-    // collision (see `hasIdentifierMatch` above), and score cannot separate it
-    // from a real match. Only applied when a genuine identifier match exists
-    // somewhere, so a query that legitimately matches only prose still returns
-    // something.
-    const bodyOnly = new Set();
-    if (ops.hasIdentifierMatch) {
-        const named = new Map();
-        for (const scope of meta.keys())
-            named.set(scope, ops.hasIdentifierMatch(scope));
-        if ([...named.values()].some(Boolean)) {
-            for (const [scope, ok] of named)
-                if (!ok)
-                    bodyOnly.add(scope);
-        }
-    }
-    for (const scope of bodyOnly) {
-        alsoMatched.push({ scope, bestId: meta.get(scope).bestId });
-        meta.delete(scope);
-    }
-    // The denominator must come from the scopes that actually rank, or a
-    // suppressed scope could still set the scale for everyone else.
-    globalMaxLex = 0;
-    for (const { maxLex } of meta.values())
-        if (maxLex > globalMaxLex)
-            globalMaxLex = maxLex;
-    for (const [scope, { lex, maxLex }] of meta) {
-        const pr = ops.walk(scope, lex);
-        const scopeScale = globalMaxLex > 0 ? maxLex / globalMaxLex : 0;
-        const candidates = new Set(lex.keys());
-        for (const [id, p] of pr)
-            if (p * scopeScale >= rescueFloor)
-                candidates.add(id);
-        for (const id of candidates) {
-            const lexN = globalMaxLex > 0 ? (lex.get(id) ?? 0) / globalMaxLex : 0;
-            const graph = (pr.get(id) ?? 0) * scopeScale;
-            const rankFactor = ops.rankFactor?.(scope, id) ?? 1;
-            const blended = (lexN + graphWeight * graph) * rankFactor;
-            if (blended > 0) {
-                candidatesWithComponents.push({
-                    id,
-                    scope,
-                    score: blended,
-                    lexical: lexN,
-                    graph,
-                    rankFactor,
-                });
-            }
-        }
+    const candidatesWithComponents = [];
+    for (const [scope, entry] of meta) {
+        appendScopeBlendedCandidates(scope, entry, globalMaxLex, ops, graphWeight, rescueFloor, candidatesWithComponents);
     }
     const scoped = ops.collapseCandidates
         ? [...ops.collapseCandidates(candidatesWithComponents)]
-        : candidatesWithComponents.map((candidate) => ({
-            id: candidate.id,
-            scope: candidate.scope,
-            score: candidate.score,
-        }));
+        : candidatesWithComponents.map((c) => ({ id: c.id, scope: c.scope, score: c.score }));
     const combined = combineComparableScopes(scoped);
     return {
         ranked: combined.ranked,

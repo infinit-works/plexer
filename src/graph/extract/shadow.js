@@ -24,7 +24,7 @@ export function sameSyntaxNode(a, b) {
 }
 
 /** True when `node` starts a nested callable/class scope with its own bindings. */
-export function isFunctionBoundary(node) {
+function isFunctionBoundary(node) {
     return Boolean(node && FUNCTION_BOUNDARY_TYPES.has(node.type));
 }
 

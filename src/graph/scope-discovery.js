@@ -62,10 +62,43 @@ function parsePnpmPackagesList(text) {
     }
     return globs.length ? globs : null;
 }
-/** Rule 2: resolve workspace-config-as-intent globs. Returns null when the repo has
- * no workspace config (pnpm-workspace.yaml wins over `package.json#workspaces` when
- * both exist). */
-function readWorkspaceGlobs(root) {
+function parseCargoTomlArray(sectionBody, key) {
+    const m = sectionBody.match(new RegExp(`^\\s*${key}\\s*=\\s*\\[([\\s\\S]*?)\\]`, "m"));
+    if (!m)
+        return [];
+    const out = [];
+    for (const q of m[1].matchAll(/["']([^"']+)["']/g)) {
+        if (q[1])
+            out.push(q[1]);
+    }
+    return out;
+}
+
+/** Parse `[workspace].members` and `[workspace].exclude` from `Cargo.toml`. */
+function parseCargoWorkspaceGlobs(text) {
+    const lines = text.split(/\r?\n/);
+    const wsLines = [];
+    let inWorkspace = false;
+    for (const raw of lines) {
+        const clean = raw.replace(/#.*$/, "");
+        const hdr = clean.match(/^\s*\[([^\]]+)\]\s*$/);
+        if (hdr) {
+            inWorkspace = hdr[1].trim() === "workspace";
+            continue;
+        }
+        if (inWorkspace)
+            wsLines.push(clean);
+    }
+    if (wsLines.length === 0)
+        return null;
+    const body = wsLines.join("\n");
+    const members = parseCargoTomlArray(body, "members");
+    const excludes = parseCargoTomlArray(body, "exclude").map((e) => (e.startsWith("!") ? e : `!${e}`));
+    const globs = [...members, ...excludes];
+    return globs.length > 0 ? globs : null;
+}
+
+function readJsWorkspaceGlobs(root) {
     const pnpmPath = join(root, "pnpm-workspace.yaml");
     if (existsSync(pnpmPath)) {
         try {
@@ -85,8 +118,21 @@ function readWorkspaceGlobs(root) {
         return ws.packages;
     return null;
 }
+
+function readCargoWorkspaceGlobs(root) {
+    const cargoPath = join(root, "Cargo.toml");
+    if (!existsSync(cargoPath))
+        return null;
+    try {
+        return parseCargoWorkspaceGlobs(readFileSync(cargoPath, "utf8"));
+    }
+    catch {
+        return null;
+    }
+}
+
 /** Resolve one workspace glob against visible directories only. Supports
- * `dir/*` (immediate subdirs), `dir/**` (any nested depth), and literal dirs. */
+ * `dir/*`, `dir/**`, literal dirs, and wildcard patterns (e.g. `crates/foo-*`). */
 function resolveGlob(dirs, pattern) {
     const norm = stripTrailingSlashes(toPosixPath(pattern));
     let base;
@@ -111,7 +157,12 @@ function resolveGlob(dirs, pattern) {
         return dirs.includes(norm) ? [norm] : [];
     }
     else {
-        return []; // unsupported glob form
+        const reBody = norm
+            .split("/")
+            .map((seg) => (seg === "**" ? ".*" : seg.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*")))
+            .join("/");
+        const re = new RegExp(`^${reBody}$`);
+        return dirs.filter((d) => d !== "" && re.test(d));
     }
     return dirs.filter((dir) => {
         if (dir === "")
@@ -123,6 +174,41 @@ function resolveGlob(dirs, pattern) {
         return parent === base;
     });
 }
+
+function applyWorkspaceGlobs(dirs, globs) {
+    const matches = new Set();
+    const excluded = new Set();
+    if (!globs)
+        return { matches, excluded };
+    for (const raw of globs) {
+        const pattern = String(raw).trim();
+        if (!pattern)
+            continue;
+        if (pattern.startsWith("!")) {
+            const neg = pattern.slice(1).trim();
+            for (const dir of resolveGlob(dirs, neg)) {
+                matches.delete(dir);
+                excluded.add(dir);
+            }
+            // If `!dir/**` or `!dir` is given, also strip subdirs under `dir/`
+            const cleanNeg = stripTrailingSlashes(toPosixPath(neg)).replace(/\/\*\*?$/, "");
+            if (cleanNeg && !cleanNeg.includes("*")) {
+                for (const d of dirs) {
+                    if (d === cleanNeg || d.startsWith(`${cleanNeg}/`)) {
+                        matches.delete(d);
+                        excluded.add(d);
+                    }
+                }
+            }
+        }
+        else {
+            for (const dir of resolveGlob(dirs, pattern))
+                matches.add(dir);
+        }
+    }
+    return { matches, excluded };
+}
+
 function collectScopeCandidates(absRoot, dirs) {
     const markerMap = new Map();
     for (const dir of dirs) {
@@ -130,25 +216,24 @@ function collectScopeCandidates(absRoot, dirs) {
         if (found.length)
             markerMap.set(dir, found);
     }
-    const workspaceGlobs = readWorkspaceGlobs(absRoot);
-    const workspaceMatches = new Set();
-    if (workspaceGlobs) {
-        for (const glob of workspaceGlobs) {
-            for (const dir of resolveGlob(dirs, glob))
-                workspaceMatches.add(dir);
-        }
-    }
+    const jsGlobs = readJsWorkspaceGlobs(absRoot);
+    const cargoGlobs = readCargoWorkspaceGlobs(absRoot);
+    const jsWs = applyWorkspaceGlobs(dirs, jsGlobs);
+    const cargoWs = applyWorkspaceGlobs(dirs, cargoGlobs);
+    const workspaceMatches = new Set([...jsWs.matches, ...cargoWs.matches]);
     const candidates = new Map();
     for (const [dir, rawMarkers] of markerMap) {
         const isWorkspace = workspaceMatches.has(dir);
         let markers = rawMarkers;
-        // Rule 2: with workspace config present, a non-matched dir's package.json
+        // Rule 2: with JS workspace config present, a non-matched dir's package.json
         // marker doesn't count — the globs are the only JS-family intent honored.
-        if (workspaceGlobs && !isWorkspace && markers.includes("package.json")) {
+        if (jsGlobs && !jsWs.matches.has(dir) && markers.includes("package.json"))
             markers = markers.filter((m) => m !== "package.json");
-            if (markers.length === 0)
-                continue;
-        }
+        // Negated Cargo workspace patterns (`!crates/foo` or `exclude`) drop Cargo.toml as well.
+        if (cargoWs.excluded.has(dir) && markers.includes("Cargo.toml"))
+            markers = markers.filter((m) => m !== "Cargo.toml");
+        if (markers.length === 0)
+            continue;
         // Rule 3: depth guard (workspace matches are exempt).
         const depth = dir === "" ? 0 : dir.split("/").length;
         if (depth > 2 && !isWorkspace)

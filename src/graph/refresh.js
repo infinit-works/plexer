@@ -127,6 +127,63 @@ async function seedUnderLock(dir, outDir, contextDir) {
  * `root` is the repository root (the same value the query itself is given), not
  * the context dir.
  */
+async function autoBuildMissingGraph(dir, outDir, opts, seed) {
+    if (opts.autoBuild !== false && isAutoBuildableRepo(dir)) {
+        const lockCache = join(outDir, CACHE_DIR);
+        if (await waitForLock(lockCache)) {
+            const unhook = releaseOnSignal(lockCache);
+            try {
+                if (!existsSync(wiringPath(outDir))) {
+                    await buildGraph(dir, { contextDir: opts.contextDir, _lockHeld: true });
+                }
+                invalidateGraphCaches(outDir);
+                return { refreshed: true, note: `indexed repo into ${outDir}` };
+            }
+            finally {
+                unhook();
+                releaseLockIn(lockCache);
+            }
+        }
+    }
+    return seed.busy
+        ? { refreshed: false, note: "another process is still copying the graph into this worktree — retry the query in a moment" }
+        : CLEAN;
+}
+
+async function rebuildExistingGraphUnderLock(dir, outDir, drift, seedNote, opts) {
+    const lockCache = join(outDir, CACHE_DIR);
+    if (!(await waitForLock(lockCache))) {
+        const busy = "a graph rebuild is already in flight — answering from the current graph";
+        return {
+            refreshed: false,
+            drift: drift ?? undefined,
+            note: seedNote ? `${seedNote}; ${busy}` : busy,
+        };
+    }
+    const unhook = releaseOnSignal(lockCache);
+    try {
+        const now = drift ? probeDrift(dir, outDir) : null;
+        if (now && isClean(now)) {
+            invalidateGraphCaches(outDir);
+            return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
+        }
+        const fp = readFingerprint(outDir);
+        await buildGraph(dir, {
+            contextDir: opts.contextDir,
+            graphOnly: true,
+            onlyDirs: fp?.onlyDirs,
+            extensions: fp?.extensions,
+            _lockHeld: true,
+        });
+        invalidateGraphCaches(outDir);
+        return { refreshed: true, drift: drift ?? undefined, note: seedNote };
+    }
+    finally {
+        unhook();
+        releaseLockIn(lockCache);
+    }
+}
+
 export async function ensureFreshGraph(root, opts = {}) {
     if (opts.disabled || envDisabled())
         return CLEAN;
@@ -137,64 +194,18 @@ export async function ensureFreshGraph(root, opts = {}) {
         if (!existsSync(wiringPath(outDir))) {
             const seed = await seedUnderLock(dir, outDir, opts.contextDir);
             seededFrom = seed.from;
+            if (seed.seeded) {
+                invalidateGraphCaches(outDir);
+            }
             if (!existsSync(wiringPath(outDir))) {
-                if (opts.autoBuild !== false && isAutoBuildableRepo(dir)) {
-                    const lockCache = join(outDir, CACHE_DIR);
-                    if (await waitForLock(lockCache)) {
-                        const unhook = releaseOnSignal(lockCache);
-                        try {
-                            if (!existsSync(wiringPath(outDir))) {
-                                await buildGraph(dir, { contextDir: opts.contextDir, _lockHeld: true });
-                            }
-                            invalidateGraphCaches(outDir);
-                            return { refreshed: true, note: `indexed repo into ${outDir}` };
-                        }
-                        finally {
-                            unhook();
-                            releaseLockIn(lockCache);
-                        }
-                    }
-                }
-                return seed.busy
-                    ? { refreshed: false, note: "another process is still copying the graph into this worktree — retry the query in a moment" }
-                    : CLEAN;
+                return await autoBuildMissingGraph(dir, outDir, opts, seed);
             }
         }
         const seedNote = seededFrom ? `copied the graph from the main checkout (${seededFrom})` : undefined;
         const drift = probeDrift(dir, outDir);
         if (drift && isClean(drift))
             return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
-        const lockCache = join(outDir, CACHE_DIR);
-        if (!(await waitForLock(lockCache))) {
-            const busy = "a graph rebuild is already in flight — answering from the current graph";
-            return {
-                refreshed: false,
-                drift: drift ?? undefined,
-                note: seedNote ? `${seedNote}; ${busy}` : busy,
-            };
-        }
-        const unhook = releaseOnSignal(lockCache);
-        try {
-            const now = drift ? probeDrift(dir, outDir) : null;
-            if (now && isClean(now)) {
-                invalidateGraphCaches(outDir);
-                return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
-            }
-            const fp = readFingerprint(outDir);
-            await buildGraph(dir, {
-                contextDir: opts.contextDir,
-                graphOnly: true,
-                onlyDirs: fp?.onlyDirs,
-                extensions: fp?.extensions,
-                _lockHeld: true,
-            });
-            invalidateGraphCaches(outDir);
-            return { refreshed: true, drift: drift ?? undefined, note: seedNote };
-        }
-        finally {
-            unhook();
-            releaseLockIn(lockCache);
-        }
+        return await rebuildExistingGraphUnderLock(dir, outDir, drift, seedNote, opts);
     }
     catch (err) {
         return { refreshed: false, note: `graph refresh skipped: ${err instanceof Error ? err.message : String(err)}` };

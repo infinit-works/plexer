@@ -99,7 +99,7 @@ function emptySession() {
 }
 
 /** The per-repo session directory holding one `<id>.json` per agent session. */
-export function sessionDir(d) {
+function sessionDir(d) {
     return join(cacheDir(d), "session");
 }
 
@@ -271,7 +271,7 @@ export function readIncludeDirs(d, cfg = readBuildConfig(d)) {
     return dirs && dirs.length ? new Set(dirs) : undefined;
 }
 
-export function readFollowSubmodules(d, cfg = readBuildConfig(d)) {
+function readFollowSubmodules(d, cfg = readBuildConfig(d)) {
     if (typeof cfg?.followSubmodules === "boolean")
         return cfg.followSubmodules;
     try {
@@ -282,7 +282,7 @@ export function readFollowSubmodules(d, cfg = readBuildConfig(d)) {
     }
 }
 
-export function readFollowNestedRepos(d, cfg = readBuildConfig(d)) {
+function readFollowNestedRepos(d, cfg = readBuildConfig(d)) {
     return cfg?.followNestedRepos === true;
 }
 
@@ -364,7 +364,7 @@ export function acquireLockIn(cache) {
     }
 }
 
-export function updateLockPidIn(cache, pid = process.pid) {
+function updateLockPidIn(cache, pid = process.pid) {
     writeJsonAtomic(join(cache, LOCK_FILE), { pid, at: new Date().toISOString() }, true);
 }
 

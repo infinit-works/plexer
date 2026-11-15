@@ -1,6 +1,11 @@
 node_modules/
 *.log
 .DS_Store
+.agents/
+.cache/
+*.tgz
+coverage/
+.env*
 
 # plexer's local graph cache — regenerable, not committed (run `plexer build`).
 /plexer/

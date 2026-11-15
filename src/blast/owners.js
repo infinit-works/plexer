@@ -22,8 +22,10 @@
  * checkout or a shallow clone leaves the report exactly as it was and the comment
  * simply says nothing about people.
  */
-import { statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { contextDirFor } from "../context/node-file.js";
+import { readJson, writeJsonAtomic } from "../util/state.js";
 import { git } from "./diff.js";
 /**
  * Recency half-life. A commit from four months ago counts half as much as one
@@ -66,7 +68,7 @@ const AFFECTED_WEIGHT = 0.6;
  * interior hyphens, 39 max) so an address that merely ends in the right domain
  * cannot smuggle something unmentionable into a comment body.
  */
-export function githubHandle(email) {
+function githubHandle(email) {
     const m = /^(?:\d+\+)?([A-Za-z0-9](?:-?[A-Za-z0-9]){0,38})@users\.noreply\.github\.com$/i.exec(email.trim());
     return m ? m[1] : null;
 }
@@ -136,14 +138,76 @@ function parseGitOwnerLog(out, wanted, now, fileCommits, seqStart = 0) {
     return seq;
 }
 
-function collectCommitsByFile(dir, uniquePaths, now, maxCommits) {
+const MAX_CACHED_HEADS = 4;
+
+function loadOwnerHistoryCache(cachePath) {
+    const raw = readJson(cachePath);
+    if (!raw || raw.version !== 1 || !raw.heads || typeof raw.heads !== "object")
+        return { version: 1, heads: {} };
+    return raw;
+}
+
+function hydrateCachedCommits(list, now, seqStart) {
+    let seq = seqStart;
+    return list.map((c) => ({
+        seq: seq++,
+        hash: c.hash,
+        at: c.at,
+        weight: Math.pow(0.5, (now - c.at) / HALF_LIFE_MS),
+        name: c.name,
+        email: c.email,
+        bot: Boolean(c.bot),
+    }));
+}
+
+function saveOwnerHistoryCache(cachePath, cache, headSha, fetchedPaths, fileCommits) {
+    const bucket = cache.heads[headSha] ?? (cache.heads[headSha] = {});
+    for (const p of fetchedPaths) {
+        const list = fileCommits.get(p) ?? [];
+        bucket[p] = list.map((c) => ({ hash: c.hash, at: c.at, name: c.name, email: c.email, bot: Boolean(c.bot) }));
+    }
+    const keys = Object.keys(cache.heads);
+    while (keys.length > MAX_CACHED_HEADS) {
+        const drop = keys.shift();
+        if (drop && drop !== headSha)
+            delete cache.heads[drop];
+    }
+    try {
+        mkdirSync(dirname(cachePath), { recursive: true });
+        writeJsonAtomic(cachePath, cache, true);
+    }
+    catch {
+        /* non-fatal: cache write failure must not break owner ranking */
+    }
+}
+
+function collectCommitsByFile(dir, uniquePaths, now, maxCommits, contextDir = null) {
     const fileCommits = new Map();
     if (uniquePaths.length === 0)
         return { fileCommits, multiChunk: false };
+    const headSha = contextDir ? git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"])?.trim() : null;
+    const cachePath = contextDir && headSha ? join(contextDir, ".cache", "owners.json") : null;
+    const cache = cachePath ? loadOwnerHistoryCache(cachePath) : null;
+    const cachedBucket = cache && headSha ? cache.heads[headSha] : null;
     let seq = 0;
+    const missingPaths = [];
+    for (const p of uniquePaths) {
+        const hit = cachedBucket && Array.isArray(cachedBucket[p]) ? cachedBucket[p] : null;
+        if (hit) {
+            if (hit.length > 0) {
+                fileCommits.set(p, hydrateCachedCommits(hit, now, seq));
+                seq += hit.length;
+            }
+        }
+        else {
+            missingPaths.push(p);
+        }
+    }
+    if (missingPaths.length === 0)
+        return { fileCommits, multiChunk: false };
     let chunks = 0;
-    for (let i = 0; i < uniquePaths.length; i += BATCH_PATHSPEC) {
-        const slice = uniquePaths.slice(i, i + BATCH_PATHSPEC);
+    for (let i = 0; i < missingPaths.length; i += BATCH_PATHSPEC) {
+        const slice = missingPaths.slice(i, i + BATCH_PATHSPEC);
         const out = git(dir, [
             "log",
             "--no-merges",
@@ -161,7 +225,9 @@ function collectCommitsByFile(dir, uniquePaths, now, maxCommits) {
             continue;
         seq = parseGitOwnerLog(out, new Set(slice), now, fileCommits, seq);
     }
-    return { fileCommits, multiChunk: chunks > 1 };
+    if (cachePath && cache && headSha)
+        saveOwnerHistoryCache(cachePath, cache, headSha, missingPaths, fileCommits);
+    return { fileCommits, multiChunk: chunks > 1 || (cachedBucket !== null && missingPaths.length > 0) };
 }
 
 function areaCommitsFromMap(paths, fileCommits, multiChunk = false) {
@@ -320,12 +386,15 @@ export function localIdentity(root) {
  */
 export function attachOwners(root, report, opts = {}) {
     const now = opts.now ?? Date.now();
+    const absRoot = resolve(root);
+    const defaultCtxDir = contextDirFor(absRoot);
+    const contextDir = opts.contextDir ?? (existsSync(defaultCtxDir) ? defaultCtxDir : null);
     const excluded = buildExcludedSet(opts.exclude);
     const areaPaths = report.areas.map((a) => [...a.files].sort().slice(0, MAX_PATHSPEC));
     const modPaths = report.modules.map((m) => [...m.files].sort().slice(0, MAX_PATHSPEC));
     const uniquePaths = [...new Set([...areaPaths.flat(), ...modPaths.flat()])].sort();
     const batchCap = Math.min(MAX_BATCH_COMMITS, Math.max(MAX_COMMITS, (areaPaths.length + modPaths.length) * MAX_COMMITS));
-    const { fileCommits, multiChunk } = collectCommitsByFile(resolve(root), uniquePaths, now, batchCap);
+    const { fileCommits, multiChunk } = collectCommitsByFile(absRoot, uniquePaths, now, batchCap, contextDir);
 
     const ranked = new Map();
     const accumulateAreaOwners = (label, paths, weight) => {

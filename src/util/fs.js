@@ -1,10 +1,33 @@
 /**
  * Filesystem walking used by `init`/`check` to enumerate a repo's source files.
  */
-import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { toPosixPath } from "./paths.js";
+import { git } from "./git.js";
+import { isLexicallyWithin, toPosixPath } from "./paths.js";
+
+/** Resolve symlinks with `resolve(p)` fallback when the target does not exist. */
+export function tryRealpath(p) {
+    if (!p || typeof p !== "string")
+        return null;
+    try {
+        return realpathSync(p);
+    }
+    catch {
+        return resolve(p);
+    }
+}
+
+/** True when `candidatePath` resides inside (or matches) `allowedRoot` after realpath resolution. */
+export function isWithinRoot(candidatePath, allowedRoot, opts = {}) {
+    if (!candidatePath || !allowedRoot)
+        return false;
+    const base = tryRealpath(allowedRoot);
+    const target = tryRealpath(candidatePath);
+    if (!base || !target)
+        return false;
+    return isLexicallyWithin(base, target, opts);
+}
 /** Safe directory-existence check (`false` on absent or non-directory paths). */
 export function dirExists(p) {
     let isDir = false;
@@ -75,7 +98,7 @@ export function shouldSkipDir(name, includes) {
  * A broken symlink throws instead of the `scandir ENOENT` `readdirSync` would
  * raise after git fails. Internal symlink policy is not decided here.
  */
-export function canonicalWalkRoot(dir) {
+function canonicalWalkRoot(dir) {
     const abs = resolve(dir);
     let st;
     try {
@@ -160,90 +183,69 @@ export function walkDir(dir, includes, opts = {}) {
 /** Git's canonical working-tree file set, relative to `dir`. Tracked files are
  * deliberately included even when a later ignore rule matches them; `.gitignore`
  * only controls untracked files in Git, and plexer follows the same contract. */
-function gitVisibleFiles(dir, includes, opts = {}, traversal) {
-    const root = resolve(dir);
-    // The recursive path costs an extra `-t --stage` classification, so take it
-    // only when at least one boundary-crossing opt-in is on. With both off the
-    // walk is byte-for-byte the historical one.
-    if (opts.followSubmodules !== true && opts.followNestedRepos !== true) {
-        return gitVisibleFilesShallow(root, includes);
-    }
-    const state = traversal ?? { topRoot: root, activeRoots: new Set() };
-    const rootKey = process.platform === "win32" ? root.toLowerCase() : root;
-    if (state.activeRoots.has(rootKey))
-        return [];
-    state.activeRoots.add(rootKey);
-    // Following uses `-t --stage` so one process can distinguish gitlinks from
-    // tracked and untracked files. `-z` keeps either form safe for unusual paths.
-    const result = spawnSync("git", ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "ls-files", "-t", "--stage", "--cached", "--others", "--exclude-standard", "-z", "--"], {
-        cwd: root,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        maxBuffer: 64 * 1024 * 1024,
-    });
-    if (result.status !== 0 || result.error || typeof result.stdout !== "string") {
-        state.activeRoots.delete(rootKey);
-        return null;
-    }
-    // A path can have multiple stage records during a merge. Collapse those
-    // records and remember if any of them identifies the path as a gitlink or as
-    // a nested-clone boundary.
+function parseGitStageEntries(stdout) {
     const entries = new Map();
-    for (const record of result.stdout.split("\0")) {
-        if (!record)
-            continue;
-        if (record.length < 2 || record[1] !== " ")
-            continue;
+    for (const record of stdout.split("\0")) {
+        if (!record || record.length < 2 || record[1] !== " ") continue;
         const tag = record[0];
         const body = record.slice(2);
         let rel;
         let gitlink = false;
         let nested = false;
         if (tag === "?") {
-            rel = body;
-            if (rel.endsWith("/")) {
-                nested = true;
-                rel = rel.slice(0, -1);
-            }
-        }
-        else {
+            nested = body.endsWith("/");
+            rel = nested ? body.slice(0, -1) : body;
+        } else {
             const tab = body.indexOf("\t");
-            if (tab === -1)
-                continue;
+            if (tab === -1) continue;
             gitlink = body.startsWith("160000 ");
             rel = body.slice(tab + 1);
         }
-        if (!rel)
-            continue;
+        if (!rel) continue;
         const prior = entries.get(rel);
         entries.set(rel, {
             gitlink: gitlink || prior?.gitlink === true,
             nested: nested || prior?.nested === true,
         });
     }
+    return entries;
+}
+
+function collectGitStageFiles(entries, root, includes, opts, state) {
     const out = new Set();
     for (const [rel, entry] of entries) {
         const abs = resolve(root, rel);
-        if (skippedPath(relative(state.topRoot, abs), includes))
-            continue;
-        const followChild = (entry.gitlink && opts.followSubmodules === true) ||
-            (entry.nested && opts.followNestedRepos === true);
+        if (skippedPath(relative(state.topRoot, abs), includes)) continue;
+        const followChild = (entry.gitlink && opts.followSubmodules === true) || (entry.nested && opts.followNestedRepos === true);
         if (followChild) {
-            if (!existsSync(join(abs, ".git")))
-                continue;
-            let childFiles = gitVisibleFiles(abs, includes, opts, state);
-            if (childFiles === null) {
-                childFiles = walkFilesystem(abs, includes);
-            }
-            for (const file of childFiles)
-                out.add(file);
-            continue;
-        }
-        if (isIndexableFile(abs))
+            if (!existsSync(join(abs, ".git"))) continue;
+            const childFiles = gitVisibleFiles(abs, includes, opts, state) ?? walkFilesystem(abs, includes);
+            for (const file of childFiles) out.add(file);
+        } else if (isIndexableFile(abs)) {
             out.add(abs);
+        }
     }
-    state.activeRoots.delete(rootKey);
     return [...out].sort();
+}
+
+function gitVisibleFiles(dir, includes, opts = {}, traversal) {
+    const root = resolve(dir);
+    if (opts.followSubmodules !== true && opts.followNestedRepos !== true) {
+        return gitVisibleFilesShallow(root, includes);
+    }
+    const state = traversal ?? { topRoot: root, activeRoots: new Set() };
+    const rootKey = process.platform === "win32" ? root.toLowerCase() : root;
+    if (state.activeRoots.has(rootKey)) return [];
+    state.activeRoots.add(rootKey);
+    const stdout = git(root, ["ls-files", "-t", "--stage", "--cached", "--others", "--exclude-standard", "-z", "--"]);
+    if (stdout === null) {
+        state.activeRoots.delete(rootKey);
+        return null;
+    }
+    const entries = parseGitStageEntries(stdout);
+    const files = collectGitStageFiles(entries, root, includes, opts, state);
+    state.activeRoots.delete(rootKey);
+    return files;
 }
 function isIndexableFile(abs) {
     try {
@@ -264,16 +266,11 @@ function isIndexableFile(abs) {
  * exactly the same command, filtering, ordering, and duplicate handling as it
  * did before submodule support existed. */
 function gitVisibleFilesShallow(root, includes) {
-    const result = spawnSync("git", ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"], {
-        cwd: root,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        maxBuffer: 64 * 1024 * 1024,
-    });
-    if (result.status !== 0 || result.error || typeof result.stdout !== "string")
+    const stdout = git(root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"]);
+    if (stdout === null)
         return null;
     const out = [];
-    for (const rel of result.stdout.split("\0")) {
+    for (const rel of stdout.split("\0")) {
         if (!rel || skippedPath(rel, includes))
             continue;
         const abs = resolve(root, rel);

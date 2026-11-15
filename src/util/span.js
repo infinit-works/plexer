@@ -1,10 +1,52 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
+import { tryRealpath } from "./fs.js";
 import { readSourceFile } from "./source.js";
 
 export const MAX_SOURCE_READ_BYTES = 10 * 1024 * 1024;
 
 export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** Parse a graph node's `startLine`/`endLine` or `L<start>-L<end>` span into `{ start, end }`. */
+export function parseNodeSpan(node) {
+    const start = Number(node?.startLine);
+    const end = Number(node?.endLine);
+    if (Number.isFinite(start) && Number.isFinite(end) && start >= 1 && end >= start) {
+        return { start, end };
+    }
+    const m = /^L?(\d+)(?:-L?(\d+))?$/.exec(String(node?.span ?? ""));
+    if (!m)
+        return null;
+    const s = Number(m[1]);
+    const e = m[2] ? Number(m[2]) : s;
+    return s >= 1 && e >= s ? { start: s, end: e } : null;
+}
+
+/** Trim and strip matching outer quotes (parsing JSON string escapes for double quotes). */
+export function unquoteArg(val, emptyFallback = "") {
+    if (typeof val !== "string")
+        return emptyFallback;
+    const trimmed = val.trim();
+    if (!trimmed)
+        return emptyFallback;
+    if (trimmed.length >= 2) {
+        const q = trimmed[0];
+        if ((q === '"' || q === "'") && trimmed[trimmed.length - 1] === q) {
+            if (q === '"') {
+                try {
+                    const parsed = JSON.parse(trimmed);
+                    if (typeof parsed === "string")
+                        return parsed;
+                }
+                catch {
+                    /* fall through */
+                }
+            }
+            return trimmed.slice(1, -1);
+        }
+    }
+    return trimmed;
+}
 
 /** `L12-L34` → `{ start: 12, end: 34 }`. */
 export function spanRange(span) {
@@ -76,81 +118,66 @@ const HEADER_CONTEXT_RE = /\.(?:command|on|connect|handle)\s*\(|:(?:Connect|Once
  * any line ranges in `excludeRanges` (e.g. a target symbol's own definition span
  * or nested named caller spans when quoting a file-level caller).
  */
+function collectSpanLineHits(lines, start, end, needles, isExcluded, maxMatches) {
+    const matched = [];
+    const importMatches = [];
+    for (let lineNo = start; lineNo <= end; lineNo++) {
+        if (isExcluded(lineNo)) continue;
+        const text = lines[lineNo - 1];
+        if (!needles.some((re) => re.test(text))) continue;
+        if (/^\s*import\b.*\bfrom\b/.test(text)) {
+            importMatches.push({ n: lineNo, text });
+            continue;
+        }
+        matched.push({ n: lineNo, text });
+        if (matched.length >= maxMatches) break;
+    }
+    if (matched.length === 0 && importMatches.length > 0) matched.push(...importMatches.slice(0, maxMatches));
+    return matched;
+}
+
+function attachMatchHeaderContext(lines, m, start, end, contextRadius, allowAboveSpan, isExcluded) {
+    const winStart = Math.max(start, m.n - Math.max(0, contextRadius));
+    const winEnd = Math.min(end, m.n + Math.max(0, contextRadius));
+    const windowLines = [];
+    let headerLine = null;
+    const searchTop = allowAboveSpan ? Math.max(1, m.n - 110) : Math.max(start, m.n - 75);
+    const startIndent = (lines[start - 1] ?? "").match(/^\s*/)?.[0]?.length ?? 0;
+    for (let k = winStart - 1; k >= searchTop; k--) {
+        if (isExcluded(k)) break;
+        const candidate = lines[k - 1];
+        const isAboveMatch = k < start && (candidate.match(/^\s*/)?.[0]?.length ?? 0) <= startIndent && /^\s*name\s*=\s*["'][^"']+["']/.test(candidate);
+        const isHeaderMatch = k >= start && !(k === start && /^\s*run\s*=\s*function\b/.test(candidate)) && HEADER_CONTEXT_RE.test(candidate);
+        if (isAboveMatch || isHeaderMatch) {
+            headerLine = { n: k, text: candidate };
+            windowLines.push(headerLine);
+            if (k + 1 < winStart) windowLines.push({ n: 0, text: `… (lines L${k + 1}-L${winStart - 1} omitted)` });
+            break;
+        }
+    }
+    if (contextRadius > 0 || windowLines.length > 0) {
+        for (let k = winStart; k <= winEnd; k++) {
+            if (k !== m.n && isExcluded(k)) continue;
+            windowLines.push({ n: k, text: lines[k - 1] });
+        }
+        return { ...m, ...(headerLine ? { header: headerLine } : {}), window: windowLines };
+    }
+    return headerLine ? { ...m, header: headerLine } : m;
+}
+
 export function referenceLines(path, span, needles, read, opts = {}) {
     const range = spanRange(span);
     const lines = read(path);
-    if (!range || !lines || !needles?.length)
-        return [];
+    if (!range || !lines || !needles?.length) return [];
     const maxMatches = opts.maxMatches ?? 6;
     const excludeRanges = opts.excludeRanges ?? [];
     const contextRadius = opts.contextLines ?? 0;
     const isExcluded = (lineNo) => excludeRanges.some((r) => lineNo >= r.start && lineNo <= r.end);
     const end = Math.min(lines.length, range.end);
     const start = Math.max(1, range.start);
-    const matched = [];
-    const importMatches = [];
-    for (let lineNo = start; lineNo <= end; lineNo++) {
-        if (isExcluded(lineNo))
-            continue;
-        const text = lines[lineNo - 1];
-        if (needles.some((re) => re.test(text))) {
-            if (/^\s*import\b.*\bfrom\b/.test(text)) {
-                importMatches.push({ n: lineNo, text });
-                continue;
-            }
-            matched.push({ n: lineNo, text });
-            if (matched.length >= maxMatches)
-                break;
-        }
-    }
-    if (matched.length === 0 && importMatches.length > 0) {
-        matched.push(...importMatches.slice(0, maxMatches));
-    }
-    if ((contextRadius <= 0 && !opts.includeHeaderContext) || matched.length === 0)
-        return matched;
-    return matched.map((m) => {
-        const winStart = Math.max(start, m.n - Math.max(0, contextRadius));
-        const winEnd = Math.min(end, m.n + Math.max(0, contextRadius));
-        const windowLines = [];
-        let headerLine = null;
-        // Look up to 110 lines above winStart for an enclosing command/event builder header
-        const searchTop = opts.allowAboveSpan ? Math.max(1, m.n - 110) : Math.max(start, m.n - 75);
-        const startIndent = (lines[start - 1] ?? "").match(/^\s*/)?.[0]?.length ?? 0;
-        for (let k = winStart - 1; k >= searchTop; k--) {
-            if (isExcluded(k))
-                break;
-            const candidate = lines[k - 1];
-            if (k < start) {
-                const candIndent = candidate.match(/^\s*/)?.[0]?.length ?? 0;
-                if (candIndent <= startIndent && /^\s*name\s*=\s*["'][^"']+["']/.test(candidate)) {
-                    headerLine = { n: k, text: candidate };
-                    windowLines.push(headerLine);
-                    if (k + 1 < winStart)
-                        windowLines.push({ n: 0, text: `… (lines L${k + 1}-L${winStart - 1} omitted)` });
-                    break;
-                }
-                continue;
-            }
-            if (k === start && /^\s*run\s*=\s*function\b/.test(candidate))
-                continue;
-            if (HEADER_CONTEXT_RE.test(candidate)) {
-                headerLine = { n: k, text: candidate };
-                windowLines.push(headerLine);
-                if (k + 1 < winStart)
-                    windowLines.push({ n: 0, text: `… (lines L${k + 1}-L${winStart - 1} omitted)` });
-                break;
-            }
-        }
-        if (contextRadius > 0 || windowLines.length > 0) {
-            for (let k = winStart; k <= winEnd; k++) {
-                if (k !== m.n && isExcluded(k))
-                    continue;
-                windowLines.push({ n: k, text: lines[k - 1] });
-            }
-            return { ...m, ...(headerLine ? { header: headerLine } : {}), window: windowLines };
-        }
-        return headerLine ? { ...m, header: headerLine } : m;
-    });
+    const matched = collectSpanLineHits(lines, start, end, needles, isExcluded, maxMatches);
+    if ((contextRadius <= 0 && !opts.includeHeaderContext) || matched.length === 0) return matched;
+    return matched.map((m) => attachMatchHeaderContext(lines, m, start, end, contextRadius, opts.allowAboveSpan, isExcluded));
 }
 
 const SENSITIVE_BASENAME_RE = /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)$|\.(?:pem|key|p12|pfx)$/i;
@@ -201,18 +228,10 @@ export function resolveSafeRepoFile(absRoot, realRoot, relPath, opts = {}) {
 }
 
 /** Read each file once via `readSourceFile` (UTF-8 / UTF-16LE aware), returning split lines or null. */
-export function fileReader(root) {
+export function fileReader(root, opts = {}) {
     const cache = new Map();
     const absRoot = root !== undefined ? resolve(root) : null;
-    let realRoot = absRoot;
-    if (absRoot) {
-        try {
-            realRoot = realpathSync(absRoot);
-        }
-        catch {
-            /* keep absRoot fallback */
-        }
-    }
+    const realRoot = absRoot ? tryRealpath(absRoot) : null;
     return (path) => {
         if (!absRoot || !realRoot || typeof path !== "string" || !path)
             return null;
@@ -221,7 +240,7 @@ export function fileReader(root) {
             return hit;
         let lines = null;
         try {
-            const safe = resolveSafeRepoFile(absRoot, realRoot, path);
+            const safe = resolveSafeRepoFile(absRoot, realRoot, path, opts);
             if (!safe) {
                 cache.set(path, null);
                 return null;

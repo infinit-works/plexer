@@ -13,12 +13,16 @@
  * nothing about the receiver.
  */
 import { posix } from "node:path";
-import { pathUnderPrefix, pushMap, toPosixPath } from "../util/paths.js";
+import { ensureMapSet, GENERIC_MEMBER_NAMES, isCompoundIdentifierName } from "../util/id.js";
+import { isTestPath, pathUnderPrefix, pushMap, toPosixPath } from "../util/paths.js";
 import { containerLangOf } from "./container.js";
 import { languageOf } from "./extract.js";
 import { genericLangOf } from "./generic.js";
 import { resolveLuauEdges } from "./luau.js";
-const IMPORT_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py"];
+const IMPORT_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py", ".vue", ".svelte", ".astro"];
+const MAX_BARREL_HOPS = 6;
+const MAX_GO_STRUCTURAL_MATCHES = 12;
+const MAX_CHA_DISPATCH_TARGETS = 24;
 /** C/C++ source + header extensions, for resolving `#include` targets. */
 const C_EXT = /\.(c|h|cc|cpp|cxx|hpp|hh|hxx|inl|ipp|c\+\+|h\+\+)$/i;
 /** Python source + stub extensions, for the constructor-call fallback below. */
@@ -76,7 +80,7 @@ function familyOf(path) {
  * An unknown family never filters: absence of data is not evidence of a mismatch,
  * and refusing edges for every extension plexer cannot name would lose real ones.
  */
-function reachable(file, candidatePath) {
+export function reachable(file, candidatePath) {
     const from = familyOf(file);
     if (from === null)
         return true;
@@ -88,141 +92,317 @@ function indexPathSuffixes(map, path) {
     for (let i = 0; i < parts.length; i++)
         pushMap(map, parts.slice(i).join("/"), path);
 }
-function buildResolutionIndex(nodes, rawEdges, opts) {
-    const byId = new Map(nodes.map((n) => [n.id, n]));
-    const globalName = new Map();
-    const perFileName = new Map();
-    const ownerMethod = new Map();
-    const goFilesByDir = new Map();
-    const javaFilesBySuffix = new Map();
-    const cFilesBySuffix = new Map();
-    const rustCrateRoots = [];
-    const phpFilesBySuffix = new Map();
-    const hasGoModules = !!opts.goModules?.length;
-    for (const n of nodes) {
-        if (n.kind === "file") {
-            if (hasGoModules && n.path.endsWith(".go")) {
-                const dir = posix.dirname(toPosixPath(n.path));
-                pushMap(goFilesByDir, dir, n.id);
-            }
-            if (n.path.endsWith(".java"))
-                indexPathSuffixes(javaFilesBySuffix, n.id);
-            if (C_EXT.test(n.path))
-                indexPathSuffixes(cFilesBySuffix, n.id);
-            if (n.path.endsWith(".php"))
-                indexPathSuffixes(phpFilesBySuffix, n.id);
-            const p = toPosixPath(n.path);
-            if (p === "lib.rs" || p === "main.rs")
-                rustCrateRoots.push("");
-            else if (p.endsWith("/lib.rs") || p.endsWith("/main.rs"))
-                rustCrateRoots.push(posix.dirname(p));
+function addGoPackageFiles(set, filePath, goFilesByDir) {
+    if (!filePath?.endsWith(".go"))
+        return;
+    const pkgFiles = goFilesByDir.get(posix.dirname(toPosixPath(filePath)));
+    if (!pkgFiles)
+        return;
+    for (const pf of pkgFiles) {
+        if (!pf.endsWith("_test.go"))
+            set.add(pf);
+    }
+}
+function collectDirectImports(rawEdges, resIdx, opts) {
+    const { byId, goFilesByDir } = resIdx;
+    const directImports = new Map();
+    for (const e of rawEdges) {
+        if (e.file?.endsWith(".luau"))
             continue;
-        }
-        pushMap(globalName, n.name, n);
-        let fileMap = perFileName.get(n.path);
-        if (!fileMap)
-            perFileName.set(n.path, (fileMap = new Map()));
-        pushMap(fileMap, n.name, n);
-        if (n.kind === "method") {
-            const owner = n.owner ?? ownerFromMethodId(n.id);
-            if (owner)
-                pushMap(ownerMethod, `${owner}.${n.name}`, n);
+        if (e.relation !== "imports" || !e.specifier || !e.file)
+            continue;
+        const set = ensureMapSet(directImports, e.file);
+        addGoPackageFiles(set, e.file, goFilesByDir);
+        const target = resolveImportTargetForFile(e.specifier, e.file, resIdx, opts, e.isRustMod);
+        if (byId.has(target)) {
+            set.add(target);
+            addGoPackageFiles(set, target, goFilesByDir);
         }
     }
-    const classParents = new Map();
-    const classTraits = new Map();
-    const reexportsByFile = new Map();
+    return directImports;
+}
+function expandSingleFileImportClosure(directSet, directImports, resIdx, opts) {
+    const { byId, goFilesByDir, reexportsByFile } = resIdx;
+    const closure = new Set(directSet);
+    const queue = [];
+    const visitedBarrels = new Set();
+    for (const imp of directSet) {
+        queue.push({ path: imp, hops: 0 });
+        visitedBarrels.add(imp);
+        for (const hop of directImports.get(imp) ?? [])
+            closure.add(hop);
+    }
+    let head = 0;
+    while (head < queue.length) {
+        const { path: cur, hops } = queue[head++];
+        if (hops >= MAX_BARREL_HOPS)
+            continue;
+        for (const r of reexportsByFile.get(cur) ?? []) {
+            const next = resolveImportTargetForFile(r.specifier, cur, resIdx, opts);
+            if (!byId.has(next))
+                continue;
+            closure.add(next);
+            addGoPackageFiles(closure, next, goFilesByDir);
+            if (!visitedBarrels.has(next)) {
+                visitedBarrels.add(next);
+                queue.push({ path: next, hops: hops + 1 });
+            }
+        }
+    }
+    return closure;
+}
+function buildImportedFilesClosure(rawEdges, resIdx, opts) {
+    const directImports = collectDirectImports(rawEdges, resIdx, opts);
+    const closureByFile = new Map();
+    for (const [file, directSet] of directImports) {
+        closureByFile.set(file, expandSingleFileImportClosure(directSet, directImports, resIdx, opts));
+    }
+    return closureByFile;
+}
+
+function addTypeHierarchyEdge(typeHierarchy, childName, parentName) {
+    if (!childName || !parentName || childName === parentName)
+        return;
+    let parents = typeHierarchy.parents.get(childName);
+    if (!parents)
+        typeHierarchy.parents.set(childName, (parents = new Set()));
+    parents.add(parentName);
+    let children = typeHierarchy.children.get(parentName);
+    if (!children)
+        typeHierarchy.children.set(parentName, (children = new Set()));
+    children.add(childName);
+}
+
+function collectGoTypesAndMethods(nodes) {
+    const goInterfaces = new Map();
+    const goConcreteMethods = new Map();
+    const goConcreteTypes = new Set();
+    for (const n of nodes) {
+        if (!n.path?.endsWith(".go"))
+            continue;
+        if (n.kind === "interface") {
+            if (!goInterfaces.has(n.name))
+                goInterfaces.set(n.name, new Set());
+        }
+        else if (n.kind === "struct" || n.kind === "type") {
+            goConcreteTypes.add(n.name);
+        }
+        else if (n.kind === "method") {
+            const owner = n.owner ?? ownerFromMethodId(n.id);
+            if (!owner)
+                continue;
+            const ifaceMethods = goInterfaces.get(owner);
+            if (ifaceMethods) {
+                ifaceMethods.add(n.name);
+            }
+            else {
+                let mset = goConcreteMethods.get(owner);
+                if (!mset)
+                    goConcreteMethods.set(owner, (mset = new Set()));
+                mset.add(n.name);
+            }
+        }
+    }
+    return { goInterfaces, goConcreteMethods, goConcreteTypes };
+}
+
+function reconcileGoInterfacesAndConcrete(goInterfaces, goConcreteMethods, goConcreteTypes) {
+    for (const [owner, mset] of goConcreteMethods) {
+        const ifaceMethods = goInterfaces.get(owner);
+        if (ifaceMethods) {
+            for (const m of mset)
+                ifaceMethods.add(m);
+            goConcreteMethods.delete(owner);
+        }
+        else {
+            goConcreteTypes.add(owner);
+        }
+    }
+}
+
+function goConcreteSatisfiesInterface(hasMethods, reqMethods) {
+    if (!hasMethods || hasMethods.size < reqMethods.size)
+        return false;
+    for (const m of reqMethods) {
+        if (!hasMethods.has(m))
+            return false;
+    }
+    return true;
+}
+
+function buildGoStructuralHierarchy(nodes, typeHierarchy) {
+    const { goInterfaces, goConcreteMethods, goConcreteTypes } = collectGoTypesAndMethods(nodes);
+    reconcileGoInterfacesAndConcrete(goInterfaces, goConcreteMethods, goConcreteTypes);
+    for (const [ifaceName, reqMethods] of goInterfaces) {
+        if (reqMethods.size === 0)
+            continue;
+        const matches = [];
+        for (const concreteName of goConcreteTypes) {
+            if (goConcreteSatisfiesInterface(goConcreteMethods.get(concreteName), reqMethods))
+                matches.push(concreteName);
+        }
+        if (matches.length >= 1 && matches.length <= MAX_GO_STRUCTURAL_MATCHES) {
+            for (const match of matches)
+                addTypeHierarchyEdge(typeHierarchy, match, ifaceName);
+        }
+    }
+}
+function indexFileResolutionNode(n, resIdx) {
+    if (resIdx.hasGoModules && n.path.endsWith(".go")) {
+        pushMap(resIdx.goFilesByDir, posix.dirname(toPosixPath(n.path)), n.id);
+    }
+    if (n.path.endsWith(".java")) indexPathSuffixes(resIdx.javaFilesBySuffix, n.id);
+    if (C_EXT.test(n.path)) indexPathSuffixes(resIdx.cFilesBySuffix, n.id);
+    if (n.path.endsWith(".php")) indexPathSuffixes(resIdx.phpFilesBySuffix, n.id);
+    if (BREADTH_IMPORT_EXT.test(n.path)) indexPathSuffixes(resIdx.breadthFilesBySuffix, n.id);
+    const p = toPosixPath(n.path);
+    if (p === "lib.rs" || p === "main.rs") resIdx.rustCrateRoots.push("");
+    else if (p.endsWith("/lib.rs") || p.endsWith("/main.rs")) resIdx.rustCrateRoots.push(posix.dirname(p));
+}
+
+function indexSymbolResolutionNode(n, resIdx) {
+    if (n.kind === "interface" || n.kind === "trait") resIdx.interfaceTypes.add(n.name);
+    if (n.defaultExport || n.name === "default") pushMap(resIdx.defaultExportsByFile, n.path, n);
+    pushMap(resIdx.globalName, n.name, n);
+    let fileMap = resIdx.perFileName.get(n.path);
+    if (!fileMap) resIdx.perFileName.set(n.path, (fileMap = new Map()));
+    pushMap(fileMap, n.name, n);
+    if (n.kind === "method") {
+        const owner = n.owner ?? ownerFromMethodId(n.id);
+        if (owner) pushMap(resIdx.ownerMethod, `${owner}.${n.name}`, n);
+    }
+    if (n.kind === "method" || n.kind === "function") {
+        pushMap(resIdx.callableByName, n.name, n);
+        if (n.name.includes(".")) {
+            const leaf = n.name.slice(n.name.lastIndexOf(".") + 1);
+            if (leaf) pushMap(resIdx.callableByName, leaf, n);
+        }
+    }
+}
+
+function indexHierarchyAndReexports(rawEdges, resIdx) {
     for (const e of rawEdges) {
         if (e.relation === "extends" && e.name) {
-            const ownName = byId.get(e.source)?.name;
-            if (ownName)
-                pushMap(classParents, ownName, e.name);
-        }
-        else if (e.relation === "implements" && e.name && e.file.endsWith(".php")) {
-            const ownName = byId.get(e.source)?.name;
-            if (ownName)
-                pushMap(classTraits, ownName, e.name);
-        }
-        else if (e.relation === "reexports" && e.specifier) {
-            pushMap(reexportsByFile, e.source, e);
+            const ownName = resIdx.byId.get(e.source)?.name;
+            if (ownName) {
+                pushMap(resIdx.classParents, ownName, e.name);
+                addTypeHierarchyEdge(resIdx.typeHierarchy, ownName, e.name);
+            }
+        } else if (e.relation === "implements" && e.name) {
+            const ownName = e.ownerName ?? resIdx.byId.get(e.source)?.name;
+            if (ownName) {
+                addTypeHierarchyEdge(resIdx.typeHierarchy, ownName, e.name);
+                if (e.file.endsWith(".php")) pushMap(resIdx.classTraits, ownName, e.name);
+            }
+        } else if (e.relation === "reexports" && e.specifier) {
+            pushMap(resIdx.reexportsByFile, e.source, e);
         }
     }
-    return {
-        byId,
-        globalName,
-        perFileName,
-        ownerMethod,
-        goFilesByDir,
-        javaFilesBySuffix,
-        cFilesBySuffix,
-        rustCrateRoots,
-        phpFilesBySuffix,
-        classParents,
-        classTraits,
-        reexportsByFile,
-        hasGoModules,
-    };
 }
-function resolveImportTargetForFile(spec, file, resIdx, opts) {
+
+function buildResolutionIndex(nodes, rawEdges, opts) {
+    const resIdx = {
+        byId: new Map(nodes.map((n) => [n.id, n])),
+        globalName: new Map(),
+        perFileName: new Map(),
+        ownerMethod: new Map(),
+        callableByName: new Map(),
+        goFilesByDir: new Map(),
+        javaFilesBySuffix: new Map(),
+        cFilesBySuffix: new Map(),
+        rustCrateRoots: [],
+        phpFilesBySuffix: new Map(),
+        breadthFilesBySuffix: new Map(),
+        defaultExportsByFile: new Map(),
+        interfaceTypes: new Set(),
+        typeHierarchy: { parents: new Map(), children: new Map() },
+        classParents: new Map(),
+        classTraits: new Map(),
+        reexportsByFile: new Map(),
+        hasGoModules: !!opts.goModules?.length,
+        importedFilesByFile: null,
+    };
+    for (const n of nodes) {
+        if (n.kind === "file") indexFileResolutionNode(n, resIdx);
+        else indexSymbolResolutionNode(n, resIdx);
+    }
+    indexHierarchyAndReexports(rawEdges, resIdx);
+    buildGoStructuralHierarchy(nodes, resIdx.typeHierarchy);
+    resIdx.importedFilesByFile = buildImportedFilesClosure(rawEdges, resIdx, opts);
+    return resIdx;
+}
+const BREADTH_IMPORT_EXT = /\.(?:rb|cs|scala|sc|ex|exs|dart|lua|clj|cljc|cljs|nix|sol)$/i;
+function resolveImportTargetForFile(spec, file, resIdx, opts, isRustMod = false) {
     if (resIdx.hasGoModules && file.endsWith(".go"))
         return resolveGoImport(spec, opts.goModules, resIdx.goFilesByDir);
     if (file.endsWith(".java"))
         return resolveJavaImport(spec, resIdx.javaFilesBySuffix);
     if (C_EXT.test(file))
         return resolveCInclude(spec, file, resIdx.byId, resIdx.cFilesBySuffix);
-    if (file.endsWith(".rs"))
+    if (file.endsWith(".rs")) {
+        if (isRustMod) {
+            const hit = resolveRustUse(`self::${spec}`, file, resIdx.byId, resIdx.rustCrateRoots);
+            return hit === `self::${spec}` ? spec : hit;
+        }
         return resolveRustUse(spec, file, resIdx.byId, resIdx.rustCrateRoots);
+    }
     if (file.endsWith(".php"))
         return resolvePhpUse(spec, resIdx.phpFilesBySuffix);
+    if (BREADTH_IMPORT_EXT.test(file))
+        return resolveBreadthImport(spec, file, resIdx.byId, resIdx.breadthFilesBySuffix);
     return resolveImport(spec, file, resIdx.byId, resIdx, opts);
 }
-function resolveExportedSymbolInFile(targetFile, name, kinds, resIdx, opts, visited = new Set()) {
-    if (visited.size >= 5 || visited.has(targetFile) || !resIdx.byId.has(targetFile))
-        return null;
-    const allInFile = resIdx.perFileName.get(targetFile)?.get(name) ?? [];
-    let candidates = kinds ? allInFile.filter((n) => kinds.includes(n.kind)) : allInFile;
-    if (candidates.length === 0 && allInFile.length === 1) {
-        candidates = allInFile;
-    }
-    if (candidates.length === 1) {
-        return { node: candidates[0], typeOnly: false };
-    }
-    if (candidates.length > 1) {
-        return null;
-    }
-    const reexports = resIdx.reexportsByFile?.get(targetFile);
-    if (!reexports || reexports.length === 0)
-        return null;
-    const nextVisited = new Set(visited);
-    nextVisited.add(targetFile);
+function resolveNamedReexports(reexports, targetFile, wantedExportName, kinds, resIdx, opts, nextVisited) {
     for (const r of reexports) {
-        if (r.star || r.exportedName !== name)
-            continue;
+        if (r.exportedName !== wantedExportName) continue;
         const nextFile = resolveImportTargetForFile(r.specifier, targetFile, resIdx, opts);
-        if (!resIdx.byId.has(nextFile))
-            continue;
-        const hit = resolveExportedSymbolInFile(nextFile, r.localName || name, kinds, resIdx, opts, nextVisited);
-        if (hit)
-            return { node: hit.node, typeOnly: Boolean(r.typeOnly || hit.typeOnly) };
+        if (!resIdx.byId.has(nextFile)) continue;
+        if (r.star && !kinds) {
+            const targetFileNode = resIdx.byId.get(nextFile);
+            if (targetFileNode) return { node: targetFileNode, typeOnly: Boolean(r.typeOnly) };
+        }
+        if (r.star) continue;
+        const nextIsDefault = Boolean(r.isDefault || r.localName === "default");
+        const hit = resolveExportedSymbolInFile(nextFile, r.localName || wantedExportName, kinds, resIdx, opts, nextVisited, nextIsDefault);
+        if (hit) return { node: hit.node, typeOnly: Boolean(r.typeOnly || hit.typeOnly) };
     }
+    return null;
+}
+
+function resolveStarReexports(reexports, targetFile, name, kinds, resIdx, opts, nextVisited) {
     const starHits = new Map();
     for (const r of reexports) {
-        if (!r.star)
-            continue;
+        if (!r.star || r.exportedName) continue;
         const nextFile = resolveImportTargetForFile(r.specifier, targetFile, resIdx, opts);
-        if (!resIdx.byId.has(nextFile))
-            continue;
-        const hit = resolveExportedSymbolInFile(nextFile, name, kinds, resIdx, opts, nextVisited);
-        if (hit) {
-            const prev = starHits.get(hit.node.id);
-            const combinedTypeOnly = Boolean(r.typeOnly || hit.typeOnly);
-            if (!prev || (prev.typeOnly && !combinedTypeOnly))
-                starHits.set(hit.node.id, { node: hit.node, typeOnly: combinedTypeOnly });
+        if (!resIdx.byId.has(nextFile)) continue;
+        const hit = resolveExportedSymbolInFile(nextFile, name, kinds, resIdx, opts, nextVisited, false);
+        if (!hit) continue;
+        const prev = starHits.get(hit.node.id);
+        const combinedTypeOnly = Boolean(r.typeOnly || hit.typeOnly);
+        if (!prev || (prev.typeOnly && !combinedTypeOnly)) {
+            starHits.set(hit.node.id, { node: hit.node, typeOnly: combinedTypeOnly });
         }
     }
-    if (starHits.size === 1)
-        return [...starHits.values()][0];
-    return null;
+    return starHits.size === 1 ? [...starHits.values()][0] : null;
+}
+
+function resolveExportedSymbolInFile(targetFile, name, kinds, resIdx, opts, visited = new Set(), isDefault = false) {
+    if (visited.size >= MAX_BARREL_HOPS || visited.has(targetFile) || !resIdx.byId.has(targetFile)) return null;
+    const matchDefault = isDefault || name === "default";
+    const allInFile = matchDefault
+        ? (resIdx.defaultExportsByFile?.get(targetFile) ?? [])
+        : (resIdx.perFileName.get(targetFile)?.get(name) ?? []);
+    let candidates = kinds ? allInFile.filter((n) => kinds.includes(n.kind)) : allInFile;
+    if (candidates.length === 0 && allInFile.length === 1) candidates = allInFile;
+    if (candidates.length === 1) return { node: candidates[0], typeOnly: false };
+    if (candidates.length > 1) return null;
+    const reexports = resIdx.reexportsByFile?.get(targetFile);
+    if (!reexports || reexports.length === 0) return null;
+    const nextVisited = new Set(visited);
+    nextVisited.add(targetFile);
+    const namedHit = resolveNamedReexports(reexports, targetFile, matchDefault ? "default" : name, kinds, resIdx, opts, nextVisited);
+    if (namedHit || matchDefault) return namedHit;
+    return resolveStarReexports(reexports, targetFile, name, kinds, resIdx, opts, nextVisited);
 }
 function resolveReferenceEdge(e, resIdx, emitResolvedEdge, opts) {
     const { byId, perFileName, globalName } = resIdx;
@@ -230,7 +410,7 @@ function resolveReferenceEdge(e, resIdx, emitResolvedEdge, opts) {
         const targetFile = resolveImportTargetForFile(e.specifier, e.file, resIdx, opts);
         if (!byId.has(targetFile))
             return;
-        const found = resolveExportedSymbolInFile(targetFile, e.name, null, resIdx, opts);
+        const found = resolveExportedSymbolInFile(targetFile, e.name, null, resIdx, opts, new Set(), Boolean(e.isDefault));
         if (found)
             emitResolvedEdge(e.source, found.node.id, "references", "extracted", Boolean(e.typeOnly || found.typeOnly));
     }
@@ -262,7 +442,7 @@ function resolveImportedMemberCall(e, resIdx, emitResolvedEdge, opts) {
         targetFile = resolveImportTargetForFile(e.fallbackSpecifier, e.file, resIdx, opts);
     }
     if (!byId.has(targetFile))
-        return;
+        return false;
     if (e.file.endsWith(".go")) {
         const pkgDir = posix.dirname(toPosixPath(targetFile));
         const pkgFiles = (goFilesByDir.get(pkgDir) ?? [targetFile]).filter((f) => !f.endsWith("_test.go"));
@@ -273,8 +453,9 @@ function resolveImportedMemberCall(e, resIdx, emitResolvedEdge, opts) {
         }
         if (matches.length === 1) {
             emitResolvedEdge(e.source, matches[0].id, "calls", "extracted", Boolean(e.typeOnly));
+            return true;
         }
-        return;
+        return matches.length > 1;
     }
     let searchFile = targetFile;
     if (e.subModule) {
@@ -288,43 +469,183 @@ function resolveImportedMemberCall(e, resIdx, emitResolvedEdge, opts) {
     const found = resolveExportedSymbolInFile(searchFile, e.name, ["function", "method", "class"], resIdx, opts);
     if (found) {
         emitResolvedEdge(e.source, found.node.id, "calls", "extracted", Boolean(e.typeOnly || found.typeOnly));
+        return true;
     }
+    return false;
+}
+
+const STRICT_NOMINAL_METHOD_EXT = /\.(?:go|java|cs|swift|kt|scala|rs|c|h|cc|cpp|cxx|hpp|hh)$/i;
+
+function resolveUniqueUntypedMember(e, resIdx) {
+    if (!e.name || e.name.length < 4 || GENERIC_MEMBER_NAMES.has(e.name.toLowerCase()))
+        return null;
+    const raw = resIdx.callableByName?.get(e.name);
+    if (!raw || raw.length === 0)
+        return null;
+    const strictMethodsOnly = STRICT_NOMINAL_METHOD_EXT.test(e.file);
+    const callerIsTest = isTestPath(e.file);
+    const reachableCands = raw.filter((c) => {
+        if (c.id === e.source || !reachable(e.file, c.path))
+            return false;
+        if (!callerIsTest && isTestPath(c.path))
+            return false;
+        if (strictMethodsOnly && c.kind !== "method")
+            return false;
+        if (c.path === e.file && c.kind === "function" && !c.owner)
+            return false;
+        return true;
+    });
+    if (reachableCands.length === 0)
+        return null;
+    const impSet = resIdx.importedFilesByFile?.get(e.file);
+    let sameGoPkgSet = null;
+    if (e.file.endsWith(".go") && resIdx.goFilesByDir) {
+        const pkgFiles = resIdx.goFilesByDir.get(posix.dirname(toPosixPath(e.file)));
+        if (pkgFiles)
+            sameGoPkgSet = new Set(pkgFiles.filter((f) => !f.endsWith("_test.go")));
+    }
+    const closureCands = narrowByArity(
+        reachableCands.filter((c) => c.path === e.file || impSet?.has(c.path) || sameGoPkgSet?.has(c.path)),
+        e.argCount,
+    );
+    if (closureCands.length === 1)
+        return { id: closureCands[0].id, confidence: "inferred" };
+    if (closureCands.length > 1)
+        return null;
+    if (!isCompoundIdentifierName(e.name))
+        return null;
+    const repoCands = narrowByArity(
+        reachableCands.filter((c) => c.kind === "method" || Boolean(c.owner) || Boolean(c.exported) || /\.(?:js|cjs|mjs|ts|tsx|jsx)$/i.test(c.path)),
+        e.argCount,
+    );
+    if (repoCands.length === 1)
+        return { id: repoCands[0].id, confidence: "inferred" };
+    return null;
+}
+
+function resolveFactoryReturnType(e, resIdx, opts) {
+    if (!e.factoryName)
+        return null;
+    const kinds = ["function", "method", "class"];
+    if (e.factorySpecifier) {
+        const targetFile = resolveImportTargetForFile(e.factorySpecifier, e.file, resIdx, opts);
+        if (e.file.endsWith(".go") && resIdx.byId.has(targetFile)) {
+            const pkgDir = posix.dirname(toPosixPath(targetFile));
+            const pkgFiles = (resIdx.goFilesByDir.get(pkgDir) ?? [targetFile]).filter((f) => !f.endsWith("_test.go"));
+            const matches = [];
+            for (const pf of pkgFiles) {
+                matches.push(...(resIdx.perFileName.get(pf)?.get(e.factoryName) ?? []).filter((n) => n.returnType));
+            }
+            if (matches.length === 1)
+                return matches[0].returnType;
+        }
+        const found = resolveExportedSymbolInFile(targetFile, e.factoryName, kinds, resIdx, opts, new Set(), Boolean(e.factoryIsDefault));
+        return found?.node?.returnType ?? null;
+    }
+    if (e.factoryOwner) {
+        const cands = (resIdx.ownerMethod.get(`${e.factoryOwner}.${e.factoryName}`) ?? []).filter((c) => reachable(e.file, c.path) && c.returnType);
+        if (cands.length === 1)
+            return cands[0].returnType;
+    }
+    if (e.file.endsWith(".go") && resIdx.goFilesByDir) {
+        const pkgFiles = (resIdx.goFilesByDir.get(posix.dirname(toPosixPath(e.file))) ?? []).filter((f) => !f.endsWith("_test.go"));
+        const matches = [];
+        for (const pf of pkgFiles) {
+            matches.push(...(resIdx.perFileName.get(pf)?.get(e.factoryName) ?? []).filter((n) => n.returnType));
+        }
+        if (matches.length === 1)
+            return matches[0].returnType;
+    }
+    const hit = resolveName(e.factoryName, e.file, kinds, resIdx.perFileName, resIdx.globalName);
+    return hit ? (resIdx.byId.get(hit.id)?.returnType ?? null) : null;
+}
+
+function collectSubtypeMethodTargets(baseType, methodName, file, resIdx, argCount, excludeId = null) {
+    const childrenMap = resIdx.typeHierarchy?.children;
+    if (!childrenMap || !childrenMap.has(baseType))
+        return [];
+    const visited = new Set([baseType]);
+    const queue = [baseType];
+    const rawTargets = [];
+    const seenIds = new Set();
+    let head = 0;
+    while (head < queue.length && visited.size <= 64) {
+        const cur = queue[head++];
+        for (const sub of childrenMap.get(cur) ?? []) {
+            if (visited.has(sub))
+                continue;
+            visited.add(sub);
+            queue.push(sub);
+            const cands = (resIdx.ownerMethod.get(`${sub}.${methodName}`) ?? []).filter((c) => c.id !== excludeId && reachable(file, c.path));
+            if (cands.length > 0) {
+                for (const c of narrowByArity(cands, argCount)) {
+                    if (!seenIds.has(c.id)) {
+                        seenIds.add(c.id);
+                        rawTargets.push(c);
+                    }
+                }
+            }
+        }
+    }
+    if (rawTargets.length === 0)
+        return [];
+    const callerIsTest = isTestPath(file);
+    const nonTest = callerIsTest ? rawTargets : rawTargets.filter((c) => !isTestPath(c.path));
+    const finalTargets = nonTest.length > 0 ? nonTest : rawTargets;
+    return finalTargets.slice(0, MAX_CHA_DISPATCH_TARGETS);
+}
+
+function resolveViaMemberCall(e, resIdx, emitResolvedEdge, opts) {
+    const { ownerMethod, classParents, classTraits } = resIdx;
+    let effectiveRecvType = e.recvType;
+    if (e.recvIsDefault && e.recvSpecifier) {
+        const targetFile = resolveImportTargetForFile(e.recvSpecifier, e.file, resIdx, opts);
+        const defCls = resolveExportedSymbolInFile(targetFile, "default", ["class", "interface", "struct"], resIdx, opts, new Set(), true);
+        if (defCls?.node?.name)
+            effectiveRecvType = defCls.node.name;
+    }
+    const factoryRet = resolveFactoryReturnType(e, resIdx, opts);
+    if (factoryRet)
+        effectiveRecvType = factoryRet;
+    if (!effectiveRecvType) {
+        if (e.specifier && resolveImportedMemberCall(e, resIdx, emitResolvedEdge, opts))
+            return true;
+        const inferred = resolveUniqueUntypedMember(e, resIdx);
+        if (inferred)
+            emitResolvedEdge(e.source, inferred.id, "calls", inferred.confidence, Boolean(e.typeOnly));
+        return true;
+    }
+    const hit = resolveTypedMember(effectiveRecvType, e.name, e.file, ownerMethod, classParents, classTraits, e.argCount, resIdx.typeHierarchy?.parents);
+    if (hit && hit !== "ambiguous")
+        emitResolvedEdge(e.source, hit.id, "calls", hit.confidence, Boolean(e.typeOnly));
+    const subtypeTargets = collectSubtypeMethodTargets(
+        effectiveRecvType,
+        e.name,
+        e.file,
+        resIdx,
+        e.argCount,
+        hit && hit !== "ambiguous" ? hit.id : null,
+    );
+    for (const subTarget of subtypeTargets)
+        emitResolvedEdge(e.source, subTarget.id, "calls", "interface_dispatch", Boolean(e.typeOnly));
+    return Boolean(hit || subtypeTargets.length > 0 || !e.implicitSelf);
 }
 
 function resolveCallEdge(e, resIdx, emitResolvedEdge, opts) {
-    const { byId, perFileName, globalName, ownerMethod, classParents, classTraits } = resIdx;
-    if (e.viaMember) {
-        if (!e.recvType) {
-            if (e.specifier)
-                resolveImportedMemberCall(e, resIdx, emitResolvedEdge, opts);
-            return;
-        }
-        const hit = resolveTypedMember(e.recvType, e.name, e.file, ownerMethod, classParents, classTraits, e.argCount);
-        if (hit === "ambiguous")
-            return;
-        if (hit) {
-            emitResolvedEdge(e.source, hit.id, "calls", hit.confidence, Boolean(e.typeOnly));
-            return;
-        }
-        if (!e.implicitSelf)
-            return;
-    }
+    const { byId, perFileName, globalName } = resIdx;
+    if (e.viaMember && resolveViaMemberCall(e, resIdx, emitResolvedEdge, opts))
+        return;
     const srcOrigin = byId.get(e.source)?.origin;
     const callKinds = e.kinds ??
-        (srcOrigin === "generic"
-            ? ["function", "method"]
-            : e.file.endsWith(".java")
-                ? ["class", "struct", "enum", "interface"]
-                : ["function"]);
+        (srcOrigin === "generic" ? ["function", "method"] : e.file.endsWith(".java") ? ["class", "struct", "enum", "interface"] : ["function"]);
     if (!e.viaMember && e.specifier) {
         const targetFile = resolveImportTargetForFile(e.specifier, e.file, resIdx, opts);
         if (byId.has(targetFile)) {
-            let found = resolveExportedSymbolInFile(targetFile, e.name, callKinds, resIdx, opts);
+            let found = resolveExportedSymbolInFile(targetFile, e.name, callKinds, resIdx, opts, new Set(), Boolean(e.isDefault));
             if (!found && PY_EXT.test(e.file))
                 found = resolveExportedSymbolInFile(targetFile, e.name, PY_CTOR_KINDS, resIdx, opts);
-            if (found) {
+            if (found)
                 emitResolvedEdge(e.source, found.node.id, "calls", "extracted", Boolean(e.typeOnly || found.typeOnly));
-            }
             return;
         }
         if (!e.file.endsWith(".php") && !PY_EXT.test(e.file))
@@ -340,49 +661,56 @@ function resolveCallEdge(e, resIdx, emitResolvedEdge, opts) {
     if (hit)
         emitResolvedEdge(e.source, hit.id, "calls", hit.confidence, Boolean(e.typeOnly));
 }
+
+function recordUniqueResolvedEdge(out, seen, source, target, relation, confidence, typeOnly = false) {
+    const key = `${source}\0${relation}\0${target}`;
+    const existing = seen.get(key);
+    if (existing) {
+        if (!typeOnly && existing.typeOnly)
+            delete existing.typeOnly;
+        return;
+    }
+    const edge = { source, target, relation, confidence, ...(typeOnly ? { typeOnly: true } : {}) };
+    seen.set(key, edge);
+    out.push(edge);
+}
+
+function resolveNonLuauRawEdge(e, resIdx, emitResolvedEdge, opts) {
+    if (e.relation === "contains" && e.targetId) {
+        emitResolvedEdge(e.source, e.targetId, "contains", "extracted");
+    }
+    else if ((e.relation === "imports" || e.relation === "reexports") && e.specifier) {
+        emitResolvedEdge(e.source, resolveImportTargetForFile(e.specifier, e.file, resIdx, opts, e.isRustMod), e.relation, "extracted", Boolean(e.typeOnly));
+    }
+    else if (e.relation === "extends" || e.relation === "implements") {
+        const kinds = e.relation === "implements" ? ["interface", "trait"] : ["class", "interface"];
+        const hit = resolveName(e.name, e.file, kinds, resIdx.perFileName, resIdx.globalName);
+        let sourceId = e.source;
+        if (e.ownerName) {
+            const ownerHit = resolveName(e.ownerName, e.file, ["struct", "class", "enum", "type"], resIdx.perFileName, resIdx.globalName);
+            if (ownerHit)
+                sourceId = ownerHit.id;
+        }
+        emitResolvedEdge(sourceId, hit?.id ?? e.name, e.relation, hit?.confidence ?? "inferred", Boolean(e.typeOnly));
+    }
+    else if (e.relation === "references" && e.name) {
+        resolveReferenceEdge(e, resIdx, emitResolvedEdge, opts);
+    }
+    else if (e.relation === "calls") {
+        resolveCallEdge(e, resIdx, emitResolvedEdge, opts);
+    }
+}
+
 export function resolveEdges(nodes, rawEdges, opts = {}) {
     const resIdx = buildResolutionIndex(nodes, rawEdges, opts);
     const out = [];
     const seen = new Map();
-    const emitResolvedEdge = (source, target, relation, confidence, typeOnly = false) => {
-        const key = `${source}\0${relation}\0${target}`;
-        const existing = seen.get(key);
-        if (existing) {
-            if (!typeOnly && existing.typeOnly)
-                delete existing.typeOnly;
-            return;
-        }
-        const edge = {
-            source,
-            target,
-            relation,
-            confidence,
-            ...(typeOnly ? { typeOnly: true } : {}),
-        };
-        seen.set(key, edge);
-        out.push(edge);
-    };
+    const emitResolvedEdge = (source, target, relation, confidence, typeOnly = false) =>
+        recordUniqueResolvedEdge(out, seen, source, target, relation, confidence, typeOnly);
     resolveLuauEdges(nodes, rawEdges, emitResolvedEdge, opts);
     for (const e of rawEdges) {
-        if (e.file?.endsWith(".luau"))
-            continue;
-        if (e.relation === "contains" && e.targetId) {
-            emitResolvedEdge(e.source, e.targetId, "contains", "extracted");
-        }
-        else if (e.relation === "imports" && e.specifier) {
-            emitResolvedEdge(e.source, resolveImportTargetForFile(e.specifier, e.file, resIdx, opts), "imports", "extracted", Boolean(e.typeOnly));
-        }
-        else if (e.relation === "extends" || e.relation === "implements") {
-            const kinds = e.relation === "implements" ? ["interface", "trait"] : ["class", "interface"];
-            const hit = resolveName(e.name, e.file, kinds, resIdx.perFileName, resIdx.globalName);
-            emitResolvedEdge(e.source, hit?.id ?? e.name, e.relation, hit?.confidence ?? "inferred", Boolean(e.typeOnly));
-        }
-        else if (e.relation === "references" && e.name) {
-            resolveReferenceEdge(e, resIdx, emitResolvedEdge, opts);
-        }
-        else if (e.relation === "calls") {
-            resolveCallEdge(e, resIdx, emitResolvedEdge, opts);
-        }
+        if (!e.file?.endsWith(".luau"))
+            resolveNonLuauRawEdge(e, resIdx, emitResolvedEdge, opts);
     }
     return out;
 }
@@ -453,47 +781,47 @@ function narrowByArity(candidates, argCount) {
     });
     return fits.length > 0 ? fits : candidates;
 }
-function resolveTypedMember(recvType, name, file, ownerMethod, classParents, classTraits, argCount) {
+function pickOwnerMethodCandidate(type, name, file, ownerMethod, argCount) {
+    const all = ownerMethod.get(`${type}.${name}`)?.filter((c) => reachable(file, c.path));
+    if (!all || all.length === 0)
+        return null;
+    const candidates = narrowByArity(all, argCount);
+    if (candidates.length === 1) {
+        const c = candidates[0];
+        return { id: c.id, confidence: c.path === file ? "extracted" : "inferred" };
+    }
+    if (SWIFT_EXT.test(file))
+        return "ambiguous";
+    const sameFile = candidates.find((c) => c.path === file);
+    return sameFile ? { id: sameFile.id, confidence: "extracted" } : "ambiguous";
+}
+function advanceTypeHierarchyFrontier(frontier, visited, hierarchyParents, classParents) {
+    const next = [];
+    for (const type of frontier) {
+        const parentNames = hierarchyParents?.get(type) ?? classParents.get(type) ?? [];
+        for (const parent of parentNames) {
+            if (visited.has(parent))
+                continue;
+            visited.add(parent);
+            next.push(parent);
+        }
+    }
+    return next;
+}
+function resolveTypedMember(recvType, name, file, ownerMethod, classParents, classTraits, argCount, hierarchyParents = null) {
     const MAX_DEPTH = 3;
     const visited = new Set([recvType]);
     let frontier = [recvType];
     for (let depth = 0; depth <= MAX_DEPTH && frontier.length; depth++) {
         for (const type of frontier) {
-            const all = ownerMethod.get(`${type}.${name}`)?.filter((c) => reachable(file, c.path));
-            if (all && all.length > 0) {
-                const candidates = narrowByArity(all, argCount);
-                if (candidates.length === 1) {
-                    const c = candidates[0];
-                    return { id: c.id, confidence: c.path === file ? "extracted" : "inferred" };
-                }
-                // Swift: several candidates surviving arity narrowing are a genuine
-                // overload set distinguished only by parameter TYPES (`save(Int)` vs
-                // `save(String)`), which this pass cannot read — the same-file tiebreak
-                // below would pick whichever overload appears first in the file and
-                // stamp it `extracted`, a confidently wrong edge. Drop instead.
-                if (SWIFT_EXT.test(file))
-                    return "ambiguous";
-                const sameFile = candidates.find((c) => c.path === file);
-                if (sameFile)
-                    return { id: sameFile.id, confidence: "extracted" };
-                return "ambiguous"; // several, none same-file — drop and stop
-            }
+            const ownerHit = pickOwnerMethodCandidate(type, name, file, ownerMethod, argCount);
+            if (ownerHit)
+                return ownerHit;
             const traitHit = resolveTraitMember(type, name, file, ownerMethod, classTraits, argCount);
-            if (traitHit === "ambiguous")
-                return "ambiguous";
             if (traitHit)
                 return traitHit;
         }
-        const next = [];
-        for (const type of frontier) {
-            for (const parent of classParents.get(type) ?? []) {
-                if (visited.has(parent))
-                    continue;
-                visited.add(parent);
-                next.push(parent);
-            }
-        }
-        frontier = next;
+        frontier = advanceTypeHierarchyFrontier(frontier, visited, hierarchyParents, classParents);
     }
     return null; // chain exhausted, no candidate anywhere
 }
@@ -639,6 +967,49 @@ function resolvePythonImportSpec(spec, posixFile, byId, opts) {
     return spec;
 }
 
+function resolveTsConfigWildcardPattern(spec, pattern, targets, baseDir, byId) {
+    const [prefix, suffix] = pattern.split("*");
+    if (!spec.startsWith(prefix) || !spec.endsWith(suffix) || spec.length < prefix.length + suffix.length)
+        return null;
+    const star = spec.slice(prefix.length, spec.length - suffix.length);
+    for (const t of targets) {
+        if (typeof t !== "string")
+            continue;
+        const mapped = t.replace(/\*/g, star);
+        const hit = probeImportPath(baseDir ? posix.join(baseDir, mapped) : mapped, byId, false);
+        if (hit)
+            return hit;
+    }
+    return null;
+}
+function resolveTsConfigExactPattern(targets, baseDir, byId) {
+    for (const t of targets) {
+        if (typeof t !== "string")
+            continue;
+        const hit = probeImportPath(baseDir ? posix.join(baseDir, t) : t, byId, false);
+        if (hit)
+            return hit;
+    }
+    return null;
+}
+function resolveTsConfigForEntry(spec, cfg, baseDir, byId) {
+    if (cfg.paths && typeof cfg.paths === "object") {
+        for (const [pattern, targets] of Object.entries(cfg.paths)) {
+            if (!Array.isArray(targets))
+                continue;
+            const hit = pattern.includes("*")
+                ? resolveTsConfigWildcardPattern(spec, pattern, targets, baseDir, byId)
+                : pattern === spec
+                    ? resolveTsConfigExactPattern(targets, baseDir, byId)
+                    : null;
+            if (hit)
+                return hit;
+        }
+    }
+    if (cfg.baseUrl)
+        return probeImportPath(baseDir ? posix.join(baseDir, spec) : spec, byId, false);
+    return null;
+}
 function resolveTsConfigPaths(spec, posixFile, byId, tsConfigs) {
     for (const cfg of tsConfigs) {
         const cfgDir = cfg.dir === "." ? "" : cfg.dir;
@@ -646,102 +1017,52 @@ function resolveTsConfigPaths(spec, posixFile, byId, tsConfigs) {
             continue;
         const rawBase = cfg.baseUrl ? (cfgDir ? posix.join(cfgDir, cfg.baseUrl) : cfg.baseUrl) : cfgDir;
         const baseDir = rawBase === "." ? "" : posix.normalize(rawBase);
-        if (cfg.paths && typeof cfg.paths === "object") {
-            for (const [pattern, targets] of Object.entries(cfg.paths)) {
-                if (!Array.isArray(targets))
-                    continue;
-                if (!pattern.includes("*")) {
-                    if (pattern !== spec)
-                        continue;
-                    for (const t of targets) {
-                        if (typeof t !== "string")
-                            continue;
-                        const cand = baseDir ? posix.join(baseDir, t) : t;
-                        const hit = probeImportPath(cand, byId, false);
-                        if (hit)
-                            return hit;
-                    }
-                }
-                else {
-                    const [prefix, suffix] = pattern.split("*");
-                    if (!spec.startsWith(prefix) || !spec.endsWith(suffix) || spec.length < prefix.length + suffix.length)
-                        continue;
-                    const star = spec.slice(prefix.length, spec.length - suffix.length);
-                    for (const t of targets) {
-                        if (typeof t !== "string")
-                            continue;
-                        const mapped = t.replace(/\*/g, star);
-                        const cand = baseDir ? posix.join(baseDir, mapped) : mapped;
-                        const hit = probeImportPath(cand, byId, false);
-                        if (hit)
-                            return hit;
-                    }
-                }
-            }
-        }
-        if (cfg.baseUrl) {
-            const cand = baseDir ? posix.join(baseDir, spec) : spec;
-            const hit = probeImportPath(cand, byId, false);
+        const hit = resolveTsConfigForEntry(spec, cfg, baseDir, byId);
+        if (hit)
+            return hit;
+    }
+    return null;
+}
+
+function resolvePackageExportsTargets(pkgExports, subpath) {
+    if (typeof pkgExports === "string" || Array.isArray(pkgExports))
+        return subpath === "." ? extractPackageTargets(pkgExports) : [];
+    if (typeof pkgExports !== "object")
+        return [];
+    const isSubpathMap = Object.keys(pkgExports).some((k) => k.startsWith("."));
+    if (isSubpathMap)
+        return matchExportMap(pkgExports, subpath);
+    return subpath === "." ? extractPackageTargets(pkgExports) : [];
+}
+function probeSelfPackageEntry(pkg, spec, byId) {
+    if (!pkg.name || (spec !== pkg.name && !spec.startsWith(`${pkg.name}/`)))
+        return null;
+    const pkgDir = pkg.dir === "." ? "" : pkg.dir;
+    const subpath = spec === pkg.name ? "." : `./${spec.slice(pkg.name.length + 1)}`;
+    if (pkg.exports) {
+        for (const t of resolvePackageExportsTargets(pkg.exports, subpath)) {
+            const hit = probePackageTarget(pkgDir, t, byId);
             if (hit)
                 return hit;
         }
+    }
+    const relSub = subpath === "." ? "" : subpath.slice(2);
+    const fallbackCands = subpath === "."
+        ? [pkgDir ? `${pkgDir}/src/index` : "src/index", pkgDir ? `${pkgDir}/index` : "index"]
+        : [pkgDir ? `${pkgDir}/${relSub}` : relSub, pkgDir ? `${pkgDir}/src/${relSub}` : `src/${relSub}`];
+    for (const c of fallbackCands) {
+        const hit = probeImportPath(c, byId, false);
+        if (hit)
+            return hit;
     }
     return null;
 }
 
 function resolveSelfPackageExport(spec, byId, packageConfigs) {
     for (const pkg of packageConfigs) {
-        if (!pkg.name)
-            continue;
-        if (spec !== pkg.name && !spec.startsWith(`${pkg.name}/`))
-            continue;
-        const pkgDir = pkg.dir === "." ? "" : pkg.dir;
-        const subpath = spec === pkg.name ? "." : `./${spec.slice(pkg.name.length + 1)}`;
-        if (pkg.exports) {
-            let targets = [];
-            if (typeof pkg.exports === "string" || Array.isArray(pkg.exports)) {
-                if (subpath === ".")
-                    targets = extractPackageTargets(pkg.exports);
-            }
-            else if (typeof pkg.exports === "object") {
-                const keys = Object.keys(pkg.exports);
-                const isSubpathMap = keys.some((k) => k.startsWith("."));
-                if (isSubpathMap) {
-                    targets = matchExportMap(pkg.exports, subpath);
-                }
-                else if (subpath === ".") {
-                    targets = extractPackageTargets(pkg.exports);
-                }
-            }
-            for (const t of targets) {
-                const hit = probePackageTarget(pkgDir, t, byId);
-                if (hit)
-                    return hit;
-            }
-        }
-        if (subpath === ".") {
-            const rootCands = [
-                pkgDir ? `${pkgDir}/src/index` : "src/index",
-                pkgDir ? `${pkgDir}/index` : "index",
-            ];
-            for (const c of rootCands) {
-                const hit = probeImportPath(c, byId, false);
-                if (hit)
-                    return hit;
-            }
-        }
-        else {
-            const relSub = subpath.slice(2);
-            const subCands = [
-                pkgDir ? `${pkgDir}/${relSub}` : relSub,
-                pkgDir ? `${pkgDir}/src/${relSub}` : `src/${relSub}`,
-            ];
-            for (const c of subCands) {
-                const hit = probeImportPath(c, byId, false);
-                if (hit)
-                    return hit;
-            }
-        }
+        const hit = probeSelfPackageEntry(pkg, spec, byId);
+        if (hit)
+            return hit;
     }
     return null;
 }
@@ -842,6 +1163,77 @@ function resolveCInclude(spec, file, byId, bySuffix) {
  * one file: `App/Models/User.php`, then `Models/User.php`, then `User.php`. The longest
  * unique match wins; an ambiguous tail or a vendor/out-of-repo class stays the raw name.
  */
+const BREADTH_REL_EXT_MAP = {
+    ".rb": [".rb"],
+    ".lua": [".lua", "/init.lua"],
+    ".nix": [".nix", "/default.nix"],
+    ".dart": [".dart"],
+    ".sol": [".sol"],
+};
+const CLJ_EXTS = new Set([".clj", ".cljc", ".cljs"]);
+function resolveBreadthRelativeImport(cleanSpec, dir, ext, byId) {
+    const relJoin = posix.normalize(posix.join(dir, cleanSpec));
+    if (byId.has(relJoin))
+        return relJoin;
+    if (!posix.extname(relJoin) && BREADTH_REL_EXT_MAP[ext]) {
+        for (const sfx of BREADTH_REL_EXT_MAP[ext]) {
+            const cand = `${relJoin}${sfx}`;
+            if (byId.has(cand))
+                return cand;
+        }
+    }
+    return null;
+}
+function resolveDartPackageSpec(cleanSpec, bySuffix) {
+    const rest = cleanSpec.slice("package:".length);
+    const slash = rest.indexOf("/");
+    if (slash <= 0)
+        return null;
+    const sub = rest.slice(slash + 1);
+    const uniq = [...new Set([...(bySuffix.get(`lib/${sub}`) ?? []), ...(bySuffix.get(sub) ?? [])])];
+    return uniq.length === 1 ? uniq[0] : null;
+}
+function resolveLuaPackageSpec(cleanSpec, byId, bySuffix) {
+    const slash = cleanSpec.replace(/\./g, "/");
+    for (const suf of [`${slash}.lua`, `${slash}/init.lua`]) {
+        if (byId.has(suf))
+            return suf;
+        const hits = bySuffix.get(suf);
+        if (hits?.length === 1)
+            return hits[0];
+    }
+    return null;
+}
+function resolveBreadthPackageOrSuffix(cleanSpec, ext, byId, bySuffix) {
+    if (ext === ".dart" && cleanSpec.startsWith("package:"))
+        return resolveDartPackageSpec(cleanSpec, bySuffix);
+    if (ext === ".lua")
+        return resolveLuaPackageSpec(cleanSpec, byId, bySuffix);
+    if (ext === ".rb") {
+        const hits = bySuffix.get(cleanSpec.endsWith(".rb") ? cleanSpec : `${cleanSpec}.rb`);
+        return hits?.length === 1 ? hits[0] : null;
+    }
+    if (CLJ_EXTS.has(ext)) {
+        const slash = cleanSpec.replace(/\./g, "/").replace(/-/g, "_");
+        for (const e of CLJ_EXTS) {
+            const hits = bySuffix.get(`${slash}${e}`);
+            if (hits?.length === 1)
+                return hits[0];
+        }
+    }
+    return null;
+}
+function resolveBreadthImport(spec, file, byId, bySuffix) {
+    const dir = posix.dirname(toPosixPath(file));
+    const ext = posix.extname(file).toLowerCase();
+    const cleanSpec = spec.trim();
+    if (cleanSpec.startsWith(".")) {
+        const relHit = resolveBreadthRelativeImport(cleanSpec, dir, ext, byId);
+        if (relHit)
+            return relHit;
+    }
+    return resolveBreadthPackageOrSuffix(cleanSpec, ext, byId, bySuffix) ?? cleanSpec;
+}
 function resolvePhpUse(fqn, bySuffix) {
     const parts = fqn.split("\\").filter(Boolean);
     if (parts.length === 0)

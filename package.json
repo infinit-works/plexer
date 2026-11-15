@@ -38,6 +38,11 @@
 		"grammars",
 		"agents",
 		"assets",
+		"rules",
+		"skills",
+		"sidecars",
+		"plugin.json",
+		"hooks.json",
 		"SKILL.md",
 		"README.md",
 		"LICENSE"
@@ -50,7 +55,7 @@
 		}
 	},
 	"scripts": {
-		"test": "node --test test/*.test.js",
+		"test": "PLEXER_NO_DAEMON=1 node --test",
 		"bench": "node bench/run.js"
 	},
 	"dependencies": {
@@ -59,6 +64,6 @@
 		"web-tree-sitter": "^0.27.1"
 	},
 	"engines": {
-		"node": ">=20"
+		"node": ">=22.13.0"
 	}
 }

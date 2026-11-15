@@ -9,9 +9,9 @@
 import { basename } from "node:path";
 import { contentHash, fileResidual, mintId, searchBody } from "../util/id.js";
 import { extractLeadingSummary } from "./extract/ast.js";
-import { R_ASSIGN_OPS, R_RIGHT_ASSIGN_OPS, collectBindings, goReceiverTypeOf, goReceiverVarOf, phpClosureName, resolveRecvType } from "./bindings.js";
+import { R_ASSIGN_OPS, R_RIGHT_ASSIGN_OPS, collectBindings, goReceiverTypeOf, goReceiverVarOf, phpClosureName, resolveRecvFactory, resolveRecvType } from "./bindings.js";
 import { collectShadowedLocals, sameSyntaxNode } from "./extract/shadow.js";
-import { cCppExported, isNodeExported, rustExported } from "./extract/visibility.js";
+import { cCppExported, isNodeExported, rustExported, tsDefaultExported } from "./extract/visibility.js";
 import { genericLangOf, loadWasmLanguage, parseWasm } from "./generic.js";
 
 export { cCppExported, extractLeadingSummary, fileResidual, isNodeExported, mintId, rustExported, searchBody };
@@ -69,7 +69,9 @@ export function languageOf(path) {
  * and the one that matters to a reader checking coverage.
  */
 export function languageLabelOf(path) {
-    return entryFor(path)?.label ?? (path.toLowerCase().endsWith(".vue") ? "vue" : null) ?? genericLangOf(path)?.name ?? null;
+    const p = path.toLowerCase();
+    const containerLabel = p.endsWith(".vue") ? "vue" : p.endsWith(".svelte") ? "svelte" : p.endsWith(".astro") ? "astro" : null;
+    return entryFor(path)?.label ?? containerLabel ?? genericLangOf(path)?.name ?? null;
 }
 const TS_KINDS = {
     class_declaration: "class",
@@ -77,6 +79,8 @@ const TS_KINDS = {
     function_declaration: "function",
     generator_function_declaration: "function",
     method_definition: "method",
+    method_signature: "method",
+    abstract_method_signature: "method",
     interface_declaration: "interface",
     type_alias_declaration: "type",
     enum_declaration: "enum",
@@ -275,6 +279,7 @@ export function extractFile(rel, source, lang = languageOf(rel)) {
         importedSymbols,
         shadowedNames: EMPTY_SET,
         nonCallableShadows: EMPTY_SET,
+        defaultExportNames: new Set(),
         rR6Access: null,
         rGenerics,
         rSuperClass: null,
@@ -285,6 +290,17 @@ export function extractFile(rel, source, lang = languageOf(rel)) {
     }
     finally {
         root._tree?.delete?.();
+    }
+    if (ctx.defaultExportNames.size > 0) {
+        for (const n of nodes) {
+            if (n.kind === "file")
+                continue;
+            const localPart = n.id.slice(rel.length + 1);
+            if (!localPart.includes(".") && ctx.defaultExportNames.has(n.name)) {
+                n.exported = true;
+                n.defaultExport = true;
+            }
+        }
     }
     nodes[0].body_text = fileResidual(source, nodes.slice(1));
     return { nodes, rawEdges };
@@ -412,6 +428,9 @@ function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
         ? (isGoMethod ? (goReceiverTypeOf(node) ?? undefined) : (desc.owner ?? ctx.enclosingClass ?? undefined))
         : undefined;
     const nodeText = desc.hashNode.text;
+    const isTsOrTsx = ctx.lang === "typescript" || ctx.lang === "tsx";
+    const isDefaultExp = isTsOrTsx && tsDefaultExported(node);
+    const returnType = ctx.bindings.getNodeReturnType?.(node);
     out.push({
         id,
         name: desc.name,
@@ -419,7 +438,7 @@ function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
         path: ctx.rel,
         span: `L${desc.hashNode.startPosition.row + 1}-L${desc.hashNode.endPosition.row + 1}`,
         signature: clean(ctx.source.slice(desc.hashNode.startIndex, desc.headerEnd)),
-        exported: isNodeExported(node, desc.name, ctx),
+        exported: isDefaultExp || isNodeExported(node, desc.name, ctx),
         origin: "ast",
         body_hash: contentHash(nodeText),
         body_text: searchBody(nodeText),
@@ -429,18 +448,20 @@ function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
         ...(owner !== undefined ? { owner } : {}),
         ...(desc.arity !== undefined ? { arity: desc.arity } : {}),
         ...(desc.variadic ? { variadic: true } : {}),
+        ...(isDefaultExp ? { defaultExport: true } : {}),
+        ...(returnType ? { returnType } : {}),
     });
     edges.push({ source: ctx.parentId, relation: "contains", targetId: id, file: ctx.rel });
     const javaTypeDecl = ctx.lang === "java" && JAVA_TYPE_KINDS.has(desc.kind);
     const kotlinTypeDecl = ctx.lang === "kotlin" && KOTLIN_TYPE_KINDS.has(desc.kind);
     const swiftTypeDecl = ctx.lang === "swift" && SWIFT_TYPE_KINDS.has(desc.kind);
-    if (desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
+    if (desc.kind === "class" || desc.kind === "interface" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
         edges.push(...heritageEdges(node, id, ctx));
     if (ctx.lang === "php")
         edges.push(...phpAttributeReferenceEdges(node, id, ctx));
     if (ctx.lang === "java")
         edges.push(...javaAnnotationReferenceEdges(node, id, ctx));
-    const enclosingClass = desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl
+    const enclosingClass = desc.kind === "class" || desc.kind === "interface" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl
         ? desc.name
         : isGoMethod
             ? goReceiverTypeOf(node)
@@ -465,20 +486,30 @@ function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
     };
     walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
 }
-function emitExtractedCallEdge(node, ctx, edges) {
-    const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
-    const isConsumedRClassCall = consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
-    const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
-    if (!callee)
-        return;
-    if (!callee.viaMember && ctx.nonCallableShadows?.has(callee.name))
-        return;
-    const sameFileOnly = !callee.viaMember && Boolean(ctx.shadowedNames?.has(callee.name));
-    const imported = !callee.viaMember ? ctx.importedSymbols.get(callee.name) : undefined;
-    const recvType = callee.viaMember ? resolveRecvType(callee.receiver, ctx) : undefined;
-    let nsImported = callee.viaMember && !recvType && callee.receiver ? ctx.importedSymbols.get(callee.receiver) : undefined;
+function resolveCallFactoryMeta(recvFactory, ctx) {
+    if (!recvFactory)
+        return {};
+    if (!recvFactory.viaMember) {
+        const fImp = ctx.importedSymbols.get(recvFactory.callee);
+        return {
+            factoryName: fImp ? (fImp.isDefault ? recvFactory.callee : fImp.name) : recvFactory.callee,
+            factorySpec: fImp?.specifier,
+            factoryIsDefault: Boolean(fImp?.isDefault),
+        };
+    }
+    const fNs = recvFactory.receiver ? ctx.importedSymbols.get(recvFactory.receiver) : undefined;
+    return {
+        factoryName: recvFactory.callee,
+        factorySpec: fNs?.specifier,
+        factoryOwner: !fNs && recvFactory.receiver ? recvFactory.receiver : undefined,
+    };
+}
+function resolveCallNamespaceMeta(callee, recvType, ctx) {
+    if (!callee.viaMember || recvType || !callee.receiver)
+        return {};
+    let nsImported = ctx.importedSymbols.get(callee.receiver);
     let subModule;
-    if (!nsImported && callee.viaMember && !recvType && callee.receiver?.includes(".")) {
+    if (!nsImported && callee.receiver.includes(".")) {
         const dot = callee.receiver.indexOf(".");
         const root = callee.receiver.slice(0, dot);
         if (root !== "self" && root !== "this") {
@@ -495,6 +526,15 @@ function emitExtractedCallEdge(node, ctx, edges) {
             : `${nsImported.specifier}.${nsImported.name}`;
         nsFallbackSpec = nsImported.specifier;
     }
+    return { nsImported, nsSpec, nsFallbackSpec, subModule };
+}
+function buildExtractedCallEdge(node, callee, recvType, ctx) {
+    const sameFileOnly = !callee.viaMember && Boolean(ctx.shadowedNames?.has(callee.name));
+    const imported = !callee.viaMember ? ctx.importedSymbols.get(callee.name) : undefined;
+    const recvDefaultImp = recvType ? ctx.importedSymbols.get(recvType) : undefined;
+    const recvFactory = callee.viaMember ? resolveRecvFactory(callee.receiver, ctx) : undefined;
+    const { factoryName, factorySpec, factoryOwner, factoryIsDefault } = resolveCallFactoryMeta(recvFactory, ctx);
+    const { nsImported, nsSpec, nsFallbackSpec, subModule } = resolveCallNamespaceMeta(callee, recvType, ctx);
     const callEdge = {
         source: ctx.parentId,
         relation: "calls",
@@ -506,27 +546,33 @@ function emitExtractedCallEdge(node, ctx, edges) {
         ...(nsFallbackSpec ? { fallbackSpecifier: nsFallbackSpec } : {}),
         ...(subModule ? { subModule } : {}),
         ...(sameFileOnly ? { sameFileOnly: true } : {}),
+        ...(imported?.isDefault ? { isDefault: true } : {}),
+        ...(recvDefaultImp?.isDefault ? { recvSpecifier: recvDefaultImp.specifier, recvIsDefault: true } : {}),
+        ...(factoryName ? { factoryName } : {}),
+        ...(factorySpec ? { factorySpecifier: factorySpec } : {}),
+        ...(factoryOwner ? { factoryOwner } : {}),
+        ...(factoryIsDefault ? { factoryIsDefault: true } : {}),
         ...(imported?.typeOnly || nsImported?.typeOnly ? { typeOnly: true } : {}),
     };
     const argCount = ctx.lang === "java" ? javaArgCount(node) : ctx.lang === "swift" ? swiftArgCount(node) : undefined;
     if (argCount !== undefined)
         callEdge.argCount = argCount;
-    const swiftImplicitSelf = ctx.lang === "swift" &&
-        !callee.viaMember &&
-        !callee.kinds &&
-        ctx.enclosingClass &&
-        !/^[A-Z]/.test(callee.name);
+    return callEdge;
+}
+function emitExtractedCallEdge(node, ctx, edges) {
+    const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
+    const isConsumedRClassCall = consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
+    const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
+    if (!callee || (!callee.viaMember && ctx.nonCallableShadows?.has(callee.name)))
+        return;
+    const recvType = callee.viaMember ? resolveRecvType(callee.receiver, ctx) : undefined;
+    const callEdge = buildExtractedCallEdge(node, callee, recvType, ctx);
+    const swiftImplicitSelf = ctx.lang === "swift" && !callee.viaMember && !callee.kinds && ctx.enclosingClass && !/^[A-Z]/.test(callee.name);
     if (swiftImplicitSelf) {
-        edges.push({
-            ...callEdge,
-            viaMember: true,
-            recvType: ctx.enclosingClass,
-            implicitSelf: true,
-        });
+        edges.push({ ...callEdge, viaMember: true, recvType: ctx.enclosingClass, implicitSelf: true });
+        return;
     }
-    else {
-        edges.push(recvType ? { ...callEdge, recvType } : callEdge);
-    }
+    edges.push(recvType ? { ...callEdge, recvType } : callEdge);
 }
 function emitJavaAnonymousClass(node, body, ctx, out, edges, minted) {
     const idPart = "{anonymous}";
@@ -610,14 +656,14 @@ function emitTsDynamicImportEdges(node, ctx, edges) {
     if (!dynSpec)
         return;
     edges.push({ source: ctx.rel, relation: "imports", specifier: dynSpec, file: ctx.rel });
-    if (ctx.enclosingKind !== "file")
+    if (ctx.enclosingKind !== null)
         return;
     const p = node.parent;
-    if (p?.type === "call_expression" && p.childForFieldName("function") === node) {
+    if (p?.type === "call_expression" && p.childForFieldName("function")?.id === node.id) {
         edges.push({ source: ctx.rel, relation: "reexports", specifier: dynSpec, star: true, file: ctx.rel });
         return;
     }
-    if (p?.type === "assignment_expression" && p.childForFieldName("right") === node) {
+    if (p?.type === "assignment_expression" && p.childForFieldName("right")?.id === node.id) {
         const left = p.childForFieldName("left");
         const prop = left?.type === "member_expression" ? left.childForFieldName("property")?.text : null;
         if (!prop)
@@ -653,6 +699,7 @@ function emitImportedIdentifierRefEdge(node, callTypes, ctx, edges) {
         name: imported.isDefault ? node.text : imported.name,
         specifier: imported.specifier,
         file: ctx.rel,
+        ...(imported.isDefault ? { isDefault: true } : {}),
         ...(imported.typeOnly ? { typeOnly: true } : {}),
     });
 }
@@ -1060,44 +1107,117 @@ function isRequireDeclarator(node) {
     const call = unwrapCallExpression(node.childForFieldName("value"));
     return Boolean(call && tsCallImportSpecifier(call));
 }
+function collectTsObjectRequireProps(nameNode, specifier, out) {
+    for (const prop of nameNode.namedChildren) {
+        if (prop.type === "shorthand_property_identifier_pattern" || prop.type === "shorthand_property_identifier") {
+            out.set(prop.text, { name: prop.text, specifier });
+        }
+        else if (prop.type === "object_assignment_pattern") {
+            const left = prop.childForFieldName("left");
+            if (left?.text)
+                out.set(left.text, { name: left.text, specifier });
+        }
+        else if (prop.type === "pair_pattern") {
+            const key = prop.childForFieldName("key")?.text;
+            const val = prop.childForFieldName("value");
+            const local = (val?.type === "identifier" ? val.text : val?.childForFieldName("left")?.text) ?? key;
+            if (key && local)
+                out.set(local, { name: key, specifier });
+        }
+    }
+}
 function collectTsRequireBindings(node, out) {
     const call = unwrapCallExpression(node.childForFieldName("value"));
-    if (!call)
-        return;
-    const specifier = tsCallImportSpecifier(call);
-    if (!specifier)
-        return;
-    const nameNode = node.childForFieldName("name");
+    const specifier = call ? tsCallImportSpecifier(call) : null;
+    const nameNode = specifier ? node.childForFieldName("name") : null;
     if (!nameNode)
         return;
     if (nameNode.type === "identifier") {
-        out.set(nameNode.text, {
-            name: "default",
-            local: nameNode.text,
-            specifier,
-            isDefault: true,
-        });
+        out.set(nameNode.text, { name: "default", local: nameNode.text, specifier, isDefault: true });
         return;
     }
-    if (nameNode.type === "object_pattern") {
-        for (const prop of nameNode.namedChildren) {
-            if (prop.type === "shorthand_property_identifier_pattern" || prop.type === "shorthand_property_identifier") {
-                out.set(prop.text, { name: prop.text, specifier });
-            }
-            else if (prop.type === "object_assignment_pattern") {
-                const left = prop.childForFieldName("left");
-                if (left?.text)
-                    out.set(left.text, { name: left.text, specifier });
-            }
-            else if (prop.type === "pair_pattern") {
-                const key = prop.childForFieldName("key")?.text;
-                const val = prop.childForFieldName("value");
-                const local = (val?.type === "identifier" ? val.text : val?.childForFieldName("left")?.text) ?? key;
-                if (key && local)
-                    out.set(local, { name: key, specifier });
+    if (nameNode.type === "object_pattern")
+        collectTsObjectRequireProps(nameNode, specifier, out);
+}
+function emitTsExternalExportEdges(node, spec, exportClause, specifiers, isExportType, ctx, edges) {
+    const allSpecsTypeOnly = specifiers.length > 0 && specifiers.every((s) => isTsTypeSpecifier(s));
+    const importTypeOnly = isExportType || allSpecsTypeOnly;
+    edges.push({ source: ctx.rel, relation: "imports", specifier: spec, file: ctx.rel, ...(importTypeOnly ? { typeOnly: true } : {}) });
+    if (exportClause) {
+        for (const s of specifiers) {
+            const orig = s.childForFieldName("name")?.text;
+            const alias = s.childForFieldName("alias")?.text;
+            const specTypeOnly = isExportType || isTsTypeSpecifier(s);
+            if (orig) {
+                edges.push({
+                    source: ctx.rel,
+                    relation: "reexports",
+                    specifier: spec,
+                    exportedName: alias || orig,
+                    localName: orig,
+                    file: ctx.rel,
+                    ...(specTypeOnly ? { typeOnly: true } : {}),
+                });
             }
         }
     }
+    const nsExport = node.namedChildren.find((c) => c.type === "namespace_export");
+    const nsName = nsExport
+        ? (nsExport.namedChildren.find((c) => c.type === "identifier")?.text ?? nsExport.text.replace(/^\*\s+as\s+/, "").trim())
+        : null;
+    if (nsExport && !nsName)
+        return;
+    edges.push({
+        source: ctx.rel,
+        relation: "reexports",
+        specifier: spec,
+        ...(nsName ? { exportedName: nsName } : {}),
+        star: true,
+        file: ctx.rel,
+        ...(isExportType ? { typeOnly: true } : {}),
+    });
+}
+function emitTsLocalReexportClauseEdges(specifiers, isExportType, ctx, edges) {
+    for (const s of specifiers) {
+        const orig = s.childForFieldName("name")?.text;
+        const alias = s.childForFieldName("alias")?.text;
+        const imported = orig ? ctx.importedSymbols.get(orig) : undefined;
+        if (imported) {
+            const specTypeOnly = Boolean(imported.typeOnly || isExportType || isTsTypeSpecifier(s));
+            edges.push({
+                source: ctx.rel,
+                relation: "reexports",
+                specifier: imported.specifier,
+                exportedName: alias || orig,
+                localName: imported.isDefault ? orig : imported.name,
+                ...(imported.isDefault ? { isDefault: true } : {}),
+                file: ctx.rel,
+                ...(specTypeOnly ? { typeOnly: true } : {}),
+            });
+        }
+        else if (orig && alias === "default") {
+            ctx.defaultExportNames.add(orig);
+        }
+    }
+}
+function emitTsDefaultReexportEdge(node, isExportType, ctx, edges) {
+    const val = node.childForFieldName("value");
+    if (val?.type !== "identifier")
+        return;
+    ctx.defaultExportNames.add(val.text);
+    const imported = ctx.importedSymbols.get(val.text);
+    if (!imported)
+        return;
+    edges.push({
+        source: ctx.rel,
+        relation: "reexports",
+        specifier: imported.specifier,
+        exportedName: "default",
+        localName: imported.isDefault ? val.text : imported.name,
+        ...(imported.isDefault ? { isDefault: true } : {}),
+        file: ctx.rel,
+        ...(imported.typeOnly || isExportType ? { typeOnly: true } : {}),
+    });
 }
 function emitTsExportEdges(node, ctx, edges) {
     const isExportType = isTsStatementTypeKeyword(node, "export");
@@ -1105,64 +1225,15 @@ function emitTsExportEdges(node, ctx, edges) {
     const exportClause = node.namedChildren.find((c) => c.type === "export_clause");
     const specifiers = exportClause ? exportClause.namedChildren.filter((c) => c.type === "export_specifier") : [];
     if (spec) {
-        const allSpecsTypeOnly = specifiers.length > 0 && specifiers.every((s) => isTsTypeSpecifier(s));
-        const importTypeOnly = isExportType || allSpecsTypeOnly;
-        edges.push({
-            source: ctx.rel,
-            relation: "imports",
-            specifier: spec,
-            file: ctx.rel,
-            ...(importTypeOnly ? { typeOnly: true } : {}),
-        });
-        if (exportClause) {
-            for (const s of specifiers) {
-                const orig = s.childForFieldName("name")?.text;
-                const alias = s.childForFieldName("alias")?.text;
-                const specTypeOnly = isExportType || isTsTypeSpecifier(s);
-                if (orig) {
-                    edges.push({
-                        source: ctx.rel,
-                        relation: "reexports",
-                        specifier: spec,
-                        exportedName: alias || orig,
-                        localName: orig,
-                        file: ctx.rel,
-                        ...(specTypeOnly ? { typeOnly: true } : {}),
-                    });
-                }
-            }
-        }
-        else if (!node.namedChildren.some((c) => c.type === "namespace_export")) {
-            edges.push({
-                source: ctx.rel,
-                relation: "reexports",
-                specifier: spec,
-                star: true,
-                file: ctx.rel,
-                ...(isExportType ? { typeOnly: true } : {}),
-            });
-        }
+        emitTsExternalExportEdges(node, spec, exportClause, specifiers, isExportType, ctx, edges);
         return;
     }
     if (exportClause) {
-        for (const s of specifiers) {
-            const orig = s.childForFieldName("name")?.text;
-            const alias = s.childForFieldName("alias")?.text;
-            const imported = orig ? ctx.importedSymbols.get(orig) : undefined;
-            if (imported) {
-                const specTypeOnly = Boolean(imported.typeOnly || isExportType || isTsTypeSpecifier(s));
-                edges.push({
-                    source: ctx.rel,
-                    relation: "reexports",
-                    specifier: imported.specifier,
-                    exportedName: alias || orig,
-                    localName: imported.isDefault ? orig : imported.name,
-                    file: ctx.rel,
-                    ...(specTypeOnly ? { typeOnly: true } : {}),
-                });
-            }
-        }
+        emitTsLocalReexportClauseEdges(specifiers, isExportType, ctx, edges);
+        return;
     }
+    if (node.children.some((c) => c.type === "default"))
+        emitTsDefaultReexportEdge(node, isExportType, ctx, edges);
 }
 /** A direct invocation already emits a stronger `calls` edge. Java names the callee
  * in a `name` field (there is no `function` field on `method_invocation`), so both
@@ -1188,84 +1259,90 @@ function isDeclarationName(node) {
         return true;
     return sameSyntaxNode(parent?.childForFieldName("name"), node);
 }
-function describeTypeScriptSpecial(node, ctx) {
-    // TS: `const foo = (…) => …` / `const foo = function () {}`
+function describeTsDefaultExport(node) {
+    const isFnOrClass = FUNCTION_VALUE_TYPES.has(node.type) ||
+        node.type === "function_declaration" ||
+        node.type === "generator_function_declaration" ||
+        node.type === "class_declaration" ||
+        node.type === "abstract_class_declaration";
+    if (!isFnOrClass || node.childForFieldName("name") || node.parent?.type !== "export_statement")
+        return null;
+    if (!node.parent.children.some((c) => c.type === "default"))
+        return null;
+    const isClass = node.type === "class_declaration" || node.type === "abstract_class_declaration";
+    const body = node.childForFieldName("body");
+    return { name: "default", kind: isClass ? "class" : "function", headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
+}
+function describeTsAssignedFn(node) {
     if (node.type === "variable_declarator") {
         const value = node.childForFieldName("value");
-        if (value && FUNCTION_VALUE_TYPES.has(value.type)) {
-            const name = node.childForFieldName("name")?.text;
-            if (!name)
-                return null;
-            const vbody = value.childForFieldName("body");
-            return {
-                name,
-                kind: "function",
-                headerEnd: vbody ? vbody.startIndex : node.endIndex,
-                hashNode: node,
-            };
-        }
+        const name = value && FUNCTION_VALUE_TYPES.has(value.type) ? node.childForFieldName("name")?.text : null;
+        if (!name)
+            return null;
+        const vbody = value.childForFieldName("body");
+        return { name, kind: "function", headerEnd: vbody ? vbody.startIndex : node.endIndex, hashNode: node };
     }
-    // JS/TS CommonJS / prototype method assignment: `Obj.foo = function () {}` / `exports.foo = () => …`
-    if (node.type === "assignment_expression") {
-        const left = node.childForFieldName("left");
-        const right = node.childForFieldName("right");
-        if (left?.type === "member_expression" && right && FUNCTION_VALUE_TYPES.has(right.type)) {
-            const prop = left.childForFieldName("property")?.text;
-            const objText = left.childForFieldName("object")?.text;
-            if (prop && prop !== "exports" && /^[A-Za-z_$][\w$]*$/.test(prop)) {
-                const owner = objText && objText !== "exports" && objText !== "module.exports" && objText !== "this"
-                    ? objText.replace(/\.prototype$/, "")
-                    : undefined;
-                const vbody = right.childForFieldName("body");
-                return {
-                    name: prop,
-                    ...(owner && /^[A-Za-z_$][\w$]*$/.test(owner) ? { idName: `${owner}.${prop}`, owner, kind: "method" } : { kind: "function" }),
-                    headerEnd: vbody ? vbody.startIndex : node.endIndex,
-                    hashNode: node,
-                };
-            }
-        }
-    }
-    // JS/TS top-level CLI subcommand builder chain: `program.command("skeleton ...")....action((...) => { ... })`
-    if (node.type === "call_expression" && node.parent?.type === "expression_statement" && ctx.scope.length === 0) {
-        const outerFn = node.childForFieldName("function");
-        const outerProp = outerFn?.type === "member_expression" ? outerFn.childForFieldName("property")?.text : null;
-        if (outerProp === "action" || outerProp === "handler") {
-            const actionCb = node.childForFieldName("arguments")?.namedChildren.find((c) => FUNCTION_VALUE_TYPES.has(c.type));
-            let cur = outerFn.childForFieldName("object");
-            let cmdName = null;
-            while (cur?.type === "call_expression") {
-                const m = cur.childForFieldName("function");
-                if (m?.type === "member_expression" && m.childForFieldName("property")?.text === "command") {
-                    const firstArg = cur.childForFieldName("arguments")?.namedChildren[0];
-                    if (firstArg?.type === "string") {
-                        const rawCmd = firstArg.text.replace(/^['"`]|['"`]$/g, "").trim();
-                        const mCmd = /^([A-Za-z][\w-]*)/.exec(rawCmd);
-                        if (mCmd)
-                            cmdName = mCmd[1];
-                    }
-                    break;
-                }
-                cur = m?.type === "member_expression" ? m.childForFieldName("object") : null;
-            }
-            if (cmdName && actionCb) {
-                const vbody = actionCb.childForFieldName("body");
-                return {
-                    name: cmdName,
-                    idName: `Command.${cmdName}`,
-                    owner: "Command",
-                    kind: "method",
-                    headerEnd: vbody ? vbody.startIndex : node.endIndex,
-                    hashNode: node,
-                };
-            }
-        }
-    }
-    return null;
+    if (node.type !== "assignment_expression")
+        return null;
+    const left = node.childForFieldName("left");
+    const right = node.childForFieldName("right");
+    if (left?.type !== "member_expression" || !right || !FUNCTION_VALUE_TYPES.has(right.type))
+        return null;
+    const prop = left.childForFieldName("property")?.text;
+    if (!prop || prop === "exports" || !/^[A-Za-z_$][\w$]*$/.test(prop))
+        return null;
+    const objText = left.childForFieldName("object")?.text;
+    const owner = objText && objText !== "exports" && objText !== "module.exports" && objText !== "this"
+        ? objText.replace(/\.prototype$/, "")
+        : undefined;
+    const vbody = right.childForFieldName("body");
+    return {
+        name: prop,
+        ...(owner && /^[A-Za-z_$][\w$]*$/.test(owner) ? { idName: `${owner}.${prop}`, owner, kind: "method" } : { kind: "function" }),
+        headerEnd: vbody ? vbody.startIndex : node.endIndex,
+        hashNode: node,
+    };
 }
-/** Recognize the definition shapes: mapped node types, Go's type/method forms, and
- * TS arrow-consts. */
-function describe(node, ctx) {
+function describeTsCliCommandAction(node, ctx) {
+    if (node.type !== "call_expression" || node.parent?.type !== "expression_statement" || ctx.scope.length !== 0)
+        return null;
+    const outerFn = node.childForFieldName("function");
+    const outerProp = outerFn?.type === "member_expression" ? outerFn.childForFieldName("property")?.text : null;
+    if (outerProp !== "action" && outerProp !== "handler")
+        return null;
+    const actionCb = node.childForFieldName("arguments")?.namedChildren.find((c) => FUNCTION_VALUE_TYPES.has(c.type));
+    if (!actionCb)
+        return null;
+    let cur = outerFn.childForFieldName("object");
+    let cmdName = null;
+    while (cur?.type === "call_expression") {
+        const m = cur.childForFieldName("function");
+        if (m?.type === "member_expression" && m.childForFieldName("property")?.text === "command") {
+            const firstArg = cur.childForFieldName("arguments")?.namedChildren[0];
+            if (firstArg?.type === "string") {
+                const rawCmd = firstArg.text.replace(/^['"`]|['"`]$/g, "").trim();
+                cmdName = /^([A-Za-z][\w-]*)/.exec(rawCmd)?.[1] ?? null;
+            }
+            break;
+        }
+        cur = m?.type === "member_expression" ? m.childForFieldName("object") : null;
+    }
+    if (!cmdName)
+        return null;
+    const vbody = actionCb.childForFieldName("body");
+    return {
+        name: cmdName,
+        idName: `Command.${cmdName}`,
+        owner: "Command",
+        kind: "method",
+        headerEnd: vbody ? vbody.startIndex : node.endIndex,
+        hashNode: node,
+    };
+}
+function describeTypeScriptSpecial(node, ctx) {
+    return describeTsDefaultExport(node) ?? describeTsAssignedFn(node) ?? describeTsCliCommandAction(node, ctx);
+}
+function describeLangSpecial(node, ctx) {
     if (ctx.lang === "go")
         return describeGo(node, ctx);
     if (ctx.lang === "r")
@@ -1278,41 +1355,36 @@ function describe(node, ctx) {
         return describeSwift(node, ctx);
     if (ctx.lang === "php" && (node.type === "anonymous_function" || node.type === "arrow_function")) {
         const body = node.childForFieldName("body");
-        return {
-            name: phpClosureName(node),
-            kind: "function",
-            headerEnd: body ? body.startIndex : node.endIndex,
-            hashNode: node,
-        };
+        return { name: phpClosureName(node), kind: "function", headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
     }
     if (ctx.lang === "php" && node.type === "anonymous_class") {
         const body = node.childForFieldName("body");
-        return {
-            name: "{anonymous}",
-            kind: "class",
-            headerEnd: body ? body.startIndex : node.endIndex,
-            hashNode: node,
-        };
+        return { name: "{anonymous}", kind: "class", headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
+    }
+    return undefined;
+}
+/** Recognize the definition shapes: mapped node types, Go's type/method forms, and
+ * TS arrow-consts. */
+function describe(node, ctx) {
+    const special = describeLangSpecial(node, ctx);
+    if (special !== undefined)
+        return special;
+    if (ctx.lang === "typescript" || ctx.lang === "tsx") {
+        const tsSpecial = describeTypeScriptSpecial(node, ctx);
+        if (tsSpecial)
+            return tsSpecial;
     }
     const mapped = ctx.kinds[node.type];
-    if (mapped) {
-        const name = node.childForFieldName("name")?.text;
-        if (!name)
-            return null;
-        let kind = mapped;
-        if (ctx.lang === "python" && mapped === "function" && ctx.enclosingKind === "class") {
-            kind = "method";
-        }
-        if (ctx.lang === "php" && mapped === "function" && ctx.enclosingKind === "enum") {
-            kind = "method";
-        }
-        const body = node.childForFieldName("body");
-        return { name, kind, headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
+    const name = mapped ? node.childForFieldName("name")?.text : null;
+    if (!name)
+        return null;
+    let kind = mapped;
+    if ((ctx.lang === "python" && mapped === "function" && ctx.enclosingKind === "class") ||
+        (ctx.lang === "php" && mapped === "function" && ctx.enclosingKind === "enum")) {
+        kind = "method";
     }
-    if (ctx.lang === "typescript" || ctx.lang === "tsx") {
-        return describeTypeScriptSpecial(node, ctx);
-    }
-    return null;
+    const body = node.childForFieldName("body");
+    return { name, kind, headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
 }
 /** Go definition shapes: top-level funcs, receiver methods, and named types
  * (struct / interface / type alias). Methods carry no nesting — they're qualified
@@ -1352,6 +1424,12 @@ function describeGo(node, _ctx) {
         // (a one-line alias like `type ID int`).
         const headerEnd = type && (kind === "struct" || kind === "interface") ? type.startIndex : node.endIndex;
         return { name, kind, headerEnd, hashNode: node };
+    }
+    if (node.type === "method_elem") {
+        const name = node.namedChildren.find((c) => c.type === "field_identifier")?.text;
+        if (!name)
+            return null;
+        return { name, kind: "method", headerEnd: node.endIndex, hashNode: node };
     }
     return null;
 }
@@ -1403,65 +1481,73 @@ function describeGo(node, _ctx) {
  *     NOT specially extracted — it doesn't naturally map to a class or method
  *     kind, and the plan flags it as a case not worth the design risk.
  */
-function describeR(node, ctx) {
-    if (node.type === "binary_operator") {
-        const op = node.childForFieldName("operator")?.text;
-        if (!op || !R_ASSIGN_OPS.has(op))
-            return null;
-        const lhs = node.childForFieldName("lhs");
-        const rhs = node.childForFieldName("rhs");
-        if (lhs?.type !== "identifier")
-            return null;
-        if (rhs?.type === "function_definition") {
-            return rFunctionDescriptor(lhs.text, rhs, rhs.childForFieldName("body"), ctx);
-        }
-        if (rhs?.type === "call" && rCalleeName(rhs) === "R6Class") {
-            // The class node itself; its public=/private=/active= method lists are
-            // handled by walk()'s own `argument`-node interception, not here.
-            return { name: lhs.text, kind: "class", headerEnd: rhs.endIndex, hashNode: rhs };
-        }
-        if (rhs?.type === "call" && rCalleeName(rhs) === "list" && rIsMixinContainer(rhs)) {
-            // Phase 5: a plain-list mixin/extension bundle — same treatment as R6Class.
-            return { name: lhs.text, kind: "class", headerEnd: rhs.endIndex, hashNode: rhs };
-        }
+function describeRBinaryOp(node, ctx) {
+    const op = node.childForFieldName("operator")?.text;
+    if (!op || !R_ASSIGN_OPS.has(op))
         return null;
+    const lhs = node.childForFieldName("lhs");
+    const rhs = node.childForFieldName("rhs");
+    if (lhs?.type !== "identifier")
+        return null;
+    if (rhs?.type === "function_definition") {
+        return rFunctionDescriptor(lhs.text, rhs, rhs.childForFieldName("body"), ctx);
     }
-    if (node.type === "function_definition") {
-        // Right-assign (`function() {} -> foo`): see this function's own doc
-        // comment for why this doesn't mirror the binary_operator branch above.
-        const body = node.childForFieldName("body");
-        if (body?.type !== "binary_operator")
-            return null;
-        const op = body.childForFieldName("operator")?.text;
-        if (!op || !R_RIGHT_ASSIGN_OPS.has(op))
-            return null;
-        const rhs = body.childForFieldName("rhs");
-        if (rhs?.type !== "identifier")
-            return null;
-        return rFunctionDescriptor(rhs.text, node, body.childForFieldName("lhs"), ctx);
+    if (rhs?.type === "call" && rCalleeName(rhs) === "R6Class") {
+        // The class node itself; its public=/private=/active= method lists are
+        // handled by walk()'s own `argument`-node interception, not here.
+        return { name: lhs.text, kind: "class", headerEnd: rhs.endIndex, hashNode: rhs };
     }
-    if (node.type === "call") {
-        return describeRTopLevelCall(node);
+    if (rhs?.type === "call" && rCalleeName(rhs) === "list" && rIsMixinContainer(rhs)) {
+        // Phase 5: a plain-list mixin/extension bundle — same treatment as R6Class.
+        return { name: lhs.text, kind: "class", headerEnd: rhs.endIndex, hashNode: rhs };
     }
+    return null;
+}
+
+function describeRRightAssignFn(node, ctx) {
+    // Right-assign (`function() {} -> foo`): see this function's own doc
+    // comment for why this doesn't mirror the binary_operator branch above.
+    const body = node.childForFieldName("body");
+    if (body?.type !== "binary_operator")
+        return null;
+    const op = body.childForFieldName("operator")?.text;
+    if (!op || !R_RIGHT_ASSIGN_OPS.has(op))
+        return null;
+    const rhs = body.childForFieldName("rhs");
+    if (rhs?.type !== "identifier")
+        return null;
+    return rFunctionDescriptor(rhs.text, node, body.childForFieldName("lhs"), ctx);
+}
+
+function describeR6MethodArg(node) {
     // R6 (Phase 2): reached via walk()'s own `argument`-node interception for a
     // `public =`/`private =`/`active =` list entry — see the special case there
     // for why this can't just be a flat kind-table/node-type check like every
     // other definition shape.
-    if (node.type === "argument" && ctx.rR6Access !== null) {
-        const argName = node.childForFieldName("name");
-        const value = node.childForFieldName("value");
-        if (argName?.type !== "identifier" || value?.type !== "function_definition")
-            return null;
-        const body = value.childForFieldName("body");
-        return {
-            name: argName.text,
-            kind: "method",
-            headerEnd: body ? body.startIndex : value.endIndex,
-            hashNode: value,
-            // owner deliberately unset — R6 methods DO lexically nest inside the
-            // class-defining call, so ctx.enclosingClass already has it.
-        };
-    }
+    const argName = node.childForFieldName("name");
+    const value = node.childForFieldName("value");
+    if (argName?.type !== "identifier" || value?.type !== "function_definition")
+        return null;
+    const body = value.childForFieldName("body");
+    return {
+        name: argName.text,
+        kind: "method",
+        headerEnd: body ? body.startIndex : value.endIndex,
+        hashNode: value,
+        // owner deliberately unset — R6 methods DO lexically nest inside the
+        // class-defining call, so ctx.enclosingClass already has it.
+    };
+}
+
+function describeR(node, ctx) {
+    if (node.type === "binary_operator")
+        return describeRBinaryOp(node, ctx);
+    if (node.type === "function_definition")
+        return describeRRightAssignFn(node, ctx);
+    if (node.type === "call")
+        return describeRTopLevelCall(node);
+    if (node.type === "argument" && ctx.rR6Access !== null)
+        return describeR6MethodArg(node);
     return null;
 }
 /** A plain function assignment (left- or right-assign), OR — if `name` matches
@@ -1759,153 +1845,82 @@ function childHeadEnd(node, ...types) {
     const body = node.namedChildren.find((c) => types.includes(c.type));
     return body ? body.startIndex : node.endIndex;
 }
+function describeKotlinClass(node) {
+    const name = childTypeName(node);
+    if (!name)
+        return null;
+    let kind = "class";
+    if (node.namedChildren.some((c) => c.type === "enum_class_body"))
+        kind = "enum";
+    else if (node.children.some((c) => c.type === "interface"))
+        kind = "interface";
+    else if (node.namedChildren.find((c) => c.type === "modifiers")?.namedChildren.some((c) => c.type === "class_modifier" && c.text === "annotation"))
+        kind = "interface";
+    return { name, kind, headerEnd: childHeadEnd(node, "class_body", "enum_class_body"), hashNode: node };
+}
 /** Kotlin definition shapes. Unlike Java's, tree-sitter-kotlin exposes no `name`
- * or `body` fields: a definition's name is an unnamed `simple_identifier` (functions)
- * or `type_identifier` (types) child, and its body is a `class_body` / `function_body`
- * / `statements` child. `class_declaration` also folds classes, interfaces, and enum
- * classes into one node type — the kind is read off the declaration's own keywords. */
+ * or `body` fields. */
 function describeKotlin(node, ctx) {
-    if (node.type === "class_declaration") {
+    if (node.type === "class_declaration")
+        return describeKotlinClass(node);
+    if (node.type === "object_declaration" || node.type === "type_alias") {
         const name = childTypeName(node);
         if (!name)
             return null;
-        let kind = "class";
-        if (node.namedChildren.some((c) => c.type === "enum_class_body"))
-            kind = "enum";
-        else if (node.children.some((c) => c.type === "interface"))
-            kind = "interface";
-        else {
-            const mods = node.namedChildren.find((c) => c.type === "modifiers");
-            // `annotation class` → the interface role Java's annotation_type_declaration plays.
-            if (mods?.namedChildren.some((c) => c.type === "class_modifier" && c.text === "annotation"))
-                kind = "interface";
-        }
-        return { name, kind, headerEnd: childHeadEnd(node, "class_body", "enum_class_body"), hashNode: node };
-    }
-    if (node.type === "object_declaration") {
-        const name = childTypeName(node);
-        if (!name)
-            return null;
-        return { name, kind: "class", headerEnd: childHeadEnd(node, "class_body"), hashNode: node };
+        return node.type === "object_declaration"
+            ? { name, kind: "class", headerEnd: childHeadEnd(node, "class_body"), hashNode: node }
+            : { name, kind: "type", headerEnd: node.endIndex, hashNode: node };
     }
     if (node.type === "function_declaration") {
         const name = childFuncName(node);
-        if (!name)
-            return null;
-        const kind = KOTLIN_TYPE_KINDS.has(ctx.enclosingKind ?? "file") ? "method" : "function";
-        return { name, kind, headerEnd: childHeadEnd(node, "function_body"), hashNode: node };
+        return name ? { name, kind: KOTLIN_TYPE_KINDS.has(ctx.enclosingKind ?? "file") ? "method" : "function", headerEnd: childHeadEnd(node, "function_body"), hashNode: node } : null;
     }
     if (node.type === "secondary_constructor") {
-        // Constructors carry no name of their own — they are the class's own, so scope the
-        // node under the enclosing class the same way Java's constructor_declaration does.
-        if (!ctx.enclosingClass)
-            return null;
-        return {
-            name: ctx.enclosingClass,
-            kind: "method",
-            headerEnd: childHeadEnd(node, "statements"),
-            hashNode: node,
-        };
+        return ctx.enclosingClass ? { name: ctx.enclosingClass, kind: "method", headerEnd: childHeadEnd(node, "statements"), hashNode: node } : null;
     }
-    if (node.type === "type_alias") {
-        const name = childTypeName(node);
-        if (!name)
-            return null;
-        return { name, kind: "type", headerEnd: node.endIndex, hashNode: node };
-    }
-    if (node.type === "property_declaration") {
-        // Top-level `val`/`var` only — a class property is a field, not a definition node
-        // (no depth tier emits fields), so it must not become one.
-        if (ctx.enclosingKind !== null)
-            return null;
-        const decl = node.namedChildren.find((c) => c.type === "variable_declaration");
-        const name = decl?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
-        if (!name)
-            return null;
-        return { name, kind: "variable", headerEnd: node.endIndex, hashNode: node };
+    if (node.type === "property_declaration" && ctx.enclosingKind === null) {
+        const name = node.namedChildren.find((c) => c.type === "variable_declaration")?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+        return name ? { name, kind: "variable", headerEnd: node.endIndex, hashNode: node } : null;
     }
     return null;
 }
-/** Swift definition shapes. Like Kotlin's, tree-sitter-swift exposes no `name` or
- * `body` fields: a definition's name is a direct `type_identifier` (types) or
- * `simple_identifier` (functions) child, and its body is a `class_body` /
- * `enum_class_body` / `protocol_body` / `function_body` child. One
- * `class_declaration` node type covers `class`, `struct`, `enum`, `actor` AND
- * `extension` — the declaration's own keyword token tells them apart. */
+function describeSwiftClass(node) {
+    const kw = node.children.find((c) => c.type === "class" || c.type === "struct" || c.type === "enum" || c.type === "actor" || c.type === "extension")?.type;
+    const name = kw === "extension"
+        ? (node.namedChildren.find((c) => c.type === "user_type")?.namedChildren.filter((c) => c.type === "type_identifier").at(-1)?.text ?? null)
+        : childTypeName(node);
+    if (!name)
+        return null;
+    const kind = kw === "extension" ? "module" : kw === "struct" ? "struct" : kw === "enum" ? "enum" : "class";
+    return { name, kind, headerEnd: childHeadEnd(node, "class_body", "enum_class_body"), hashNode: node };
+}
+/** Swift definition shapes. */
 function describeSwift(node, ctx) {
-    if (node.type === "class_declaration") {
-        const kw = node.children.find((c) => c.type === "class" ||
-            c.type === "struct" ||
-            c.type === "enum" ||
-            c.type === "actor" ||
-            c.type === "extension")?.type;
-        let name;
-        if (kw === "extension") {
-            const ut = node.namedChildren.find((c) => c.type === "user_type");
-            const ids = ut?.namedChildren.filter((c) => c.type === "type_identifier") ?? [];
-            name = ids.length ? ids[ids.length - 1].text : null;
-        }
-        else {
-            name = childTypeName(node);
-        }
-        if (!name)
-            return null;
-        // An actor is class-like (reference semantics, methods) and there is no
-        // dedicated actor kind, so it takes "class".
-        const kind = kw === "extension" ? "module" : kw === "struct" ? "struct" : kw === "enum" ? "enum" : "class";
-        return { name, kind, headerEnd: childHeadEnd(node, "class_body", "enum_class_body"), hashNode: node };
-    }
-    if (node.type === "protocol_declaration") {
+    if (node.type === "class_declaration")
+        return describeSwiftClass(node);
+    if (node.type === "protocol_declaration" || node.type === "typealias_declaration") {
         const name = childTypeName(node);
         if (!name)
             return null;
-        return { name, kind: "interface", headerEnd: childHeadEnd(node, "protocol_body"), hashNode: node };
+        return node.type === "protocol_declaration"
+            ? { name, kind: "interface", headerEnd: childHeadEnd(node, "protocol_body"), hashNode: node }
+            : { name, kind: "type", headerEnd: node.endIndex, hashNode: node };
     }
-    // A protocol requirement (`protocol_function_declaration`) has no body and is
-    // always a member; an ordinary `function_declaration` is a method exactly when
-    // it is nested in a type (or an extension of one).
     if (node.type === "function_declaration" || node.type === "protocol_function_declaration") {
         const name = childFuncName(node);
         if (!name)
             return null;
-        const kind = node.type === "protocol_function_declaration" ||
-            SWIFT_TYPE_KINDS.has(ctx.enclosingKind ?? "file")
-            ? "method"
-            : "function";
-        return {
-            name,
-            kind,
-            headerEnd: childHeadEnd(node, "function_body"),
-            hashNode: node,
-            ...swiftArity(node),
-        };
+        const kind = node.type === "protocol_function_declaration" || SWIFT_TYPE_KINDS.has(ctx.enclosingKind ?? "file") ? "method" : "function";
+        return { name, kind, headerEnd: childHeadEnd(node, "function_body"), hashNode: node, ...swiftArity(node) };
     }
     if (node.type === "init_declaration") {
-        if (!ctx.enclosingClass)
-            return null;
-        return {
-            name: ctx.enclosingClass,
-            kind: "method",
-            headerEnd: childHeadEnd(node, "function_body"),
-            hashNode: node,
-            ...swiftArity(node),
-        };
+        return ctx.enclosingClass
+            ? { name: ctx.enclosingClass, kind: "method", headerEnd: childHeadEnd(node, "function_body"), hashNode: node, ...swiftArity(node) }
+            : null;
     }
-    if (node.type === "typealias_declaration") {
-        const name = childTypeName(node);
-        if (!name)
-            return null;
-        return { name, kind: "type", headerEnd: node.endIndex, hashNode: node };
-    }
-    if (node.type === "property_declaration") {
-        if (ctx.enclosingKind !== null)
-            return null;
-        const name = node.namedChildren
-            .find((c) => c.type === "pattern")
-            ?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
-        if (!name)
-            return null;
-        return { name, kind: "variable", headerEnd: node.endIndex, hashNode: node };
+    if (node.type === "property_declaration" && ctx.enclosingKind === null) {
+        const name = node.namedChildren.find((c) => c.type === "pattern")?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+        return name ? { name, kind: "variable", headerEnd: node.endIndex, hashNode: node } : null;
     }
     return null;
 }
@@ -1945,110 +1960,120 @@ function swiftSuperClassName(node) {
         ?.namedChildren.filter((c) => c.type === "type_identifier");
     return ids?.length ? ids[ids.length - 1].text : null;
 }
-function jvmSwiftHeritageEdges(node, classId, ctx) {
+function javaHeritageEdges(node, classId, ctx) {
     const edges = [];
-    if (ctx.lang === "java") {
-        const typeParams = javaTypeParameterNames(node);
-        for (const child of node.namedChildren) {
-            const relation = child.type === "superclass"
-                ? "extends"
-                : child.type === "super_interfaces" || child.type === "extends_interfaces"
-                    ? "implements"
-                    : null;
-            if (!relation)
-                continue;
-            for (const entry of javaSupertypeEntries(child)) {
-                const name = javaSupertypeName(entry);
-                if (!name || typeParams.has(name))
-                    continue;
+    const typeParams = javaTypeParameterNames(node);
+    for (const child of node.namedChildren) {
+        const relation = child.type === "superclass"
+            ? "extends"
+            : child.type === "super_interfaces" || child.type === "extends_interfaces"
+                ? "implements"
+                : null;
+        if (!relation)
+            continue;
+        for (const entry of javaSupertypeEntries(child)) {
+            const name = javaSupertypeName(entry);
+            if (name && !typeParams.has(name))
                 edges.push({ source: classId, relation, name, file: ctx.rel });
-            }
         }
-        return edges;
     }
-    if (ctx.lang === "kotlin") {
-        for (const child of node.namedChildren) {
-            if (child.type !== "delegation_specifier")
-                continue;
+    return edges;
+}
+function jvmSwiftHeritageEdges(node, classId, ctx) {
+    if (ctx.lang === "java")
+        return javaHeritageEdges(node, classId, ctx);
+    const edges = [];
+    for (const child of node.namedChildren) {
+        if (ctx.lang === "kotlin" && child.type === "delegation_specifier") {
             const t = child.namedChildren.find((c) => c.type === "user_type")?.namedChildren.find((c) => c.type === "type_identifier");
             if (t)
                 edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
         }
-        return edges;
+        else if (ctx.lang === "swift" && child.type === "inheritance_specifier") {
+            const ids = child.namedChildren.find((c) => c.type === "user_type")?.namedChildren.filter((c) => c.type === "type_identifier");
+            const t = ids?.at(-1);
+            if (t)
+                edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
+        }
     }
-    for (const child of node.namedChildren) {
-        if (child.type !== "inheritance_specifier")
-            continue;
-        const ids = child.namedChildren
-            .find((c) => c.type === "user_type")
-            ?.namedChildren.filter((c) => c.type === "type_identifier");
-        const t = ids?.length ? ids[ids.length - 1] : undefined;
-        if (t)
-            edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
+    return edges;
+}
+function extractRHeritageEdges(node, classId, ctx) {
+    const call = node.type === "binary_operator" ? node.childForFieldName("rhs") : node;
+    const callee = call?.type === "call" ? rCalleeName(call) : null;
+    const edges = [];
+    if (callee === "R6Class") {
+        const value = rNamedArg(call, "inherit");
+        if (value?.type === "identifier")
+            edges.push({ source: classId, relation: "extends", name: value.text, file: ctx.rel });
+    }
+    else if (callee === "setClass") {
+        for (const name of rStringOrCVector(rNamedArg(call, "contains")))
+            edges.push({ source: classId, relation: "extends", name, file: ctx.rel });
+    }
+    return edges;
+}
+function extractPhpHeritageEdges(node, classId, ctx) {
+    const edges = [];
+    for (const clause of node.namedChildren) {
+        const relation = clause.type === "base_clause" ? "extends" : clause.type === "class_interface_clause" ? "implements" : null;
+        if (!relation) continue;
+        for (const t of clause.namedChildren) {
+            if (t.type === "name" || t.type === "qualified_name")
+                edges.push({ source: classId, relation, name: t.text.replace(/^.*\\/, ""), file: ctx.rel });
+        }
+    }
+    return edges;
+}
+function extractGoHeritageEdges(node, classId, ctx) {
+    const edges = [];
+    const ifaceNode = node.childForFieldName("type");
+    if (ifaceNode?.type !== "interface_type")
+        return edges;
+    for (const elem of ifaceNode.namedChildren) {
+        if (elem.type !== "type_elem") continue;
+        for (const t of elem.namedChildren) {
+            const name = t.type === "type_identifier" ? t.text : t.type === "qualified_type" ? t.childForFieldName("name")?.text : null;
+            if (name)
+                edges.push({ source: classId, relation: "extends", name, file: ctx.rel });
+        }
+    }
+    return edges;
+}
+function extractPhpGoHeritageEdges(node, classId, ctx) {
+    return ctx.lang === "php"
+        ? extractPhpHeritageEdges(node, classId, ctx)
+        : extractGoHeritageEdges(node, classId, ctx);
+}
+function extractTsHeritageEdges(node, classId, ctx) {
+    const edges = [];
+    const heritage = node.namedChildren.find((c) => c.type === "class_heritage");
+    const directExtends = node.namedChildren.find((c) => c.type === "extends_type_clause");
+    const clauses = [...(heritage?.namedChildren ?? []), ...(directExtends ? [directExtends] : [])];
+    for (const clause of clauses) {
+        const relation = clause.type === "implements_clause" ? "implements" : (clause.type === "extends_clause" || clause.type === "extends_type_clause") ? "extends" : null;
+        if (!relation) continue;
+        for (const t of clause.namedChildren) {
+            const nameNode = t.type === "generic_type" ? t.childForFieldName("name") : t;
+            if (nameNode?.type === "identifier" || nameNode?.type === "type_identifier")
+                edges.push({ source: classId, relation, name: nameNode.text, file: ctx.rel });
+        }
     }
     return edges;
 }
 function heritageEdges(node, classId, ctx) {
-    if (ctx.lang === "java" || ctx.lang === "kotlin" || ctx.lang === "swift") {
+    if (ctx.lang === "java" || ctx.lang === "kotlin" || ctx.lang === "swift")
         return jvmSwiftHeritageEdges(node, classId, ctx);
-    }
-    const edges = [];
     if (ctx.lang === "python") {
-        const supers = node.childForFieldName("superclasses");
-        for (const c of supers?.namedChildren ?? []) {
-            if (c.type === "identifier") {
-                edges.push({ source: classId, relation: "extends", name: c.text, file: ctx.rel });
-            }
-        }
-        return edges;
+        return (node.childForFieldName("superclasses")?.namedChildren ?? [])
+            .filter((c) => c.type === "identifier")
+            .map((c) => ({ source: classId, relation: "extends", name: c.text, file: ctx.rel }));
     }
-    if (ctx.lang === "r") {
-        const call = node.type === "binary_operator" ? node.childForFieldName("rhs") : node;
-        if (call?.type !== "call")
-            return edges;
-        const callee = rCalleeName(call);
-        if (callee === "R6Class") {
-            const value = rNamedArg(call, "inherit");
-            if (value?.type === "identifier") {
-                edges.push({ source: classId, relation: "extends", name: value.text, file: ctx.rel });
-            }
-        }
-        else if (callee === "setClass") {
-            for (const name of rStringOrCVector(rNamedArg(call, "contains"))) {
-                edges.push({ source: classId, relation: "extends", name, file: ctx.rel });
-            }
-        }
-        return edges;
-    }
-    if (ctx.lang === "php") {
-        for (const clause of node.namedChildren) {
-            const relation = clause.type === "base_clause" ? "extends" : clause.type === "class_interface_clause" ? "implements" : null;
-            if (!relation)
-                continue;
-            for (const t of clause.namedChildren) {
-                if (t.type === "name" || t.type === "qualified_name") {
-                    edges.push({ source: classId, relation, name: t.text.replace(/^.*\\/, ""), file: ctx.rel });
-                }
-            }
-        }
-        return edges;
-    }
-    const heritage = node.namedChildren.find((c) => c.type === "class_heritage");
-    for (const clause of heritage?.namedChildren ?? []) {
-        const relation = clause.type === "implements_clause"
-            ? "implements"
-            : clause.type === "extends_clause"
-                ? "extends"
-                : null;
-        if (!relation)
-            continue;
-        for (const t of clause.namedChildren) {
-            if (t.type === "identifier" || t.type === "type_identifier") {
-                edges.push({ source: classId, relation, name: t.text, file: ctx.rel });
-            }
-        }
-    }
-    return edges;
+    if (ctx.lang === "r")
+        return extractRHeritageEdges(node, classId, ctx);
+    if (ctx.lang === "php" || ctx.lang === "go")
+        return extractPhpGoHeritageEdges(node, classId, ctx);
+    return extractTsHeritageEdges(node, classId, ctx);
 }
 /**
  * The supertypes a heritage clause names, one node each — NOT every `type_identifier`
@@ -2104,65 +2129,61 @@ function javaTypeParameterNames(decl) {
     visitTypeParam(params);
     return out;
 }
-function jvmSwiftCalleeName(node, lang) {
-    if (lang === "java") {
-        if (node.type === "object_creation_expression") {
-            const name = javaConstructedTypeName(node.childForFieldName("type"));
-            return name ? { name, viaMember: false } : null;
-        }
-        const nameNode = node.childForFieldName("name");
-        if (!nameNode)
-            return null;
-        const obj = node.childForFieldName("object");
-        if (!obj)
-            return { name: nameNode.text, viaMember: true, receiver: "this" };
-        return { name: nameNode.text, viaMember: true, receiver: javaReceiver(obj) };
+function javaCalleeName(node) {
+    if (node.type === "object_creation_expression") {
+        const name = javaConstructedTypeName(node.childForFieldName("type"));
+        return name ? { name, viaMember: false } : null;
     }
-    if (lang === "kotlin") {
-        const target = node.namedChildren[0];
-        if (target?.type === "simple_identifier")
-            return { name: target.text, viaMember: false };
-        if (target?.type === "navigation_expression") {
-            const suffix = target.namedChildren.find((c) => c.type === "navigation_suffix");
-            const name = suffix?.namedChildren.find((c) => c.type === "simple_identifier");
-            const receiver = target.namedChildren[0];
-            if (!name)
-                return null;
-            if (receiver?.type === "simple_identifier")
-                return { name: name.text, viaMember: true, receiver: receiver.text };
-            if (receiver?.type === "this_expression" || receiver?.type === "super_expression")
-                return { name: name.text, viaMember: true, receiver: receiver.type === "this_expression" ? "this" : "super" };
-        }
+    const nameNode = node.childForFieldName("name");
+    if (!nameNode)
         return null;
-    }
+    const obj = node.childForFieldName("object");
+    return { name: nameNode.text, viaMember: true, receiver: obj ? javaReceiver(obj) : "this" };
+}
+function kotlinCalleeName(node) {
     const target = node.namedChildren[0];
     if (target?.type === "simple_identifier")
         return { name: target.text, viaMember: false };
-    if (target?.type === "navigation_expression") {
-        const suffix = target.namedChildren.find((c) => c.type === "navigation_suffix");
-        const name = suffix?.namedChildren.find((c) => c.type === "simple_identifier");
-        const receiver = target.namedChildren[0];
-        if (!name)
-            return null;
-        if (receiver?.type === "simple_identifier")
-            return { name: name.text, viaMember: true, receiver: receiver.text };
-        if (receiver?.type === "self_expression" || receiver?.type === "super_expression")
-            return {
-                name: name.text,
-                viaMember: true,
-                receiver: receiver.type === "self_expression" ? "self" : "super",
-            };
-        if (receiver?.type === "navigation_expression") {
-            const head = receiver.namedChildren[0];
-            const field = receiver.namedChildren
-                .find((c) => c.type === "navigation_suffix")
-                ?.namedChildren.find((c) => c.type === "simple_identifier");
-            if (head?.type === "self_expression" && field)
-                return { name: name.text, viaMember: true, receiver: `self.${field.text}` };
-        }
-        return { name: name.text, viaMember: true };
-    }
+    if (target?.type !== "navigation_expression")
+        return null;
+    const name = target.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier");
+    const receiver = target.namedChildren[0];
+    if (!name)
+        return null;
+    if (receiver?.type === "simple_identifier")
+        return { name: name.text, viaMember: true, receiver: receiver.text };
+    if (receiver?.type === "this_expression" || receiver?.type === "super_expression")
+        return { name: name.text, viaMember: true, receiver: receiver.type === "this_expression" ? "this" : "super" };
     return null;
+}
+function swiftCalleeName(node) {
+    const target = node.namedChildren[0];
+    if (target?.type === "simple_identifier")
+        return { name: target.text, viaMember: false };
+    if (target?.type !== "navigation_expression")
+        return null;
+    const name = target.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier");
+    const receiver = target.namedChildren[0];
+    if (!name)
+        return null;
+    if (receiver?.type === "simple_identifier")
+        return { name: name.text, viaMember: true, receiver: receiver.text };
+    if (receiver?.type === "self_expression" || receiver?.type === "super_expression")
+        return { name: name.text, viaMember: true, receiver: receiver.type === "self_expression" ? "self" : "super" };
+    if (receiver?.type === "navigation_expression") {
+        const head = receiver.namedChildren[0];
+        const field = receiver.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier");
+        if (head?.type === "self_expression" && field)
+            return { name: name.text, viaMember: true, receiver: `self.${field.text}` };
+    }
+    return { name: name.text, viaMember: true };
+}
+function jvmSwiftCalleeName(node, lang) {
+    if (lang === "java")
+        return javaCalleeName(node);
+    if (lang === "kotlin")
+        return kotlinCalleeName(node);
+    return swiftCalleeName(node);
 }
 function rOperatorCalleeName(fn) {
     const rhs = fn.childForFieldName("rhs");

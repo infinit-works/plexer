@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readJson } from "./state.js";
 
-export function resolvePackageJsonPath(moduleUrl = import.meta.url) {
+function resolvePackageJsonPath(moduleUrl = import.meta.url) {
 	const moduleDir = dirname(fileURLToPath(moduleUrl));
 	const candidates = [
 		fileURLToPath(new URL("../../package.json", import.meta.url)),

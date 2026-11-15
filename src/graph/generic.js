@@ -37,8 +37,7 @@ export const GENERIC_LANGS = [
     { name: "cpp", exts: [".cpp", ".cc", ".cxx", ".hpp", ".hh"], wasm: "cpp" },
     { name: "ruby", exts: [".rb"], wasm: "ruby" },
     { name: "c_sharp", exts: [".cs"], wasm: "c_sharp" },
-    // These ship a tags.scm (calls + symbols); ocaml/zig have none and use the
-    // node-kind walker fallback (symbols only) — still one row, zero query.
+    // All breadth languages below ship a queries/<name>.scm (calls + symbols + imports).
     { name: "scala", exts: [".scala", ".sc"], wasm: "scala" },
     { name: "elixir", exts: [".ex", ".exs"], wasm: "elixir" },
     { name: "solidity", exts: [".sol"], wasm: "solidity" },
@@ -222,11 +221,13 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
         const lines = source.split("\n");
         const defs = [];
         const spanSeen = new Set();
-        const mkDef = (name, kind, whole) => {
+        const mkDef = (name, kind, whole, owner = null) => {
             if (spanSeen.has(whole.startIndex))
                 return;
             spanSeen.add(whole.startIndex);
-            const id = mintId(`${rel}#${name}`, minted);
+            const effKind = owner && kind === "function" ? "method" : kind;
+            const idName = owner ? `${owner}.${name}` : name;
+            const id = mintId(`${rel}#${idName}`, minted);
             const startRow = whole.startPosition.row, endRow = whole.endPosition.row;
             const sigLine = (lines[startRow] ?? "").trim().replace(/\s*\{?\s*$/, "");
             const rawSlice = source.slice(whole.startIndex, whole.endIndex);
@@ -235,8 +236,8 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
                 : langName === "c" || langName === "cpp"
                     ? cCppExported(whole)
                     : true;
-            nodes.push({
-                id, name, kind, path: rel,
+            const node = {
+                id, name, kind: effKind, path: rel,
                 span: `L${startRow + 1}-L${endRow + 1}`,
                 signature: sigLine || null, exported, origin: "generic",
                 body_hash: contentHash(rawSlice),
@@ -244,8 +245,11 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
                 summary_state: "pending",
                 summary: extractLeadingSummary(lines, startRow, rawSlice),
                 crux: null,
-            });
-            defs.push({ id, startIndex: whole.startIndex, endIndex: whole.endIndex });
+            };
+            if (owner)
+                node.owner = owner;
+            nodes.push(node);
+            defs.push({ id, startIndex: whole.startIndex, endIndex: whole.endIndex, name, kind: effKind, owner });
         };
         if (entry.query) {
             tagsExtract(entry.query, tree.rootNode, rel, mkDef, defs, rawEdges, langName);
@@ -256,7 +260,9 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
         if (langName === "c" || langName === "cpp")
             extractIncludes(tree.rootNode, rel, rawEdges);
         else if (langName === "rust")
-            extractUses(tree.rootNode, rel, rawEdges);
+            extractRustExtras(tree.rootNode, rel, defs, rawEdges);
+        else
+            extractBreadthImports(langName, tree.rootNode, rel, rawEdges);
     }
     finally {
         tree.delete?.();
@@ -264,39 +270,498 @@ export function extractGeneric(rel, source, langName = genericLangOf(rel)?.name)
     nodes[0].body_text = fileResidual(source, nodes.slice(1));
     return { nodes, rawEdges };
 }
-/** Rust `use crate::…` / `use self::…` / `use super::…` → a file→module `imports` raw edge.
- * External crates, `std::`, and globs are skipped; resolve.js settles in-crate and relative
- * module paths against the file's crate root / module directory. */
-function extractUses(root, rel, rawEdges) {
-    const visitUseNode = (n) => {
+const RUST_TYPE_WRAPPERS = new Set(["Box", "Arc", "Rc", "Cell", "RefCell", "Mutex", "RwLock", "Option", "Result", "Pin"]);
+/** Base type identifier for a Rust type AST node, unwrapping references, generics, paths, and dyn Trait. */
+function rustTypeName(node) {
+    let cur = node;
+    for (let depth = 0; cur && depth < 12; depth++) {
+        if (cur.type === "type_identifier" || cur.type === "identifier")
+            return cur.text;
+        if (cur.type === "reference_type" || cur.type === "pointer_type" || cur.type === "parenthesized_type") {
+            cur = cur.childForFieldName?.("type") ?? cur.namedChild?.(0);
+            continue;
+        }
+        if (cur.type === "dynamic_type" || cur.type === "abstract_type") {
+            cur = cur.childForFieldName?.("trait") ?? cur.namedChild?.(0);
+            continue;
+        }
+        if (cur.type === "scoped_type_identifier" || cur.type === "scoped_identifier") {
+            return cur.childForFieldName?.("name")?.text ?? null;
+        }
+        if (cur.type === "generic_type") {
+            const outer = rustTypeName(cur.childForFieldName?.("type"));
+            if (outer && RUST_TYPE_WRAPPERS.has(outer)) {
+                const args = cur.childForFieldName?.("type_arguments");
+                if (args && args.namedChildCount > 0) {
+                    cur = args.namedChild(0);
+                    continue;
+                }
+            }
+            return outer;
+        }
+        if (cur.type === "bounded_type") {
+            cur = cur.namedChild?.(0);
+            continue;
+        }
+        return null;
+    }
+    return null;
+}
+/** Enclosing impl/trait owner type for a Rust method/fn definition or call node. */
+function rustEnclosingOwner(node, stopAtFn = false) {
+    for (let p = node?.parent; p; p = p.parent) {
+        if (stopAtFn && (p.type === "function_item" || p.type === "function_signature_item"))
+            return null;
+        if (p.type === "impl_item")
+            return rustTypeName(p.childForFieldName?.("type"));
+        if (p.type === "trait_item")
+            return p.childForFieldName?.("name")?.text ?? null;
+    }
+    return null;
+}
+/** Collect `structName -> Map<fieldName, fieldType>` across all Rust structs in the file. */
+function collectRustStructFields(root) {
+    const out = new Map();
+    const visit = (n) => {
+        if (n.type === "struct_item") {
+            const name = n.childForFieldName?.("name")?.text;
+            const body = n.childForFieldName?.("body");
+            if (name && body) {
+                const fields = new Map();
+                for (let i = 0; i < (body.namedChildCount ?? 0); i++) {
+                    const f = body.namedChild(i);
+                    if (f?.type !== "field_declaration")
+                        continue;
+                    const fn = f.childForFieldName?.("name")?.text;
+                    const ft = rustTypeName(f.childForFieldName?.("type"));
+                    if (fn && ft)
+                        fields.set(fn, ft);
+                }
+                out.set(name, fields);
+            }
+        }
+        for (let i = 0; i < (n.namedChildCount ?? 0); i++)
+            visit(n.namedChild(i));
+    };
+    visit(root);
+    return out;
+}
+function inferRustLetBindingType(n, owner, fnReturns) {
+    const ann = rustTypeName(n.childForFieldName?.("type"));
+    if (ann)
+        return ann;
+    const val = n.childForFieldName?.("value");
+    if (val?.type === "struct_expression")
+        return rustTypeName(val.childForFieldName?.("name"));
+    if (val?.type !== "call_expression")
+        return null;
+    const fn = val.childForFieldName?.("function");
+    if (fn?.type === "scoped_identifier") {
+        const seg = fn.childForFieldName?.("path")?.text?.split("::").pop();
+        return seg === "Self" ? owner : (seg && /^[A-Z]/.test(seg) ? seg : null);
+    }
+    return fn?.type === "identifier" ? (fnReturns.get(fn.text) ?? null) : null;
+}
+
+function collectRustLetBindingsRecursive(n, fnNode, owner, fnReturns, vars) {
+    if (n.type === "function_item" && n !== fnNode)
+        return;
+    if (n.type === "let_declaration") {
+        const pat = n.childForFieldName?.("pattern");
+        if (pat?.type === "identifier") {
+            const resolved = inferRustLetBindingType(n, owner, fnReturns);
+            if (resolved)
+                vars.set(pat.text, resolved);
+        }
+    }
+    for (let i = 0; i < (n.namedChildCount ?? 0); i++)
+        collectRustLetBindingsRecursive(n.namedChild(i), fnNode, owner, fnReturns, vars);
+}
+
+/** Collect parameter & `let` bindings inside a Rust function_item for receiver typing. */
+function collectRustFnBindings(fnNode, owner, fnReturns) {
+    const vars = new Map();
+    if (owner)
+        vars.set("self", owner);
+    const params = fnNode?.childForFieldName?.("parameters");
+    if (params) {
+        for (let i = 0; i < params.namedChildCount; i++) {
+            const p = params.namedChild(i);
+            if (p?.type !== "parameter")
+                continue;
+            const pat = p.childForFieldName?.("pattern");
+            const tn = rustTypeName(p.childForFieldName?.("type"));
+            if (pat?.type === "identifier" && tn)
+                vars.set(pat.text, tn);
+        }
+    }
+    const body = fnNode?.childForFieldName?.("body");
+    if (body)
+        collectRustLetBindingsRecursive(body, fnNode, owner, fnReturns, vars);
+    return vars;
+}
+
+function collectRustTopFnReturns(n, fnReturns) {
+    if (n.type === "function_item" && !rustEnclosingOwner(n, true)) {
+        const name = n.childForFieldName?.("name")?.text;
+        const rt = rustTypeName(n.childForFieldName?.("return_type"));
+        if (name && rt && /^[A-Z]/.test(rt))
+            fnReturns.set(name, rt);
+    }
+    for (let i = 0; i < (n.namedChildCount ?? 0); i++)
+        collectRustTopFnReturns(n.namedChild(i), fnReturns);
+}
+
+function resolveRustNodeBindings(node, fnReturns, fnBindingsCache) {
+    let fn = node?.parent;
+    while (fn && fn.type !== "function_item")
+        fn = fn.parent;
+    if (!fn)
+        return null;
+    if (fnBindingsCache.has(fn))
+        return fnBindingsCache.get(fn);
+    const map = collectRustFnBindings(fn, rustEnclosingOwner(fn, true), fnReturns);
+    fnBindingsCache.set(fn, map);
+    return map;
+}
+
+function resolveRustFieldExprReceiver(recv, nameNode, structFields, fnReturns, fnBindingsCache) {
+    if (!recv)
+        return { viaMember: true };
+    if (recv.type === "self" || (recv.type === "identifier" && recv.text === "self")) {
+        const owner = rustEnclosingOwner(nameNode);
+        return owner ? { viaMember: true, recvType: owner } : { viaMember: true };
+    }
+    if (recv.type === "identifier") {
+        const recvType = resolveRustNodeBindings(nameNode, fnReturns, fnBindingsCache)?.get(recv.text) ?? null;
+        return recvType ? { viaMember: true, recvType } : { viaMember: true };
+    }
+    if (recv.type === "field_expression") {
+        const base = recv.childForFieldName?.("value");
+        const fld = recv.childForFieldName?.("field")?.text;
+        if ((base?.type === "self" || (base?.type === "identifier" && base.text === "self")) && fld) {
+            const owner = rustEnclosingOwner(nameNode);
+            const ft = owner ? structFields.get(owner)?.get(fld) : null;
+            if (ft)
+                return { viaMember: true, recvType: ft };
+        }
+    }
+    return { viaMember: true };
+}
+
+/** Build Rust receiver-typing helper closure over a parsed file. */
+function createRustCallResolver(root) {
+    const structFields = collectRustStructFields(root);
+    const fnReturns = new Map();
+    const fnBindingsCache = new WeakMap();
+    collectRustTopFnReturns(root, fnReturns);
+    return (nameNode) => {
+        const parent = nameNode.parent;
+        if (!parent)
+            return null;
+        if (parent.type === "scoped_identifier") {
+            const seg = (parent.childForFieldName?.("path")?.text ?? "").split("::").pop() ?? "";
+            const owner = seg === "Self" ? rustEnclosingOwner(nameNode) : seg;
+            return owner && /^[A-Z]/.test(owner) ? { viaMember: true, recvType: owner } : null;
+        }
+        if (parent.type === "field_expression") {
+            return resolveRustFieldExprReceiver(parent.childForFieldName?.("value"), nameNode, structFields, fnReturns, fnBindingsCache);
+        }
+        return null;
+    };
+}
+/** Flatten a Rust `use` subtree into normalized `crate/...` / `self/...` / `super/...` module paths. */
+function expandRustUseTree(node, prefix, out) {
+    if (!node)
+        return;
+    const flattenPath = (p) => {
+        if (!p)
+            return [];
+        if (p.type === "scoped_identifier")
+            return [...flattenPath(p.childForFieldName?.("path")), p.childForFieldName?.("name")?.text].filter(Boolean);
+        return p.text ? [p.text] : [];
+    };
+    const emit = (parts) => {
+        if (parts.length > 0 && (parts[0] === "crate" || parts[0] === "self" || parts[0] === "super"))
+            out.push(parts.join("/"));
+    };
+    if (node.type === "scoped_use_list") {
+        const nextPrefix = [...prefix, ...flattenPath(node.childForFieldName?.("path"))];
+        const list = node.childForFieldName?.("list");
+        for (let i = 0; i < (list?.namedChildCount ?? 0); i++)
+            expandRustUseTree(list.namedChild(i), nextPrefix, out);
+        return;
+    }
+    if (node.type === "use_list") {
+        for (let i = 0; i < node.namedChildCount; i++)
+            expandRustUseTree(node.namedChild(i), prefix, out);
+        return;
+    }
+    if (node.type === "use_as_clause") {
+        expandRustUseTree(node.childForFieldName?.("path"), prefix, out);
+        return;
+    }
+    if (node.type === "use_wildcard") {
+        const sub = node.namedChildCount > 0 ? flattenPath(node.namedChild(0)) : [];
+        emit([...prefix, ...sub]);
+        return;
+    }
+    if (node.type === "self" && prefix.length > 0) {
+        emit(prefix);
+        return;
+    }
+    if (node.type === "scoped_identifier" || node.type === "identifier" || node.type === "crate" || node.type === "super") {
+        emit([...prefix, ...flattenPath(node)]);
+    }
+}
+/** Rust extras: grouped `use` expansion, external `mod foo;`, and `impl Trait for Type` heritage. */
+function extractRustExtras(root, rel, defs, rawEdges) {
+    const defByName = new Map();
+    for (const d of defs)
+        if (d.kind !== "function" && d.kind !== "method" && !defByName.has(d.name))
+            defByName.set(d.name, d.id);
+    const specsSeen = new Set();
+    const visit = (n) => {
         if (n.type === "use_declaration") {
-            const spec = rustUseModule(n.text);
-            if (spec !== null)
-                rawEdges.push({ source: rel, relation: "imports", specifier: spec, file: rel });
+            const specs = [];
+            expandRustUseTree(n.childForFieldName?.("argument"), [], specs);
+            for (const spec of specs) {
+                if (!specsSeen.has(spec)) {
+                    specsSeen.add(spec);
+                    rawEdges.push({ source: rel, relation: "imports", specifier: spec, file: rel });
+                }
+            }
+        }
+        else if (n.type === "mod_item" && !n.childForFieldName?.("body")) {
+            const modName = n.childForFieldName?.("name")?.text;
+            if (modName)
+                rawEdges.push({ source: rel, relation: "imports", specifier: modName, isRustMod: true, file: rel });
+        }
+        else if (n.type === "impl_item") {
+            const traitNode = n.childForFieldName?.("trait");
+            const typeNode = n.childForFieldName?.("type");
+            if (traitNode && typeNode) {
+                const traitName = rustTypeName(traitNode);
+                const typeName = rustTypeName(typeNode);
+                if (traitName && typeName) {
+                    const sourceId = defByName.get(typeName) ?? rel;
+                    rawEdges.push({ source: sourceId, ownerName: typeName, relation: "implements", name: traitName, file: rel });
+                }
+            }
         }
         for (let i = 0; i < (n.namedChildCount ?? 0); i++) {
-            const c = n.namedChild?.(i);
+            const c = n.namedChild(i);
             if (c)
-                visitUseNode(c);
+                visit(c);
         }
     };
-    visitUseNode(root);
+    visit(root);
 }
-/** The normalized path a Rust `use crate::…` / `self::…` / `super::…` names (`::`→`/`), or null
- * when it is an external crate or glob import. */
-function rustUseModule(text) {
-    let s = text.replace(/^\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+/, "").replace(/;\s*$/, "").trim();
-    const brace = s.indexOf("{");
-    if (brace >= 0)
-        s = s.slice(0, brace).replace(/::\s*$/, "");
-    else
-        s = s.replace(/\s+as\s+\w+$/, "");
-    s = s.trim();
-    if (!/^(?:crate|self|super)(?:$|::)/.test(s))
+const BREADTH_UNQUOTE = (raw) => raw.replace(/^["'`]|["'`]$/g, "").trim();
+function extractElixirAliasArgs(arg, out) {
+    if (!arg)
+        return;
+    if (arg.type === "alias") {
+        out.push(arg.text.trim());
+    }
+    else if (arg.type === "dot") {
+        const left = arg.childForFieldName?.("left")?.text?.trim();
+        const right = arg.childForFieldName?.("right");
+        if (left && right?.type === "tuple") {
+            for (let i = 0; i < right.namedChildCount; i++) {
+                const sub = right.namedChild(i)?.text?.trim();
+                if (sub)
+                    out.push(`${left}.${sub}`);
+            }
+        }
+    }
+}
+function clojureSymName(node) {
+    return node?.type === "sym_lit" ? (node.childForFieldName?.("name")?.text ?? node.text) : null;
+}
+function collectClojureNsSpec(node, prefix, out) {
+    if (!node)
+        return;
+    if (node.type === "sym_lit") {
+        const sym = clojureSymName(node);
+        if (sym)
+            out.push(prefix ? `${prefix}.${sym}` : sym);
+        return;
+    }
+    if (node.type !== "vec_lit" && node.type !== "list_lit")
+        return;
+    const headName = clojureSymName(node.namedChild(0));
+    if (!headName)
+        return;
+    const fullPrefix = prefix ? `${prefix}.${headName}` : headName;
+    const nested = [];
+    for (let j = 1; j < node.namedChildCount; j++) {
+        const item = node.namedChild(j);
+        if (item?.type === "vec_lit" || item?.type === "list_lit")
+            nested.push(item);
+    }
+    if (nested.length === 0) {
+        out.push(fullPrefix);
+        return;
+    }
+    for (const sub of nested)
+        collectClojureNsSpec(sub, fullPrefix, out);
+}
+function extractClojureNsForm(nsForm, out) {
+    for (let i = 0; i < nsForm.namedChildCount; i++) {
+        const child = nsForm.namedChild(i);
+        if (child?.type !== "list_lit")
+            continue;
+        const first = child.namedChild(0);
+        const kwd = first?.type === "kwd_lit" ? first.childForFieldName?.("name")?.text : null;
+        if (kwd !== "require" && kwd !== "require-macros" && kwd !== "use" && kwd !== "import")
+            continue;
+        for (let j = 1; j < child.namedChildCount; j++)
+            collectClojureNsSpec(child.namedChild(j), "", out);
+    }
+}
+function firstBreadthDesc(n, type) {
+    if (!n)
         return null;
-    if (s.includes("*"))
-        return null;
-    return s.replace(/\s+/g, "").replace(/::/g, "/");
+    if (n.type === type)
+        return n;
+    for (let i = 0; i < (n.namedChildCount ?? 0); i++) {
+        const hit = firstBreadthDesc(n.namedChild(i), type);
+        if (hit)
+            return hit;
+    }
+    return null;
+}
+function extractScalaBreadthImports(n, specs) {
+    const parts = [];
+    let selectors = null;
+    for (let i = 0; i < n.namedChildCount; i++) {
+        const c = n.namedChild(i);
+        if (c.type === "identifier" || c.type === "stable_identifier")
+            parts.push(c.text);
+        else if (c.type === "namespace_selectors")
+            selectors = c;
+    }
+    const prefix = parts.join(".");
+    if (!selectors) {
+        if (prefix)
+            specs.push(prefix);
+        return;
+    }
+    for (let i = 0; i < selectors.namedChildCount; i++) {
+        const sel = selectors.namedChild(i);
+        const name = sel.type === "arrow_renamed_identifier"
+            ? sel.childForFieldName?.("name")?.text
+            : sel.type === "identifier" ? sel.text : null;
+        if (name && prefix)
+            specs.push(`${prefix}.${name}`);
+        else if (sel.type === "namespace_wildcard" && prefix)
+            specs.push(prefix);
+    }
+}
+const BREADTH_IMPORT_HANDLERS = {
+    ruby(n, specs) {
+        if (n.type !== "call")
+            return;
+        const m = n.childForFieldName?.("method")?.text;
+        if (m !== "require" && m !== "require_relative" && m !== "load")
+            return;
+        const str = firstBreadthDesc(n.childForFieldName?.("arguments"), "string_content")?.text?.trim();
+        if (str)
+            specs.push(m === "require_relative" && !str.startsWith(".") ? `./${str}` : str);
+    },
+    c_sharp(n, specs) {
+        if (n.type !== "using_directive")
+            return;
+        const q = firstBreadthDesc(n, "qualified_name");
+        const id = !q ? firstBreadthDesc(n, "identifier") : null;
+        const ns = (q ?? id)?.text?.trim();
+        if (ns && !/^System(?:\.|$)|^Microsoft(?:\.|$)/.test(ns))
+            specs.push(ns);
+    },
+    scala(n, specs) {
+        if (n.type === "import_declaration")
+            extractScalaBreadthImports(n, specs);
+    },
+    elixir(n, specs) {
+        if (n.type !== "call")
+            return;
+        const t = n.childForFieldName?.("target")?.text;
+        if (t !== "alias" && t !== "import" && t !== "use" && t !== "require")
+            return;
+        for (let i = 0; i < n.namedChildCount; i++) {
+            const c = n.namedChild(i);
+            if (c.type === "arguments" && c.namedChildCount > 0)
+                extractElixirAliasArgs(c.namedChild(0), specs);
+        }
+    },
+    dart(n, specs) {
+        if (n.type !== "import_or_export" && n.type !== "part_directive")
+            return;
+        const lit = firstBreadthDesc(n, "string_literal")?.text;
+        const uri = lit ? BREADTH_UNQUOTE(lit) : null;
+        if (uri && !uri.startsWith("dart:"))
+            specs.push(uri);
+    },
+    lua(n, specs) {
+        if (n.type !== "function_call")
+            return;
+        const fn = n.childForFieldName?.("name")?.text;
+        if (fn !== "require" && fn !== "dofile")
+            return;
+        const strNode = firstBreadthDesc(n.childForFieldName?.("arguments"), "string");
+        const inner = strNode ? (firstBreadthDesc(strNode, "string_content")?.text ?? BREADTH_UNQUOTE(strNode.text)) : null;
+        if (inner)
+            specs.push(inner);
+    },
+    clojure(n, specs) {
+        if (n.type !== "list_lit")
+            return;
+        const head = n.namedChild(0);
+        const hName = head?.type === "sym_lit" ? head.childForFieldName?.("name")?.text : null;
+        if (hName === "ns")
+            extractClojureNsForm(n, specs);
+    },
+    nix(n, specs) {
+        if (n.type !== "apply_expression")
+            return;
+        const fn = n.childForFieldName?.("function");
+        const arg = n.childForFieldName?.("argument");
+        const fnName = fn?.type === "variable_expression"
+            ? fn.text.trim()
+            : fn?.type === "select_expression" ? fn.childForFieldName?.("attrpath")?.text?.split(".").pop()?.trim() : null;
+        if ((fnName === "import" || fnName === "callPackage") && arg?.type === "path_expression") {
+            const p = arg.text.trim();
+            if (p)
+                specs.push(p);
+        }
+    },
+    solidity(n, specs) {
+        if (n.type !== "import_directive")
+            return;
+        const src = n.childForFieldName?.("source")?.text;
+        const p = src ? BREADTH_UNQUOTE(src) : null;
+        if (p)
+            specs.push(p);
+    },
+};
+function visitBreadthImportNode(handler, n, specs) {
+    if (handler)
+        handler(n, specs);
+    for (let i = 0; i < (n.namedChildCount ?? 0); i++)
+        visitBreadthImportNode(handler, n.namedChild(i), specs);
+}
+/** Breadth-tier `imports` raw edge extraction across Ruby, C#, Scala, Elixir, Dart, Lua, Clojure, Nix, and Solidity. */
+function extractBreadthImports(langName, root, rel, rawEdges) {
+    const specs = [];
+    visitBreadthImportNode(BREADTH_IMPORT_HANDLERS[langName] ?? null, root, specs);
+    const seen = new Set();
+    for (const specifier of specs) {
+        if (!seen.has(specifier)) {
+            seen.add(specifier);
+            rawEdges.push({ source: rel, relation: "imports", specifier, file: rel });
+        }
+    }
 }
 /** C/C++ `#include "header.h"` → a file→file `imports` raw edge. Only LOCAL includes
  * (quoted) are captured; system includes (`<stdio.h>`) are skipped — high volume, and
@@ -339,10 +804,15 @@ function tagsExtract(query, root, rel, mkDef, defs, rawEdges, langName) {
         const defKey = Object.keys(cap).find((k) => k.startsWith("definition."));
         if (defKey && cap.name) {
             defNameAt.add(cap.name.startIndex);
-            mkDef(cap.name.text, KIND[defKey.slice("definition.".length)] ?? "function", defScope(cap[defKey], langName));
+            const scopeNode = defScope(cap[defKey], langName);
+            const defKind = KIND[defKey.slice("definition.".length)] ?? "function";
+            const owner = langName === "rust" && (defKind === "function" || defKind === "method")
+                ? rustEnclosingOwner(scopeNode, true)
+                : null;
+            mkDef(cap.name.text, defKind, scopeNode, owner);
         }
         if (("reference.call" in cap || "reference.send" in cap) && cap.name)
-            calls.push({ name: cap.name.text, at: cap.name.startIndex });
+            calls.push({ name: cap.name.text, at: cap.name.startIndex, node: cap.name });
         // Structural references the grammar already marks: a supertype (extends), an
         // implemented interface, an object creation (`new Foo`), a module alias. Grammars
         // label these @reference.class/.interface/.implementation/.module — heterogeneous
@@ -354,11 +824,13 @@ function tagsExtract(query, root, rel, mkDef, defs, rawEdges, langName) {
             "reference.implementation" in cap || "reference.module" in cap) && cap.name)
             refs.push({ name: cap.name.text, at: cap.name.startIndex });
     }
+    const resolveRustCall = langName === "rust" ? createRustCallResolver(root) : null;
     for (const c of calls) {
         if (defNameAt.has(c.at))
             continue;
         const enc = enclosingDef(defs, c.at);
-        rawEdges.push({ source: enc ? enc.id : rel, relation: "calls", file: rel, name: c.name });
+        const meta = resolveRustCall ? resolveRustCall(c.node) : null;
+        rawEdges.push({ source: enc ? enc.id : rel, relation: "calls", file: rel, name: c.name, ...(meta ?? {}) });
     }
     for (const r of refs) {
         if (defNameAt.has(r.at))

@@ -29,7 +29,9 @@ import { contentHash } from "../util/id.js";
  * row each, but they are left out until someone has a repo to verify them
  * against — a wrong `body` node type would produce silently misplaced spans. */
 export const CONTAINER_LANGS = [
-    { name: "vue", exts: [".vue"], wasm: "vue", block: "script_element", body: "raw_text", inner: "typescript" },
+    { name: "vue", exts: [".vue"], wasm: "vue", block: "script_element", body: "raw_text", inner: "typescript", warmInner: ["typescript", "tsx"] },
+    { name: "svelte", exts: [".svelte"], wasm: "svelte", block: "script_element", body: "raw_text", inner: "typescript", warmInner: ["typescript", "tsx"] },
+    { name: "astro", exts: [".astro"], wasm: "astro", block: "script_element", body: "raw_text", frontmatterBlock: "frontmatter", frontmatterBody: "frontmatter_js_block", inner: "typescript", warmInner: ["typescript", "tsx"] },
 ];
 const byExt = new Map();
 for (const l of CONTAINER_LANGS)
@@ -59,7 +61,7 @@ export async function warmContainerGrammars(langNames) {
         const row = CONTAINER_LANGS.find((l) => l.name === name);
         if (!row)
             continue;
-        await warmDepthGrammars([row.inner]);
+        await warmDepthGrammars(row.warmInner ?? [row.inner]);
         const language = await loadWasmLanguage(row.wasm);
         if (language)
             loaded.set(name, language);
@@ -99,24 +101,54 @@ function containerFileNode(rel, source, residual) {
         crux: null,
     };
 }
-/** Every embedded block in document order, as [bodyNode] — an SFC may legally
- * carry two (`<script>` for options/exports plus `<script setup>`), and each
- * needs its own offset. */
+function scriptBlockInnerLang(blockNode, defaultInner) {
+    if (blockNode.type === "frontmatter")
+        return "typescript";
+    const startTag = blockNode.namedChildren?.find((c) => c.type === "start_tag");
+    if (!startTag)
+        return defaultInner;
+    for (const attr of startTag.namedChildren ?? []) {
+        if (attr.type !== "attribute")
+            continue;
+        const nameNode = attr.namedChildren?.find((c) => c.type === "attribute_name");
+        if (nameNode?.text?.toLowerCase() !== "lang")
+            continue;
+        const quoted = attr.namedChildren?.find((c) => c.type === "quoted_attribute_value");
+        const valNode = quoted?.namedChildren?.find((c) => c.type === "attribute_value") ??
+            attr.namedChildren?.find((c) => c.type === "attribute_value");
+        const raw = (valNode?.text ?? quoted?.text ?? "").replace(/^['"]|['"]$/g, "").trim().toLowerCase();
+        if (raw === "tsx" || raw === "jsx")
+            return "tsx";
+        if (raw === "ts" || raw === "typescript" || raw === "js" || raw === "javascript")
+            return "typescript";
+    }
+    return defaultInner;
+}
+
+/** Every embedded block in document order, as `{ body, innerLang }` — an SFC may legally
+ * carry two (`<script>` for options/exports plus `<script setup>`), or Astro frontmatter +
+ * client `<script>`, each with its own line offset and `lang` attribute. */
 function blocks(root, lang) {
     const out = [];
     const n = root.namedChildCount ?? 0;
     for (let i = 0; i < n; i++) {
         const child = root.namedChild?.(i);
-        if (!child || child.type !== lang.block)
+        if (!child)
             continue;
+        const isScript = child.type === lang.block;
+        const isFrontmatter = Boolean(lang.frontmatterBlock && child.type === lang.frontmatterBlock);
+        if (!isScript && !isFrontmatter)
+            continue;
+        const targetBodyType = isFrontmatter ? lang.frontmatterBody : lang.body;
+        const innerLang = scriptBlockInnerLang(child, lang.inner);
         const kids = child.namedChildCount ?? 0;
         for (let j = 0; j < kids; j++) {
             const body = child.namedChild?.(j);
             // An empty `<script></script>` has no body child at all — skipped here, so
             // the file still gets its file node and nothing else, which is the same
             // shape as a file whose grammar is missing.
-            if (body && body.type === lang.body)
-                out.push(body);
+            if (body && body.type === targetBodyType)
+                out.push({ body, innerLang });
         }
     }
     return out;
@@ -128,11 +160,11 @@ function blocks(root, lang) {
  * inner extractor chokes on all degrade to "fewer nodes", because a build must
  * not fail over one component.
  */
-export function extractContainer(rel, source, lang) {
+export function extractContainer(rel, source, lang = containerLangOf(rel)) {
     const nodes = [];
     const rawEdges = [];
     const residuals = [];
-    const language = loaded.get(lang.name);
+    const language = lang ? loaded.get(lang.name) : null;
     const root = language ? parseWasm(language, source) : null;
     if (root) {
         try {
@@ -141,11 +173,11 @@ export function extractContainer(rel, source, lang) {
             // makes the second one `path#setup~2`, and the rename is applied to that
             // block's edges too so nothing points at an id that no longer exists.
             const minted = new Set([rel]);
-            for (const body of blocks(root, lang)) {
+            for (const { body, innerLang } of blocks(root, lang)) {
                 const script = source.slice(body.startIndex, body.endIndex);
                 let inner;
                 try {
-                    inner = extractFile(rel, script, lang.inner);
+                    inner = extractFile(rel, script, innerLang);
                 }
                 catch {
                     continue; // one bad block, not a bad build

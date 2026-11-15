@@ -13,6 +13,7 @@
  */
 import { resolve } from "node:path";
 import { contextDirFor, readGraph, wiringPath } from "../context/node-file.js";
+import { computeRepoConfigHash } from "./build.js";
 import { listSourceStats } from "./source-files.js";
 import { extractSourceFiles, readExtractCache } from "./extract-cache.js";
 import { readFingerprint } from "./fingerprint.js";
@@ -22,6 +23,7 @@ export async function checkGraph(dir, opts = {}) {
     const result = {
         ok: false,
         missing: false,
+        configStale: false,
         added: [],
         removed: [],
         changed: [],
@@ -35,9 +37,11 @@ export async function checkGraph(dir, opts = {}) {
         result.missing = true;
         return result;
     }
-    const fpOnlyDirs = readFingerprint(outDir)?.onlyDirs;
+    const fp = readFingerprint(outDir);
+    const fpOnlyDirs = fp?.onlyDirs;
     const onlyDirs = fpOnlyDirs && fpOnlyDirs.length > 0 ? new Set(fpOnlyDirs) : undefined;
-    const sourceStats = listSourceStats(root, outDir, undefined, onlyDirs, opts.extensions);
+    const extensions = opts.extensions ?? (Array.isArray(fp?.extensions) && fp.extensions.length > 0 ? fp.extensions : undefined);
+    const sourceStats = listSourceStats(root, outDir, undefined, onlyDirs, extensions);
     const { nodes: extractedNodes } = await extractSourceFiles(sourceStats, readExtractCache(outDir), {
         trustStat: false,
     });
@@ -58,8 +62,17 @@ export async function checkGraph(dir, opts = {}) {
     for (const arr of [result.added, result.removed, result.changed]) {
         arr.sort();
     }
+    const currentConfigHash = computeRepoConfigHash(root, extractedNodes, {
+        contextDir: opts.contextDir,
+        onlyDirs,
+    });
+    if (committed.meta?.config_hash && committed.meta.config_hash !== currentConfigHash) {
+        result.configStale = true;
+        result.stale.push("config_hash");
+    }
     result.ok =
-        result.added.length === 0 &&
+        !result.configStale &&
+            result.added.length === 0 &&
             result.removed.length === 0 &&
             result.changed.length === 0;
     return result;
@@ -73,6 +86,9 @@ export function formatGraphCheckReport(r) {
         return `graph check: OK — the wiring graph is in sync with the code (${r.nodes} nodes).`;
     }
     const lines = ["graph check: STALE", ""];
+    if (r.configStale) {
+        lines.push("config (1):", "  ~ resolver config / scopes changed (config_hash mismatch)");
+    }
     if (r.changed.length) {
         lines.push(`changed (${r.changed.length}):`);
         for (const id of r.changed)

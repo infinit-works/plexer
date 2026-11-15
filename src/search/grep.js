@@ -26,11 +26,17 @@ const MAX_HIT_TEXT = 160;
  * a span starts after `line` — nothing later in the sort can contain it. */
 function enclosingSymbol(symbols, line) {
     let found = null;
+    let bestSpan = Infinity;
     for (const s of symbols) {
         if (s.start > line)
             break;
-        if (line <= s.end)
-            found = s.node;
+        if (line <= s.end) {
+            const span = s.end - s.start;
+            if (span <= bestSpan) {
+                bestSpan = span;
+                found = s.node;
+            }
+        }
     }
     return found;
 }
@@ -57,7 +63,7 @@ function getOrBuildGrepSymbolIndex(graph, inPrefix) {
         pushMap(symbolsByPath, n.path, { node: n, start: b.start, end: b.end });
     }
     for (const syms of symbolsByPath.values()) {
-        syms.sort((a, b) => a.start - b.start);
+        syms.sort((a, b) => (a.start - b.start) || ((a.end - a.start) - (b.end - b.start)));
     }
     if (inPrefix === undefined) {
         Object.defineProperty(graph, "_grepSymbolIndex", { value: { fileNodes, symbolsByPath }, enumerable: false, configurable: true, writable: true });
@@ -75,6 +81,60 @@ function getOrInitGrepTextCache(graph, repoRoot) {
     Object.defineProperty(graph, "_grepFileTextLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
     return textCache;
 }
+function readCachedGrepFileText(filePath, safe, textCache) {
+    const st = safe.stat;
+    const cached = textCache.get(filePath);
+    if (cached !== undefined && st && st.mtimeMs === cached.mtimeMs && st.size === cached.size) {
+        return cached.text;
+    }
+    let text;
+    try {
+        text = st ? readSourceFile(safe.realFile) : null;
+    } catch {
+        text = null;
+    }
+    textCache.set(filePath, {
+        mtimeMs: st ? st.mtimeMs : -1,
+        size: st ? st.size : -1,
+        text,
+    });
+    return text;
+}
+
+function recordMatchedFileLines(filePath, lines, ctx) {
+    let symbols;
+    let totalMatchedLines = 0;
+    let fileHasHit = false;
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        if (ctx.isSimpleFixed ? !raw.includes(ctx.pattern) : !ctx.regex.test(raw)) continue;
+        fileHasHit = true;
+        totalMatchedLines++;
+        const lineNo = i + 1;
+        if (!symbols) symbols = ctx.symbolsByPath.get(filePath) ?? [];
+        const sym = enclosingSymbol(symbols, lineNo);
+        const key = sym ? sym.id : `file:${filePath}`;
+        let group = ctx.groups.get(key);
+        if (!group) {
+            group = {
+                symbol: sym ? toSymbolRef(sym) : null,
+                path: filePath,
+                inDegree: sym ? (ctx.inDegree.get(sym.id) ?? 0) : 0,
+                hits: [],
+                omittedHits: 0,
+            };
+            ctx.groups.set(key, group);
+        }
+        if (group.hits.length >= ctx.maxHitsPerSymbol) {
+            group.omittedHits = (group.omittedHits ?? 0) + 1;
+            continue;
+        }
+        const trimmed = raw.trim();
+        group.hits.push({ line: lineNo, text: trimmed.length > MAX_HIT_TEXT ? trimmed.slice(0, MAX_HIT_TEXT) : trimmed });
+    }
+    return { totalMatchedLines, fileHasHit };
+}
+
 function collectGrepFileMatches(fileNodes, repoRoot, textCache, isSimpleFixed, pattern, regex, symbolsByPath, inDegree, maxHitsPerSymbol, linesByPath) {
     const groups = new Map();
     let totalMatchedLines = 0;
@@ -83,75 +143,23 @@ function collectGrepFileMatches(fileNodes, repoRoot, textCache, isSimpleFixed, p
     let realRoot = absRoot;
     try {
         realRoot = realpathSync(absRoot);
-    }
-    catch {
+    } catch {
         /* keep absRoot fallback */
     }
+    const ctx = { isSimpleFixed, pattern, regex, symbolsByPath, inDegree, maxHitsPerSymbol, groups };
     for (const file of fileNodes) {
         const safe = resolveSafeRepoFile(absRoot, realRoot, file.path);
-        if (!safe)
-            continue;
-        const absPath = safe.realFile;
-        const st = safe.stat;
-        const cached = textCache.get(file.path);
-        let text;
-        if (cached !== undefined && st && st.mtimeMs === cached.mtimeMs && st.size === cached.size) {
-            text = cached.text;
-        }
-        else {
-            try {
-                text = st ? readSourceFile(absPath) : null;
-            }
-            catch {
-                text = null;
-            }
-            textCache.set(file.path, {
-                mtimeMs: st ? st.mtimeMs : -1,
-                size: st ? st.size : -1,
-                text,
-            });
-        }
+        if (!safe) continue;
+        const text = readCachedGrepFileText(file.path, safe, textCache);
         if (text === null) {
             truncatedFiles++;
             continue;
         }
-        if (isSimpleFixed ? !text.includes(pattern) : !regex.test(text))
-            continue;
-        let symbols;
+        if (isSimpleFixed ? !text.includes(pattern) : !regex.test(text)) continue;
         const lines = text.split("\n");
-        let fileHasHit = false;
-        for (let i = 0; i < lines.length; i++) {
-            const raw = lines[i];
-            if (isSimpleFixed ? !raw.includes(pattern) : !regex.test(raw))
-                continue;
-            fileHasHit = true;
-            totalMatchedLines++;
-            const lineNo = i + 1;
-            if (!symbols) {
-                symbols = symbolsByPath.get(file.path) ?? [];
-            }
-            const sym = enclosingSymbol(symbols, lineNo);
-            const key = sym ? sym.id : `file:${file.path}`;
-            let group = groups.get(key);
-            if (!group) {
-                group = {
-                    symbol: sym ? toSymbolRef(sym) : null,
-                    path: file.path,
-                    inDegree: sym ? (inDegree.get(sym.id) ?? 0) : 0,
-                    hits: [],
-                    omittedHits: 0,
-                };
-                groups.set(key, group);
-            }
-            if (group.hits.length >= maxHitsPerSymbol) {
-                group.omittedHits = (group.omittedHits ?? 0) + 1;
-                continue;
-            }
-            const trimmed = raw.trim();
-            group.hits.push({ line: lineNo, text: trimmed.length > MAX_HIT_TEXT ? trimmed.slice(0, MAX_HIT_TEXT) : trimmed });
-        }
-        if (fileHasHit && linesByPath)
-            linesByPath.set(file.path, lines);
+        const matched = recordMatchedFileLines(file.path, lines, ctx);
+        totalMatchedLines += matched.totalMatchedLines;
+        if (matched.fileHasHit && linesByPath) linesByPath.set(file.path, lines);
     }
     return { groups, totalMatchedLines, truncatedFiles };
 }
@@ -211,7 +219,7 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
         ? pattern.includes("\\|") || /^[A-Za-z0-9_.:#\s-]+(?:\|[A-Za-z0-9_.:#\s-]+)+$/.test(pattern)
             ? pattern.split(/\\?\||\|/).map(escapeRegExp).join("|")
             : escapeRegExp(pattern)
-        : pattern.replace(/\\\|/g, "|");
+        : pattern;
     const regex = compileSafeUserRegex(source, opts.ignoreCase ? "i" : "");
     const inDegree = computeInDegree(graph);
     const inPrefix = opts.in ? normalizePathPrefix(opts.in) : undefined;

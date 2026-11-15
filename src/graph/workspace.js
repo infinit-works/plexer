@@ -28,7 +28,7 @@ import { checkGraph } from "./check.js";
 import { loadGraphCached } from "../context/graph-store.js";
 import { buildRepoMap, formatRepoMap } from "./map.js";
 import { discoverWorkspaceChildren } from "./scope-discovery.js";
-import { headerOf, hitJson, hitLine, looseNoteFor, quoteFor, renderMatchBlock, symbolJson } from "./traverse-cli.js";
+import { hitJson, looseNoteFor, renderMatchBlock, symbolJson } from "./traverse-cli.js";
 import { resolveSymbol } from "../context/symbol-query.js";
 import { edgeWalk } from "./traverse.js";
 import { linkTestsForGraph } from "./test-links.js";
@@ -154,6 +154,30 @@ function qualifyWorkspaceHit(child, hit, score = hit.score, scope = hit.scope ? 
         pointer: prefixPointer(child, hit.pointer),
     };
 }
+function partitionAskRunsByCoverageGate(runs, onlyChild) {
+    const gatedOut = [];
+    const survivors = [];
+    const baselineSurvivors = [];
+    for (const run of runs) {
+        const baselineEligible = onlyChild ||
+            run.baselineCoverageStrong >= STRONG_FLOOR ||
+            run.baselineCoverage >= HIGH_FLOOR;
+        const fileEligible = onlyChild ||
+            run.coverageStrong >= STRONG_FLOOR ||
+            run.coverage >= HIGH_FLOOR;
+        if (baselineEligible)
+            baselineSurvivors.push(run);
+        if (baselineEligible || fileEligible) {
+            survivors.push(run);
+        }
+        else {
+            const best = run.ranking?.groups[0]?.hits[0] ?? run.hits[0];
+            gatedOut.push({ scope: run.child, bestId: prefixPointer(run.child, best.pointer) });
+        }
+    }
+    return { gatedOut, survivors, baselineSurvivors };
+}
+
 function collectChildAskRuns(root, wg, query, opts, limit, onlyChild, childIn) {
     const runs = [];
     let matchedAnyPrefix = !childIn || Boolean(onlyChild);
@@ -197,26 +221,7 @@ function collectChildAskRuns(root, wg, query, opts, limit, onlyChild, childIn) {
     }
     if (!matchedAnyPrefix && lastPrefixErr)
         throw lastPrefixErr;
-    const gatedOut = [];
-    const survivors = [];
-    const baselineSurvivors = [];
-    for (const run of runs) {
-        const baselineEligible = onlyChild ||
-            run.baselineCoverageStrong >= STRONG_FLOOR ||
-            run.baselineCoverage >= HIGH_FLOOR;
-        const fileEligible = onlyChild ||
-            run.coverageStrong >= STRONG_FLOOR ||
-            run.coverage >= HIGH_FLOOR;
-        if (baselineEligible)
-            baselineSurvivors.push(run);
-        if (baselineEligible || fileEligible)
-            survivors.push(run);
-        else {
-            const best = run.ranking?.groups[0]?.hits[0] ?? run.hits[0];
-            gatedOut.push({ scope: run.child, bestId: prefixPointer(run.child, best.pointer) });
-        }
-    }
-    return { gatedOut, survivors, baselineSurvivors };
+    return partitionAskRunsByCoverageGate(runs, onlyChild);
 }
 function computeWorkspaceBaselineTop(baselineSurvivors) {
     const baselineDocs = [];
@@ -616,34 +621,59 @@ export function federateRead(root, override, spanSpecs, opts = {}) {
     }
     return { blocks };
 }
+function resolveUniqueCallersMatches(graph, queries, childIn) {
+    const matches = [];
+    const seenIds = new Set();
+    for (const q of queries) {
+        const resolved = resolveSymbol(graph, q, childIn ? { in: childIn } : {});
+        for (const m of resolved) {
+            if (!seenIds.has(m.id)) {
+                seenIds.add(m.id);
+                matches.push(m);
+            }
+        }
+    }
+    return matches;
+}
+
+function renderFederatedCallersChild(root, child, graph, matches, direction, depth, opts) {
+    const showDepth = depth > 1;
+    const results = matches.map((m) => ({ symbol: m, hits: edgeWalk(graph, m, direction, depth) }));
+    const read = fileReader(join(root, child));
+    const testLinks = linkTestsForGraph(graph);
+    const lines = [`## ${child}/`];
+    const entries = [];
+    for (const { symbol: sym, hits } of results) {
+        lines.push(renderMatchBlock(sym, hits, direction, showDepth, matches.length, read, { source: Boolean(opts.source), graph, testLinks }));
+        const entry = {
+            repo: child,
+            symbol: symbolJson({ ...sym, path: `${child}/${sym.path}` }),
+            hits: hits.map((h) => hitJson(h.node ? { ...h, node: { ...h.node, path: `${child}/${h.node.path}` } } : h)),
+        };
+        if (hits.length === 0)
+            entry.note = looseNoteFor(direction, sym.name, matches.length);
+        entries.push(entry);
+    }
+    return { block: lines.join("\n"), entries };
+}
+
 export function federateCallers(root, override, symbol, opts = {}) {
     const wg = loadWorkspaceGraphs(root, override);
     const { onlyChild, childIn } = resolveWorkspaceIn(wg, opts.in);
     const direction = opts.direction ?? "in";
     const depth = opts.depth && opts.depth >= 1 ? Math.floor(opts.depth) : 1;
-    const showDepth = depth > 1;
     const queries = (Array.isArray(symbol) ? symbol : [symbol])
         .flatMap((q) => String(q).split(",").map((s) => s.trim()).filter(Boolean));
     const blocks = [];
     const jsonMatches = [];
-    let found = false;
     let matchedAnyPrefix = !childIn || Boolean(onlyChild);
     let lastPrefixErr = null;
     for (const { child, graph } of wg.loaded) {
         if (onlyChild && child !== onlyChild)
             continue;
-        let matches = [];
-        const seenIds = new Set();
+        let matches;
         try {
-            for (const q of queries) {
-                const resolved = resolveSymbol(graph, q, childIn ? { in: childIn } : {});
-                for (const m of resolved) {
-                    if (!seenIds.has(m.id)) {
-                        seenIds.add(m.id);
-                        matches.push(m);
-                    }
-                }
-            }
+            matches = resolveUniqueCallersMatches(graph, queries, childIn);
             matchedAnyPrefix = true;
         }
         catch (err) {
@@ -655,36 +685,19 @@ export function federateCallers(root, override, symbol, opts = {}) {
         }
         if (matches.length === 0)
             continue;
-        found = true;
-        const results = matches.map((m) => ({ symbol: m, hits: edgeWalk(graph, m, direction, depth) }));
-        const read = fileReader(join(root, child));
-        const testLinks = linkTestsForGraph(graph);
-        const lines = [`## ${child}/`];
-        for (const { symbol: sym, hits } of results) {
-            lines.push(renderMatchBlock(sym, hits, direction, showDepth, matches.length, read, { source: Boolean(opts.source), graph, testLinks }));
-            const entry = {
-                repo: child,
-                symbol: symbolJson({ ...sym, path: `${child}/${sym.path}` }),
-                hits: hits.map((h) => hitJson(h.node ? { ...h, node: { ...h.node, path: `${child}/${h.node.path}` } } : h)),
-            };
-            if (hits.length === 0)
-                entry.note = looseNoteFor(direction, sym.name, matches.length);
-            jsonMatches.push(entry);
-        }
-        blocks.push(lines.join("\n"));
+        const rendered = renderFederatedCallersChild(root, child, graph, matches, direction, depth, opts);
+        blocks.push(rendered.block);
+        jsonMatches.push(...rendered.entries);
     }
     if (!matchedAnyPrefix && lastPrefixErr)
         throw lastPrefixErr;
     const cov = coverageNote(wg);
-    if (!found) {
+    if (blocks.length === 0) {
         const label = Array.isArray(symbol) ? symbol.join(", ") : symbol;
         const base = `no symbol "${label}" in any of the ${wg.loaded.length} workspace repo(s) — check spelling or run plexer build`;
         return { text: cov ? `${base}\n${cov}` : base, found: false, matches: [], coverage: cov };
     }
-    let text = blocks.join("\n\n");
-    if (cov)
-        text += `\n\n${cov}`;
-    return { text, found: true, matches: jsonMatches, coverage: cov };
+    return { text: cov ? `${blocks.join("\n\n")}\n\n${cov}` : blocks.join("\n\n"), found: true, matches: jsonMatches, coverage: cov };
 }
 /**
  * Split a parent into a workspace: build each git child (via the supplied

@@ -53,21 +53,22 @@ function directorySimilarity(srcPath, testPath) {
     return shared;
 }
 
-function collectDirectAndCompanionTestLinks(graph, byId, testFiles, prodFilesByStem, recordFileTest, recordSymbolTest) {
+function collectProdFileImportsOut(graph, byId) {
     // Track 1-hop file imports from non-test files (e.g. `src/index.js` -> `src/foo/bar.js`)
     // so a test importing `src/index.js` still links to its barrel-exported modules when needed.
     const fileImportsOut = new Map();
     for (const e of graph.edges) {
-        if (e.relation === "imports") {
-            const sNode = byId.get(e.source);
-            const tNode = byId.get(e.target);
-            if (sNode?.kind === "file" && tNode?.kind === "file" && !isTestPath(sNode.path) && !isTestPath(tNode.path)) {
-                pushMap(fileImportsOut, sNode.path, tNode.path);
-            }
+        if (e.relation !== "imports") continue;
+        const sNode = byId.get(e.source);
+        const tNode = byId.get(e.target);
+        if (sNode?.kind === "file" && tNode?.kind === "file" && !isTestPath(sNode.path) && !isTestPath(tNode.path)) {
+            pushMap(fileImportsOut, sNode.path, tNode.path);
         }
     }
+    return fileImportsOut;
+}
 
-    // 1. Direct symbol edges & module imports from test files
+function linkDirectTestEdges(graph, byId, fileImportsOut, recordFileTest, recordSymbolTest) {
     for (const e of graph.edges) {
         if (e.relation === "contains") continue;
         const srcNode = byId.get(e.source);
@@ -90,34 +91,40 @@ function collectDirectAndCompanionTestLinks(graph, byId, testFiles, prodFilesByS
             recordSymbolTest(tgtNode.id, tgtPath, srcPath, "symbol_call");
         }
     }
+}
 
-    // 2. Stem-companion pairing (`foo.test.ts` <-> `foo.ts`)
+function pickBestStemCompanions(candidates, tPath) {
+    if (candidates.length === 1) return candidates;
+    let bestSim = -1;
+    let best = [];
+    for (const c of candidates) {
+        const sim = directorySimilarity(c, tPath);
+        if (sim > bestSim) {
+            bestSim = sim;
+            best = [c];
+        } else if (sim === bestSim) {
+            best.push(c);
+        }
+    }
+    return best.length === 1 || bestSim >= 1 ? best : [];
+}
+
+function linkStemCompanionTests(testFiles, prodFilesByStem, recordFileTest) {
     for (const tPath of testFiles) {
         const stem = canonicalFileStem(tPath);
         if (!stem || stem.length < 2) continue;
         const candidates = prodFilesByStem.get(stem);
         if (!candidates || candidates.length === 0) continue;
-        if (candidates.length === 1) {
-            recordFileTest(candidates[0], tPath, "stem_companion");
-        } else {
-            let bestSim = -1;
-            let best = [];
-            for (const c of candidates) {
-                const sim = directorySimilarity(c, tPath);
-                if (sim > bestSim) {
-                    bestSim = sim;
-                    best = [c];
-                } else if (sim === bestSim) {
-                    best.push(c);
-                }
-            }
-            if (best.length === 1 || bestSim >= 1) {
-                for (const c of best) {
-                    recordFileTest(c, tPath, "stem_companion");
-                }
-            }
+        for (const c of pickBestStemCompanions(candidates, tPath)) {
+            recordFileTest(c, tPath, "stem_companion");
         }
     }
+}
+
+function collectDirectAndCompanionTestLinks(graph, byId, testFiles, prodFilesByStem, recordFileTest, recordSymbolTest) {
+    const fileImportsOut = collectProdFileImportsOut(graph, byId);
+    linkDirectTestEdges(graph, byId, fileImportsOut, recordFileTest, recordSymbolTest);
+    linkStemCompanionTests(testFiles, prodFilesByStem, recordFileTest);
 }
 
 function formatTestEntries(map) {

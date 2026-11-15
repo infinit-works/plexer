@@ -1,7 +1,8 @@
 /**
  * Repo-relative paths, always posix, plus canonical context-directory resolution.
  */
-import { isAbsolute, join, relative, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Platform separators → `/`. Identity on posix. */
 export function toPosixPath(p) {
@@ -115,4 +116,34 @@ export function isTestPath(path) {
 /** True when `path` is a generated, protobuf, or minified bundle artifact. */
 export function isGeneratedPath(path) {
     return /\.pb\.(?:go|ts|js|cc|h)$|_pb2(?:_grpc)?\.py$|\.(?:min|bundle)\.(?:js|mjs|cjs|css)$|(?:^|\/|\.)(?:generated|__generated__|gen)\.[a-z0-9]+$|(?:\b|^)(?:generated|__generated__)\//i.test(path || "");
+}
+
+/** Convert a `file://` URI (or pass through a filesystem path) into a local path string. */
+export function fileUriToPath(uri) {
+    if (!uri || typeof uri !== "string")
+        return null;
+    if (uri.startsWith("file://")) {
+        try {
+            return fileURLToPath(uri);
+        }
+        catch {
+            try {
+                return decodeURIComponent(new URL(uri).pathname);
+            }
+            catch {
+                return uri.slice(7);
+            }
+        }
+    }
+    return uri;
+}
+
+/** True when `candidateAbs` resolves lexically inside `rootAbs` (or equals it when `allowEqual`). */
+export function isLexicallyWithin(rootAbs, candidateAbs, { allowEqual = true } = {}) {
+    if (!rootAbs || !candidateAbs)
+        return false;
+    const rel = relative(resolve(rootAbs), resolve(candidateAbs));
+    if (rel === "")
+        return allowEqual;
+    return !rel.startsWith("..") && !isAbsolute(rel);
 }
