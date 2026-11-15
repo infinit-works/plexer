@@ -29,7 +29,7 @@ plexer viz                                           # Launch local Canvas graph
 After initialization, lifecycle hooks run through a unified cross-host dispatcher (`src/hosts/engine/dispatcher.js`) and the local `plexerd` socket daemon. On Turn 0, hooks inject repository orientation, prompt-matched code spans, and co-edit or test pointers; after edits, they warn on downstream caller impact and track seen line spans per session. Run `plexer uninstall --yes` (or `plexer retract --yes`) to remove host edits cleanly.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@1.1.1/assets/how-it-works.svg" alt="How plexer works: your codebase (27 languages and SFCs) is indexed by plexer init into plexer/, powering Turn-0 retrieval, caller traversal, blast radius, and the interactive graph viewer." width="100%" />
+  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@2.0.0/assets/how-it-works.svg" alt="How plexer works: your codebase (27 languages and SFCs) is indexed by plexer init into plexer/, powering Turn-0 retrieval, caller traversal, blast radius, and the interactive graph viewer." width="100%" />
 </p>
 
 ## Architecture
@@ -80,7 +80,7 @@ plexer health prompt          # Output the autonomous review prompt for your age
 Evaluated across **Gemini 4 Carbon**, **Gemini 4 Argon**, **Gemini 3.8 Flash**, **Claude Opus 5.5**, and **Claude Sonnet 5.5**. The benchmark spans **28 tasks (`T1`–`T12`, `S1`–`S8`, `L1`–`L8`)** across **11 repositories** up to **1,350+ files**, totaling **140 paired and 3-arm evaluations** (methodology in [`bench/README.md`](bench/README.md)).
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@1.1.1/assets/chart-small.svg" alt="plexer Benchmark Summary: 12-Task Suite, SWE-bench Pro V2, Large-Repo Suite, and 3-Arm Comparison vs. trail-code and Cold Baseline" width="100%" />
+  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@2.0.0/assets/chart-small.svg" alt="plexer Benchmark Summary: 12-Task Suite, SWE-bench Pro V2, Large-Repo Suite, and 3-Arm Comparison vs. trail-code and Cold Baseline" width="100%" />
 </p>
 
 - On `T1`–`T12` (60 task-model pairs), `plexer` cuts tool output tokens by **57.3%** (`59W/1L`), tool calls by **50.1%**, cumulative input tokens by **52.9%**, and search time by **27.9%**, raising rubric score from `476/480` to `478/480`.
