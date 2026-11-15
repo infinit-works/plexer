@@ -284,58 +284,48 @@ function filterHolisticOpenIssues(state, zoneMap) {
  * Build the objective Holistic Context packet (`architecture`, `conventions`, `errors`,
  * `testing`, `structure`, `codebase_stats`, `concerns`) for `review_packet_blind.json`.
  */
-export function buildHolisticContext(graph, state, zoneMap, readLines) {
-    const inDeg = computeInDegree(graph);
-    const outDeg = computeOutDegree(graph);
-    const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
-
+function collectHolisticFileStats(graph, zoneMap, readLines, inDeg, outDeg) {
     const prodFiles = [];
     const testFiles = [];
     let totalProdLoc = 0;
     const namingByDir = Object.create(null);
     const dirProfiles = Object.create(null);
-
     for (const node of graph.nodes) {
         if (node.kind !== "file") continue;
-        const zone =
-            (zoneMap && typeof zoneMap.get === "function" ? zoneMap.get(node.path) : null) ||
-            "production";
+        const zone = (zoneMap && typeof zoneMap.get === "function" ? zoneMap.get(node.path) : null) || "production";
         const lines = typeof readLines === "function" ? readLines(node.path) : null;
-        const loc =
-            Array.isArray(lines) && lines.length > 0 ? lines.length : Number(node.lineCount) || 0;
-
+        const loc = Array.isArray(lines) && lines.length > 0 ? lines.length : Number(node.lineCount) || 0;
         if (zone === "test") {
             testFiles.push({ path: node.path, loc });
             continue;
         }
         if (!SCORED_ZONES.has(zone)) continue;
-
         const fanIn = inDeg.get(node.id) || 0;
         const fanOut = outDeg.get(node.id) || 0;
         totalProdLoc += loc;
         prodFiles.push({ path: node.path, loc, fan_in: fanIn, fan_out: fanOut });
-
         const dir = dirname(node.path);
         const conv = classifyStemConvention(basename(node.path), true);
         if (conv) {
             if (!namingByDir[dir]) namingByDir[dir] = Object.create(null);
             namingByDir[dir][conv] = (namingByDir[dir][conv] || 0) + 1;
         }
-
-        if (!dirProfiles[dir]) {
-            dirProfiles[dir] = { file_count: 0, total_loc: 0, total_fan_in: 0, total_fan_out: 0 };
-        }
+        if (!dirProfiles[dir]) dirProfiles[dir] = { file_count: 0, total_loc: 0, total_fan_in: 0, total_fan_out: 0 };
         dirProfiles[dir].file_count += 1;
         dirProfiles[dir].total_loc += loc;
         dirProfiles[dir].total_fan_in += fanIn;
         dirProfiles[dir].total_fan_out += fanOut;
     }
+    return { prodFiles, testFiles, totalProdLoc, namingByDir, dirProfiles };
+}
 
+export function buildHolisticContext(graph, state, zoneMap, readLines) {
+    const inDeg = computeInDegree(graph);
+    const outDeg = computeOutDegree(graph);
+    const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
+    const { prodFiles, testFiles, totalProdLoc, namingByDir, dirProfiles } = collectHolisticFileStats(graph, zoneMap, readLines, inDeg, outDeg);
     const couplingMatrix = computeCouplingMatrix(graph, nodeById);
-    const topHubs = [...prodFiles]
-        .sort((a, b) => b.fan_in - a.fan_in || b.loc - a.loc)
-        .slice(0, 12);
-    const rootFiles = prodFiles.filter((f) => dirname(f.path) === ".");
+    const topHubs = [...prodFiles].sort((a, b) => b.fan_in - a.fan_in || b.loc - a.loc).slice(0, 12);
     const openIssues = filterHolisticOpenIssues(state, zoneMap);
     const errorByDir = {};
     for (const iss of openIssues) {
@@ -344,25 +334,10 @@ export function buildHolisticContext(graph, state, zoneMap, readLines) {
             errorByDir[d] = (errorByDir[d] || 0) + 1;
         }
     }
-
     return {
-        codebase_stats: {
-            production_files: prodFiles.length,
-            production_loc: totalProdLoc,
-            test_files: testFiles.length,
-            languages: graph.languages || [],
-        },
-        architecture: {
-            top_hubs: topHubs,
-            open_cycle_issues: openIssues.filter(
-                (i) => i.detector === "file_cycles" || i.detector === "directory_cycles",
-            ).length,
-        },
-        structure: {
-            root_files: rootFiles,
-            directory_profiles: dirProfiles,
-            coupling_matrix: couplingMatrix,
-        },
+        codebase_stats: { production_files: prodFiles.length, production_loc: totalProdLoc, test_files: testFiles.length, languages: graph.languages || [] },
+        architecture: { top_hubs: topHubs, open_cycle_issues: openIssues.filter((i) => i.detector === "file_cycles" || i.detector === "directory_cycles").length },
+        structure: { root_files: prodFiles.filter((f) => dirname(f.path) === "."), directory_profiles: dirProfiles, coupling_matrix: couplingMatrix },
         conventions: { naming_by_directory: namingByDir },
         errors: { silent_catches_by_directory: errorByDir },
         testing: {

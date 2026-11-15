@@ -419,6 +419,51 @@ function findingDetailLength(f) {
     );
 }
 
+function locateDuplicateFindingIndex(merged, item, normDim, itemFiles, itemSummaryTokens, itemCombinedTokens, similarity) {
+    for (let i = 0; i < merged.length; i++) {
+        const ex = merged[i];
+        const exDim = normalizeDimensionKey(ex.dimension) || ex.dimension || "";
+        if (exDim !== normDim) continue;
+        const exFiles = Array.isArray(ex.related_files) ? ex.related_files : [];
+        if (
+            ex.identifier &&
+            item.identifier &&
+            ex.identifier === item.identifier &&
+            (exFiles[0] || "") === (itemFiles[0] || "")
+        ) {
+            return i;
+        }
+        const hasFileOverlap =
+            (exFiles.length === 0 && itemFiles.length === 0) ||
+            exFiles.some((f) => itemFiles.includes(f));
+        if (!hasFileOverlap) continue;
+        const sim = Math.max(
+            jaccardSimilarity(tokenizeText(ex.summary), itemSummaryTokens),
+            jaccardSimilarity(tokenizeText(`${ex.summary || ""} ${ex.suggestion || ""}`), itemCombinedTokens),
+        );
+        if (sim >= similarity) return i;
+    }
+    return -1;
+}
+
+function mergeDuplicateFindingPair(existing, item, normDim, itemFiles) {
+    const combinedFiles = [...new Set([...(existing.related_files || []), ...itemFiles])];
+    const combinedEvidence = [
+        ...new Set([
+            ...(Array.isArray(existing.evidence) ? existing.evidence : []),
+            ...(Array.isArray(item.evidence) ? item.evidence : []),
+        ]),
+    ];
+    const base = findingDetailLength(item) > findingDetailLength(existing) ? item : existing;
+    return {
+        ...base,
+        dimension: normDim || base.dimension,
+        related_files: combinedFiles,
+        evidence: combinedEvidence,
+        merged_count: (existing.merged_count || 1) + (item.merged_count || 1),
+    };
+}
+
 function deduplicateReviewFindings(rawFindings, similarity = 0.8) {
     const merged = [];
     for (const item of rawFindings) {
@@ -427,42 +472,15 @@ function deduplicateReviewFindings(rawFindings, similarity = 0.8) {
         const itemFiles = Array.isArray(item.related_files) ? item.related_files : [];
         const itemSummaryTokens = tokenizeText(item.summary);
         const itemCombinedTokens = tokenizeText(`${item.summary || ""} ${item.suggestion || ""}`);
-
-        let matchedIdx = -1;
-        for (let i = 0; i < merged.length; i++) {
-            const ex = merged[i];
-            const exDim = normalizeDimensionKey(ex.dimension) || ex.dimension || "";
-            if (exDim !== normDim) continue;
-            const exFiles = Array.isArray(ex.related_files) ? ex.related_files : [];
-
-            const exactKeyMatch =
-                ex.identifier &&
-                item.identifier &&
-                ex.identifier === item.identifier &&
-                (exFiles[0] || "") === (itemFiles[0] || "");
-
-            if (exactKeyMatch) {
-                matchedIdx = i;
-                break;
-            }
-
-            const hasFileOverlap =
-                (exFiles.length === 0 && itemFiles.length === 0) ||
-                exFiles.some((f) => itemFiles.includes(f));
-            if (!hasFileOverlap) continue;
-
-            const exSummaryTokens = tokenizeText(ex.summary);
-            const exCombinedTokens = tokenizeText(`${ex.summary || ""} ${ex.suggestion || ""}`);
-            const sim = Math.max(
-                jaccardSimilarity(exSummaryTokens, itemSummaryTokens),
-                jaccardSimilarity(exCombinedTokens, itemCombinedTokens),
-            );
-            if (sim >= similarity) {
-                matchedIdx = i;
-                break;
-            }
-        }
-
+        const matchedIdx = locateDuplicateFindingIndex(
+            merged,
+            item,
+            normDim,
+            itemFiles,
+            itemSummaryTokens,
+            itemCombinedTokens,
+            similarity,
+        );
         if (matchedIdx === -1) {
             merged.push({
                 ...item,
@@ -472,25 +490,7 @@ function deduplicateReviewFindings(rawFindings, similarity = 0.8) {
                 merged_count: item.merged_count || 1,
             });
         } else {
-            const existing = merged[matchedIdx];
-            const combinedFiles = [
-                ...new Set([...(existing.related_files || []), ...itemFiles]),
-            ];
-            const combinedEvidence = [
-                ...new Set([
-                    ...(Array.isArray(existing.evidence) ? existing.evidence : []),
-                    ...(Array.isArray(item.evidence) ? item.evidence : []),
-                ]),
-            ];
-            const base =
-                findingDetailLength(item) > findingDetailLength(existing) ? item : existing;
-            merged[matchedIdx] = {
-                ...base,
-                dimension: normDim || base.dimension,
-                related_files: combinedFiles,
-                evidence: combinedEvidence,
-                merged_count: (existing.merged_count || 1) + (item.merged_count || 1),
-            };
+            merged[matchedIdx] = mergeDuplicateFindingPair(merged[matchedIdx], item, normDim, itemFiles);
         }
     }
     return merged;
@@ -520,67 +520,75 @@ function resolveBatchEntriesList(filesOrDir) {
     return selected.sort().map((f) => join(filesOrDir, f));
 }
 
+function mergeOneDimensionJudgment(dimensionJudgment, rawDim, jVal) {
+    const dim = normalizeDimensionKey(rawDim);
+    if (!dim || !jVal || typeof jVal !== "object") return;
+    const prev = dimensionJudgment[dim];
+    if (!prev) {
+        dimensionJudgment[dim] = {
+            ...jVal,
+            ...(Array.isArray(jVal.strengths) ? { strengths: [...jVal.strengths] } : {}),
+        };
+        return;
+    }
+    const prevChar = String(prev.dimension_character || "").trim();
+    const nextChar = String(jVal.dimension_character || "").trim();
+    const prevRat = String(prev.score_rationale || "").trim();
+    const nextRat = String(jVal.score_rationale || "").trim();
+    const strengths = [
+        ...new Set([
+            ...(Array.isArray(prev.strengths) ? prev.strengths : []),
+            ...(Array.isArray(jVal.strengths) ? jVal.strengths : []),
+        ]),
+    ];
+    dimensionJudgment[dim] = {
+        ...prev,
+        ...jVal,
+        dimension_character:
+            nextChar.length >= prevChar.length && nextChar
+                ? jVal.dimension_character
+                : prev.dimension_character || jVal.dimension_character,
+        score_rationale:
+            nextRat.length >= prevRat.length && nextRat
+                ? jVal.score_rationale
+                : prev.score_rationale || jVal.score_rationale,
+        strengths,
+    };
+}
+
+function mergeOneContextUpdate(contextUpdates, rawDim, uVal) {
+    const dim = normalizeDimensionKey(rawDim);
+    if (!dim || !uVal || typeof uVal !== "object") return;
+    const prev = contextUpdates[dim];
+    if (!prev) {
+        contextUpdates[dim] = {
+            ...uVal,
+            ...(Array.isArray(uVal.add) ? { add: [...uVal.add] } : {}),
+            ...(Array.isArray(uVal.remove) ? { remove: [...uVal.remove] } : {}),
+            ...(Array.isArray(uVal.settle) ? { settle: [...uVal.settle] } : {}),
+            ...(Array.isArray(uVal.unsettle) ? { unsettle: [...uVal.unsettle] } : {}),
+        };
+        return;
+    }
+    for (const key of ["add", "remove", "settle", "unsettle"]) {
+        if (Array.isArray(prev[key]) || Array.isArray(uVal[key])) {
+            prev[key] = [
+                ...(Array.isArray(prev[key]) ? prev[key] : []),
+                ...(Array.isArray(uVal[key]) ? uVal[key] : []),
+            ];
+        }
+    }
+}
+
 function mergeBatchJudgmentAndContext(dimensionJudgment, contextUpdates, parsed) {
     if (parsed.dimension_judgment && typeof parsed.dimension_judgment === "object") {
         for (const [rawDim, jVal] of Object.entries(parsed.dimension_judgment)) {
-            const dim = normalizeDimensionKey(rawDim);
-            if (!dim || !jVal || typeof jVal !== "object") continue;
-            const prev = dimensionJudgment[dim];
-            if (!prev) {
-                dimensionJudgment[dim] = {
-                    ...jVal,
-                    ...(Array.isArray(jVal.strengths) ? { strengths: [...jVal.strengths] } : {}),
-                };
-            } else {
-                const prevChar = String(prev.dimension_character || "").trim();
-                const nextChar = String(jVal.dimension_character || "").trim();
-                const prevRat = String(prev.score_rationale || "").trim();
-                const nextRat = String(jVal.score_rationale || "").trim();
-                const strengths = [
-                    ...new Set([
-                        ...(Array.isArray(prev.strengths) ? prev.strengths : []),
-                        ...(Array.isArray(jVal.strengths) ? jVal.strengths : []),
-                    ]),
-                ];
-                dimensionJudgment[dim] = {
-                    ...prev,
-                    ...jVal,
-                    dimension_character:
-                        nextChar.length >= prevChar.length && nextChar
-                            ? jVal.dimension_character
-                            : prev.dimension_character || jVal.dimension_character,
-                    score_rationale:
-                        nextRat.length >= prevRat.length && nextRat
-                            ? jVal.score_rationale
-                            : prev.score_rationale || jVal.score_rationale,
-                    strengths,
-                };
-            }
+            mergeOneDimensionJudgment(dimensionJudgment, rawDim, jVal);
         }
     }
     if (parsed.context_updates && typeof parsed.context_updates === "object") {
         for (const [rawDim, uVal] of Object.entries(parsed.context_updates)) {
-            const dim = normalizeDimensionKey(rawDim);
-            if (!dim || !uVal || typeof uVal !== "object") continue;
-            const prev = contextUpdates[dim];
-            if (!prev) {
-                contextUpdates[dim] = {
-                    ...uVal,
-                    ...(Array.isArray(uVal.add) ? { add: [...uVal.add] } : {}),
-                    ...(Array.isArray(uVal.remove) ? { remove: [...uVal.remove] } : {}),
-                    ...(Array.isArray(uVal.settle) ? { settle: [...uVal.settle] } : {}),
-                    ...(Array.isArray(uVal.unsettle) ? { unsettle: [...uVal.unsettle] } : {}),
-                };
-            } else {
-                for (const key of ["add", "remove", "settle", "unsettle"]) {
-                    if (Array.isArray(prev[key]) || Array.isArray(uVal[key])) {
-                        prev[key] = [
-                            ...(Array.isArray(prev[key]) ? prev[key] : []),
-                            ...(Array.isArray(uVal[key]) ? uVal[key] : []),
-                        ];
-                    }
-                }
-            }
+            mergeOneContextUpdate(contextUpdates, rawDim, uVal);
         }
     }
 }
@@ -588,13 +596,34 @@ function mergeBatchJudgmentAndContext(dimensionJudgment, contextUpdates, parsed)
 /**
  * Merge `batch-*.raw.txt` files from a directory or explicit file/object list into a single review payload.
  */
-export function mergeReviewBatches(arg1, arg2 = {}, arg3 = null, arg4 = null, arg5 = {}) {
-    let filesOrDir = arg1;
-    let opts = arg2 || {};
-    if (typeof arg4 === "string" || Array.isArray(arg4)) {
-        filesOrDir = arg4;
-        opts = arg5 || {};
+function parseReviewBatchEntry(entry) {
+    if (typeof entry === "object" && entry !== null) return entry;
+    try {
+        return parseReviewRawText(readFileSync(entry, "utf8"));
+    } catch (err) {
+        throw new Error(`Failed to parse review batch ${entry}: ${err.message}`);
     }
+}
+
+function accumulateBatchDimensionScores(rawScores, scoreBuckets) {
+    if (!rawScores || typeof rawScores !== "object") return;
+    for (const [rawDim, val] of Object.entries(rawScores)) {
+        const dim = normalizeDimensionKey(rawDim);
+        const num = Number(typeof val === "object" && val !== null ? val.score : val);
+        if (!Number.isFinite(num)) continue;
+        let arr = scoreBuckets.get(dim);
+        if (!arr) {
+            arr = [];
+            scoreBuckets.set(dim, arr);
+        }
+        arr.push(num);
+    }
+}
+
+export function mergeReviewBatches(arg1, arg2 = {}, arg3 = null, arg4 = null, arg5 = {}) {
+    const useTailArgs = typeof arg4 === "string" || Array.isArray(arg4);
+    const filesOrDir = useTailArgs ? arg4 : arg1;
+    const opts = (useTailArgs ? arg5 : arg2) || {};
     const similarity = Number(opts.similarity ?? 0.8);
     const entriesList = resolveBatchEntriesList(filesOrDir);
 
@@ -606,37 +635,11 @@ export function mergeReviewBatches(arg1, arg2 = {}, arg3 = null, arg4 = null, ar
     let session = null;
 
     for (const entry of entriesList) {
-        let parsed;
-        if (typeof entry === "object" && entry !== null) {
-            parsed = entry;
-        } else {
-            try {
-                parsed = parseReviewRawText(readFileSync(entry, "utf8"));
-            } catch (err) {
-                throw new Error(`Failed to parse review batch ${entry}: ${err.message}`);
-            }
-        }
+        const parsed = parseReviewBatchEntry(entry);
         if (parsed.session && !session) session = parsed.session;
-        const rawScores = parsed.assessments || parsed.dimensions;
-        if (rawScores && typeof rawScores === "object") {
-            for (const [rawDim, val] of Object.entries(rawScores)) {
-                const dim = normalizeDimensionKey(rawDim);
-                const num = Number(typeof val === "object" && val !== null ? val.score : val);
-                if (!Number.isFinite(num)) continue;
-                let arr = scoreBuckets.get(dim);
-                if (!arr) {
-                    arr = [];
-                    scoreBuckets.set(dim, arr);
-                }
-                arr.push(num);
-            }
-        }
+        accumulateBatchDimensionScores(parsed.assessments || parsed.dimensions, scoreBuckets);
         mergeBatchJudgmentAndContext(dimensionJudgment, contextUpdates, parsed);
-        const batchFindings = Array.isArray(parsed.findings)
-            ? parsed.findings
-            : Array.isArray(parsed.issues)
-              ? parsed.issues
-              : [];
+        const batchFindings = Array.isArray(parsed.findings) ? parsed.findings : Array.isArray(parsed.issues) ? parsed.issues : [];
         rawFindingsAll.push(...batchFindings);
         if (Array.isArray(parsed.dismissed_concerns)) {
             dismissedConcerns.push(...parsed.dismissed_concerns);
@@ -649,14 +652,12 @@ export function mergeReviewBatches(arg1, arg2 = {}, arg3 = null, arg4 = null, ar
         assessments[dim] = Number(avg.toFixed(1));
     }
 
-    const findings = deduplicateReviewFindings(rawFindingsAll, similarity);
-
     return {
         ...(session ? { session } : {}),
         assessments,
         dimension_judgment: dimensionJudgment,
         context_updates: contextUpdates,
-        findings,
+        findings: deduplicateReviewFindings(rawFindingsAll, similarity),
         dismissed_concerns: dismissedConcerns,
     };
 }
@@ -664,6 +665,58 @@ export function mergeReviewBatches(arg1, arg2 = {}, arg3 = null, arg4 = null, ar
 /**
  * Store per-dimension `context_updates` (`add`, `remove`, `settle`, `unsettle`) into `state.dimension_contexts`.
  */
+function removeDimensionInsightsByHeader(insights, removeHeaders) {
+    let changed = false;
+    for (const rmHeader of removeHeaders || []) {
+        if (typeof rmHeader !== "string") continue;
+        const target = rmHeader.trim().toLowerCase();
+        const idx = insights.findIndex((ins) => String(ins.header || "").trim().toLowerCase() === target);
+        if (idx >= 0) {
+            insights.splice(idx, 1);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+function upsertDimensionInsights(insights, addItems, nowIso) {
+    let changed = false;
+    for (const item of addItems || []) {
+        if (!item || typeof item !== "object" || !item.header) continue;
+        const header = String(item.header).trim();
+        const key = header.toLowerCase();
+        const existingIdx = insights.findIndex((ins) => String(ins.header || "").trim().toLowerCase() === key);
+        if (existingIdx >= 0) {
+            if (item.description) insights[existingIdx].description = String(item.description).trim();
+            if (item.positive !== undefined) insights[existingIdx].positive = Boolean(item.positive);
+            if (item.settled !== undefined) insights[existingIdx].settled = Boolean(item.settled);
+        } else {
+            insights.push({
+                header,
+                description: String(item.description || "").trim(),
+                positive: Boolean(item.positive),
+                settled: Boolean(item.settled),
+                added_at: nowIso,
+            });
+        }
+        changed = true;
+    }
+    return changed;
+}
+
+function updateInsightSettledState(insights, headers, settledValue) {
+    let changed = false;
+    for (const rawHeader of headers || []) {
+        const target = String(rawHeader).trim().toLowerCase();
+        const idx = insights.findIndex((ins) => String(ins.header || "").trim().toLowerCase() === target);
+        if (idx >= 0 && Boolean(insights[idx].settled) !== settledValue) {
+            insights[idx].settled = settledValue;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 export function storeContextUpdates(state, contextUpdates, nowIso) {
     if (!contextUpdates || typeof contextUpdates !== "object") return;
     if (!state.dimension_contexts) state.dimension_contexts = {};
@@ -679,65 +732,10 @@ export function storeContextUpdates(state, contextUpdates, nowIso) {
             insights: [],
         };
         const insights = Array.isArray(ctx.insights) ? [...ctx.insights] : [];
-        let changed = false;
-
-        // Remove by header
-        for (const rmHeader of updates.remove || []) {
-            if (typeof rmHeader !== "string") continue;
-            const target = rmHeader.trim().toLowerCase();
-            const idx = insights.findIndex(
-                (ins) => String(ins.header || "").trim().toLowerCase() === target,
-            );
-            if (idx >= 0) {
-                insights.splice(idx, 1);
-                changed = true;
-            }
-        }
-
-        // Add or update by header
-        for (const item of updates.add || []) {
-            if (!item || typeof item !== "object" || !item.header) continue;
-            const header = String(item.header).trim();
-            const key = header.toLowerCase();
-            const existingIdx = insights.findIndex(
-                (ins) => String(ins.header || "").trim().toLowerCase() === key,
-            );
-            if (existingIdx >= 0) {
-                if (item.description) insights[existingIdx].description = String(item.description).trim();
-                if (item.positive !== undefined) insights[existingIdx].positive = Boolean(item.positive);
-                if (item.settled !== undefined) insights[existingIdx].settled = Boolean(item.settled);
-                changed = true;
-            } else {
-                insights.push({
-                    header,
-                    description: String(item.description || "").trim(),
-                    positive: Boolean(item.positive),
-                    settled: Boolean(item.settled),
-                    added_at: nowIso,
-                });
-                changed = true;
-            }
-        }
-
-        // Settle / unsettle
-        for (const sHeader of updates.settle || []) {
-            const idx = insights.findIndex(
-                (ins) => String(ins.header || "").trim().toLowerCase() === String(sHeader).trim().toLowerCase(),
-            );
-            if (idx >= 0 && !insights[idx].settled) {
-                insights[idx].settled = true;
-                changed = true;
-            }
-        }
-        for (const uHeader of updates.unsettle || []) {
-            const idx = insights.findIndex(
-                (ins) => String(ins.header || "").trim().toLowerCase() === String(uHeader).trim().toLowerCase(),
-            );
-            if (idx >= 0 && insights[idx].settled) {
-                insights[idx].settled = false;
-                changed = true;
-            }
-        }
+        let changed = removeDimensionInsightsByHeader(insights, updates.remove);
+        if (upsertDimensionInsights(insights, updates.add, nowIso)) changed = true;
+        if (updateInsightSettledState(insights, updates.settle, true)) changed = true;
+        if (updateInsightSettledState(insights, updates.unsettle, false)) changed = true;
 
         ctx.insights = insights;
         if (changed) {
@@ -750,8 +748,7 @@ export function storeContextUpdates(state, contextUpdates, nowIso) {
     }
 }
 
-function validateReviewPayload(rawAssessments, rawFindings, dimensionJudgment, opts) {
-    const errors = [];
+function parseNormalizedAssessments(rawAssessments, errors) {
     const normalizedAssessments = {};
     for (const [rawDim, rawVal] of Object.entries(rawAssessments)) {
         const dim = normalizeDimensionKey(rawDim);
@@ -766,37 +763,44 @@ function validateReviewPayload(rawAssessments, rawFindings, dimensionJudgment, o
         }
         normalizedAssessments[dim] = num;
     }
+    return normalizedAssessments;
+}
 
+function collectValidatedFindings(rawFindings, errors) {
     const validFindings = [];
     const findingsByDim = new Map();
     for (let i = 0; i < rawFindings.length; i++) {
         const f = rawFindings[i];
         const normDim = normalizeDimensionKey(f?.dimension);
-        if (
-            !f ||
-            typeof f !== "object" ||
-            !normDim ||
-            !SUBJECTIVE_DIMENSIONS[normDim] ||
-            !f.identifier ||
-            !f.summary ||
-            !Array.isArray(f.related_files) ||
-            f.related_files.length === 0 ||
-            !Array.isArray(f.evidence) ||
-            f.evidence.length === 0 ||
-            !f.suggestion
-        ) {
+        const hasRequired =
+            f &&
+            typeof f === "object" &&
+            normDim &&
+            SUBJECTIVE_DIMENSIONS[normDim] &&
+            f.identifier &&
+            f.summary &&
+            Array.isArray(f.related_files) &&
+            f.related_files.length > 0 &&
+            Array.isArray(f.evidence) &&
+            f.evidence.length > 0 &&
+            f.suggestion;
+        if (!hasRequired) {
             errors.push(
                 `Finding #${i + 1} is missing required fields (dimension, identifier, summary, related_files, evidence, suggestion)`,
             );
             continue;
         }
-        const cleaned = { ...f, dimension: normDim };
-        validFindings.push(cleaned);
+        validFindings.push({ ...f, dimension: normDim });
         findingsByDim.set(normDim, (findingsByDim.get(normDim) || 0) + 1);
     }
+    return { validFindings, findingsByDim };
+}
 
-    const strictGuard =
-        opts.strictGuard !== undefined ? Boolean(opts.strictGuard) : !opts.manualOverride;
+function validateReviewPayload(rawAssessments, rawFindings, dimensionJudgment, opts) {
+    const errors = [];
+    const normalizedAssessments = parseNormalizedAssessments(rawAssessments, errors);
+    const { validFindings, findingsByDim } = collectValidatedFindings(rawFindings, errors);
+    const strictGuard = opts.strictGuard !== undefined ? Boolean(opts.strictGuard) : !opts.manualOverride;
 
     if (strictGuard) {
         for (const [dim, score] of Object.entries(normalizedAssessments)) {
@@ -1250,13 +1254,15 @@ function spawnReviewRunnerProcess(rootDir, runner, runnerCmd, promptFilePath, pr
     }
     const norm = (runner || "claude").toLowerCase();
     let bin = "claude";
-    let args = ["-p", promptText];
+    // Pipe prompt text via stdin instead of argv to avoid OS command-length limits
+    // and keep large blind-review payloads out of process listings.
+    let args = ["-p", "-"];
     if (norm === "codex") {
         bin = "codex";
-        args = ["exec", promptText];
+        args = ["exec", "-"];
     } else if (norm === "gemini") {
         bin = "gemini";
-        args = ["-p", promptText];
+        args = ["-p", ""];
     }
     return spawn(bin, args, {
         cwd: rootDir,
@@ -1265,19 +1271,12 @@ function spawnReviewRunnerProcess(rootDir, runner, runnerCmd, promptFilePath, pr
 }
 
 function flushRunnerPromptStdin(child, runnerCmd, promptText) {
-    if (runnerCmd && child.stdin) {
-        try {
-            child.stdin.write(promptText || "");
-            child.stdin.end();
-        } catch {
-            // Ignore broken pipe if fast-exiting command doesn't read stdin
-        }
-    } else if (child.stdin) {
-        try {
-            child.stdin.end();
-        } catch {
-            // Ignore
-        }
+    if (!child.stdin) return;
+    try {
+        child.stdin.write(promptText || "");
+        child.stdin.end();
+    } catch {
+        // Ignore broken pipe if fast-exiting command doesn't read stdin
     }
 }
 

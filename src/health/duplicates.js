@@ -50,6 +50,12 @@ const STOP_KEYWORDS = new Set([
     "import",
     "from",
     "export",
+    "in",
+    "and",
+    "or",
+    "not",
+    "new",
+    "typeof",
     "true",
     "false",
     "null",
@@ -60,45 +66,191 @@ const STOP_KEYWORDS = new Set([
     "this",
 ]);
 
-function stripCommentsAndNormalize(lines, relPath = "") {
+function advanceQuotedString(raw, startIdx) {
+    const q = raw[startIdx];
+    let i = startIdx + 1;
+    while (i < raw.length) {
+        if (raw[i] === "\\") {
+            i += 2;
+            continue;
+        }
+        i += 1;
+        if (raw[i - 1] === q) break;
+    }
+    return i;
+}
+
+function stripLineCommentsPreserveStrings(raw, { isDashComment, isHashComment, isSlashComment }) {
+    let out = "";
+    let i = 0;
+    while (i < raw.length) {
+        const ch = raw[i];
+        if (isSlashComment && ch === "/" && raw[i + 1] === "/") break;
+        if (isSlashComment && ch === "/" && raw[i + 1] === "*") {
+            const close = raw.indexOf("*/", i + 2);
+            if (close < 0) break;
+            out += " ";
+            i = close + 2;
+            continue;
+        }
+        if (isDashComment && ch === "-" && raw[i + 1] === "-") break;
+        if (isHashComment && ch === "#") break;
+        if (ch === '"' || ch === "'" || ch === "`") {
+            const nextIdx = advanceQuotedString(raw, i);
+            out += raw.slice(i, nextIdx);
+            i = nextIdx;
+            continue;
+        }
+        out += ch;
+        i += 1;
+    }
+    return out.trim();
+}
+
+function stripCommentsPreserveStrings(lines, relPath = "") {
     const isDashComment = /\.(?:luau|lua|sql)$/i.test(relPath);
     const isHashComment = /\.(?:py|pyi|sh|bash|zsh|rb|pl|r|ya?ml|toml)$/i.test(relPath);
-    const isSlashComment = !isDashComment && !isHashComment;
+    const mode = { isDashComment, isHashComment, isSlashComment: !isDashComment && !isHashComment };
     const cleaned = [];
     for (const raw of lines) {
-        let line = raw.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, '"$STR"');
-        if (isSlashComment) line = line.replace(/\/\/.*$/, "");
-        if (isDashComment) line = line.replace(/--.*$/, "");
-        if (isHashComment) line = line.replace(/#.*$/, "");
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        cleaned.push(trimmed);
+        const trimmed = stripLineCommentsPreserveStrings(raw, mode);
+        if (trimmed) cleaned.push(trimmed);
     }
     return cleaned;
 }
 
-function normalizeStructuralTokens(lines) {
-    const text = lines
-        .join("\n")
-        .replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, "$STR")
-        .replace(/\b\d+(?:\.\d+)?\b/g, "$NUM");
-    const rawTokens = text.match(/\$STR|\$NUM|[A-Za-z_][A-Za-z0-9_]*|[{}()[\].,:;+\-/*%=<>!&|?~]+/g) || [];
-    const idMap = new Map();
-    let idSeq = 0;
-    return rawTokens.map((tok) => {
-        if (tok === "$STR" || tok === "$NUM") return tok;
-        if (/^[A-Za-z_]/.test(tok)) {
-            if (STOP_KEYWORDS.has(tok)) return tok;
-            let mapped = idMap.get(tok);
-            if (!mapped) {
-                idSeq += 1;
-                mapped = `$ID${idSeq}`;
-                idMap.set(tok, mapped);
+function collectParamNamesFromHeader(headerLines, locals) {
+    const headerText = headerLines.join(" ");
+    const openIdx = headerText.indexOf("(");
+    if (openIdx < 0) return;
+    let depth = 0;
+    let closeIdx = -1;
+    for (let i = openIdx; i < headerText.length; i++) {
+        if (headerText[i] === "(") depth += 1;
+        else if (headerText[i] === ")") {
+            depth -= 1;
+            if (depth === 0) {
+                closeIdx = i;
+                break;
             }
-            return mapped;
         }
-        return tok;
-    });
+    }
+    if (closeIdx <= openIdx) return;
+    for (const part of headerText.slice(openIdx + 1, closeIdx).split(",")) {
+        const m = /^\s*(?:\*{1,2}|\.{3})?\s*([A-Za-z_$][A-Za-z0-9_$]*)/.exec(part);
+        if (m && m[1] !== "self" && m[1] !== "this") locals.add(m[1]);
+    }
+}
+
+function addCommaSeparatedLocals(rawList, locals, splitColon = false) {
+    for (const id of rawList.split(",")) {
+        const clean = (splitColon ? id.split(":")[0] : id).trim();
+        if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(clean)) locals.add(clean);
+    }
+}
+
+function collectLineDeclaredLocals(line, locals) {
+    let m;
+    // Luau / JS / TS / Rust / Go local variable declarations
+    if ((m = /^(?:local\s+function|export\s+(?:async\s+)?function|function)\s+([A-Za-z_$][A-Za-z0-9_$]*)/.exec(line))) {
+        locals.add(m[1]);
+    } else if ((m = /^(?:local|const|let(?:\s+mut)?|var)\s+([A-Za-z_$][A-Za-z0-9_$,\s]*?)(?:\s*:[^=]+)?(?:\s*=|\s*;|\s*$)/.exec(line))) {
+        addCommaSeparatedLocals(m[1], locals);
+    } else if ((m = /^(?:const|let|var)\s*\{([^}]+)\}\s*=/.exec(line))) {
+        addCommaSeparatedLocals(m[1], locals, true);
+    } else if ((m = /^for\s+(?:\(\s*(?:const|let|var)\s+)?([A-Za-z_$][A-Za-z0-9_$,\s]*?)\s*(?:=|in\b|of\b)/.exec(line))) {
+        addCommaSeparatedLocals(m[1], locals);
+    } else if ((m = /^([A-Za-z_][A-Za-z0-9_]*)\s*:=/.exec(line))) {
+        locals.add(m[1]);
+    } else if ((m = /^([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[A-Za-z0-9_[\]|.,\s]+)?=\s*(?!=)/.exec(line))) {
+        if (!STOP_KEYWORDS.has(m[1])) locals.add(m[1]);
+    }
+}
+
+function extractDeclaredLocalsAndParams(headerLines, bodyLines) {
+    const locals = new Set();
+    collectParamNamesFromHeader(headerLines, locals);
+    for (const raw of bodyLines) {
+        const line = raw.trim();
+        if (line) collectLineDeclaredLocals(line, locals);
+    }
+    return locals;
+}
+
+function buildExactAndStructuralTokens(lines, declaredLocals) {
+    const rawText = lines.join("\n");
+    const rawTokens =
+        rawText.match(
+            /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b\d+(?:\.\d+)?\b|[A-Za-z_$][A-Za-z0-9_$]*|[{}()[\].,:;+\-/*%=<>!&|?~]+/g,
+        ) || [];
+
+    const exactTokens = [];
+    const structuralTokens = [];
+    const externalVocab = new Set();
+    const localIdMap = new Map();
+    const structIdMap = new Map();
+    let localSeq = 0;
+    let structSeq = 0;
+
+    for (let i = 0; i < rawTokens.length; i++) {
+        const tok = rawTokens[i];
+        const prevTok = i > 0 ? rawTokens[i - 1] : "";
+        const isMemberProp = prevTok === "." || prevTok === ":" || prevTok === "::";
+
+        if (tok.startsWith('"') || tok.startsWith("'") || tok.startsWith("`")) {
+            exactTokens.push(tok);
+            structuralTokens.push("$STR");
+            continue;
+        }
+        if (/^\d/.test(tok)) {
+            exactTokens.push(tok);
+            structuralTokens.push("$NUM");
+            continue;
+        }
+        if (/^[A-Za-z_$]/.test(tok)) {
+            if (STOP_KEYWORDS.has(tok) && !isMemberProp) {
+                exactTokens.push(tok);
+                structuralTokens.push(tok);
+                continue;
+            }
+            if (!isMemberProp && declaredLocals.has(tok)) {
+                let mappedLocal = localIdMap.get(tok);
+                if (!mappedLocal) {
+                    localSeq += 1;
+                    mappedLocal = `$LOC${localSeq}`;
+                    localIdMap.set(tok, mappedLocal);
+                }
+                exactTokens.push(mappedLocal);
+            } else {
+                // Preserve non-local callees, external globals, and member property names in exact clones.
+                exactTokens.push(tok);
+                externalVocab.add(tok);
+            }
+            let mappedStruct = structIdMap.get(tok);
+            if (!mappedStruct) {
+                structSeq += 1;
+                mappedStruct = `$ID${structSeq}`;
+                structIdMap.set(tok, mappedStruct);
+            }
+            structuralTokens.push(mappedStruct);
+            continue;
+        }
+        exactTokens.push(tok);
+        structuralTokens.push(tok);
+    }
+
+    return { exactTokens, structuralTokens, externalVocab };
+}
+
+function externalVocabOverlap(setA, setB) {
+    if (setA.size === 0 && setB.size === 0) return 1;
+    let inter = 0;
+    const [smaller, larger] = setA.size <= setB.size ? [setA, setB] : [setB, setA];
+    for (const item of smaller) {
+        if (larger.has(item)) inter += 1;
+    }
+    const union = setA.size + setB.size - inter;
+    return union > 0 ? inter / union : 0;
 }
 
 function buildShingles(tokens, k = 4) {
@@ -177,17 +329,23 @@ function collectDuplicateCandidates(graph, readLines, zoneMap, ignoreRules) {
         if (hasInlineSuppression(fileLines, range.start, "duplicates")) continue;
 
         const bodyLines = fileLines.slice(range.start - 1, range.end);
-        const innerLines = stripCommentsAndNormalize(
-            sliceFunctionBodyAfterSignature(bodyLines),
-            node.path,
-        );
+        const bodyAfterSig = sliceFunctionBodyAfterSignature(bodyLines);
+        const headerCount = Math.max(1, bodyLines.length - bodyAfterSig.length);
+        const innerLines = stripCommentsPreserveStrings(bodyAfterSig, node.path);
         if (innerLines.length < MIN_DUP_LINES - 2) continue;
 
-        const tokens = normalizeStructuralTokens(innerLines);
-        if (tokens.length < MIN_DUP_TOKENS) continue;
+        const declaredLocals = extractDeclaredLocalsAndParams(
+            bodyLines.slice(0, headerCount),
+            innerLines,
+        );
+        const { exactTokens, structuralTokens, externalVocab } = buildExactAndStructuralTokens(
+            innerLines,
+            declaredLocals,
+        );
+        if (structuralTokens.length < MIN_DUP_TOKENS) continue;
 
-        const exactHash = createHash("sha256").update(tokens.join(" ")).digest("hex").slice(0, 16);
-        const shingles = buildShingles(tokens, 4);
+        const exactHash = createHash("sha256").update(exactTokens.join(" ")).digest("hex").slice(0, 16);
+        const shingles = buildShingles(structuralTokens, 4);
 
         candidates.push({
             node,
@@ -199,6 +357,7 @@ function collectDuplicateCandidates(graph, readLines, zoneMap, ignoreRules) {
             loc,
             exactHash,
             shingles,
+            externalVocab,
         });
     }
     return candidates;
@@ -246,6 +405,78 @@ function findCloneDrift(members, gitHistory) {
     return best;
 }
 
+function unionNearDuplicatePairs(remaining, uf, maxSimByIdx, maxVocabOverlapByIdx) {
+    for (let i = 0; i < remaining.length; i++) {
+        const base = remaining[i].c;
+        const maxLoc = Math.ceil(base.loc / 0.7);
+        for (let j = i + 1; j < remaining.length; j++) {
+            const other = remaining[j].c;
+            if (other.loc > maxLoc) break;
+            if (other.path === base.path && other.name === base.name && other.start === base.start) continue;
+            const sim = jaccard(base.shingles, other.shingles);
+            if (sim < JACCARD_THRESHOLD) continue;
+            const vocabOverlap = externalVocabOverlap(base.externalVocab, other.externalVocab);
+            // Require pairwise external-vocab overlap on every unioned pair so
+            // unrelated >=14-LOC functions never bridge transitively.
+            if (vocabOverlap < 0.5) continue;
+            uf.union(i, j);
+            maxSimByIdx.set(i, Math.max(maxSimByIdx.get(i) || 0, sim));
+            maxSimByIdx.set(j, Math.max(maxSimByIdx.get(j) || 0, sim));
+            maxVocabOverlapByIdx.set(i, Math.max(maxVocabOverlapByIdx.get(i) || 0, vocabOverlap));
+            maxVocabOverlapByIdx.set(j, Math.max(maxVocabOverlapByIdx.get(j) || 0, vocabOverlap));
+        }
+    }
+}
+
+function buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOverlapByIdx, gitHistory) {
+    const cluster = sortCloneMembers(compIndices.map((idx) => remaining[idx].c));
+    let bestVocabOverlap = 0;
+    let bestSim = JACCARD_THRESHOLD;
+    for (const idx of compIndices) {
+        bestVocabOverlap = Math.max(bestVocabOverlap, maxVocabOverlapByIdx.get(idx) || 0);
+        bestSim = Math.max(bestSim, maxSimByIdx.get(idx) || 0);
+    }
+    if (bestVocabOverlap < 0.5) return null;
+
+    const primary = cluster[0];
+    const peerList = cluster.slice(1).map((m) => `${m.path}:${m.span} (${m.name})`).join(", ");
+    const pct = Math.round(bestSim * 100);
+    const cloneDrift = findCloneDrift(cluster, gitHistory);
+    const driftSuffix = cloneDrift
+        ? ` [clone_drift: ${cloneDrift.file_a} <-> ${cloneDrift.file_b} co-changed in ${cloneDrift.co_commits} commits]`
+        : "";
+
+    return {
+        id: mintIssueId("duplicates", primary.path, `near_${primary.name}_L${primary.start}`),
+        detector: "duplicates",
+        category: "duplicates",
+        dimension: "duplication",
+        tier: cloneDrift ? "T2" : "T3",
+        confidence: bestSim >= 0.9 && bestVocabOverlap >= 0.5 ? "high" : "medium",
+        severity: cloneDrift || cluster.length >= 3 || primary.loc >= 30 ? "high" : "medium",
+        file: primary.path,
+        line: primary.start,
+        end_line: primary.end,
+        span: primary.span,
+        identifier: primary.name,
+        similarity: Number(bestSim.toFixed(2)),
+        kind: "near_duplicate",
+        ...(cloneDrift ? { clone_drift: cloneDrift } : {}),
+        detail: {
+            cluster_size: cluster.length,
+            ...(cloneDrift ? { clone_drift: cloneDrift } : {}),
+        },
+        members: cluster.map((m) => ({
+            file: m.path,
+            name: m.name,
+            span: m.span,
+            loc: m.loc,
+        })),
+        summary: `Near-duplicate function cluster (${pct}% token similarity across ${cluster.length} functions): ${primary.name} and ${peerList}${driftSuffix}`,
+        suggestion: `Consolidate the shared control flow between ${primary.name} and ${peerList} into a parameterized helper.`,
+    };
+}
+
 function collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHistory = null) {
     const remaining = candidates
         .map((c, idx) => ({ c, idx }))
@@ -254,72 +485,13 @@ function collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHis
 
     const uf = new UnionFind();
     const maxSimByIdx = new Map();
-
-    for (let i = 0; i < remaining.length; i++) {
-        const base = remaining[i].c;
-        const maxLoc = Math.ceil(base.loc / 0.7);
-
-        for (let j = i + 1; j < remaining.length; j++) {
-            const other = remaining[j].c;
-            if (other.loc > maxLoc) break;
-            if (other.path === base.path && other.name === base.name && other.start === base.start) continue;
-            const sim = jaccard(base.shingles, other.shingles);
-            if (sim >= JACCARD_THRESHOLD) {
-                uf.union(i, j);
-                maxSimByIdx.set(i, Math.max(maxSimByIdx.get(i) || 0, sim));
-                maxSimByIdx.set(j, Math.max(maxSimByIdx.get(j) || 0, sim));
-            }
-        }
-    }
+    const maxVocabOverlapByIdx = new Map();
+    unionNearDuplicatePairs(remaining, uf, maxSimByIdx, maxVocabOverlapByIdx);
 
     for (const compIndices of uf.components()) {
         if (compIndices.length < 2) continue;
-        const cluster = sortCloneMembers(compIndices.map((idx) => remaining[idx].c));
-        let bestSim = JACCARD_THRESHOLD;
-        for (const idx of compIndices) {
-            bestSim = Math.max(bestSim, maxSimByIdx.get(idx) || 0);
-        }
-
-        const primary = cluster[0];
-        const peerList = cluster
-            .slice(1)
-            .map((m) => `${m.path}:${m.span} (${m.name})`)
-            .join(", ");
-        const pct = Math.round(bestSim * 100);
-        const cloneDrift = findCloneDrift(cluster, gitHistory);
-        const driftSuffix = cloneDrift
-            ? ` [clone_drift: ${cloneDrift.file_a} <-> ${cloneDrift.file_b} co-changed in ${cloneDrift.co_commits} commits]`
-            : "";
-
-        issues.push({
-            id: mintIssueId("duplicates", primary.path, `near_${primary.name}_L${primary.start}`),
-            detector: "duplicates",
-            category: "duplicates",
-            dimension: "duplication",
-            tier: cloneDrift ? "T2" : "T3",
-            confidence: bestSim >= 0.9 ? "high" : "medium",
-            severity: cloneDrift || cluster.length >= 3 || primary.loc >= 30 ? "high" : "medium",
-            file: primary.path,
-            line: primary.start,
-            end_line: primary.end,
-            span: primary.span,
-            identifier: primary.name,
-            similarity: Number(bestSim.toFixed(2)),
-            kind: "near_duplicate",
-            ...(cloneDrift ? { clone_drift: cloneDrift } : {}),
-            detail: {
-                cluster_size: cluster.length,
-                ...(cloneDrift ? { clone_drift: cloneDrift } : {}),
-            },
-            members: cluster.map((m) => ({
-                file: m.path,
-                name: m.name,
-                span: m.span,
-                loc: m.loc,
-            })),
-            summary: `Near-duplicate function cluster (${pct}% token similarity across ${cluster.length} functions): ${primary.name} and ${peerList}${driftSuffix}`,
-            suggestion: `Consolidate the shared control flow between ${primary.name} and ${peerList} into a parameterized helper.`,
-        });
+        const issue = buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOverlapByIdx, gitHistory);
+        if (issue) issues.push(issue);
     }
 }
 

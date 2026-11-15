@@ -62,6 +62,7 @@ export const MECHANICAL_DIMENSIONS = {
         fileBased: true,
         detectors: [
             "dead_symbols",
+            "unused_imports",
             "unreferenced_exports",
             "orphaned_files",
             "single_importer_files",
@@ -130,6 +131,7 @@ export const ALL_CATEGORIES = [
 export const DETECTOR_CATEGORY = {
     duplicates: "duplicates",
     dead_symbols: "dead",
+    unused_imports: "dead",
     unreferenced_exports: "dead",
     orphaned_files: "dead",
     single_importer_files: "dead",
@@ -223,6 +225,7 @@ export const TRIAGE_STAGES = [
 export const DETECTOR_STALE_DIMENSIONS = {
     orphaned_files: ["design_coherence"],
     dead_symbols: ["design_coherence"],
+    unused_imports: ["design_coherence"],
     flat_dirs: ["package_organization"],
     naming_inconsistencies: ["convention_outlier", "naming_quality"],
     import_affinity_outliers: ["cross_module_architecture"],
@@ -299,12 +302,21 @@ Work the two loops: **outer** (\`scan\` → \`score\` → at target? → \`resca
    then \`plexer health plan triage --complete --strategy "..."\`.
 9. **Check progress**: \`plexer health status\` — dimension scores dashboard.
 
-### Understanding Scores
+### Understanding Scores & False Positives
 - **Overall**: 25% mechanical + 75% subjective. Lenient — wontfix doesn't count against you.
 - **Objective**: Mechanical detectors only (no subjective review component).
-- **Strict**: Same as overall, but wontfix items and open review defects count against you. **THIS IS YOUR NORTH STAR.**
+- **Strict**: Same as overall, but \`wontfix\` items and open review defects count against you. **THIS IS YOUR NORTH STAR.**
 - **Verified**: Like strict, but only credits fixes the scanner has confirmed on rescan.
-- Wontfix is not free — every wontfix (\`plexer health plan skip --permanent\` or \`suppress\`) requires attestation and widens the overall↔strict gap.`;
+- Wontfix is not free — every \`wontfix\` (\`plan skip --permanent\` or \`suppress\`) requires \`--attest\` and widens the overall↔strict gap.
+- Genuine detector mistakes belong in \`false_positive\`, NOT risky refactors:
+  \`plexer health suppress "<id>" --false-positive --reason "<15+ chars explaining why detector is wrong>"\`
+  or \`plexer health plan skip "<id>" --false-positive --reason "<explanation>"\` (exempt from strict/verified penalties when reasoned/attested).
+
+### Do-No-Harm Guardrails
+- **Never delete \`@generated\` headers, generated files, or CI scripts** just to clear an orphaned/single-importer finding; classify them as \`plexer health zone set <path> generated\` or \`exclude\` instead.
+- **Never collapse intentional data tables, registries, or config modules** into callers to chase fewer files.
+- **Never remove public package entrypoints, dynamic loader modules, or documented API exports** without verifying external/runtime callers.
+- **Never strip outgoing payload keys** referenced by serialized/wire consumers, and **never add dummy \`local _ = ...\` bindings** to silence leak detectors — store handles and clean up on teardown or dismiss proven false positives with \`--false-positive --reason\`.`;
 }
 
 /**
@@ -314,27 +326,30 @@ export function buildAgentLoopPrompt(targetPath = ".") {
     return `I want you to systematically improve the quality of this codebase using \`plexer health\`.
 Run ALL of the following:
 
-Before scanning, check for directories that should be excluded (vendor, build output,
-generated code, packages, worktrees, etc.) and exclude obvious ones with \`plexer health exclude <path>\`.
-Share any questionable candidates with me before excluding.
+Before scanning, check for directories/files that should be excluded or marked \`generated\` (vendor, build output,
+generated code, packages, worktrees, CI generators, etc.) and exclude obvious ones with \`plexer health exclude <path>\`
+or \`plexer health zone set <path> generated\`. Share any questionable candidates with me before excluding.
 
 plexer health scan ${targetPath}
 plexer health next
 
 Your goal is to get the **strict score** as high as possible (target >= 98). The scoring
-resists gaming — the only way to improve it is to genuinely make the code better.
+resists gaming — real defects require real code fixes, while genuine detector false positives should be
+dismissed transparently via \`plexer health suppress <id> --false-positive --reason "<why>"\` or
+\`plexer health plan skip <id> --false-positive --reason "<why>"\` rather than destructive refactors.
 
 THE LOOP: run \`plexer health next\`. It is the execution queue from the living plan, not the
 whole backlog. It tells you what to fix now, which file and lines, and the exact
 \`plexer health resolve\` command to run when done.
-Fix it, resolve it, run \`plexer health next\` again. Over and over. This is your main job.
+Fix real defects, dismiss proven false positives cleanly, resolve it, and run \`plexer health next\` again. Over and over.
 
 Use \`plexer health backlog\` only when you need to inspect broader open work that is not
 currently driving execution.
 
-Don't be lazy. Large refactors and small detailed fixes — do both with equal energy. No task
-is too big or too small. Fix things properly, not minimally. Use \`plexer callers\`, \`plexer blast\`,
-and \`plexer health move\` to verify blast radius and update all callers cleanly.
+Do no harm: NEVER delete generated/CI files, inline cohesive data/config tables solely to reduce file count,
+strip public/dynamic entrypoints or wire payload keys, or silence warnings with dummy \`local _ = ...\` bindings.
+Fix things properly, not minimally. Use \`plexer callers\`, \`plexer blast\`, and \`plexer health move\` to verify
+blast radius and update all callers cleanly.
 
 Use \`plexer health plan\` / \`plexer health plan cluster create <name>\` to reorder priorities or
 group related issues. When subjective review is surfaced by \`next\`, run \`plexer health review --prepare\`,

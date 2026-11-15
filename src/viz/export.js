@@ -5,9 +5,9 @@
  * directly via `file://`, published to GitHub Pages, or attached to a CI build.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadGraphCached } from "../context/graph-store.js";
-import { buildVizHealthPayload } from "./serve.js";
+import { buildVizHealthPayload, renderHealthTreemapHtml } from "./serve.js";
 /**
  * JSON safe to drop inside a `<script>` element.
  */
@@ -35,14 +35,18 @@ export function exportViz(opts) {
     const code = wanted ? loadGraphCached(opts.contextDir) : null;
     const codeNodes = code?.nodes?.length ?? 0;
     const defaultTab = wantContext && (opts.contextGraph || context.nodes.length > 0 || codeNodes === 0) ? "context" : "code";
+    const health = buildVizHealthPayload(opts.contextDir);
+    const repoRoot = opts.rootDir ?? dirname(opts.contextDir);
+    const treemapHtml = health ? renderHealthTreemapHtml(repoRoot, opts.contextDir) : null;
+    const effectiveTabs = treemapHtml && !tabs.includes("treemap") ? [...tabs, "treemap"] : tabs.filter((t) => t !== "treemap" || Boolean(treemapHtml));
     const contextGraph = {
         ...context,
-        meta: { ...context.meta, repoName: opts.repoName, subtitle: opts.subtitle, defaultTab, tabs },
+        meta: { ...context.meta, repoName: opts.repoName, subtitle: opts.subtitle, defaultTab, tabs: effectiveTabs },
     };
-    const health = buildVizHealthPayload(opts.contextDir);
     const data = [
         "<script>window.__PLEXER_DATA__ = {",
         `  health: ${inlineJson(health)},`,
+        `  treemapHtml: ${inlineJson(treemapHtml)},`,
         `  contextGraph: ${inlineJson(contextGraph)},`,
         `  codeGraph: ${inlineJson(code)}`,
         "};</script>",

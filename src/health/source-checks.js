@@ -196,7 +196,7 @@ function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues) {
             summary: `Log-only \`catch\` block at L${lineNum} logs the error and continues execution without rethrowing or returning a fallback.`,
             suggestion: `Propagate the error, return an explicit error result, or document why continuing after failure is safe.`,
         });
-    } else if (/^return\s+(?:\[\]|\{\}|null|undefined)\s*;?$/.test(blockLines[0])) {
+    } else if (/^return\s+undefined\s*;?$/.test(blockLines[0])) {
         issues.push({
             id: mintIssueId("silent_catches", relPath, `empty_return_L${lineNum}`),
             detector: "silent_catches",
@@ -216,64 +216,86 @@ function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues) {
     }
 }
 
+function checkPySilentExceptOnLine(relPath, lines, i, lineNum, trimmed, issues) {
+    const nextLine = (lines[i + 1] || "").trim();
+    const afterNext = (lines[i + 2] || "").trim();
+    const isSwallowedNext = nextLine === "pass" || /^return\s+(?:\[\]|\{\}|None)$/.test(nextLine) || /^(?:logger|logging|print)\b/.test(nextLine);
+    if (!isSwallowedNext || /^(?:raise|return)\b/.test(afterNext) || hasInlineSuppression(lines, lineNum, "silent_catches"))
+        return;
+    issues.push({
+        id: mintIssueId("silent_catches", relPath, `py_except_L${lineNum}`),
+        detector: "silent_catches",
+        category: "catches",
+        dimension: "code_quality",
+        tier: "T3",
+        confidence: "high",
+        severity: "medium",
+        file: relPath,
+        line: lineNum,
+        end_line: lineNum + 1,
+        span: `L${lineNum}-L${lineNum + 1}`,
+        identifier: `except_L${lineNum}`,
+        summary: `Broad \`${trimmed}\` block at L${lineNum} swallows or masks errors via \`${nextLine}\`.`,
+        suggestion: `Catch only specific expected exception types or re-raise unexpected errors.`,
+    });
+}
+function extractPcallWindowText(lines, startIdx) {
+    let pcallDepth = 0;
+    let sawPcallOpen = false;
+    const callLines = [];
+    for (let k = startIdx; k < Math.min(lines.length, startIdx + 8); k++) {
+        const cLine = stripCodeStringsAndComments(lines[k] || "", true, false);
+        callLines.push(cLine);
+        for (let p = 0; p < cLine.length; p++) {
+            if (cLine[p] === "(") {
+                pcallDepth += 1;
+                sawPcallOpen = true;
+            } else if (cLine[p] === ")") {
+                pcallDepth = Math.max(0, pcallDepth - 1);
+            }
+        }
+        if (sawPcallOpen && pcallDepth === 0) break;
+    }
+    return callLines.join("\n");
+}
+function checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, issues) {
+    if (!/^\s*(?:local\s+_(?:\s*,\s*_)*\s*=\s*)?pcall\s*\(/.test(raw) || isLuauContinuationLine(lines, i))
+        return;
+    if (hasInlineSuppression(lines, lineNum, "silent_catches"))
+        return;
+    const pcallWindow = extractPcallWindowText(lines, i);
+    const isBestEffortCleanup = /(?::|\.)(?:Destroy|Disconnect|ClearAllChildren|SetCore|SetCoreGuiEnabled)\b|\btask\.cancel\b|\bcancel\s*\(/.test(pcallWindow);
+    if (isBestEffortCleanup)
+        return;
+    issues.push({
+        id: mintIssueId("silent_catches", relPath, `luau_pcall_L${lineNum}`),
+        detector: "silent_catches",
+        category: "catches",
+        dimension: "code_quality",
+        tier: "T2",
+        confidence: "high",
+        severity: "medium",
+        file: relPath,
+        line: lineNum,
+        end_line: lineNum,
+        span: `L${lineNum}-L${lineNum}`,
+        identifier: `pcall_L${lineNum}`,
+        summary: `Unchecked \`pcall(...)\` at L${lineNum} discards \`(ok, err)\` and silently ignores runtime failures.`,
+        suggestion: `Capture \`local ok, err = pcall(...)\` and handle or warn on \`not ok\`.`,
+    });
+}
 function checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flags, issues) {
     if (!flags.allowCatches) return;
-    if (flags.isJsTs && /\bcatch\s*(?:\([^)]*\))?\s*\{/.test(trimmed)) {
+    if (flags.isJsTs && /\bcatch\s*(?:\([^)]*\))?\s*\{/.test(trimmed))
         checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues);
-    } else if (flags.isPy && /^except(?:\s+Exception|\s*:)/.test(trimmed)) {
-        const nextLine = (lines[i + 1] || "").trim();
-        const afterNext = (lines[i + 2] || "").trim();
-        if (
-            (nextLine === "pass" ||
-                /^return\s+(?:\[\]|\{\}|None)$/.test(nextLine) ||
-                /^(?:logger|logging|print)\b/.test(nextLine)) &&
-            !/^(?:raise|return)\b/.test(afterNext) &&
-            !hasInlineSuppression(lines, lineNum, "silent_catches")
-        ) {
-            issues.push({
-                id: mintIssueId("silent_catches", relPath, `py_except_L${lineNum}`),
-                detector: "silent_catches",
-                category: "catches",
-                dimension: "code_quality",
-                tier: "T3",
-                confidence: "high",
-                severity: "medium",
-                file: relPath,
-                line: lineNum,
-                end_line: lineNum + 1,
-                span: `L${lineNum}-L${lineNum + 1}`,
-                identifier: `except_L${lineNum}`,
-                summary: `Broad \`${trimmed}\` block at L${lineNum} swallows or masks errors via \`${nextLine}\`.`,
-                suggestion: `Catch only specific expected exception types or re-raise unexpected errors.`,
-            });
-        }
-    } else if (
-        flags.isLuau &&
-        /^\s*pcall\s*\(/.test(raw) &&
-        !isLuauContinuationLine(lines, i) &&
-        !hasInlineSuppression(lines, lineNum, "silent_catches")
-    ) {
-        issues.push({
-            id: mintIssueId("silent_catches", relPath, `luau_pcall_L${lineNum}`),
-            detector: "silent_catches",
-            category: "catches",
-            dimension: "code_quality",
-            tier: "T2",
-            confidence: "high",
-            severity: "medium",
-            file: relPath,
-            line: lineNum,
-            end_line: lineNum,
-            span: `L${lineNum}-L${lineNum}`,
-            identifier: `pcall_L${lineNum}`,
-            summary: `Unchecked \`pcall(...)\` at L${lineNum} discards \`(ok, err)\` and silently ignores runtime failures.`,
-            suggestion: `Capture \`local ok, err = pcall(...)\` and handle or warn on \`not ok\`.`,
-        });
-    }
+    else if (flags.isPy && /^except(?:\s+Exception|\s*:)/.test(trimmed))
+        checkPySilentExceptOnLine(relPath, lines, i, lineNum, trimmed, issues);
+    else if (flags.isLuau)
+        checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, issues);
 }
 
 const CLIENT_SERVER_SERVICE_ACCESS_RE =
-    /\bgame\s*(?::\s*(?:GetService|FindService)\s*\(\s*["'](ServerScriptService|ServerStorage|DataStoreService|MemoryStoreService|MessagingService)["']\s*\)|\.\s*(ServerScriptService|ServerStorage|DataStoreService|MemoryStoreService|MessagingService)\b(?!\s*=))/;
+    /\bgame\s*(?::\s*GetService\s*\(\s*["'](ServerScriptService|ServerStorage|DataStoreService|MemoryStoreService|MessagingService)["']\s*\)|\.\s*(ServerScriptService|ServerStorage|DataStoreService|MemoryStoreService|MessagingService)\b(?!\s*=))/;
 
 const CLIENT_SERVER_API_ACCESS_RE =
     /\b(?:(HttpService\s*:\s*(?:GetAsync|PostAsync|RequestAsync))|(TeleportService\s*:\s*ReserveServer)|(InsertService\s*:\s*LoadAsset)|(BadgeService\s*:\s*AwardBadge))\s*\(|\b(MarketplaceService\.ProcessReceipt)\s*=/;
@@ -329,11 +351,19 @@ function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
             trimmed,
         );
     if (remoteMatch && !hasInlineSuppression(lines, lineNum, "roblox_security")) {
+        const payloadParams = remoteMatch[1]
+            .split(",")
+            .map((p) => p.split(":")[0].trim())
+            .filter(Boolean);
+        const allIgnoredParams = payloadParams.length > 0 && payloadParams.every((p) => /^_[A-Za-z0-9_]*$/.test(p));
         const bodyWindow = lines
-            .slice(i + 1, Math.min(lines.length, i + 10))
+            .slice(i + 1, Math.min(lines.length, i + 23))
             .map((l) => stripCodeStringsAndComments(l, true, false))
             .join("\n");
-        if (!/\b(?:typeof|type|assert|validate|check|schema)\b/i.test(bodyWindow)) {
+        if (
+            !allIgnoredParams &&
+            !/\b(?:typeof|type|tonumber|tostring|assert|validate|check|schema|sanitize)\b|\bt\.[A-Za-z_]/i.test(bodyWindow)
+        ) {
             issues.push({
                 id: mintIssueId("roblox_security", relPath, `unvalidated_remote_L${lineNum}`),
                 detector: "roblox_security",
@@ -354,34 +384,149 @@ function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
     }
 }
 
-function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, issues) {
+const LUAU_SCHEDULER_NAMES = new Set(["wait", "spawn", "delay"]);
+
+function skipQuotedLiteralOnLine(line, startIdx, quoteCh) {
+    let i = startIdx + 1;
+    while (i < line.length) {
+        if (line[i] === "\\") {
+            i += 2;
+            continue;
+        }
+        if (line[i] === quoteCh) return i + 1;
+        i += 1;
+    }
+    return i;
+}
+
+function tryOpenLuauLongBracket(line, i) {
+    const ch = line[i];
+    if (ch === "-" && line[i + 1] === "-") {
+        const lb = /^--\[(=*)\[/.exec(line.slice(i));
+        return lb ? { comment: true, len: lb[0].length, close: `]${lb[1]}]` } : { comment: true };
+    }
+    if (ch === "[") {
+        const lb = /^\[(=*)\[/.exec(line.slice(i));
+        return lb ? { len: lb[0].length, close: `]${lb[1]}]` } : null;
+    }
+    return null;
+}
+
+function stripLuauLongBracketsOnLine(line, state) {
+    let out = "";
+    let i = 0;
+    while (i < line.length) {
+        if (state.longClose) {
+            const idx = line.indexOf(state.longClose, i);
+            if (idx === -1) return out;
+            i = idx + state.longClose.length;
+            state.longClose = null;
+            out += " ";
+            continue;
+        }
+        const bracket = tryOpenLuauLongBracket(line, i);
+        if (bracket) {
+            if (!bracket.close) break;
+            state.longClose = bracket.close;
+            i += bracket.len;
+            if (!bracket.comment) out += '""';
+            continue;
+        }
+        const ch = line[i];
+        if (ch === '"' || ch === "'" || ch === "`") {
+            i = skipQuotedLiteralOnLine(line, i, ch);
+            out += '""';
+            continue;
+        }
+        out += ch;
+        i += 1;
+    }
+    return out;
+}
+
+function collectShadowedLuauSchedulerNames(lines) {
+    const shadowed = new Set();
+    const longState = { longClose: null };
+    for (const raw of lines) {
+        const code = stripLuauLongBracketsOnLine(raw || "", longState);
+        if (!code.trim()) continue;
+
+        for (const m of code.matchAll(/\blocal\s+function\s+(wait|spawn|delay)\b/g)) {
+            shadowed.add(m[1]);
+        }
+        const localStmt = /^\s*local\s+(.+?)(?:=|$)/.exec(code);
+        if (localStmt && !/^function\b/.test(localStmt[1].trim())) {
+            for (const part of localStmt[1].split(",")) {
+                const ident = part.split(":")[0].trim();
+                if (LUAU_SCHEDULER_NAMES.has(ident)) shadowed.add(ident);
+            }
+        }
+        for (const m of code.matchAll(/\bfunction(?:\s+[A-Za-z0-9_.:]+)?\s*\(([^)]*)\)/g)) {
+            for (const part of m[1].split(",")) {
+                const ident = part.split(":")[0].trim();
+                if (LUAU_SCHEDULER_NAMES.has(ident)) shadowed.add(ident);
+            }
+        }
+    }
+    return shadowed;
+}
+
+function stepLuauFnBlockStack(stack, code) {
+    const re = /(?:^|[;])\s*\b(if)\b|\b(function|do|repeat|until|end)\b/g;
+    let m;
+    while ((m = re.exec(code)) !== null) {
+        const tok = m[1] || m[2];
+        if (tok === "function") stack.push("fn");
+        else if (tok === "if" || tok === "do") stack.push("block");
+        else if (tok === "repeat") stack.push("repeat");
+        else if (tok === "until") {
+            for (let idx = stack.length - 1; idx >= 0; idx--) {
+                if (stack[idx] === "repeat") {
+                    stack.splice(idx, 1);
+                    break;
+                }
+            }
+        } else if (tok === "end") {
+            if (stack.length > 0) stack.pop();
+        }
+    }
+}
+
+function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, stateTracker, issues) {
     if (!flags.isLuau) return;
+    const codeOnly = (stateTracker?.luauLineCode ?? stripCodeStringsAndComments(lines[i] || trimmed, true, false)).trim();
+    if (!codeOnly) return;
+
     if (flags.allowSecurity) {
         checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues);
     }
 
     if (flags.allowTraps && !trimmed.startsWith("--")) {
-        const codeOnly = stripCodeStringsAndComments(lines[i] || trimmed, true, false).trim();
         const schedMatch = /(?:^|[^.\w:])(wait|spawn|delay)\s*\(/.exec(codeOnly);
         if (schedMatch && !hasInlineSuppression(lines, lineNum, "luau_quality")) {
             const fnName = schedMatch[1];
-            issues.push({
-                id: mintIssueId("luau_quality", relPath, `legacy_${fnName}_L${lineNum}`),
-                detector: "luau_quality",
-                category: "traps",
-                dimension: "code_quality",
-                tier: "T1",
-                confidence: "high",
-                severity: "medium",
-                file: relPath,
-                line: lineNum,
-                end_line: lineNum,
-                span: `L${lineNum}-L${lineNum}`,
-                identifier: `${fnName}_L${lineNum}`,
-                fixer: "luau-task-scheduler",
-                summary: `Legacy Roblox scheduler global \`${fnName}(...)\` on L${lineNum} throttles at 30Hz; use \`task.${fnName}(...)\`.`,
-                suggestion: `Replace \`${fnName}(...)\` with \`task.${fnName}(...)\` (or run \`plexer health autofix luau-task-scheduler\`).`,
-            });
+            const isShadowed =
+                stateTracker?.shadowedLuauSchedulers?.has(fnName) ||
+                new RegExp(`\\bfunction\\s+(?:[A-Za-z0-9_.]+[.:])?${fnName}\\s*\\(`).test(codeOnly);
+            if (!isShadowed) {
+                issues.push({
+                    id: mintIssueId("luau_quality", relPath, `legacy_${fnName}_L${lineNum}`),
+                    detector: "luau_quality",
+                    category: "traps",
+                    dimension: "code_quality",
+                    tier: "T1",
+                    confidence: "high",
+                    severity: "medium",
+                    file: relPath,
+                    line: lineNum,
+                    end_line: lineNum,
+                    span: `L${lineNum}-L${lineNum}`,
+                    identifier: `${fnName}_L${lineNum}`,
+                    fixer: "luau-task-scheduler",
+                    summary: `Legacy Roblox scheduler global \`${fnName}(...)\` on L${lineNum} throttles at 30Hz; use \`task.${fnName}(...)\`.`,
+                    suggestion: `Replace \`${fnName}(...)\` with \`task.${fnName}(...)\` (or run \`plexer health autofix luau-task-scheduler\`).`,
+                });
+            }
         }
         if (
             /\bInstance\.new\s*\(\s*["'][^"']+["']\s*,/.test(trimmed) &&
@@ -404,8 +549,10 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
                 suggestion: `Call \`Instance.new(className)\` with 1 argument, assign all properties first, and set \`.Parent\` last.`,
             });
         }
+        const fnDepthBeforeLine = stateTracker?.luauFnDepthBeforeLine ?? 0;
         if (
-            /^[A-Za-z0-9_.:[\]]+:Connect\s*\(/.test(codeOnly) &&
+            fnDepthBeforeLine > 0 &&
+            /^(?:local\s+_(?:\s*,\s*_)*\s*=\s*)?[A-Za-z0-9_.:[\]()\"']+:Connect\s*\(/.test(codeOnly) &&
             !isLuauContinuationLine(lines, i) &&
             !hasInlineSuppression(lines, lineNum, "luau_quality")
         ) {
@@ -766,53 +913,54 @@ function checkPyMutableLruCacheTraps(relPath, lines, fileSymbols, issues) {
     }
 }
 
+function checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines, issues) {
+    if (sym.aliasOf || (sym.kind !== "function" && sym.kind !== "method"))
+        return;
+    const range = spanRange(sym.span);
+    if (!range)
+        return;
+    const startLineTrim = (lines[range.start - 1] || "").trim();
+    if (/^return\s+function\b/.test(startLineTrim))
+        return;
+    for (let ln = range.start; ln <= range.end && ln <= lines.length; ln++) {
+        if (seenGetServiceLines.has(ln))
+            continue;
+        const codeText = stripCodeStringsAndComments(lines[ln - 1] || "", true, false);
+        if (!/\bgame:GetService\s*\(/.test(codeText) || hasInlineSuppression(lines, ln, "luau_quality"))
+            continue;
+        const guardWindow = lines
+            .slice(Math.max(range.start - 1, ln - 6), ln)
+            .map((l) => stripCodeStringsAndComments(l, true, false))
+            .join("\n");
+        if (/\bpcall\s*\(|\bRunService\s*:\s*Is[A-Z]\w*\s*\(|\bIS_(?:SERVER|CLIENT|STUDIO)\b/.test(guardWindow))
+            continue;
+        seenGetServiceLines.add(ln);
+        issues.push({
+            id: mintIssueId("luau_quality", relPath, `service_in_fn_${sym.name}_L${ln}`),
+            detector: "luau_quality",
+            category: "traps",
+            dimension: "code_quality",
+            tier: "T2",
+            confidence: "high",
+            severity: "low",
+            file: relPath,
+            line: ln,
+            end_line: ln,
+            span: `L${ln}-L${ln}`,
+            identifier: `GetService_L${ln}`,
+            summary: `\`game:GetService(...)\` called inside ${sym.kind} \`${sym.name}\` on L${ln} instead of hoisted at module top-level.`,
+            suggestion: `Hoist \`local Service = game:GetService(...)\` to the top of \`${relPath}\`.`,
+        });
+    }
+}
 function checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTracker, issues) {
     if (flags.isLuau && flags.allowTraps) {
         const seenGetServiceLines = new Set();
-        for (const sym of fileSymbols) {
-            if (sym.aliasOf) continue;
-            if (sym.kind !== "function" && sym.kind !== "method") continue;
-            const range = spanRange(sym.span);
-            if (!range) continue;
-            const startLineTrim = (lines[range.start - 1] || "").trim();
-            if (/^return\s+function\b/.test(startLineTrim)) continue;
-            for (let ln = range.start; ln <= range.end && ln <= lines.length; ln++) {
-                if (seenGetServiceLines.has(ln)) continue;
-                const text = lines[ln - 1] || "";
-                const codeText = stripCodeStringsAndComments(text, true, false);
-                const prevCode = ln >= 2 ? stripCodeStringsAndComments(lines[ln - 2] || "", true, false) : "";
-                if (
-                    /\bgame:GetService\s*\(/.test(codeText) &&
-                    !/\bpcall\s*\(/.test(codeText) &&
-                    !/\bpcall\s*\(/.test(prevCode) &&
-                    !hasInlineSuppression(lines, ln, "luau_quality")
-                ) {
-                    seenGetServiceLines.add(ln);
-                    issues.push({
-                        id: mintIssueId("luau_quality", relPath, `service_in_fn_${sym.name}_L${ln}`),
-                        detector: "luau_quality",
-                        category: "traps",
-                        dimension: "code_quality",
-                        tier: "T2",
-                        confidence: "high",
-                        severity: "low",
-                        file: relPath,
-                        line: ln,
-                        end_line: ln,
-                        span: `L${ln}-L${ln}`,
-                        identifier: `GetService_L${ln}`,
-                        summary: `\`game:GetService(...)\` called inside ${sym.kind} \`${sym.name}\` on L${ln} instead of hoisted at module top-level.`,
-                        suggestion: `Hoist \`local Service = game:GetService(...)\` to the top of \`${relPath}\`.`,
-                    });
-                }
-            }
-        }
+        for (const sym of fileSymbols)
+            checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines, issues);
     }
-
-    if (flags.isPy && flags.allowTraps) {
+    if (flags.isPy && flags.allowTraps)
         checkPyMutableLruCacheTraps(relPath, lines, fileSymbols, issues);
-    }
-
     if (flags.isReact && stateTracker.booleanStateCount >= 5 && flags.wantTraps) {
         const ln = stateTracker.firstBooleanStateLine;
         issues.push({
@@ -845,51 +993,50 @@ function countNetBracketDelta(line) {
     return delta;
 }
 
+function isUnreachableTerminatorLine(tLine) {
+    return (
+        /^(?:return(?:\s+[^?:]+)?|break|continue|throw\s+.+|raise(?:\s+.+)?|error\s*\(.+\))\s*;?$/.test(tLine) &&
+        !/[+,\-*/|&?:({\[]\s*$/.test(tLine) &&
+        !/\b(?:if|unless|when)\b/.test(tLine)
+    );
+}
+function findNextNonContinuationLineIdx(fnLines, startIdx, initTrim) {
+    let bracketDepth = Math.max(0, countNetBracketDelta(initTrim));
+    let prevTrim = initTrim;
+    let nextIdx = startIdx;
+    while (nextIdx < fnLines.length) {
+        const nl = fnLines[nextIdx].trim();
+        if (!nl || nl.startsWith("//") || nl.startsWith("#") || nl.startsWith("--") || nl.startsWith("/*") || nl.startsWith("*")) {
+            nextIdx += 1;
+            continue;
+        }
+        const prevContinues = bracketDepth > 0 || /[+,\-*/|&?:=({\[\\]$|\.\.$|\b(?:and|or)\s*$/.test(prevTrim);
+        const curContinues = /^(?:\.|\?|:|&&|\|\|)/.test(nl) || (bracketDepth > 0 && /^[)\]}]/.test(nl));
+        if (!prevContinues && !curContinues)
+            break;
+        bracketDepth = Math.max(0, bracketDepth + countNetBracketDelta(nl));
+        prevTrim = nl;
+        nextIdx += 1;
+    }
+    return nextIdx;
+}
 function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues) {
     for (let idx = 1; idx < fnLines.length - 1; idx++) {
         const rawLine = fnLines[idx];
         const tLine = rawLine.trim();
-        if (!tLine || tLine.startsWith("//") || tLine.startsWith("#") || tLine.startsWith("--")) {
+        if (!tLine || tLine.startsWith("//") || tLine.startsWith("#") || tLine.startsWith("--"))
             continue;
-        }
-        const isTerminator =
-            /^(?:return(?:\s+[^?:]+)?|break|continue|throw\s+.+|raise(?:\s+.+)?|error\s*\(.+\))\s*;?$/.test(tLine) &&
-            !/[+,\-*/|&?:({\[]\s*$/.test(tLine) &&
-            !/\b(?:if|unless|when)\b/.test(tLine);
-        if (!isTerminator) continue;
-
-        const termIndent = rawLine.match(/^\s*/)[0].length;
-        let bracketDepth = Math.max(0, countNetBracketDelta(tLine));
-        let prevTrim = tLine;
-        let nextIdx = idx + 1;
-
-        while (nextIdx < fnLines.length) {
-            const nl = fnLines[nextIdx].trim();
-            if (!nl || nl.startsWith("//") || nl.startsWith("#") || nl.startsWith("--") || nl.startsWith("/*") || nl.startsWith("*")) {
-                nextIdx += 1;
-                continue;
-            }
-            const prevContinues =
-                bracketDepth > 0 ||
-                /[+,\-*/|&?:=({\[\\]$|\.\.$|\b(?:and|or)\s*$/.test(prevTrim);
-            const curContinues = /^(?:\.|\?|:|&&|\|\||[)\]}])/.test(nl);
-            if (prevContinues || curContinues) {
-                bracketDepth = Math.max(0, bracketDepth + countNetBracketDelta(nl));
-                prevTrim = nl;
-                nextIdx += 1;
-                continue;
-            }
+        if (!isUnreachableTerminatorLine(tLine))
+            continue;
+        const nextIdx = findNextNonContinuationLineIdx(fnLines, idx + 1, tLine);
+        if (nextIdx >= fnLines.length)
             break;
-        }
-        if (nextIdx >= fnLines.length) break;
+        const termIndent = rawLine.match(/^\s*/)[0].length;
         const nextRaw = fnLines[nextIdx];
         const nextTrim = nextRaw.trim();
         const nextIndent = nextRaw.match(/^\s*/)[0].length;
-        if (
-            nextIndent === termIndent &&
-            termIndent > 0 &&
-            !/^(?:[})\]]|end\b|else\b|elseif\b|elif\b|except\b|catch\b|finally\b|case\b|default\b|when\b|#\[|@)/.test(nextTrim)
-        ) {
+        const closesBlock = /^(?:[})\]]|end\b|else\b|elseif\b|elif\b|except\b|catch\b|finally\b|case\b|default\b|when\b|#\[|@)/.test(nextTrim);
+        if (nextIndent === termIndent && termIndent > 0 && !closesBlock) {
             const absLine = range.start + nextIdx;
             if (!hasInlineSuppression(lines, absLine, "language_traps")) {
                 issues.push({
@@ -914,333 +1061,473 @@ function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues)
     }
 }
 
+function ensureTrackedDictEntry(tracked, vName) {
+    let entry = tracked.get(vName);
+    if (!entry) {
+        entry = { writes: new Map(), reads: new Map(), initLocal: false };
+        tracked.set(vName, entry);
+    }
+    return entry;
+}
+function recordDictRegexMatches(tracked, t, ln, re, bucket, swapGroups = false, requireExistingVar = false) {
+    let m;
+    while ((m = re.exec(t)) !== null) {
+        const varName = swapGroups ? m[2] : m[1];
+        const keyName = swapGroups ? m[1] : m[2];
+        if (requireExistingVar && !tracked.has(varName))
+            continue;
+        const map = ensureTrackedDictEntry(tracked, varName)[bucket];
+        if (!map.has(keyName))
+            map.set(keyName, ln);
+    }
+}
 function collectTrackedDictKeys(range, fnLines) {
     const tracked = new Map();
-    const ensureTracked = (vName) => {
-        let entry = tracked.get(vName);
-        if (!entry) {
-            entry = { writes: new Map(), reads: new Map(), initLocal: false };
-            tracked.set(vName, entry);
-        }
-        return entry;
-    };
-
     for (let idx = 0; idx < fnLines.length; idx++) {
         const ln = range.start + idx;
         const t = fnLines[idx].trim();
-        if (!t || t.startsWith("//") || t.startsWith("#") || t.startsWith("--")) continue;
-
-        const initMatch =
-            /^(?:(?:local|const|let|var)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:\{\s*\}|dict\(\s*\))\s*;?$/.exec(t);
-        if (initMatch) ensureTracked(initMatch[1]).initLocal = true;
-
-        const writeRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*["']([A-Za-z0-9_.-]+)["']\s*\]\s*=(?!=)/g;
-        let wm;
-        while ((wm = writeRe.exec(t)) !== null) {
-            const td = ensureTracked(wm[1]);
-            if (!td.writes.has(wm[2])) td.writes.set(wm[2], ln);
-        }
-
-        const readBracketRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*["']([A-Za-z0-9_.-]+)["']\s*\](?!\s*=(?!=))/g;
-        let rm;
-        while ((rm = readBracketRe.exec(t)) !== null) {
-            const td = ensureTracked(rm[1]);
-            if (!td.reads.has(rm[2])) td.reads.set(rm[2], ln);
-        }
-
-        const getRe = /\b([A-Za-z_][A-Za-z0-9_]*)\.get\s*\(\s*["']([A-Za-z0-9_.-]+)["']/g;
-        let gm;
-        while ((gm = getRe.exec(t)) !== null) {
-            const td = ensureTracked(gm[1]);
-            if (!td.reads.has(gm[2])) td.reads.set(gm[2], ln);
-        }
-
-        const dotReadRe = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*(?:=[^=]|\())/g;
-        let dm;
-        while ((dm = dotReadRe.exec(t)) !== null) {
-            if (tracked.has(dm[1])) {
-                const td = ensureTracked(dm[1]);
-                if (!td.reads.has(dm[2])) td.reads.set(dm[2], ln);
-            }
-        }
-
+        if (!t || t.startsWith("//") || t.startsWith("#") || t.startsWith("--"))
+            continue;
+        const initMatch = /^(?:(?:local|const|let|var)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*(?:\{\s*\}|dict\(\s*\))\s*;?$/.exec(t);
+        if (initMatch)
+            ensureTrackedDictEntry(tracked, initMatch[1]).initLocal = true;
+        recordDictRegexMatches(tracked, t, ln, /\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*["']([A-Za-z0-9_.-]+)["']\s*\]\s*=(?!=)/g, "writes");
+        recordDictRegexMatches(tracked, t, ln, /\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*["']([A-Za-z0-9_.-]+)["']\s*\](?!\s*=(?!=))/g, "reads");
+        recordDictRegexMatches(tracked, t, ln, /\b([A-Za-z_][A-Za-z0-9_]*)\.get\s*\(\s*["']([A-Za-z0-9_.-]+)["']/g, "reads");
+        recordDictRegexMatches(tracked, t, ln, /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*(?:=[^=]|\())/g, "reads", false, true);
         const destructMatch = /^(?:const|let|var|local)\s*\{([^}]+)\}\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\b/.exec(t);
         if (destructMatch && tracked.has(destructMatch[2])) {
-            const td = ensureTracked(destructMatch[2]);
+            const td = ensureTrackedDictEntry(tracked, destructMatch[2]);
             for (const rawKey of destructMatch[1].split(",")) {
                 const key = rawKey.split(":")[0].split("=")[0].trim();
-                if (key && !td.reads.has(key)) td.reads.set(key, ln);
+                if (key && !td.reads.has(key))
+                    td.reads.set(key, ln);
             }
         }
-
-        const inRe = /["']([A-Za-z0-9_.-]+)["']\s+(?:not\s+)?in\s+([A-Za-z_][A-Za-z0-9_]*)\b/g;
-        let im;
-        while ((im = inRe.exec(t)) !== null) {
-            const td = ensureTracked(im[2]);
-            if (!td.reads.has(im[1])) td.reads.set(im[1], ln);
-        }
+        recordDictRegexMatches(tracked, t, ln, /["']([A-Za-z0-9_.-]+)["']\s+(?:not\s+)?in\s+([A-Za-z_][A-Za-z0-9_]*)\b/g, "reads", true);
     }
     return tracked;
 }
 
+function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, issues) {
+    for (const [rKey, rLine] of td.reads.entries()) {
+        if (td.writes.has(rKey))
+            continue;
+        const nearMatch = [...td.writes.keys()].find(
+            (wKey) => wKey.length >= 4 && rKey.length >= 4 && levenshtein(rKey, wKey) > 0 && levenshtein(rKey, wKey) <= 2,
+        );
+        if (nearMatch && !hasInlineSuppression(lines, rLine, "dict_keys")) {
+            issues.push({
+                id: mintIssueId("dict_keys", relPath, `drift_${varName}_${rKey}_L${rLine}`),
+                detector: "dict_keys",
+                category: "types",
+                dimension: "code_quality",
+                tier: "T3",
+                confidence: "high",
+                severity: "high",
+                file: relPath,
+                line: rLine,
+                end_line: rLine,
+                span: `L${rLine}-L${rLine}`,
+                identifier: `drift:${varName}.${rKey}`,
+                summary: `Dict/table key schema drift in \`${sym.name}\`: reads \`${varName}["${rKey}"]\` on L${rLine}, which was never written (did you mean \`"${nearMatch}"\`?).`,
+                suggestion: `Align the key name on L${rLine} with \`"${nearMatch}"\` or define a typed struct/interface.`,
+            });
+        }
+    }
+    if (escapes)
+        return;
+    for (const [wKey, wLine] of td.writes.entries()) {
+        if (!td.reads.has(wKey) && !hasInlineSuppression(lines, wLine, "dict_keys")) {
+            issues.push({
+                id: mintIssueId("dict_keys", relPath, `dead_write_${varName}_${wKey}_L${wLine}`),
+                detector: "dict_keys",
+                category: "types",
+                dimension: "code_quality",
+                tier: "T3",
+                confidence: "medium",
+                severity: "medium",
+                file: relPath,
+                line: wLine,
+                end_line: wLine,
+                span: `L${wLine}-L${wLine}`,
+                identifier: `dead_write:${varName}.${wKey}`,
+                summary: `Dead dict/table write in \`${sym.name}\`: \`${varName}["${wKey}"]\` is written on L${wLine} but never read before \`${varName}\` goes out of scope.`,
+                suggestion: `Remove the unused \`${varName}["${wKey}"]\` write or read the key where intended.`,
+            });
+        }
+    }
+}
 function checkDictKeysInFunction(relPath, lines, sym, range, fnLines, potentials, issues) {
     potentials.dict_keys += 1;
     const tracked = collectTrackedDictKeys(range, fnLines);
     const fullFnText = fnLines.join("\n");
-
     for (const [varName, td] of tracked.entries()) {
-        if (!td.initLocal || td.writes.size < 2 || td.reads.size < 1) continue;
+        if (!td.initLocal || td.writes.size < 2 || td.reads.size < 1)
+            continue;
         const escapedRe = new RegExp(
-            `(?:\\breturn\\b[^;\\n]*\\b${varName}\\b(?!\\s*[\\[.])|[A-Za-z0-9_.:]+\\s*\\([^)\\n]*\\b${varName}\\b(?!\\s*[\\[.])|\\.\\.\\.${varName}\\b|\\bfor\\b[^\\n]*\\b${varName}\\b|[=:,\\[]\\s*\\b${varName}\\b(?!\\s*[\\[.])|\\{\\s*\\b${varName}\\b\\s*[,}])`,
+            `(?:\\breturn\\b[^;\\n]*\\b${varName}\\b(?!\\s*[\\[.])|\\breturn\\s*\\([^()]{0,400}?\\b${varName}\\b(?!\\s*[\\[.])|[A-Za-z0-9_.:]+\\s*\\([^()]{0,400}?\\b${varName}\\b(?!\\s*[\\[.])|\\.\\.\\.${varName}\\b|\\bfor\\b[^\\n]*\\b${varName}\\b|[=:,\\[]\\s*\\b${varName}\\b(?!\\s*[\\[.])|[{,]\\s*\\b${varName}\\b\\s*[,}])`,
         );
-        const escapes = escapedRe.test(fullFnText);
-
-        for (const [rKey, rLine] of td.reads.entries()) {
-            if (td.writes.has(rKey)) continue;
-            const nearMatch = [...td.writes.keys()].find(
-                (wKey) =>
-                    wKey.length >= 4 &&
-                    rKey.length >= 4 &&
-                    levenshtein(rKey, wKey) > 0 &&
-                    levenshtein(rKey, wKey) <= 2,
-            );
-            if (nearMatch && !hasInlineSuppression(lines, rLine, "dict_keys")) {
-                issues.push({
-                    id: mintIssueId("dict_keys", relPath, `drift_${varName}_${rKey}_L${rLine}`),
-                    detector: "dict_keys",
-                    category: "types",
-                    dimension: "code_quality",
-                    tier: "T3",
-                    confidence: "high",
-                    severity: "high",
-                    file: relPath,
-                    line: rLine,
-                    end_line: rLine,
-                    span: `L${rLine}-L${rLine}`,
-                    identifier: `drift:${varName}.${rKey}`,
-                    summary: `Dict/table key schema drift in \`${sym.name}\`: reads \`${varName}["${rKey}"]\` on L${rLine}, which was never written (did you mean \`"${nearMatch}"\`?).`,
-                    suggestion: `Align the key name on L${rLine} with \`"${nearMatch}"\` or define a typed struct/interface.`,
-                });
-            }
-        }
-
-        if (!escapes) {
-            for (const [wKey, wLine] of td.writes.entries()) {
-                if (!td.reads.has(wKey) && !hasInlineSuppression(lines, wLine, "dict_keys")) {
-                    issues.push({
-                        id: mintIssueId("dict_keys", relPath, `dead_write_${varName}_${wKey}_L${wLine}`),
-                        detector: "dict_keys",
-                        category: "types",
-                        dimension: "code_quality",
-                        tier: "T3",
-                        confidence: "medium",
-                        severity: "medium",
-                        file: relPath,
-                        line: wLine,
-                        end_line: wLine,
-                        span: `L${wLine}-L${wLine}`,
-                        identifier: `dead_write:${varName}.${wKey}`,
-                        summary: `Dead dict/table write in \`${sym.name}\`: \`${varName}["${wKey}"]\` is written on L${wLine} but never read before \`${varName}\` goes out of scope.`,
-                        suggestion: `Remove the unused \`${varName}["${wKey}"]\` write or read the key where intended.`,
-                    });
-                }
-            }
-        }
+        reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapedRe.test(fullFnText), issues);
     }
 }
 
+function checkAsyncFunctionMissingAwait(relPath, lines, sym, range, fnLines, issues) {
+    if (sym.exported || range.end - range.start < 2)
+        return;
+    if (!/\basync\s+(?:function\b|[A-Za-z0-9_$]+\s*\()/.test(fnLines[0] || ""))
+        return;
+    const bodyJoined = fnLines.slice(1).join("\n");
+    if (/\b(?:await|Promise|import\s*\(|throw\s+new\s+Error)\b/.test(bodyJoined))
+        return;
+    if (hasInlineSuppression(lines, range.start, "language_traps"))
+        return;
+    issues.push({
+        id: mintIssueId("language_traps", relPath, `async_no_await_${sym.name}`),
+        detector: "language_traps",
+        category: "traps",
+        dimension: "code_quality",
+        tier: "T2",
+        confidence: "medium",
+        severity: "low",
+        file: relPath,
+        line: range.start,
+        end_line: range.end,
+        span: sym.span,
+        identifier: sym.name,
+        summary: `\`async\` ${sym.kind} \`${sym.name}\` contains no \`await\` expression and wraps its return value in an unnecessary Promise.`,
+        suggestion: `Remove the \`async\` keyword from \`${sym.name}\` or \`await\` the intended asynchronous operation.`,
+    });
+}
 function checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags, potentials, issues) {
-    if (!flags.allowTraps && !flags.allowTypes) return;
+    if (!flags.allowTraps && !flags.allowTypes)
+        return;
     for (const sym of fileSymbols) {
-        if (sym.kind !== "function" && sym.kind !== "method") continue;
+        if (sym.kind !== "function" && sym.kind !== "method")
+            continue;
         const range = spanRange(sym.span);
-        if (!range || range.end <= range.start) continue;
+        if (!range || range.end <= range.start)
+            continue;
         const fnLines = lines.slice(range.start - 1, range.end);
-
-        if (
-            flags.allowTraps &&
-            flags.isJsTs &&
-            !sym.exported &&
-            range.end - range.start >= 2 &&
-            /\basync\s+(?:function\b|[A-Za-z0-9_$]+\s*\()/.test(fnLines[0] || "")
-        ) {
-            const bodyJoined = fnLines.slice(1).join("\n");
-            if (
-                !/\b(?:await|Promise|import\s*\(|throw\s+new\s+Error)\b/.test(bodyJoined) &&
-                !hasInlineSuppression(lines, range.start, "language_traps")
-            ) {
-                issues.push({
-                    id: mintIssueId("language_traps", relPath, `async_no_await_${sym.name}`),
-                    detector: "language_traps",
-                    category: "traps",
-                    dimension: "code_quality",
-                    tier: "T2",
-                    confidence: "medium",
-                    severity: "low",
-                    file: relPath,
-                    line: range.start,
-                    end_line: range.end,
-                    span: sym.span,
-                    identifier: sym.name,
-                    summary: `\`async\` ${sym.kind} \`${sym.name}\` contains no \`await\` expression and wraps its return value in an unnecessary Promise.`,
-                    suggestion: `Remove the \`async\` keyword from \`${sym.name}\` or \`await\` the intended asynchronous operation.`,
-                });
-            }
-        }
-
-        if (flags.allowTraps) {
+        if (flags.allowTraps && flags.isJsTs)
+            checkAsyncFunctionMissingAwait(relPath, lines, sym, range, fnLines, issues);
+        if (flags.allowTraps)
             checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues);
-        }
-
-        if (flags.allowTypes && (flags.isPy || flags.isJsTs || flags.isLuau)) {
+        if (flags.allowTypes && (flags.isPy || flags.isJsTs || flags.isLuau))
             checkDictKeysInFunction(relPath, lines, sym, range, fnLines, potentials, issues);
-        }
     }
 }
 
+function checkLuauReactiveSmells(relPath, lines, issues) {
+    let inComputedStart = 0;
+    let depth = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const lineNum = i + 1;
+        const trimmed = lines[i].trim();
+        if (!trimmed || trimmed.startsWith("--"))
+            continue;
+        if (inComputedStart === 0 && /\b(?:Flux\.)?computed\s*\(\s*function\b/.test(trimmed)) {
+            inComputedStart = lineNum;
+            depth = stepLuauBlockDepth(0, trimmed) || 1;
+            continue;
+        }
+        if (inComputedStart === 0)
+            continue;
+        depth = stepLuauBlockDepth(depth, trimmed);
+        if (/\b(?::set\s*\(|Instance\.new\s*\(|:Connect\s*\()/.test(trimmed) && !hasInlineSuppression(lines, lineNum, "reactive_smells")) {
+            issues.push({
+                id: mintIssueId("reactive_smells", relPath, `computed_side_effect_L${lineNum}`),
+                detector: "reactive_smells",
+                category: "traps",
+                dimension: "code_quality",
+                tier: "T3",
+                confidence: "high",
+                severity: "high",
+                file: relPath,
+                line: lineNum,
+                end_line: lineNum,
+                span: `L${lineNum}-L${lineNum}`,
+                identifier: `computed_side_effect_L${lineNum}`,
+                summary: `Reactive side effect inside \`computed\` callback on L${lineNum} (\`${trimmed.slice(0, 60)}\`).`,
+                suggestion: `Keep \`computed\` callbacks pure; move signal writes (\`:set()\`), \`Instance.new\`, or event connections into \`effect\` / \`scope\`.`,
+            });
+        }
+        if (depth <= 0) {
+            inComputedStart = 0;
+            depth = 0;
+        }
+    }
+}
+function checkReactHookSmells(relPath, lines, issues) {
+    for (let i = 0; i < lines.length; i++) {
+        const lineNum = i + 1;
+        const trimmed = lines[i].trim();
+        if (!trimmed || trimmed.startsWith("//"))
+            continue;
+        if (/^(?:if|for|while)\s*\([^)]*\)\s*\{?[^\n]*\buse(?:State|Effect|Memo|Callback|Ref|Context)\s*\(/.test(trimmed) &&
+            !hasInlineSuppression(lines, lineNum, "reactive_smells")) {
+            issues.push({
+                id: mintIssueId("reactive_smells", relPath, `conditional_hook_L${lineNum}`),
+                detector: "reactive_smells",
+                category: "traps",
+                dimension: "code_quality",
+                tier: "T3",
+                confidence: "high",
+                severity: "high",
+                file: relPath,
+                line: lineNum,
+                end_line: lineNum,
+                span: `L${lineNum}-L${lineNum}`,
+                identifier: `conditional_hook_L${lineNum}`,
+                summary: `React hook invoked conditionally or inside a loop on L${lineNum}.`,
+                suggestion: `Call React hooks unconditionally at the top level of your component or custom hook.`,
+            });
+        }
+    }
+}
 function checkReactiveSmellsInFile(relPath, lines, flags, potentials, issues) {
-    if (!flags.allowTraps) return;
-    if (!flags.isLuau && !flags.isJsTs) return;
+    if (!flags.allowTraps || (!flags.isLuau && !flags.isJsTs))
+        return;
     potentials.reactive_smells += 1;
+    if (flags.isLuau)
+        checkLuauReactiveSmells(relPath, lines, issues);
+    if (flags.isJsTs)
+        checkReactHookSmells(relPath, lines, issues);
+}
 
-    if (flags.isLuau) {
-        let inComputedStart = 0;
-        let depth = 0;
-        for (let i = 0; i < lines.length; i++) {
-            const lineNum = i + 1;
-            const trimmed = lines[i].trim();
-            if (!trimmed || trimmed.startsWith("--")) continue;
+/**
+ * Count non-comment token references to `ident` in `lines` excluding `lineIdx`.
+ * Shared between `unused_imports` detection and `autofix unused-imports`.
+ */
+export function countIdentifierUsesOutsideLine(lines, lineIdx, ident, isPy = false, isLuau = false) {
+    const escaped = ident.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const wordRe = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
+    let count = 0;
+    for (let i = 0; i < lines.length; i++) {
+        if (i === lineIdx) continue;
+        const l = lines[i].trim();
+        if (l.startsWith("//") || l.startsWith("--") || (isPy && l.startsWith("#"))) continue;
+        const stripped = stripCodeStringsAndComments(lines[i], isLuau, isPy);
+        if (wordRe.test(stripped)) count += 1;
+    }
+    return count;
+}
 
-            if (inComputedStart === 0 && /\b(?:Flux\.)?computed\s*\(\s*function\b/.test(trimmed)) {
-                inComputedStart = lineNum;
-                depth = stepLuauBlockDepth(0, trimmed);
-                if (depth === 0) depth = 1;
-                continue;
-            }
-            if (inComputedStart > 0) {
-                depth = stepLuauBlockDepth(depth, trimmed);
-                if (
-                    /\b(?::set\s*\(|Instance\.new\s*\(|:Connect\s*\()/.test(trimmed) &&
-                    !hasInlineSuppression(lines, lineNum, "reactive_smells")
-                ) {
-                    issues.push({
-                        id: mintIssueId("reactive_smells", relPath, `computed_side_effect_L${lineNum}`),
-                        detector: "reactive_smells",
-                        category: "traps",
-                        dimension: "code_quality",
-                        tier: "T3",
-                        confidence: "high",
-                        severity: "high",
-                        file: relPath,
-                        line: lineNum,
-                        end_line: lineNum,
-                        span: `L${lineNum}-L${lineNum}`,
-                        identifier: `computed_side_effect_L${lineNum}`,
-                        summary: `Reactive side effect inside \`computed\` callback on L${lineNum} (\`${trimmed.slice(0, 60)}\`).`,
-                        suggestion: `Keep \`computed\` callbacks pure; move signal writes (\`:set()\`), \`Instance.new\`, or event connections into \`effect\` / \`scope\`.`,
-                    });
-                }
-                if (depth <= 0) {
-                    inComputedStart = 0;
-                    depth = 0;
-                }
-            }
+function pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, isPy = false, isLuau = false) {
+    if (/;.*\S/.test(trimmed)) return null;
+    const namedMatch = /^(\s*import\s*)\{([^}]+)\}(\s*from\s*["'][^"']+["']\s*;?\s*)$/.exec(line);
+    if (!namedMatch) return null;
+    const [, prefix, rawSpecs, suffix] = namedMatch;
+    const specs = rawSpecs.split(",").map((s) => s.trim()).filter(Boolean);
+    if (specs.length === 0) return null;
+
+    const kept = [];
+    const removedNames = [];
+    for (const spec of specs) {
+        if (/^type\s+/.test(spec)) {
+            kept.push(spec);
+            continue;
+        }
+        const aliasMatch = /^([A-Za-z_$][A-Za-z0-9_$]*)(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?$/.exec(spec);
+        if (!aliasMatch) {
+            kept.push(spec);
+            continue;
+        }
+        const localIdent = aliasMatch[2] || aliasMatch[1];
+        if (countIdentifierUsesOutsideLine(lines, lineIdx, localIdent, isPy, isLuau) === 0) {
+            removedNames.push(localIdent);
+        } else {
+            kept.push(spec);
         }
     }
 
-    if (flags.isJsTs) {
-        for (let i = 0; i < lines.length; i++) {
-            const lineNum = i + 1;
-            const trimmed = lines[i].trim();
-            if (!trimmed || trimmed.startsWith("//")) continue;
-            if (
-                /^(?:if|for|while)\s*\([^)]*\)\s*\{?[^\n]*\buse(?:State|Effect|Memo|Callback|Ref|Context)\s*\(/.test(
-                    trimmed,
-                ) &&
-                !hasInlineSuppression(lines, lineNum, "reactive_smells")
-            ) {
-                issues.push({
-                    id: mintIssueId("reactive_smells", relPath, `conditional_hook_L${lineNum}`),
-                    detector: "reactive_smells",
-                    category: "traps",
-                    dimension: "code_quality",
-                    tier: "T3",
-                    confidence: "high",
-                    severity: "high",
-                    file: relPath,
-                    line: lineNum,
-                    end_line: lineNum,
-                    span: `L${lineNum}-L${lineNum}`,
-                    identifier: `conditional_hook_L${lineNum}`,
-                    summary: `React hook invoked conditionally or inside a loop on L${lineNum}.`,
-                    suggestion: `Call React hooks unconditionally at the top level of your component or custom hook.`,
-                });
-            }
-        }
+    if (removedNames.length === 0) return null;
+    if (kept.length === 0) {
+        return {
+            action: "remove",
+            after: "<removed>",
+            removedNames,
+            identifier: removedNames[0],
+        };
+    }
+    const rebuilt = `${prefix}{ ${kept.join(", ")} }${suffix}`;
+    return {
+        action: "replace",
+        line: rebuilt,
+        after: rebuilt.trim(),
+        removedNames,
+        identifier: removedNames.join(","),
+    };
+}
+
+/**
+ * Determine whether `line` at `lineIdx` imports unused identifiers.
+ * Returns a shared edit descriptor consumed by both `unused_imports` scanning and `autofix`.
+ */
+export function findUnusedImportEditOnLine(line, trimmed, lines, lineIdx, isPy = false, isLuau = false) {
+    if (/;.*\S/.test(trimmed)) return null;
+    const luauReq = /^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*require\([^)]+\)\s*$/.exec(trimmed);
+    const jsImp = /^import\s+(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["'][^"']+["'];?\s*$/.exec(trimmed);
+    const pyImp = /^from\s+[A-Za-z0-9_.]+\s+import\s+([A-Za-z_][A-Za-z0-9_]*)\s*$/.exec(trimmed);
+    const ident = luauReq?.[1] || jsImp?.[1] || pyImp?.[1];
+    const effectiveIsPy = isPy || Boolean(pyImp);
+    const effectiveIsLuau = isLuau || Boolean(luauReq);
+    const usesClassicJsxReact =
+        ident === "React" &&
+        lines.some(
+            (l, idx) =>
+                idx !== lineIdx &&
+                /(?:^|[=(?:\s,])<(?:[A-Za-z][A-Za-z0-9_.]*(?:>|\s*\/>|\s+[A-Za-z_][^>\n]*>)|>)/.test(
+                    stripCodeStringsAndComments(l, false, false),
+                ),
+        );
+    if (
+        ident &&
+        !usesClassicJsxReact &&
+        countIdentifierUsesOutsideLine(lines, lineIdx, ident, effectiveIsPy, effectiveIsLuau) === 0
+    ) {
+        return {
+            action: "remove",
+            line,
+            after: "<removed>",
+            removedNames: [ident],
+            identifier: ident,
+        };
+    }
+    return pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, effectiveIsPy, effectiveIsLuau);
+}
+
+function advanceLuauLongClose(raw, luauLongClose) {
+    if (luauLongClose)
+        return raw.includes(luauLongClose) ? null : luauLongClose;
+    const lb = /(?:--)?\[(=*)\[/.exec(raw);
+    if (lb && !raw.slice(lb.index + lb[0].length).includes(`]${lb[1]}]`))
+        return `]${lb[1]}]`;
+    return null;
+}
+function checkUnusedImportsInFile(relPath, lines, flags, potentials, issues) {
+    potentials.unused_imports += 1;
+    let luauLongClose = null;
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        const lineNum = i + 1;
+        const wasInLongBracket = Boolean(luauLongClose);
+        if (flags.isLuau)
+            luauLongClose = advanceLuauLongClose(raw, luauLongClose);
+        if (wasInLongBracket || !trimmed)
+            continue;
+        if (trimmed.startsWith("//") || trimmed.startsWith("--") || (flags.isPy && trimmed.startsWith("#")))
+            continue;
+        const res = findUnusedImportEditOnLine(raw, trimmed, lines, i, flags.isPy, flags.isLuau);
+        if (!res || hasInlineSuppression(lines, lineNum, "unused_imports"))
+            continue;
+        const label = res.removedNames.join(", ");
+        const plural = res.removedNames.length > 1 ? "s" : "";
+        issues.push({
+            id: mintIssueId("unused_imports", relPath, `${res.identifier}_L${lineNum}`),
+            detector: "unused_imports",
+            category: "dead",
+            dimension: "code_quality",
+            tier: "T3",
+            confidence: "high",
+            severity: "low",
+            file: relPath,
+            line: lineNum,
+            end_line: lineNum,
+            span: `L${lineNum}-L${lineNum}`,
+            identifier: res.identifier,
+            detail: { removed_names: res.removedNames, action: res.action },
+            summary: `Unused import binding${plural} \`${label}\` at ${relPath}:L${lineNum}.`,
+            suggestion: `Remove unused import${plural} \`${label}\` or run \`plexer health autofix unused-imports\`.`,
+        });
     }
 }
 
-function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarget, ignoreRules, enabled, potentials, issues) {
+const JSTS_SOURCE_EXTS = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]);
+const TS_SOURCE_EXTS = new Set([".ts", ".tsx"]);
+const REACT_SOURCE_EXTS = new Set([".jsx", ".tsx"]);
+function buildSourceCheckFlags(relPath, ignoreRules, enabled) {
     const ext = extname(relPath).toLowerCase();
-    const flags = {
+    return {
         isLuau: isLuauFile(relPath),
         isPy: ext === ".py",
-        isJsTs: [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"].includes(ext),
-        isTs: [".ts", ".tsx"].includes(ext),
-        isReact: [".jsx", ".tsx"].includes(ext),
+        isJsTs: JSTS_SOURCE_EXTS.has(ext),
+        isTs: TS_SOURCE_EXTS.has(ext),
+        isReact: REACT_SOURCE_EXTS.has(ext),
         isRust: ext === ".rs",
         isGo: ext === ".go",
         wantTraps: enabled.wantTraps,
         wantSecurity: enabled.wantSecurity,
+        allowDead: enabled.wantDead && !ignoreRules.isIgnored(relPath, "dead"),
         allowSlop: enabled.wantSlop && !ignoreRules.isIgnored(relPath, "slop"),
         allowTypes: enabled.wantTypes && !ignoreRules.isIgnored(relPath, "types"),
         allowCatches: enabled.wantCatches && !ignoreRules.isIgnored(relPath, "catches"),
         allowTraps: enabled.wantTraps && !ignoreRules.isIgnored(relPath, "traps"),
         allowSecurity: enabled.wantSecurity && !ignoreRules.isIgnored(relPath, "security"),
     };
-
-    if (
-        flags.allowSlop &&
-        !ignoreRules.isIgnored(relPath, "stale_deprecations")
-    ) {
-        checkStaleDeprecationsInFile(relPath, lines, fileSymbols, incomingByTarget, potentials, issues);
-    }
-    if (flags.allowTypes) {
-        if (flags.isTs || flags.isLuau || flags.isPy) potentials.type_bypasses += 1;
-    }
+}
+function recordSourceCheckPotentials(relPath, flags, ignoreRules, potentials) {
+    if (flags.allowTypes && (flags.isTs || flags.isLuau || flags.isPy))
+        potentials.type_bypasses += 1;
     if (flags.allowSlop) {
         potentials.ai_slop += 1;
         potentials.debug_logs += 1;
     }
-    if (flags.allowCatches) potentials.silent_catches += 1;
+    if (flags.allowCatches)
+        potentials.silent_catches += 1;
     if (flags.isLuau) {
-        if (flags.allowSecurity) potentials.roblox_security += 1;
-        if (flags.allowTraps) potentials.luau_quality += 1;
+        if (flags.allowSecurity)
+            potentials.roblox_security += 1;
+        if (flags.allowTraps)
+            potentials.luau_quality += 1;
     }
-    if (flags.allowTraps) potentials.language_traps += 1;
-    if (flags.allowSecurity && !ignoreRules.isIgnored(relPath, "traps")) potentials.security_traps += 1;
-
-    const stateTracker = { booleanStateCount: 0, firstBooleanStateLine: 1 };
+    if (flags.allowTraps)
+        potentials.language_traps += 1;
+    if (flags.allowSecurity && !ignoreRules.isIgnored(relPath, "traps"))
+        potentials.security_traps += 1;
+}
+function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarget, ignoreRules, enabled, potentials, issues) {
+    const flags = buildSourceCheckFlags(relPath, ignoreRules, enabled);
+    if (flags.allowDead && !ignoreRules.isIgnored(relPath, "unused_imports"))
+        checkUnusedImportsInFile(relPath, lines, flags, potentials, issues);
+    if (flags.allowSlop && !ignoreRules.isIgnored(relPath, "stale_deprecations"))
+        checkStaleDeprecationsInFile(relPath, lines, fileSymbols, incomingByTarget, potentials, issues);
+    recordSourceCheckPotentials(relPath, flags, ignoreRules, potentials);
+    const stateTracker = {
+        booleanStateCount: 0,
+        firstBooleanStateLine: 1,
+        shadowedLuauSchedulers: flags.isLuau ? collectShadowedLuauSchedulerNames(lines) : new Set(),
+        luauBlockStack: [],
+        luauLongState: { longClose: null },
+        luauFnDepthBeforeLine: 0,
+        luauLineCode: "",
+    };
     for (let i = 0; i < lines.length; i++) {
         const lineNum = i + 1;
         const raw = lines[i];
         const trimmed = raw.trim();
-        if (!trimmed) continue;
-
+        if (!trimmed)
+            continue;
+        if (flags.isLuau) {
+            stateTracker.luauLineCode = stripLuauLongBracketsOnLine(raw, stateTracker.luauLongState);
+            stateTracker.luauFnDepthBeforeLine = stateTracker.luauBlockStack.filter((b) => b === "fn").length;
+            stepLuauFnBlockStack(stateTracker.luauBlockStack, stateTracker.luauLineCode);
+        }
         checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags, issues);
         checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flags, issues);
-        checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, issues);
+        checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, stateTracker, issues);
         if ((flags.wantTraps || flags.wantSecurity) && !ignoreRules.isIgnored(relPath, "traps")) {
             checkLanguageTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, stateTracker, issues);
             checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, flags, issues);
         }
     }
-
     checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTracker, issues);
     checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags, potentials, issues);
     checkReactiveSmellsInFile(relPath, lines, flags, potentials, issues);
 }
 
+// Universal language/runtime type tags and HTTP methods rather than project-specific values.
 const ENUM_BYPASS_EXCLUDED_LITERALS = new Set([
     "string",
     "number",
@@ -1258,128 +1545,39 @@ const ENUM_BYPASS_EXCLUDED_LITERALS = new Set([
     "null",
     "true",
     "false",
-    "file",
-    "method",
-    "class",
-    "struct",
-    "interface",
-    "module",
-    "type",
-    "protocol",
-    "production",
-    "test",
-    "vendor",
-    "generated",
-    "config",
-    "script",
-    "open",
-    "fixed",
-    "wontfix",
-    "deferred",
-    "false_positive",
-    "auto_resolved",
-    "high",
-    "medium",
-    "low",
-    "critical",
-    "json",
-    "text",
-    "yaml",
-    "yml",
-    "markdown",
-    "md",
-    "utf8",
-    "utf-8",
-    "sha1",
-    "sha256",
-    "md5",
-    "hex",
-    "error",
-    "ok",
-    "status",
-    "scan",
-    "next",
-    "plan",
-    "review",
-    "show",
-    "tree",
-    "viz",
-    "list",
-    "add",
-    "remove",
-    "update",
+    "nan",
+    "infinity",
+    "get",
+    "post",
+    "put",
+    "patch",
     "delete",
-    "create",
-    "merge",
-    "export",
-    "import",
-    "reset",
-    "top",
-    "bottom",
-    "up",
-    "down",
-    "before",
-    "after",
-    "item",
-    "detector",
-    "all",
+    "head",
+    "options",
 ]);
 
-const ENUM_BYPASS_GENERIC_PROP_NAMES = new Set([
-    "ext",
-    "kind",
-    "status",
-    "action",
-    "sub",
-    "subAction",
-    "fmt",
-    "format",
-    "zone",
-    "stage",
-    "stg",
-    "pos",
-    "mode",
-    "groupMode",
-    "fixerName",
-    "relation",
-    "category",
-    "dimension",
-    "tier",
-    "severity",
-    "confidence",
-    "detector",
-    "type",
-    "key",
-    "text",
-    "code",
-    "name",
-    "id",
-    "tag",
-    "role",
-    "level",
-    "lang",
-    "language",
-    "event",
-    "method",
-    "protocol",
-    "target",
-    "source",
-    "view",
-    "pool",
-    "theme",
-    "tab",
-    "scope",
-    "host",
-]);
-
-function isExcludedEnumComparison(propName, lit) {
+function isArgvOrSwitchDispatch(lines, lineIdx, rawLhs, propName, lit) {
     if (!propName || propName.length < 3) return true;
+    if (lit.startsWith("-") || /^E[A-Z0-9]{3,14}$/.test(lit)) return true;
     if (ENUM_BYPASS_EXCLUDED_LITERALS.has(lit) || ENUM_BYPASS_EXCLUDED_LITERALS.has(lit.toLowerCase())) {
         return true;
     }
-    if (/^E[A-Z0-9]{3,14}$/.test(lit)) return true;
-    const isUpperEnumLiteral = /^[A-Z][A-Z0-9]*_[A-Z0-9_]+$/.test(lit);
-    return !isUpperEnumLiteral && ENUM_BYPASS_GENERIC_PROP_NAMES.has(propName);
+    if (/^(?:argv|args|arg|cliArgs|positional|rawArgs?)$/i.test(propName)) return true;
+    if (/(?:^|\.)(?:argv|args|flags?|options?)\[/.test(rawLhs)) return true;
+
+    const winStart = Math.max(0, lineIdx - 4);
+    const winEnd = Math.min(lines.length, lineIdx + 3);
+    const windowText = lines.slice(winStart, winEnd).join("\n");
+    if (/\b(?:process\.argv|Deno\.args|sys\.argv|parseArgs)\b/.test(windowText)) return true;
+    if (/\.startsWith\(\s*["']-/.test(windowText)) return true;
+
+    const switchStart = Math.max(0, lineIdx - 12);
+    const escapedProp = propName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const switchRe = new RegExp(`\\bswitch\\s*\\([^)]*\\b${escapedProp}\\b`);
+    for (let k = lineIdx - 1; k >= switchStart; k--) {
+        if (switchRe.test(lines[k])) return true;
+    }
+    return false;
 }
 
 function matchesSourceFileFilter(fileFilter, relPath) {
@@ -1390,6 +1588,83 @@ function matchesSourceFileFilter(fileFilter, relPath) {
     return true;
 }
 
+function recordEnumBypassHit(varLiteralMap, propName, lit, relPath, lineNum) {
+    let entry = varLiteralMap.get(propName);
+    if (!entry) {
+        entry = { files: new Set(), literals: new Set(), literalFiles: new Map(), sites: [] };
+        varLiteralMap.set(propName, entry);
+    }
+    entry.files.add(relPath);
+    entry.literals.add(lit);
+    let lf = entry.literalFiles.get(lit);
+    if (!lf) {
+        lf = new Set();
+        entry.literalFiles.set(lit, lf);
+    }
+    lf.add(relPath);
+    if (entry.sites.length < 8)
+        entry.sites.push({ file: relPath, line: lineNum, literal: lit });
+}
+function scanEnumBypassFile(relPath, lines, varLiteralMap) {
+    const ext = extname(relPath).toLowerCase();
+    const isLuau = ext === ".luau" || ext === ".lua";
+    const isPy = ext === ".py";
+    const cmpRe = /\b([A-Za-z_][A-Za-z0-9_.]*)\s*(?:===|!==|==|~=|!=)\s*["']([A-Za-z][A-Za-z0-9_-]{2,28})["']/g;
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("--"))
+            continue;
+        if (/^(?:type|export\s+type|interface|enum)\b/.test(trimmed) || /\b(?:typeof|type)\s*\(/.test(trimmed))
+            continue;
+        if (hasInlineSuppression(lines, i + 1, "enum_bypasses"))
+            continue;
+        const uncommented = isLuau ? trimmed.replace(/--.*$/, "") : isPy ? trimmed.replace(/#.*$/, "") : trimmed.replace(/\/\/.*$/, "");
+        const codeOnly = stripCodeStringsAndComments(raw, isLuau, isPy);
+        if (!/(?:===|!==|==|~=|!=)\s*(?:""|'')/.test(codeOnly))
+            continue;
+        cmpRe.lastIndex = 0;
+        let m;
+        while ((m = cmpRe.exec(uncommented)) !== null) {
+            const propName = m[1].includes(".") ? m[1].split(".").pop() : m[1];
+            if (isArgvOrSwitchDispatch(lines, i, m[1], propName, m[2]) || !hasWordToken(codeOnly, propName))
+                continue;
+            recordEnumBypassHit(varLiteralMap, propName, m[2], relPath, i + 1);
+        }
+    }
+}
+function buildConsolidatedEnumBypassIssue(propName, entry, readLines) {
+    if (entry.files.size < 3 || entry.literals.size < 2)
+        return null;
+    let sharedLiteralCount = 0;
+    for (const lf of entry.literalFiles.values()) {
+        if (lf.size >= 2) sharedLiteralCount += 1;
+    }
+    if (sharedLiteralCount < 2)
+        return null;
+    const primary = entry.sites[0];
+    if (hasInlineSuppression(readLines(primary.file) || [], primary.line, "enum_bypasses"))
+        return null;
+    const litPreview = [...entry.literals].slice(0, 5).map((l) => `"${l}"`).join(", ");
+    const filePreview = [...entry.files].slice(0, 4).join(", ");
+    return {
+        id: mintIssueId("enum_bypasses", primary.file, `${propName}_string_enum`),
+        detector: "enum_bypasses",
+        category: "types",
+        dimension: "code_quality",
+        tier: "T3",
+        confidence: "medium",
+        severity: entry.files.size >= 5 ? "medium" : "low",
+        file: primary.file,
+        line: primary.line,
+        end_line: primary.line,
+        span: `L${primary.line}-L${primary.line}`,
+        identifier: propName,
+        detail: { discriminator: propName, literals: [...entry.literals], files: [...entry.files] },
+        summary: `Unconsolidated string-enum comparisons on \`${propName}\` (${litPreview}) scattered across ${entry.files.size} files (${filePreview}).`,
+        suggestion: `Define a shared constant/enum object or narrow helper for \`${propName}\` values (${litPreview}) instead of repeating raw string literals across files.`,
+    };
+}
 /**
  * Two-pass detector for scattered magic string-enum comparisons (`enum_bypasses`).
  * Flags discriminator variables compared against >= 2 distinct string literals across >= 3 files
@@ -1398,96 +1673,56 @@ function matchesSourceFileFilter(fileFilter, relPath) {
 function checkEnumBypassIssues(scoredFiles, readLines, ignoreRules, potentials, issues) {
     potentials.enum_bypasses = Math.max(1, scoredFiles.length);
     const varLiteralMap = new Map();
-
     for (const relPath of scoredFiles) {
-        if (ignoreRules.isIgnored(relPath, "types") || ignoreRules.isIgnored(relPath, "enum_bypasses")) {
+        if (ignoreRules.isIgnored(relPath, "types") || ignoreRules.isIgnored(relPath, "enum_bypasses"))
             continue;
-        }
-        const lines = readLines(relPath) || [];
-        const ext = extname(relPath).toLowerCase();
-        const isLuau = ext === ".luau" || ext === ".lua";
-        const isPy = ext === ".py";
-
-        for (let i = 0; i < lines.length; i++) {
-            const raw = lines[i];
-            const trimmed = raw.trim();
-            if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("--")) {
-                continue;
-            }
-            if (/^(?:type|export\s+type|interface|enum)\b/.test(trimmed)) continue;
-            if (/\btypeof\s*\(/.test(trimmed) || /\btype\s*\(/.test(trimmed)) continue;
-            if (hasInlineSuppression(lines, i + 1, "enum_bypasses")) continue;
-
-            const uncommented = isLuau
-                ? trimmed.replace(/--.*$/, "")
-                : isPy
-                  ? trimmed.replace(/#.*$/, "")
-                  : trimmed.replace(/\/\/.*$/, "");
-            const codeOnly = stripCodeStringsAndComments(raw, isLuau, isPy);
-            if (!/(?:===|!==|==|~=|!=)\s*(?:""|'')/.test(codeOnly)) continue;
-
-            const cmpRe =
-                /\b([A-Za-z_][A-Za-z0-9_.]*)\s*(?:===|!==|==|~=|!=)\s*["']([A-Za-z][A-Za-z0-9_-]{2,28})["']/g;
-            let m;
-            while ((m = cmpRe.exec(uncommented)) !== null) {
-                const rawLhs = m[1];
-                const lit = m[2];
-                const propName = rawLhs.includes(".") ? rawLhs.split(".").pop() : rawLhs;
-                if (isExcludedEnumComparison(propName, lit)) continue;
-                if (!hasWordToken(codeOnly, propName)) continue;
-
-                let entry = varLiteralMap.get(propName);
-                if (!entry) {
-                    entry = { files: new Set(), literals: new Set(), sites: [] };
-                    varLiteralMap.set(propName, entry);
-                }
-                entry.files.add(relPath);
-                entry.literals.add(lit);
-                if (entry.sites.length < 8) {
-                    entry.sites.push({ file: relPath, line: i + 1, literal: lit });
-                }
-            }
-        }
+        scanEnumBypassFile(relPath, readLines(relPath) || [], varLiteralMap);
     }
-
     for (const [propName, entry] of varLiteralMap.entries()) {
-        if (entry.files.size < 3 || entry.literals.size < 2) continue;
-        const primary = entry.sites[0];
-        const primaryLines = readLines(primary.file) || [];
-        if (hasInlineSuppression(primaryLines, primary.line, "enum_bypasses")) continue;
-        const litPreview = [...entry.literals].slice(0, 5).map((l) => `"${l}"`).join(", ");
-        const filePreview = [...entry.files].slice(0, 4).join(", ");
-
-        issues.push({
-            id: mintIssueId("enum_bypasses", primary.file, `${propName}_string_enum`),
-            detector: "enum_bypasses",
-            category: "types",
-            dimension: "code_quality",
-            tier: "T3",
-            confidence: "medium",
-            severity: entry.files.size >= 5 ? "medium" : "low",
-            file: primary.file,
-            line: primary.line,
-            end_line: primary.line,
-            span: `L${primary.line}-L${primary.line}`,
-            identifier: propName,
-            detail: {
-                discriminator: propName,
-                literals: [...entry.literals],
-                files: [...entry.files],
-            },
-            summary: `Unconsolidated string-enum comparisons on \`${propName}\` (${litPreview}) scattered across ${entry.files.size} files (${filePreview}).`,
-            suggestion: `Define a shared constant/enum object or narrow helper for \`${propName}\` values (${litPreview}) instead of repeating raw string literals across files.`,
-        });
+        const issue = buildConsolidatedEnumBypassIssue(propName, entry, readLines);
+        if (issue)
+            issues.push(issue);
     }
 }
 
+function buildSourceCheckGraphIndices(graph) {
+    const symbolsByFile = new Map();
+    const incomingByTarget = new Map();
+    for (const node of graph.nodes) {
+        if (node.kind === "file")
+            continue;
+        if (!symbolsByFile.has(node.path))
+            symbolsByFile.set(node.path, []);
+        symbolsByFile.get(node.path).push(node);
+    }
+    for (const edge of graph.edges) {
+        if (!WALK_RELATIONS.has(edge.relation))
+            continue;
+        if (!incomingByTarget.has(edge.target))
+            incomingByTarget.set(edge.target, new Set());
+        incomingByTarget.get(edge.target).add(edge.source);
+    }
+    return { symbolsByFile, incomingByTarget };
+}
+function fillZeroSourcePotentials(potentials, enabledCategories, scoredFileCount, luauFileCount) {
+    for (const k of Object.keys(potentials)) {
+        const cat = DETECTOR_CATEGORY[k];
+        if (cat && !enabledCategories.has(cat))
+            continue;
+        if (k === "luau_quality" || k === "roblox_security") {
+            if (potentials[k] === 0 && luauFileCount > 0) potentials[k] = luauFileCount;
+            continue;
+        }
+        if (potentials[k] === 0) potentials[k] = scoredFileCount;
+    }
+}
 /**
  * Run all source & AST checks (`catches`, `types`, `traps`, `slop`, `security`).
  */
 export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, fileFilter = null) {
     const issues = [];
     const potentials = {
+        unused_imports: 0,
         silent_catches: 0,
         type_bypasses: 0,
         enum_bypasses: 0,
@@ -1501,65 +1736,36 @@ export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledC
         security_traps: 0,
         roblox_security: 0,
     };
-
     const enabled = {
+        wantDead: enabledCategories.has("dead"),
         wantCatches: enabledCategories.has("catches"),
         wantTypes: enabledCategories.has("types"),
         wantTraps: enabledCategories.has("traps"),
         wantSlop: enabledCategories.has("slop"),
         wantSecurity: enabledCategories.has("security"),
     };
-    if (!Object.values(enabled).some(Boolean)) return { issues, potentials };
-
-    const fileNodes = graph.nodes.filter((n) => n.kind === "file");
-    const symbolsByFile = new Map();
-    const incomingByTarget = new Map();
-
-    for (const node of graph.nodes) {
-        if (node.kind !== "file") {
-            if (!symbolsByFile.has(node.path)) symbolsByFile.set(node.path, []);
-            symbolsByFile.get(node.path).push(node);
-        }
-    }
-
-    for (const edge of graph.edges) {
-        if (!WALK_RELATIONS.has(edge.relation)) continue;
-        if (!incomingByTarget.has(edge.target)) incomingByTarget.set(edge.target, new Set());
-        incomingByTarget.get(edge.target).add(edge.source);
-    }
-
+    if (!Object.values(enabled).some(Boolean))
+        return { issues, potentials };
+    const { symbolsByFile, incomingByTarget } = buildSourceCheckGraphIndices(graph);
     const scoredFiles = [];
     let luauFileCount = 0;
-
-    for (const fNode of fileNodes) {
+    for (const fNode of graph.nodes) {
+        if (fNode.kind !== "file")
+            continue;
         const relPath = fNode.path;
         const zone = zoneMap.get(relPath) || "production";
-        if (!SCORED_ZONES.has(zone) || !matchesSourceFileFilter(fileFilter, relPath)) continue;
-
-        const lines = readLines(relPath);
-        if (!lines || lines.length === 0) continue;
-
-        scoredFiles.push(relPath);
-        if (isLuauFile(relPath)) luauFileCount += 1;
-
-        const fileSymbols = symbolsByFile.get(relPath) || [];
-        scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarget, ignoreRules, enabled, potentials, issues);
-    }
-
-    if (enabled.wantTypes && scoredFiles.length > 0) {
-        checkEnumBypassIssues(scoredFiles, readLines, ignoreRules, potentials, issues);
-    }
-
-    const scoredFileCount = Math.max(1, scoredFiles.length);
-    for (const k of Object.keys(potentials)) {
-        const cat = DETECTOR_CATEGORY[k];
-        if (cat && !enabledCategories.has(cat)) continue;
-        if (k === "luau_quality" || k === "roblox_security") {
-            if (potentials[k] === 0 && luauFileCount > 0) potentials[k] = luauFileCount;
+        if (!SCORED_ZONES.has(zone) || !matchesSourceFileFilter(fileFilter, relPath))
             continue;
-        }
-        if (potentials[k] === 0) potentials[k] = scoredFileCount;
+        const lines = readLines(relPath);
+        if (!lines || lines.length === 0)
+            continue;
+        scoredFiles.push(relPath);
+        if (isLuauFile(relPath))
+            luauFileCount += 1;
+        scanSingleFileSourceChecks(relPath, lines, symbolsByFile.get(relPath) || [], incomingByTarget, ignoreRules, enabled, potentials, issues);
     }
-
+    if (enabled.wantTypes && scoredFiles.length > 0)
+        checkEnumBypassIssues(scoredFiles, readLines, ignoreRules, potentials, issues);
+    fillZeroSourcePotentials(potentials, enabledCategories, Math.max(1, scoredFiles.length), luauFileCount);
     return { issues, potentials };
 }

@@ -83,78 +83,118 @@ function parsePositionTail(rest, allowUpDown = false) {
     return { position: "top", patterns: rest };
 }
 
+function assignPositionTailArgs(rest, callOpts, withOffset) {
+    const parsed = parsePositionTail(rest, withOffset);
+    callOpts.position = parsed.position;
+    if (parsed.target) callOpts.target = parsed.target;
+    if (withOffset && parsed.offset !== undefined) callOpts.offset = parsed.offset;
+    callOpts.patterns = parsed.patterns;
+}
+
+function parseClusterPlanSubargs(rest, callOpts) {
+    const cAct = (rest[0] || "list").toLowerCase();
+    callOpts.clusterAction = cAct;
+    if (cAct === "list") {
+        callOpts.clusterName = null;
+        return;
+    }
+    if (cAct === "move") {
+        if (!callOpts.to && rest.length >= 3) {
+            callOpts.clusterName = rest[1];
+            callOpts.patterns = rest.slice(2);
+        } else {
+            callOpts.patterns = rest.slice(1);
+        }
+        return;
+    }
+    if (cAct === "merge") {
+        callOpts.clusterName = rest[1];
+        callOpts.targetCluster = rest[2];
+        callOpts.patterns = rest.slice(2);
+        return;
+    }
+    if (cAct === "export") {
+        callOpts.clusterName = rest[1];
+        if (rest[2]) callOpts.exportFormat = rest[2];
+        return;
+    }
+    if (cAct === "import") {
+        callOpts.importFile = rest[1] || callOpts.file || callOpts.import;
+        callOpts.clusterName = rest[1];
+        return;
+    }
+    callOpts.clusterName = rest[1];
+    callOpts.patterns = rest.slice(2);
+}
+
+function assignTextTailField(rest, callOpts, field) {
+    if (!callOpts[field] && rest.length >= 2) {
+        callOpts[field] = rest[rest.length - 1];
+        callOpts.patterns = rest.slice(0, -1);
+    } else {
+        callOpts.patterns = rest;
+    }
+}
+
+const PLAN_PATTERN_SUBCOMMANDS = new Set(["resolve", "skip", "reopen", "unskip", "backlog"]);
+
 function parsePlanCliSubargs(args, callOpts) {
     const sub = (args[0] || "show").toLowerCase();
     callOpts.subAction = sub;
     const rest = args.slice(1);
-    if (sub === "resolve" || sub === "skip" || sub === "reopen" || sub === "unskip" || sub === "backlog") {
-        callOpts.patterns = rest;
-    } else if (sub === "promote") {
-        const parsed = parsePositionTail(rest, false);
-        callOpts.position = parsed.position;
-        if (parsed.target) callOpts.target = parsed.target;
-        callOpts.patterns = parsed.patterns;
-    } else if (sub === "reorder") {
-        const parsed = parsePositionTail(rest, true);
-        callOpts.position = parsed.position;
-        if (parsed.target) callOpts.target = parsed.target;
-        if (parsed.offset !== undefined) callOpts.offset = parsed.offset;
-        callOpts.patterns = parsed.patterns;
-    } else if (sub === "describe") {
-        if (!callOpts.description && rest.length >= 2) {
-            callOpts.description = rest[rest.length - 1];
-            callOpts.patterns = rest.slice(0, -1);
-        } else {
-            callOpts.patterns = rest;
-        }
-    } else if (sub === "note") {
-        if (!callOpts.note && rest.length >= 2) {
-            callOpts.note = rest[rest.length - 1];
-            callOpts.patterns = rest.slice(0, -1);
-        } else {
-            callOpts.patterns = rest;
-        }
-    } else if (sub === "cluster") {
-        const cAct = (rest[0] || "list").toLowerCase();
-        callOpts.clusterAction = cAct;
-        if (cAct === "list") {
-            callOpts.clusterName = null;
-        } else if (cAct === "move") {
-            if (!callOpts.to && rest.length >= 3) {
-                callOpts.clusterName = rest[1];
-                callOpts.patterns = rest.slice(2);
-            } else {
-                callOpts.patterns = rest.slice(1);
-            }
-        } else if (cAct === "merge") {
-            callOpts.clusterName = rest[1];
-            callOpts.targetCluster = rest[2];
-            callOpts.patterns = rest.slice(2);
-        } else if (cAct === "export") {
-            callOpts.clusterName = rest[1];
-            if (rest[2]) callOpts.exportFormat = rest[2];
-        } else if (cAct === "import") {
-            callOpts.importFile = rest[1] || callOpts.file || callOpts.import;
-            callOpts.clusterName = rest[1];
-        } else {
-            callOpts.clusterName = rest[1];
-            callOpts.patterns = rest.slice(2);
-        }
-    } else if (sub === "policy") {
+    if (PLAN_PATTERN_SUBCOMMANDS.has(sub)) { callOpts.patterns = rest; return; }
+    if (sub === "promote" || sub === "reorder") { assignPositionTailArgs(rest, callOpts, sub === "reorder"); return; }
+    if (sub === "describe" || sub === "note") { assignTextTailField(rest, callOpts, sub === "describe" ? "description" : "note"); return; }
+    if (sub === "cluster") { parseClusterPlanSubargs(rest, callOpts); return; }
+    if (sub === "policy") {
         callOpts.policyAction = (rest[0] || "list").toLowerCase();
         if (rest.length > 1) callOpts.rule = rest.slice(1).join(" ");
     } else if (sub === "scan-gate" || sub === "scangate") {
         if (rest[0] === "reset" || callOpts.resetGate) callOpts.reset = true;
         if (rest[0] === "skip" || callOpts.skipGate) callOpts.skip = true;
     } else if (sub === "triage") {
-        if (rest[0] && !callOpts.stagePrompt && !callOpts["stage-prompt"]) {
-            callOpts.stagePrompt = rest[0];
-        }
+        if (rest[0] && !callOpts.stagePrompt && !callOpts["stage-prompt"]) callOpts.stagePrompt = rest[0];
     } else if (sub === "focus") {
         callOpts.clusterName = rest[0] || null;
     } else if (sub === "commit-log") {
         callOpts.commitAction = rest[0] || "status";
     }
+}
+
+const ZONE_CLI_SUBACTIONS = new Set(["set", "clear"]);
+const CONFIG_CLI_SUBACTIONS = new Set(["set", "unset"]);
+
+function applySubActionCliArgs(callOpts, args, validSub, secondField, thirdField, fallbackSecond = undefined, joinThird = false) {
+    callOpts.subAction = validSub.has(args[0]) ? args[0] : "show";
+    callOpts[secondField] = fallbackSecond !== undefined ? (args[1] || fallbackSecond) : args[1];
+    if (args[0] === "set") {
+        callOpts[thirdField] = joinThird ? args.slice(2).join(" ") : args[2];
+    }
+}
+
+function parseActionSpecificCliArgs(action, args, dir, opts, callOpts) {
+    if (["scan", "next", "backlog", "status", "tree", "viz"].includes(action)) {
+        return args.length > 0 && isDirArg(args[0], dir) ? applyTargetCandidate(args.shift(), dir, callOpts) : dir;
+    }
+    if (action === "show" || action === "resolve") { callOpts.patterns = args; }
+    else if (action === "suppress") { callOpts.pattern = args[0]; callOpts.patterns = args; }
+    else if (action === "detect") {
+        callOpts.detector = args[0] || opts.detector || "all";
+        if (args[1] && isDirArg(args[1], dir)) return applyTargetCandidate(args[1], dir, callOpts);
+    } else if (action === "exclude") { callOpts.target = args[0] || opts.target; }
+    else if (action === "autofix") { callOpts.fixer = args[0] || "all"; }
+    else if (action === "move") { callOpts.src = args[0]; callOpts.dst = args[1]; }
+    else if (action === "zone") {
+        applySubActionCliArgs(callOpts, args, ZONE_CLI_SUBACTIONS, "target", "zone", opts.target);
+    } else if (action === "config" || action === "directives") {
+        const isConfig = action === "config";
+        applySubActionCliArgs(callOpts, args, CONFIG_CLI_SUBACTIONS, isConfig ? "key" : "phase", isConfig ? "value" : "message", undefined, true);
+    } else if (action === "plan") { parsePlanCliSubargs(args, callOpts); }
+    else if (action === "review") {
+        if (opts.import) callOpts.importFile = opts.import;
+        if (opts.merge && typeof opts.merge === "string") callOpts.mergeDir = opts.merge;
+    }
+    return dir;
 }
 
 function parseHealthCliArgs(defaultDir, positionalArgs, opts) {
@@ -174,52 +214,11 @@ function parseHealthCliArgs(defaultDir, positionalArgs, opts) {
         dir = applyTargetCandidate(opts.path, dir, callOpts);
     }
 
-    if (opts.detailText !== undefined && callOpts.detail === undefined) {
-        callOpts.detail = opts.detailText;
-    } else if (opts.detailText !== undefined && action === "plan") {
+    if (opts.detailText !== undefined && (callOpts.detail === undefined || action === "plan")) {
         callOpts.detail = opts.detailText;
     }
 
-    if (["scan", "next", "backlog", "status", "tree", "viz"].includes(action)) {
-        if (args.length > 0 && isDirArg(args[0], dir)) {
-            dir = applyTargetCandidate(args.shift(), dir, callOpts);
-        }
-    } else if (action === "show" || action === "resolve") {
-        callOpts.patterns = args;
-    } else if (action === "suppress") {
-        callOpts.pattern = args[0];
-        callOpts.patterns = args;
-    } else if (action === "detect") {
-        callOpts.detector = args[0] || opts.detector || "all";
-        if (args[1] && isDirArg(args[1], dir)) {
-            dir = applyTargetCandidate(args[1], dir, callOpts);
-        }
-    } else if (action === "exclude") {
-        callOpts.target = args[0] || opts.target;
-    } else if (action === "autofix") {
-        callOpts.fixer = args[0] || "all";
-    } else if (action === "move") {
-        callOpts.src = args[0];
-        callOpts.dst = args[1];
-    } else if (action === "zone") {
-        callOpts.subAction = args[0] === "set" || args[0] === "clear" ? args[0] : "show";
-        callOpts.target = args[1] || opts.target;
-        if (args[0] === "set") callOpts.zone = args[2];
-    } else if (action === "config") {
-        callOpts.subAction = args[0] === "set" || args[0] === "unset" ? args[0] : "show";
-        callOpts.key = args[1];
-        if (args[0] === "set") callOpts.value = args.slice(2).join(" ");
-    } else if (action === "directives") {
-        callOpts.subAction = args[0] === "set" || args[0] === "unset" ? args[0] : "show";
-        callOpts.phase = args[1];
-        if (args[0] === "set") callOpts.message = args.slice(2).join(" ");
-    } else if (action === "plan") {
-        parsePlanCliSubargs(args, callOpts);
-    } else if (action === "review") {
-        if (opts.import) callOpts.importFile = opts.import;
-        if (opts.merge && typeof opts.merge === "string") callOpts.mergeDir = opts.merge;
-    }
-
+    dir = parseActionSpecificCliArgs(action, args, dir, opts, callOpts);
     return { action, dir, callOpts };
 }
 
@@ -290,85 +289,64 @@ function printCommitLogResult(result) {
     return true;
 }
 
+const PLAN_STATUS_PRINTERS = {
+    plan_resolve: (r) => {
+        if (r.status === "scan_gate_blocked" || r.status === "not_found") return r.message;
+        console.log(`✓ Resolved ${r.resolved_ids.length} finding(s): ${r.resolved_ids.join(", ")}`);
+        if (r.suggested_commit) console.log(`  Suggested commit: ${r.suggested_commit}`);
+        return null;
+    },
+    plan_skip: (r) => {
+        if (r.status === "attestation_invalid" || r.status === "not_found" || r.status === "confirm_required") {
+            return r.message || r.error;
+        }
+        console.log(`✓ Marked ${r.skipped_ids.length} finding(s) as ${r.status}: ${r.skipped_ids.join(", ")}`);
+        return null;
+    },
+    plan_unskip: (r) => {
+        if (r.status === "not_found") return r.message;
+        console.log(`✓ Unskipped ${r.unskipped_ids.length} finding(s): ${r.unskipped_ids.join(", ")}`);
+        return null;
+    },
+    plan_reopen: (r) => {
+        if (r.status === "not_found") return r.message;
+        console.log(`✓ Reopened ${(r.reopened_ids || []).length} finding(s): ${(r.reopened_ids || []).join(", ")}`);
+        return null;
+    },
+    plan_reset: () => { console.log("✓ Living plan reset."); return null; },
+    plan_promote: (r) => { console.log(`✓ Promoted ${(r.promoted_ids || []).length} finding(s) into active queue.`); return null; },
+    plan_backlog: (r) => { console.log(`✓ Demoted ${(r.demoted_ids || []).length} finding(s) to backlog.`); return null; },
+    plan_describe: (r) => {
+        if (!r.ok) return r.error || r.message;
+        console.log(`✓ Annotated ${(r.updated_ids || []).length} finding(s).`);
+        return null;
+    },
+    plan_note: (r) => PLAN_STATUS_PRINTERS.plan_describe(r),
+    plan_policy: (r) => {
+        if (!r.ok) return r.error;
+        console.log(`✓ Policy (${r.sub_action}): ${(r.policies || []).length} active policy rule(s).`);
+        return null;
+    },
+    plan_scan_gate: (r) => {
+        if (!r.ok) return r.error;
+        console.log(`✓ Scan gate status: ${r.status}`);
+        return null;
+    },
+    plan_repair_state: (r) => {
+        console.log(`✓ Repaired state from plan (${(r.repaired_ids || []).length} issue(s) synced).`);
+        return null;
+    },
+};
+
 function printPlanSubcommandResult(action, result) {
-    if (action === "resolve" || result.action === "plan_resolve") {
-        if (result.status === "scan_gate_blocked" || result.status === "not_found") {
-            console.error(`✗ ${result.message}`);
+    const key = action === "resolve" ? "plan_resolve" : result.action;
+    const printer = PLAN_STATUS_PRINTERS[key];
+    if (printer) {
+        const errMsg = printer(result);
+        if (errMsg) {
+            console.error(`✗ ${errMsg}`);
             process.exitCode = 1;
-            return true;
         }
-        console.log(`✓ Resolved ${result.resolved_ids.length} finding(s): ${result.resolved_ids.join(", ")}`);
-        if (result.suggested_commit) console.log(`  Suggested commit: ${result.suggested_commit}`);
-        return true;
-    }
-    if (result.action === "plan_skip") {
-        if (result.status === "attestation_invalid" || result.status === "not_found" || result.status === "confirm_required") {
-            console.error(`✗ ${result.message || result.error}`);
-            process.exitCode = 1;
-            return true;
-        }
-        console.log(`✓ Marked ${result.skipped_ids.length} finding(s) as ${result.status}: ${result.skipped_ids.join(", ")}`);
-        return true;
-    }
-    if (result.action === "plan_unskip") {
-        if (result.status === "not_found") {
-            console.error(`✗ ${result.message}`);
-            process.exitCode = 1;
-            return true;
-        }
-        console.log(`✓ Unskipped ${result.unskipped_ids.length} finding(s): ${result.unskipped_ids.join(", ")}`);
-        return true;
-    }
-    if (result.action === "plan_reopen") {
-        if (result.status === "not_found") {
-            console.error(`✗ ${result.message}`);
-            process.exitCode = 1;
-            return true;
-        }
-        console.log(`✓ Reopened ${(result.reopened_ids || []).length} finding(s): ${(result.reopened_ids || []).join(", ")}`);
-        return true;
-    }
-    if (result.action === "plan_reset") {
-        console.log("✓ Living plan reset.");
-        return true;
-    }
-    if (result.action === "plan_promote") {
-        console.log(`✓ Promoted ${(result.promoted_ids || []).length} finding(s) into active queue.`);
-        return true;
-    }
-    if (result.action === "plan_backlog") {
-        console.log(`✓ Demoted ${(result.demoted_ids || []).length} finding(s) to backlog.`);
-        return true;
-    }
-    if (result.action === "plan_describe" || result.action === "plan_note") {
-        if (!result.ok) {
-            console.error(`✗ ${result.error || result.message}`);
-            process.exitCode = 1;
-            return true;
-        }
-        console.log(`✓ Annotated ${(result.updated_ids || []).length} finding(s).`);
-        return true;
-    }
-    if (result.action === "plan_policy") {
-        if (!result.ok) {
-            console.error(`✗ ${result.error}`);
-            process.exitCode = 1;
-            return true;
-        }
-        console.log(`✓ Policy (${result.sub_action}): ${(result.policies || []).length} active policy rule(s).`);
-        return true;
-    }
-    if (result.action === "plan_scan_gate") {
-        if (!result.ok) {
-            console.error(`✗ ${result.error}`);
-            process.exitCode = 1;
-            return true;
-        }
-        console.log(`✓ Scan gate status: ${result.status}`);
-        return true;
-    }
-    if (result.action === "plan_repair_state") {
-        console.log(`✓ Repaired state from plan (${(result.repaired_ids || []).length} issue(s) synced).`);
         return true;
     }
     if (result.action === "plan_triage" && result.prompt) {
@@ -435,7 +413,7 @@ function printHealthMutationResult(action, result) {
 export async function runHealthCommand(defaultDir, positionalArgs = [], opts = {}) {
     const { action, dir, callOpts } = parseHealthCliArgs(defaultDir, positionalArgs, opts);
     const result =
-        callOpts.runStages || callOpts.runBatches
+        callOpts.runStages || callOpts.runBatches || action === "autofix" || action === "move"
             ? await healthAsync(dir, callOpts)
             : await health(dir, callOpts);
     const format = opts.format || (opts.json ? "json" : opts.markdown ? "markdown" : "text");
@@ -472,7 +450,7 @@ export async function runHealthCommand(defaultDir, positionalArgs = [], opts = {
             return result;
         }
         console.log(
-            `✓ Suppressed pattern "${result.pattern}" (${result.suppressed_ids.length} issue(s) marked wontfix/suppressed). Strict score: ${result.scores.strict}%`,
+            `✓ Suppressed pattern "${result.pattern}" (${result.suppressed_ids.length} issue(s) marked ${result.kind || "wontfix"}/suppressed). Strict score: ${result.scores.strict}%`,
         );
         return result;
     }

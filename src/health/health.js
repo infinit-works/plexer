@@ -7,7 +7,7 @@ import { analyzeGitHistory } from "../blast/history.js";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached } from "../context/graph-store.js";
 import { fileReader } from "../util/span.js";
-import { moveFileOrDir, runAutofix } from "./autofix.js";
+import { moveFileOrDir, runAutofix, warmAutofixGrammars } from "./autofix.js";
 import { generateConcerns } from "./concerns.js";
 import {
     ALL_CATEGORIES,
@@ -163,19 +163,7 @@ function scaleScopedPotentials(graph, zoneMap, fileFilter, potentials) {
 /**
  * Run all enabled mechanical detectors over `graph` and `rootDir`.
  */
-export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
-    const enabledCategories = parseCategorySet(opts.only, opts.skip);
-    const zoneMap = buildZoneMap(graph, config, rootDir);
-    const suppressionLedger = opts.suppressionLedger || createSuppressionLedger();
-    const ignoreRules = loadIgnoreRules(rootDir, config?.excludes || [], suppressionLedger);
-    const readLines = createTrackedLineReader(rootDir, suppressionLedger);
-    const gitHistory =
-        config?.gitHistory ||
-        (rootDir ? analyzeGitHistory(rootDir, opts.contextDir || null) : null);
-    if (config && gitHistory && !config.gitHistory) {
-        config.gitHistory = gitHistory;
-    }
-
+function buildMechanicalScopeFilter(rootDir, opts) {
     const rawIn = opts.in || (opts.scanPath && opts.scanPath !== "." ? opts.scanPath : null);
     const inPrefixes = rawIn
         ? (Array.isArray(rawIn) ? rawIn : [rawIn]).map((p) =>
@@ -210,6 +198,39 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
               }
             : null;
 
+    return { inPrefixes, diffFileSet, detectorFilter, fileFilter };
+}
+
+function issueMatchesMechanicalScope(iss, { detectorFilter, inPrefixes, diffFileSet }) {
+    if (detectorFilter?.size > 0) {
+        if (!detectorFilter.has(iss.detector.toLowerCase()) && !detectorFilter.has((iss.category || "").toLowerCase())) {
+            return false;
+        }
+    }
+    if (inPrefixes?.length > 0) {
+        const f = (iss.file || "").replace(/\\/g, "/");
+        if (!inPrefixes.some((p) => f === p || f.startsWith(`${p}/`))) return false;
+    }
+    if (diffFileSet && !diffFileSet.has(iss.file) && !(iss.partner_file && diffFileSet.has(iss.partner_file))) {
+        return false;
+    }
+    return true;
+}
+
+export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
+    const enabledCategories = parseCategorySet(opts.only, opts.skip);
+    const zoneMap = buildZoneMap(graph, config, rootDir);
+    const suppressionLedger = opts.suppressionLedger || createSuppressionLedger();
+    const ignoreRules = loadIgnoreRules(rootDir, config?.excludes || [], suppressionLedger);
+    const readLines = createTrackedLineReader(rootDir, suppressionLedger);
+    const gitHistory =
+        config?.gitHistory ||
+        (rootDir ? analyzeGitHistory(rootDir, opts.contextDir || null) : null);
+    if (config && gitHistory && !config.gitHistory) {
+        config.gitHistory = gitHistory;
+    }
+
+    const scope = buildMechanicalScopeFilter(rootDir, opts);
     const allIssues = [];
     const potentials = {};
 
@@ -223,43 +244,27 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
         rootDir,
         contextDir: opts.contextDir || null,
         plan: opts.plan || null,
-        fileFilter,
+        fileFilter: scope.fileFilter,
     });
     allIssues.push(...graphRes.issues);
     Object.assign(potentials, graphRes.potentials);
 
-    if (fileFilter) scaleScopedPotentials(graph, zoneMap, fileFilter, potentials);
+    if (scope.fileFilter) scaleScopedPotentials(graph, zoneMap, scope.fileFilter, potentials);
 
-    const srcRes = runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, fileFilter);
+    const srcRes = runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, scope.fileFilter);
     allIssues.push(...srcRes.issues);
     Object.assign(potentials, srcRes.potentials);
 
-    const filteredIssues = allIssues.filter((iss) => {
-        if (detectorFilter && detectorFilter.size > 0) {
-            if (!detectorFilter.has(iss.detector.toLowerCase()) && !detectorFilter.has((iss.category || "").toLowerCase())) {
-                return false;
-            }
-        }
-        if (inPrefixes && inPrefixes.length > 0) {
-            const f = (iss.file || "").replace(/\\/g, "/");
-            if (!inPrefixes.some((p) => f === p || f.startsWith(`${p}/`))) return false;
-        }
-        if (diffFileSet && !diffFileSet.has(iss.file) && !(iss.partner_file && diffFileSet.has(iss.partner_file))) {
-            return false;
-        }
-        return true;
-    });
-
     return {
-        issues: filteredIssues,
+        issues: allIssues.filter((iss) => issueMatchesMechanicalScope(iss, scope)),
         potentials,
         zoneMap,
         ignoreRules,
         readLines,
         suppressionLedger,
         scannedCategories: enabledCategories,
-        scannedDetectors: detectorFilter,
-        fileFilter,
+        scannedDetectors: scope.detectorFilter,
+        fileFilter: scope.fileFilter,
     };
 }
 
@@ -270,105 +275,109 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
  * `"viz"`, `"detect"`, `"zone"`, `"exclude"`, `"directives"`, `"config"`, `"prompt"`) and
  * one-shot queries (`opts.diff`, `opts.in`, `opts.only`).
  */
+function parseHealthConfigValue(key, rawValue) {
+    if (key === "layers" && typeof rawValue === "string") {
+        return rawValue.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    if (rawValue === "true") return true;
+    if (rawValue === "false") return false;
+    if (typeof rawValue === "string" && rawValue.trim() !== "" && !Number.isNaN(Number(rawValue))) {
+        return Number(rawValue);
+    }
+    return rawValue;
+}
+
+function handleConfigSubAction(contextDir, config, opts) {
+    const sub = (opts.subAction || "show").toLowerCase();
+    if (sub === "set" && opts.key) {
+        config[opts.key] = parseHealthConfigValue(opts.key, opts.value);
+        saveHealthConfig(contextDir, config);
+    } else if (sub === "unset" && opts.key) {
+        const defaults = emptyHealthConfig();
+        if (Object.prototype.hasOwnProperty.call(defaults, opts.key)) config[opts.key] = defaults[opts.key];
+        else delete config[opts.key];
+        saveHealthConfig(contextDir, config);
+    }
+    return { action: "config", sub_action: sub, key: opts.key || null, config };
+}
+
+function handleExcludeSubAction(contextDir, config, state, plan, opts) {
+    const target = String(opts.target || "").trim();
+    let pruneRes = { removed_ids: [], purged_plan_count: 0 };
+    if (target) {
+        if (!config.excludes.includes(target)) config.excludes.push(target);
+        config.needs_rescan = true;
+        saveHealthConfig(contextDir, config);
+        pruneRes = pruneExcludedIssues(state, plan, target);
+        if (pruneRes.removed_ids.length > 0) {
+            saveHealthState(contextDir, state);
+            saveLivingPlan(contextDir, plan);
+        }
+    }
+    return {
+        action: "exclude",
+        excluded: target,
+        excludes: config.excludes,
+        removed_count: pruneRes.removed_ids.length,
+        removed_ids: pruneRes.removed_ids,
+        purged_plan_count: pruneRes.purged_plan_count,
+    };
+}
+
+function handleDirectivesSubAction(contextDir, config, opts) {
+    const sub = (opts.subAction || "show").toLowerCase();
+    if (sub === "set" && opts.phase && opts.message) {
+        config.directives[opts.phase] = opts.message;
+        saveHealthConfig(contextDir, config);
+    } else if (sub === "unset" && opts.phase) {
+        delete config.directives[opts.phase];
+        saveHealthConfig(contextDir, config);
+    }
+    return { action: "directives", available_phases: AVAILABLE_DIRECTIVE_PHASES, directives: config.directives };
+}
+
 function handleHealthConfigAction(action, contextDir, config, state, plan, opts) {
-    if (action === "config") {
-        const sub = (opts.subAction || "show").toLowerCase();
-        if (sub === "set" && opts.key) {
-            let val = opts.value;
-            if (opts.key === "layers" && typeof val === "string") {
-                val = val
-                    .split(",")
-                    .map((s) => s.trim())
-                    .filter(Boolean);
-            } else if (val === "true") val = true;
-            else if (val === "false") val = false;
-            else if (typeof val === "string" && val.trim() !== "" && !Number.isNaN(Number(val))) val = Number(val);
-            config[opts.key] = val;
-            saveHealthConfig(contextDir, config);
-        } else if (sub === "unset" && opts.key) {
-            const defaults = emptyHealthConfig();
-            if (Object.prototype.hasOwnProperty.call(defaults, opts.key)) {
-                config[opts.key] = defaults[opts.key];
-            } else {
-                delete config[opts.key];
-            }
-            saveHealthConfig(contextDir, config);
-        }
-        return { action: "config", sub_action: sub, key: opts.key || null, config };
-    }
-
-    if (action === "exclude") {
-        const target = String(opts.target || "").trim();
-        let pruneRes = { removed_ids: [], purged_plan_count: 0 };
-        if (target) {
-            if (!config.excludes.includes(target)) config.excludes.push(target);
-            config.needs_rescan = true;
-            saveHealthConfig(contextDir, config);
-            pruneRes = pruneExcludedIssues(state, plan, target);
-            if (pruneRes.removed_ids.length > 0) {
-                saveHealthState(contextDir, state);
-                saveLivingPlan(contextDir, plan);
-            }
-        }
-        return {
-            action: "exclude",
-            excluded: target,
-            excludes: config.excludes,
-            removed_count: pruneRes.removed_ids.length,
-            removed_ids: pruneRes.removed_ids,
-            purged_plan_count: pruneRes.purged_plan_count,
-        };
-    }
-
-    if (action === "directives") {
-        const sub = (opts.subAction || "show").toLowerCase();
-        if (sub === "set" && opts.phase && opts.message) {
-            config.directives[opts.phase] = opts.message;
-            saveHealthConfig(contextDir, config);
-        } else if (sub === "unset" && opts.phase) {
-            delete config.directives[opts.phase];
-            saveHealthConfig(contextDir, config);
-        }
-        return {
-            action: "directives",
-            available_phases: AVAILABLE_DIRECTIVE_PHASES,
-            directives: config.directives,
-        };
-    }
+    if (action === "config") return handleConfigSubAction(contextDir, config, opts);
+    if (action === "exclude") return handleExcludeSubAction(contextDir, config, state, plan, opts);
+    if (action === "directives") return handleDirectivesSubAction(contextDir, config, opts);
     return null;
 }
 
-function handleHealthZoneAction(contextDir, graph, config, state, opts) {
+function handleHealthZoneAction(contextDir, rootDir, graph, config, state, opts) {
     const sub = (opts.subAction || "show").toLowerCase();
     let restampedCount = 0;
+    const matchesTargetPath = (filePath, cleanTarget) =>
+        Boolean(filePath && (filePath === cleanTarget || filePath.startsWith(`${cleanTarget}/`)));
+
     if (sub === "set" && opts.target && opts.zone) {
         if (!VALID_ZONES.has(opts.zone)) {
             throw new Error(`Invalid zone "${opts.zone}" — must be one of: ${[...VALID_ZONES].join(", ")}`);
         }
-        const normTarget = opts.target.replace(/\\/g, "/");
-        config.zones[normTarget] = opts.zone;
+        const cleanTarget = opts.target.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+        config.zones[cleanTarget] = opts.zone;
         saveHealthConfig(contextDir, config);
         for (const iss of Object.values(state.issues || {})) {
-            if (iss.file === normTarget) {
+            if (matchesTargetPath(iss.file, cleanTarget)) {
                 iss.zone = opts.zone;
                 restampedCount += 1;
             }
         }
         if (restampedCount > 0) saveHealthState(contextDir, state);
     } else if (sub === "clear" && opts.target) {
-        const normTarget = opts.target.replace(/\\/g, "/");
+        const normTarget = opts.target.replace(/\\/g, "/").replace(/^\.\//, "");
+        const cleanTarget = normTarget.replace(/\/+$/, "");
         delete config.zones[normTarget];
+        delete config.zones[cleanTarget];
         saveHealthConfig(contextDir, config);
-        const fallbackZone = classifyZone(normTarget, config.zones);
         for (const iss of Object.values(state.issues || {})) {
-            if (iss.file === normTarget) {
-                iss.zone = fallbackZone;
+            if (matchesTargetPath(iss.file, cleanTarget)) {
+                iss.zone = classifyZone(iss.file, config.zones, rootDir);
                 restampedCount += 1;
             }
         }
         if (restampedCount > 0) saveHealthState(contextDir, state);
     }
-    const updatedZoneMap = buildZoneMap(graph, config);
+    const updatedZoneMap = buildZoneMap(graph, config, rootDir);
     const counts = {};
     const filesByZone = {};
     for (const [f, z] of updatedZoneMap.entries()) {
@@ -546,7 +555,7 @@ function handleHealthPlanAction(root, contextDir, state, plan, config, totalProd
             opts.clusterAction || "list",
             opts.clusterName,
             opts.patterns || [],
-            opts,
+            { ...opts, rootDir: root },
         );
         saveLivingPlan(contextDir, plan);
         return { action: "plan_cluster", ...cRes };
@@ -584,6 +593,69 @@ function handleHealthPlanAction(root, contextDir, state, plan, config, totalProd
     return { action: "plan", plan, queue, scores: computeScoreSnapshot(state) };
 }
 
+function buildShowDimensionResponse(state, firstPat, lowerPat, opts) {
+    const normDimKey = firstPat ? normalizeDimensionKey(firstPat) : "";
+    const isMechDim = Boolean(firstPat && MECHANICAL_DIMENSIONS[lowerPat]);
+    const isSubjDim = Boolean(normDimKey && SUBJECTIVE_DIMENSIONS[normDimKey]);
+    if (!isMechDim && !isSubjDim) return null;
+    const scores = computeScoreSnapshot(state);
+    const dimId = isMechDim ? lowerPat : normDimKey;
+    const dimScoreObj = isMechDim ? scores.mechanical_dimensions[dimId] : scores.subjective_dimensions[dimId];
+    const detSet = isMechDim ? new Set(MECHANICAL_DIMENSIONS[dimId].detectors) : new Set(["review"]);
+    const dimIssues = Object.values(state.issues || {}).filter((iss) => {
+        if (opts.status && iss.status !== opts.status.toLowerCase()) return false;
+        if (isMechDim) return iss.detector !== "review" && (iss.dimension ? iss.dimension === dimId : detSet.has(iss.detector));
+        return iss.detector === "review" && normalizeDimensionKey(iss.dimension) === dimId;
+    });
+    return {
+        action: "show",
+        view: "dimension",
+        dimension: dimScoreObj,
+        context: state.dimension_contexts?.[dimId] || null,
+        count: dimIssues.length,
+        items: dimIssues,
+    };
+}
+
+function filterChronicShowItems(state, items) {
+    const hasAnyReopenCount = Object.values(state.issues || {}).some((i) => (i.reopen_count || 0) > 0);
+    return items.filter((iss) =>
+        hasAnyReopenCount
+            ? (iss.reopen_count || 0) >= 2
+            : (iss.reopen_count || 0) >= 2 ||
+              Number(iss.last_seen_scan || 1) - Number(iss.first_seen_scan || 1) >= 1,
+    );
+}
+
+function applyShowNoiseBudget(items, config, opts) {
+    if (opts.noBudget) return items;
+    const perDetBudget = Number(config?.issue_noise_budget ?? 10);
+    const globalBudget = Number(config?.issue_noise_global_budget ?? 0);
+    let budgeted = items;
+    if (perDetBudget > 0) {
+        const detCounts = new Map();
+        budgeted = budgeted.filter((iss) => {
+            const c = detCounts.get(iss.detector) || 0;
+            if (c >= perDetBudget) return false;
+            detCounts.set(iss.detector, c + 1);
+            return true;
+        });
+    }
+    return globalBudget > 0 && budgeted.length > globalBudget ? budgeted.slice(0, globalBudget) : budgeted;
+}
+
+function enrichShowItemsWithCode(items, readLines) {
+    return items.map((iss) => {
+        const fLines = iss.file ? readLines(iss.file) : null;
+        if (!fLines || fLines.length === 0) return iss;
+        const sLine = Math.max(1, (iss.line || 1) - 1);
+        const eLine = Math.min(fLines.length, (iss.end_line || iss.line || 1) + 2);
+        const excerpt = [];
+        for (let ln = sLine; ln <= eLine; ln++) excerpt.push(`L${ln}: ${fLines[ln - 1]}`);
+        return { ...iss, code_excerpt: excerpt.join("\n") };
+    });
+}
+
 function handleHealthShowAction(graph, state, config, zoneMap, readLines, opts) {
     const firstPat = opts.patterns && opts.patterns.length === 1 ? String(opts.patterns[0]).trim() : "";
     const lowerPat = firstPat.toLowerCase();
@@ -599,28 +671,8 @@ function handleHealthShowAction(graph, state, config, zoneMap, readLines, opts) 
         };
     }
 
-    const normDimKey = firstPat ? normalizeDimensionKey(firstPat) : "";
-    const isMechDim = Boolean(firstPat && MECHANICAL_DIMENSIONS[lowerPat]);
-    const isSubjDim = Boolean(normDimKey && SUBJECTIVE_DIMENSIONS[normDimKey]);
-    if (isMechDim || isSubjDim) {
-        const scores = computeScoreSnapshot(state);
-        const dimId = isMechDim ? lowerPat : normDimKey;
-        const dimScoreObj = isMechDim ? scores.mechanical_dimensions[dimId] : scores.subjective_dimensions[dimId];
-        const detSet = isMechDim ? new Set(MECHANICAL_DIMENSIONS[dimId].detectors) : new Set(["review"]);
-        const dimIssues = Object.values(state.issues || {}).filter((iss) => {
-            if (opts.status && iss.status !== opts.status.toLowerCase()) return false;
-            if (isMechDim) return iss.detector !== "review" && (iss.dimension ? iss.dimension === dimId : detSet.has(iss.detector));
-            return iss.detector === "review" && normalizeDimensionKey(iss.dimension) === dimId;
-        });
-        return {
-            action: "show",
-            view: "dimension",
-            dimension: dimScoreObj,
-            context: state.dimension_contexts?.[dimId] || null,
-            count: dimIssues.length,
-            items: dimIssues,
-        };
-    }
+    const dimResp = buildShowDimensionResponse(state, firstPat, lowerPat, opts);
+    if (dimResp) return dimResp;
 
     const statusFilter = opts.status ? new Set([opts.status.toLowerCase()]) : null;
     const ids =
@@ -628,49 +680,13 @@ function handleHealthShowAction(graph, state, config, zoneMap, readLines, opts) 
             ? matchIssueIds(state, opts.patterns, statusFilter)
             : Object.keys(state.issues || {}).filter((id) => !statusFilter || statusFilter.has(state.issues[id].status));
     let items = ids.map((id) => state.issues[id]).filter(Boolean);
-    if (opts.chronic) {
-        const hasAnyReopenCount = Object.values(state.issues || {}).some(
-            (i) => (i.reopen_count || 0) > 0,
-        );
-        items = items.filter((iss) =>
-            hasAnyReopenCount
-                ? (iss.reopen_count || 0) >= 2
-                : (iss.reopen_count || 0) >= 2 ||
-                  Number(iss.last_seen_scan || 1) - Number(iss.first_seen_scan || 1) >= 1,
-        );
-    }
+    if (opts.chronic) items = filterChronicShowItems(state, items);
 
     items.sort((a, b) => compareIssuesByPriority(a, b));
     const totalBeforeBudget = items.length;
-    if (!opts.noBudget) {
-        const perDetBudget = Number(config?.issue_noise_budget ?? 10);
-        const globalBudget = Number(config?.issue_noise_global_budget ?? 0);
-        if (perDetBudget > 0) {
-            const detCounts = new Map();
-            items = items.filter((iss) => {
-                const c = detCounts.get(iss.detector) || 0;
-                if (c >= perDetBudget) return false;
-                detCounts.set(iss.detector, c + 1);
-                return true;
-            });
-        }
-        if (globalBudget > 0 && items.length > globalBudget) {
-            items = items.slice(0, globalBudget);
-        }
-    }
-
+    items = applyShowNoiseBudget(items, config, opts);
     const sliced = opts.max && opts.max !== "all" ? items.slice(0, Number(opts.max)) : items;
-    const enriched = opts.code
-        ? sliced.map((iss) => {
-              const fLines = iss.file ? readLines(iss.file) : null;
-              if (!fLines || fLines.length === 0) return iss;
-              const sLine = Math.max(1, (iss.line || 1) - 1);
-              const eLine = Math.min(fLines.length, (iss.end_line || iss.line || 1) + 2);
-              const excerpt = [];
-              for (let ln = sLine; ln <= eLine; ln++) excerpt.push(`L${ln}: ${fLines[ln - 1]}`);
-              return { ...iss, code_excerpt: excerpt.join("\n") };
-          })
-        : sliced;
+    const enriched = opts.code ? enrichShowItemsWithCode(sliced, readLines) : sliced;
 
     return {
         action: "show",
@@ -1025,17 +1041,19 @@ function handleHealthToolAction(
             plan,
         });
         const scores = computeScoreSnapshot(state);
-        if (!opts.dryRun && afRes.reconciled_issue_ids?.length > 0) {
-            appendScoreHistory(state, scores, "autofix");
+        if (!opts.dryRun && (afRes.reconciled_issue_ids?.length > 0 || afRes.files_changed > 0)) {
+            if (afRes.reconciled_issue_ids?.length > 0) appendScoreHistory(state, scores, "autofix");
             saveHealthState(contextDir, state);
             saveLivingPlan(contextDir, plan);
-            if (!opts.noBadge) emitScorecardBadge(contextDir, scores, state);
+            if (afRes.reconciled_issue_ids?.length > 0 && !opts.noBadge) emitScorecardBadge(contextDir, scores, state);
         }
         return { action: "autofix", ...afRes, scores };
     }
     if (action === "move") {
         const mvRes = moveFileOrDir(root, graph, opts.src, opts.dst, {
             dryRun: opts.dryRun,
+            contextDir,
+            rebuildGraph: opts.rebuildGraph,
             state,
             plan,
         });
@@ -1043,7 +1061,11 @@ function handleHealthToolAction(
             saveHealthState(contextDir, state);
             saveLivingPlan(contextDir, plan);
         }
-        return { action: "move", ...mvRes };
+        const out = { action: "move", ...mvRes };
+        if (mvRes._rebuildPromise) {
+            Object.defineProperty(out, "_rebuildPromise", { value: mvRes._rebuildPromise, enumerable: false });
+        }
+        return out;
     }
     if (action === "detect") {
         const detName = opts.detector || (opts.patterns && opts.patterns[0]) || "all";
@@ -1103,7 +1125,7 @@ export function health(dir, opts = {}) {
     const totalProdFiles = countScoredFiles(graph, zoneMap);
     const readLines = fileReader(root);
 
-    if (action === "zone") return handleHealthZoneAction(contextDir, graph, config, state, opts);
+    if (action === "zone") return handleHealthZoneAction(contextDir, root, graph, config, state, opts);
     const toolRes = handleHealthToolAction(
         action,
         root,
@@ -1138,9 +1160,27 @@ export function health(dir, opts = {}) {
         return handleHealthQueueOrStatusAction(action, graph, root, contextDir, config, state, plan, totalProdFiles, opts);
     }
 
+    if (action === "scan" || !opts.action) {
+        const filePaths = graph.nodes.filter((n) => n.kind === "file" && n.path).map((n) => n.path);
+        void warmAutofixGrammars(filePaths).catch(() => null);
+    }
+
     return runHealthScanAction(root, contextDir, graph, config, state, plan, totalProdFiles, opts);
 }
 
 export async function healthAsync(dir, opts = {}) {
-    return await health(dir, opts);
+    const action = String(opts.action || "scan").toLowerCase();
+    if (action === "autofix") {
+        const root = resolve(dir || ".");
+        const ctxDir = contextDirFor(root, opts.contextDir);
+        const g = loadGraphCached(ctxDir);
+        if (g?.nodes) {
+            await warmAutofixGrammars(g.nodes.filter((n) => n.kind === "file" && n.path).map((n) => n.path));
+        }
+    }
+    const res = await health(dir, opts);
+    if (res?._rebuildPromise) {
+        await res._rebuildPromise;
+    }
+    return res;
 }

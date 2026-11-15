@@ -25,16 +25,51 @@ import { healthDir } from "./state.js";
 
 const MAX_REVIEW_ISSUES_FOR_SPAN = 15;
 const REVIEW_ISSUE_PENALTY_SPAN = 40.0;
+const TIER_WEIGHTS = {
+    T1: 1.5,
+    T2: 1.25,
+    T3: 1.0,
+    T4: 0.5,
+};
 
 function round(val, decimals = 2) {
     return Number(Number(val || 0).toFixed(decimals));
 }
 
+function issuePenaltyWeight(iss) {
+    const confW = CONFIDENCE_WEIGHTS[iss?.confidence] ?? 0.7;
+    const tierW = TIER_WEIGHTS[iss?.tier] ?? 1.0;
+    return confW * tierW;
+}
+
 function fileCappedFailureUnits(weightedCount) {
     if (weightedCount <= 0) return 0;
-    if (weightedCount <= 2.0) return Math.min(1.0, weightedCount * 0.5);
-    if (weightedCount <= 5.0) return 1.5;
-    return 2.0;
+    // Strictly monotone concave curve in [0, 2.0] so suppressing or fixing any single
+    // finding in multi-issue files always improves strict/overall scores.
+    if (weightedCount <= 2.0) return weightedCount * 0.5;
+    if (weightedCount <= 5.0) return 1.0 + ((weightedCount - 2.0) / 3.0) * 0.5;
+    return 1.5 + Math.min(0.5, (weightedCount - 5.0) * 0.05);
+}
+
+function effectiveDimensionPotential(dimDef, potentials) {
+    const positive = [];
+    for (const det of dimDef.detectors) {
+        const val = Number(potentials?.[det] || 0);
+        if (val > 0) positive.push(val);
+    }
+    if (positive.length === 0) return 20;
+
+    if (dimDef.fileBased) {
+        // File-based dimensions deduplicate and cap failures per file (0..2 units/file),
+        // so use the upper-median detector surface * 2 instead of summing N overlapping detectors.
+        positive.sort((a, b) => a - b);
+        const medianSurface = positive[Math.floor(positive.length * 0.5)];
+        return Math.max(20, round(medianSurface * 2.0, 2));
+    }
+
+    let sum = 0;
+    for (const val of positive) sum += val;
+    return Math.max(20, sum);
 }
 
 function countsTowardVariant(issue, variant) {
@@ -47,26 +82,16 @@ function countsTowardVariant(issue, variant) {
         return st === "open" || st === "deferred" || st === "triaged_out";
     }
     if (variant === "strict") {
+        if (st === "false_positive") return false;
         if (isMechUnverifiedFix) return true;
-        // `wontfix` and `false_positive` also count as failure in strict mode!
-        return (
-            st === "open" ||
-            st === "deferred" ||
-            st === "triaged_out" ||
-            st === "wontfix" ||
-            st === "false_positive"
-        );
+        // `wontfix` also counts as failure in strict mode; attested `false_positive` does not.
+        return st === "open" || st === "deferred" || st === "triaged_out" || st === "wontfix";
     }
     if (variant === "verified") {
+        if (st === "false_positive") return false;
         // Like strict, plus unverified `fixed` items (including review issues) count as failure until rescan confirms them!
         if (st === "fixed" && !issue.verified) return true;
-        return (
-            st === "open" ||
-            st === "deferred" ||
-            st === "triaged_out" ||
-            st === "wontfix" ||
-            st === "false_positive"
-        );
+        return st === "open" || st === "deferred" || st === "triaged_out" || st === "wontfix";
     }
     if (issue.suppressed || st === "false_positive") return false;
     return st === "open";
@@ -74,11 +99,7 @@ function countsTowardVariant(issue, variant) {
 
 function computeMechanicalDimensionScore(dimDef, allIssues, potentials, variant) {
     const detSet = new Set(dimDef.detectors);
-    let potential = 0;
-    for (const det of dimDef.detectors) {
-        potential += Number(potentials[det] || 0);
-    }
-    if (potential <= 0) potential = 20;
+    const potential = effectiveDimensionPotential(dimDef, potentials);
 
     const matchingIssues = allIssues.filter(
         (iss) =>
@@ -91,7 +112,7 @@ function computeMechanicalDimensionScore(dimDef, allIssues, potentials, variant)
     if (dimDef.fileBased) {
         const byFile = new Map();
         for (const iss of matchingIssues) {
-            const w = CONFIDENCE_WEIGHTS[iss.confidence] ?? 0.7;
+            const w = issuePenaltyWeight(iss);
             const f = iss.file || "repo";
             byFile.set(f, (byFile.get(f) || 0) + w);
         }
@@ -100,7 +121,7 @@ function computeMechanicalDimensionScore(dimDef, allIssues, potentials, variant)
         }
     } else {
         for (const iss of matchingIssues) {
-            const w = CONFIDENCE_WEIGHTS[iss.confidence] ?? 0.7;
+            const w = issuePenaltyWeight(iss);
             weightedFailures += w;
         }
     }
@@ -380,6 +401,14 @@ export function computeScoreSnapshot(state) {
     const unverifiedFixedCount = allIssues.filter(
         (i) => i.status === "fixed" && i.verified === false,
     ).length;
+    const baseIgnoreIntegrity = state?.ignore_integrity || {
+        ignored_count: 0,
+        suppressed_pct: 0,
+        ignored_by_detector: {},
+    };
+    const falsePositivePct = allIssues.length > 0 ? round((falsePositiveCount / allIssues.length) * 100, 1) : 0;
+    const falsePositiveAbuseWarning =
+        falsePositivePct > 10 && (allIssues.length >= 5 || falsePositiveCount >= 3);
     const staleDimensions = Object.values(subjDims)
         .filter((d) => d.stale)
         .map((d) => d.id);
@@ -404,10 +433,11 @@ export function computeScoreSnapshot(state) {
         wontfix_count: wontfixCount,
         false_positive_count: falsePositiveCount,
         unverified_fixed_count: unverifiedFixedCount,
-        ignore_integrity: state?.ignore_integrity || {
-            ignored_count: 0,
-            suppressed_pct: 0,
-            ignored_by_detector: {},
+        ignore_integrity: {
+            ...baseIgnoreIntegrity,
+            false_positive_count: falsePositiveCount,
+            false_positive_pct: falsePositivePct,
+            false_positive_abuse_warning: falsePositiveAbuseWarning,
         },
         has_subjective: hasSubjectiveScores,
         subjective_coverage: subjectiveCoverage,
@@ -420,68 +450,243 @@ export function computeScoreSnapshot(state) {
     };
 }
 
+function resolveMechDimensionId(iss) {
+    if (iss.dimension && MECHANICAL_DIMENSIONS[iss.dimension]) return iss.dimension;
+    for (const dimDef of Object.values(MECHANICAL_DIMENSIONS)) {
+        if (dimDef.detectors.includes(iss.detector)) return dimDef.id;
+    }
+    return "code_quality";
+}
+
+function buildMechDimImpactState(dimDef, issuesList, potentials, mechPoolFactor, lenientMechPoolFactor) {
+    const potential = effectiveDimensionPotential(dimDef, potentials);
+    const strictByFile = new Map();
+    const lenientByFile = new Map();
+    let strictRawTotal = 0;
+    let lenientRawTotal = 0;
+
+    for (const iss of issuesList) {
+        const w = issuePenaltyWeight(iss);
+        const f = iss.file || "repo";
+        if (countsTowardVariant(iss, "strict")) {
+            if (dimDef.fileBased) strictByFile.set(f, (strictByFile.get(f) || 0) + w);
+            else strictRawTotal += w;
+        }
+        if (countsTowardVariant(iss, "lenient")) {
+            if (dimDef.fileBased) lenientByFile.set(f, (lenientByFile.get(f) || 0) + w);
+            else lenientRawTotal += w;
+        }
+    }
+
+    let strictFailures = strictRawTotal;
+    let lenientFailures = lenientRawTotal;
+    if (dimDef.fileBased) {
+        strictFailures = 0;
+        for (const rw of strictByFile.values()) strictFailures += fileCappedFailureUnits(rw);
+        lenientFailures = 0;
+        for (const rw of lenientByFile.values()) lenientFailures += fileCappedFailureUnits(rw);
+    }
+
+    const dampening = Math.min(1.0, potential / SAMPLE_DAMPENING_THRESHOLD);
+    const sampleFactor = Math.max(0.25, dampening);
+    return {
+        dimDef,
+        potential,
+        effectiveWeight: dimDef.weight * sampleFactor,
+        strictFailures,
+        lenientFailures,
+        strictByFile,
+        lenientByFile,
+        strictRaw: Math.max(0, Math.min(100, ((potential - strictFailures) / potential) * 100)),
+        lenientRaw: Math.max(0, Math.min(100, ((potential - lenientFailures) / potential) * 100)),
+        poolShare: 0,
+        mechPoolFactor,
+        lenientMechPoolFactor,
+    };
+}
+
+/**
+ * Build an `O(1)` per-issue analytical score impact estimator over one pre-indexed pass of `state`.
+ */
+function bucketImpactIssuesByDim(issuesMap) {
+    const mechByDim = new Map();
+    const revByDim = new Map();
+    for (const iss of Object.values(issuesMap)) {
+        if (iss.detector === "review") {
+            const dKey = normalizeDimensionKey(iss.dimension);
+            if (!dKey) continue;
+            let list = revByDim.get(dKey);
+            if (!list) revByDim.set(dKey, (list = []));
+            list.push(iss);
+        } else {
+            const dimId = resolveMechDimensionId(iss);
+            let list = mechByDim.get(dimId);
+            if (!list) mechByDim.set(dimId, (list = []));
+            list.push(iss);
+        }
+    }
+    return { mechByDim, revByDim };
+}
+
+function buildMechDimImpactMap(baseScores, mechByDim, potentials) {
+    const effWeightFactor = baseScores.has_subjective ? 1.0 - (baseScores.effective_pool_weight || 0) : 1.0;
+    const mechDims = new Map();
+    let totalMechEffWeight = 0;
+    for (const dimDef of Object.values(MECHANICAL_DIMENSIONS)) {
+        const entry = buildMechDimImpactState(dimDef, mechByDim.get(dimDef.id) || [], potentials, effWeightFactor, effWeightFactor);
+        mechDims.set(dimDef.id, entry);
+        totalMechEffWeight += entry.effectiveWeight;
+    }
+    for (const entry of mechDims.values()) {
+        entry.poolShare = totalMechEffWeight > 0 ? entry.effectiveWeight / totalMechEffWeight : 0;
+    }
+    return mechDims;
+}
+
+function buildSubjDimImpactMap(baseScores, revByDim) {
+    const subjDims = new Map();
+    for (const [dKey, sObj] of Object.entries(baseScores.subjective_dimensions || {})) {
+        if (!sObj || sObj.assessment_score === null || sObj.assessment_score === undefined) continue;
+        let strictW = 0;
+        let lenientW = 0;
+        for (const iss of revByDim.get(dKey) || []) {
+            const w = CONFIDENCE_WEIGHTS[iss.confidence] ?? 0.7;
+            if (countsTowardVariant(iss, "strict")) strictW += w;
+            if (countsTowardVariant(iss, "lenient")) lenientW += w;
+        }
+        const rawAssessment = Number(sObj.assessment_score);
+        subjDims.set(dKey, {
+            rawAssessment,
+            strictW,
+            lenientW,
+            strictDimScore: Math.max(0, rawAssessment - calcReviewPenalty(strictW, REVIEW_ISSUE_PENALTY_SPAN)),
+            lenientDimScore: Math.max(0, rawAssessment - calcReviewPenalty(lenientW, REVIEW_ISSUE_PENALTY_SPAN * 0.5)),
+            overallPerPoint: sObj.overall_per_point || 0,
+        });
+    }
+    return subjDims;
+}
+
+function accumulateSingleIssueDelta(iss, seenIds, mechDeltas, revDeltas, mechDims, subjDims) {
+    if (!iss || seenIds.has(iss.id) || iss.status === "fixed" || iss.status === "auto_resolved") return;
+    seenIds.add(iss.id);
+    if (iss.detector === "review") {
+        const dKey = normalizeDimensionKey(iss.dimension);
+        if (!dKey || !subjDims.has(dKey)) return;
+        const w = CONFIDENCE_WEIGHTS[iss.confidence] ?? 0.7;
+        const prev = revDeltas.get(dKey) || { strictW: 0, lenientW: 0 };
+        if (countsTowardVariant(iss, "strict")) prev.strictW += w;
+        if (countsTowardVariant(iss, "lenient")) prev.lenientW += w;
+        revDeltas.set(dKey, prev);
+        return;
+    }
+    const dimId = resolveMechDimensionId(iss);
+    const mState = mechDims.get(dimId);
+    if (!mState) return;
+    const w = issuePenaltyWeight(iss);
+    let dAcc = mechDeltas.get(dimId);
+    if (!dAcc) mechDeltas.set(dimId, (dAcc = { strictByFile: new Map(), lenientByFile: new Map(), strictFlat: 0, lenientFlat: 0 }));
+    const f = iss.file || "repo";
+    if (countsTowardVariant(iss, "strict")) {
+        if (mState.dimDef.fileBased) dAcc.strictByFile.set(f, (dAcc.strictByFile.get(f) || 0) + w);
+        else dAcc.strictFlat += w;
+    }
+    if (countsTowardVariant(iss, "lenient")) {
+        if (mState.dimDef.fileBased) dAcc.lenientByFile.set(f, (dAcc.lenientByFile.get(f) || 0) + w);
+        else dAcc.lenientFlat += w;
+    }
+}
+
+function sumFileCappedRemoval(byFileDeltas, baseByFile) {
+    let removed = 0;
+    for (const [f, rw] of byFileDeltas.entries()) {
+        const baseW = baseByFile.get(f) || 0;
+        removed += fileCappedFailureUnits(baseW) - fileCappedFailureUnits(Math.max(0, baseW - rw));
+    }
+    return removed;
+}
+
+function collectTargetImpactIssues(targetIssueIdsOrDetector, issuesMap, onIssue) {
+    if (typeof targetIssueIdsOrDetector === "string") {
+        const key = targetIssueIdsOrDetector.trim();
+        if (issuesMap[key]) {
+            onIssue(issuesMap[key]);
+        } else {
+            for (const iss of Object.values(issuesMap)) {
+                if (iss.detector === key) onIssue(iss);
+            }
+        }
+    } else if (Array.isArray(targetIssueIdsOrDetector) || targetIssueIdsOrDetector instanceof Set) {
+        for (const item of targetIssueIdsOrDetector) {
+            if (typeof item === "string") onIssue(issuesMap[item]);
+            else if (item && typeof item === "object" && item.id) onIssue(issuesMap[item.id] || item);
+        }
+    }
+}
+
+function accumulateMechDeltaTotals(mechDeltas, mechDims, totals) {
+    for (const [dimId, dAcc] of mechDeltas.entries()) {
+        const m = mechDims.get(dimId);
+        const strictRemoved = m.dimDef.fileBased ? sumFileCappedRemoval(dAcc.strictByFile, m.strictByFile) : dAcc.strictFlat;
+        const lenientRemoved = m.dimDef.fileBased ? sumFileCappedRemoval(dAcc.lenientByFile, m.lenientByFile) : dAcc.lenientFlat;
+        const newStrict = Math.max(0, Math.min(100, ((m.potential - Math.max(0, m.strictFailures - strictRemoved)) / m.potential) * 100));
+        const newLenient = Math.max(0, Math.min(100, ((m.potential - Math.max(0, m.lenientFailures - lenientRemoved)) / m.potential) * 100));
+        const dS = newStrict - m.strictRaw;
+        const dL = newLenient - m.lenientRaw;
+        totals.deltaObjective += dS * m.poolShare;
+        totals.deltaStrict += dS * m.poolShare * m.mechPoolFactor;
+        totals.deltaOverall += dL * m.poolShare * m.lenientMechPoolFactor;
+    }
+}
+
+function accumulateSubjDeltaTotals(revDeltas, subjDims, totals) {
+    for (const [dKey, rAcc] of revDeltas.entries()) {
+        const s = subjDims.get(dKey);
+        if (!s) continue;
+        const newStrict = Math.max(0, s.rawAssessment - calcReviewPenalty(Math.max(0, s.strictW - rAcc.strictW), REVIEW_ISSUE_PENALTY_SPAN));
+        const newLenient = Math.max(0, s.rawAssessment - calcReviewPenalty(Math.max(0, s.lenientW - rAcc.lenientW), REVIEW_ISSUE_PENALTY_SPAN * 0.5));
+        totals.deltaStrict += (newStrict - s.strictDimScore) * s.overallPerPoint;
+        totals.deltaOverall += (newLenient - s.lenientDimScore) * s.overallPerPoint;
+    }
+}
+
+export function createFastScoreImpactEstimator(state, baselineScores = null) {
+    if (!state || !state.issues) {
+        return { estimateForIds: () => ({ deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 }) };
+    }
+    const baseScores = baselineScores || computeScoreSnapshot(state);
+    const issuesMap = state.issues;
+    const { mechByDim, revByDim } = bucketImpactIssuesByDim(issuesMap);
+    const mechDims = buildMechDimImpactMap(baseScores, mechByDim, state.potentials || {});
+    const subjDims = buildSubjDimImpactMap(baseScores, revByDim);
+
+    const estimateForIds = (targetIssueIdsOrDetector) => {
+        const seenIds = new Set();
+        const mechDeltas = new Map();
+        const revDeltas = new Map();
+        collectTargetImpactIssues(targetIssueIdsOrDetector, issuesMap, (iss) =>
+            accumulateSingleIssueDelta(iss, seenIds, mechDeltas, revDeltas, mechDims, subjDims),
+        );
+        if (seenIds.size === 0) return { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
+        const totals = { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
+        accumulateMechDeltaTotals(mechDeltas, mechDims, totals);
+        accumulateSubjDeltaTotals(revDeltas, subjDims, totals);
+        return {
+            deltaStrict: round(totals.deltaStrict, 2),
+            deltaOverall: round(totals.deltaOverall, 2),
+            deltaObjective: round(totals.deltaObjective, 2),
+        };
+    };
+
+    return { estimateForIds };
+}
+
 /**
  * Simulate marking the given open issue IDs (Array/Set) or detector name as `fixed`
  * and compute `{ deltaStrict, deltaOverall, deltaObjective }`.
  */
 export function computeScoreImpact(state, targetIssueIdsOrDetector, baselineScores = null) {
-    if (!state || !state.issues) {
-        return { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
-    }
-    const oldScores = baselineScores || computeScoreSnapshot(state);
-    const issuesMap = state.issues;
-    const targetIds = new Set();
-
-    if (typeof targetIssueIdsOrDetector === "string") {
-        const key = targetIssueIdsOrDetector.trim();
-        if (issuesMap[key]) {
-            targetIds.add(key);
-        } else {
-            for (const iss of Object.values(issuesMap)) {
-                if (iss.detector === key) targetIds.add(iss.id);
-            }
-        }
-    } else if (Array.isArray(targetIssueIdsOrDetector) || targetIssueIdsOrDetector instanceof Set) {
-        for (const item of targetIssueIdsOrDetector) {
-            if (typeof item === "string") {
-                if (issuesMap[item]) targetIds.add(item);
-            } else if (item && typeof item === "object" && item.id) {
-                targetIds.add(item.id);
-            }
-        }
-    }
-
-    if (targetIds.size === 0) {
-        return { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
-    }
-
-    const simIssues = { ...issuesMap };
-    let changed = false;
-    for (const id of targetIds) {
-        const existing = simIssues[id];
-        if (!existing || existing.status === "fixed" || existing.status === "auto_resolved") continue;
-        simIssues[id] = {
-            ...existing,
-            status: "fixed",
-            verified: true,
-        };
-        changed = true;
-    }
-
-    if (!changed) {
-        return { deltaStrict: 0, deltaOverall: 0, deltaObjective: 0 };
-    }
-
-    const newScores = computeScoreSnapshot({
-        ...state,
-        issues: simIssues,
-    });
-
-    return {
-        deltaStrict: round(newScores.strict - oldScores.strict, 2),
-        deltaOverall: round(newScores.overall - oldScores.overall, 2),
-        deltaObjective: round(newScores.objective - oldScores.objective, 2),
-    };
+    return createFastScoreImpactEstimator(state, baselineScores).estimateForIds(targetIssueIdsOrDetector);
 }
 
 /**

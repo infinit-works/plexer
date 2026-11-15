@@ -4,8 +4,10 @@
  * resolve/skip/reopen with scan-gate protection, attested `suppress`, and 4-stage triage.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parsePolicyLayerRule } from "../blast/layer-rules.js";
+import { resolveSafeRepoFile } from "../util/span.js";
 import {
     ATTEST_RESOLVE_EXAMPLE,
     ATTEST_WONTFIX_EXAMPLE,
@@ -15,8 +17,103 @@ import {
     TRIAGE_STAGES,
 } from "./constants.js";
 import { detectReviewCoverage } from "./review.js";
-import { buildAutoClusters, computeScoreImpact, computeScoreSnapshot } from "./scoring.js";
+import {
+    buildAutoClusters,
+    computeScoreSnapshot,
+    createFastScoreImpactEstimator,
+} from "./scoring.js";
 import { emptyLivingPlan, wildcardToRegExp } from "./state.js";
+
+function resolveClusterRepoRoots(rootDir) {
+    const absRoot = resolve(rootDir || process.cwd());
+    let realRoot = absRoot;
+    try {
+        realRoot = realpathSync(absRoot);
+    } catch {
+        /* fallback */
+    }
+    return { absRoot, realRoot };
+}
+
+function readSafeClusterRepoInput(rawOrInline, rootDir, label, inlineHints = []) {
+    const raw = String(rawOrInline || "");
+    const trimmed = raw.trim();
+    const isLikelyInline =
+        raw.includes("\n") ||
+        trimmed.startsWith("{") ||
+        inlineHints.some((fn) => fn(trimmed));
+    if (isLikelyInline) return raw;
+
+    const { absRoot, realRoot } = resolveClusterRepoRoots(rootDir);
+    const safe = resolveSafeRepoFile(absRoot, realRoot, raw, { noSymlinks: true });
+    if (safe) return readFileSync(safe.realFile, "utf8");
+
+    const looksLikeExternalOrFile =
+        isAbsolute(raw) ||
+        raw.includes("..") ||
+        existsSync(raw) ||
+        existsSync(resolve(absRoot, raw)) ||
+        /[\\/]|\.(?:md|markdown|txt|json|ya?ml)$/i.test(trimmed);
+    if (looksLikeExternalOrFile) {
+        throw new Error(`${label} path must stay within repository root: ${raw}`);
+    }
+    return raw;
+}
+
+function writeSafeClusterRepoOutput(rawOutputPath, content, rootDir) {
+    if (!rawOutputPath || typeof rawOutputPath !== "string" || rawOutputPath.includes("\0")) {
+        throw new Error("Cluster export --output path must be a valid repo-relative path.");
+    }
+    const { absRoot, realRoot } = resolveClusterRepoRoots(rootDir);
+    const absOut = resolve(absRoot, rawOutputPath);
+    const rel = relative(absRoot, absOut);
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+        throw new Error(`Cluster export --output path must stay within repository root: ${rawOutputPath}`);
+    }
+    if (existsSync(absOut)) {
+        const safe = resolveSafeRepoFile(absRoot, realRoot, rawOutputPath, { noSymlinks: true });
+        if (!safe) {
+            throw new Error(`Cluster export --output path must stay within repository root: ${rawOutputPath}`);
+        }
+        writeFileSync(safe.realFile, content, "utf8");
+        return safe.realFile;
+    }
+
+    const segs = rel.split(/[\\/]/).filter(Boolean);
+    if (segs.some((s) => s.startsWith("."))) {
+        throw new Error(`Cluster export --output path must not target hidden/dot directories: ${rawOutputPath}`);
+    }
+    let cur = dirname(absOut);
+    while (cur && cur.startsWith(absRoot) && cur !== absRoot) {
+        if (existsSync(cur) && lstatSync(cur).isSymbolicLink()) {
+            throw new Error(`Cluster export --output refuses symlink ancestor: ${rawOutputPath}`);
+        }
+        const parent = dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+    }
+    let existingAncestor = dirname(absOut);
+    while (!existsSync(existingAncestor)) {
+        const p = dirname(existingAncestor);
+        if (p === existingAncestor) break;
+        existingAncestor = p;
+    }
+    const realAncestor = realpathSync(existingAncestor);
+    const relAnc = relative(realRoot, realAncestor);
+    if (relAnc.startsWith("..") || isAbsolute(relAnc)) {
+        throw new Error(`Cluster export --output path must stay within repository root: ${rawOutputPath}`);
+    }
+
+    mkdirSync(dirname(absOut), { recursive: true });
+    const safeTarget = join(realpathSync(dirname(absOut)), basename(absOut));
+    writeFileSync(safeTarget, content, "utf8");
+    const verified = resolveSafeRepoFile(absRoot, realRoot, rawOutputPath, { noSymlinks: true });
+    if (!verified) {
+        try { unlinkSync(safeTarget); } catch { /* ignore */ }
+        throw new Error(`Cluster export --output failed repository containment verification: ${rawOutputPath}`);
+    }
+    return verified.realFile;
+}
 
 export { parsePolicyLayerRule };
 
@@ -33,6 +130,23 @@ export function validateAttestation(attestation) {
     const hasNotGaming = lower.includes("not gaming");
     const hasReviewed = lower.includes("reviewed") || lower.includes("i have actually");
     return hasNotGaming && hasReviewed;
+}
+
+const FP_BOILERPLATE_RE =
+    /^(?:false positive|not an issue|intentional(?: pattern)?|not a bug|ignore(?: this)?|works as intended|no issue|n\/a|none|test)$/i;
+
+/**
+ * Validate a detailed `--reason` explanation for `false_positive` dismissals.
+ * Requires >= 15 characters, >= 3 words, and non-boilerplate content.
+ */
+export function validateFalsePositiveReason(reason) {
+    if (!reason || typeof reason !== "string") return false;
+    const trimmed = reason.trim();
+    if (trimmed.length < 15) return false;
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    if (words.length < 3) return false;
+    if (FP_BOILERPLATE_RE.test(trimmed)) return false;
+    return true;
 }
 
 export function compareIssuesByPriority(a, b, customOrderIndex = new Map(), promotedSet = new Set()) {
@@ -55,14 +169,12 @@ export function compareIssuesByPriority(a, b, customOrderIndex = new Map(), prom
     return String(a.id).localeCompare(String(b.id));
 }
 
-function collectPrioritizedOpenIssues(state, plan, allClusters, isBacklog, includeSkipped, focusCluster) {
+function buildCustomOrderIndex(rawOrder, allClusters) {
     const customOrderIndex = new Map();
-    const rawOrder = plan?.queue_order || [];
     let orderPos = 0;
-    for (const token of rawOrder) {
+    for (const token of rawOrder || []) {
         if (typeof token === "string" && token.startsWith("cluster:")) {
-            const cName = token.slice("cluster:".length);
-            const cl = allClusters[cName];
+            const cl = allClusters[token.slice("cluster:".length)];
             for (const cid of cl?.issue_ids || []) {
                 if (!customOrderIndex.has(cid)) customOrderIndex.set(cid, orderPos++);
             }
@@ -70,53 +182,56 @@ function collectPrioritizedOpenIssues(state, plan, allClusters, isBacklog, inclu
             customOrderIndex.set(token, orderPos++);
         }
     }
+    return customOrderIndex;
+}
 
+function buildPromotedIssueSet(promotedIds, allClusters) {
     const promotedSet = new Set();
-    for (const p of plan?.promoted_ids || []) {
+    for (const p of promotedIds || []) {
         if (typeof p === "string" && p.startsWith("cluster:")) {
-            const cName = p.slice("cluster:".length);
-            for (const cid of allClusters[cName]?.issue_ids || []) promotedSet.add(cid);
+            for (const cid of allClusters[p.slice("cluster:".length)]?.issue_ids || []) promotedSet.add(cid);
         } else {
             promotedSet.add(p);
         }
     }
+    return promotedSet;
+}
 
+function partitionBlockedClusterIssues(openIssues, allClusters, stateIssues) {
+    const blockedIssueIds = new Set();
+    for (const c of Object.values(allClusters)) {
+        const deps = Array.isArray(c.depends_on) ? c.depends_on : [];
+        const hasUnresolvedDep = deps.some((depName) => {
+            const depCluster = allClusters[depName];
+            return Boolean(depCluster) && (depCluster.issue_ids || []).some(
+                (id) => stateIssues?.[id]?.status === "open" && !stateIssues?.[id]?.suppressed,
+            );
+        });
+        if (!hasUnresolvedDep) continue;
+        for (const id of c.issue_ids || []) blockedIssueIds.add(id);
+    }
+    if (blockedIssueIds.size === 0) return openIssues;
+    const unblocked = openIssues.filter((i) => !blockedIssueIds.has(i.id));
+    const blocked = openIssues.filter((i) => blockedIssueIds.has(i.id));
+    return unblocked.length > 0 ? [...unblocked, ...blocked] : openIssues;
+}
+
+function collectPrioritizedOpenIssues(state, plan, allClusters, isBacklog, includeSkipped, focusCluster) {
+    const customOrderIndex = buildCustomOrderIndex(plan?.queue_order, allClusters);
+    const promotedSet = buildPromotedIssueSet(plan?.promoted_ids, allClusters);
     const deferredSet = new Set(plan?.deferred_ids || []);
-    const allIssues = Object.values(state.issues || {});
-    let openIssues = allIssues
+    let openIssues = Object.values(state.issues || {})
         .filter((i) => {
             if (!isBacklog && !includeSkipped && deferredSet.has(i.id)) return false;
-            if (includeSkipped) {
-                return i.status === "open" || i.status === "deferred" || i.status === "wontfix";
-            }
-            return i.status === "open" && !i.suppressed;
+            return includeSkipped
+                ? i.status === "open" || i.status === "deferred" || i.status === "wontfix"
+                : i.status === "open" && !i.suppressed;
         })
         .sort((a, b) => compareIssuesByPriority(a, b, customOrderIndex, promotedSet));
 
     if (!isBacklog) {
-        const blockedIssueIds = new Set();
-        for (const c of Object.values(allClusters)) {
-            const deps = Array.isArray(c.depends_on) ? c.depends_on : [];
-            const hasUnresolvedDep = deps.some((depName) => {
-                const depCluster = allClusters[depName];
-                if (!depCluster) return false;
-                return (depCluster.issue_ids || []).some(
-                    (id) => state.issues?.[id]?.status === "open" && !state.issues?.[id]?.suppressed,
-                );
-            });
-            if (hasUnresolvedDep) {
-                for (const id of c.issue_ids || []) blockedIssueIds.add(id);
-            }
-        }
-        if (blockedIssueIds.size > 0) {
-            const unblocked = openIssues.filter((i) => !blockedIssueIds.has(i.id));
-            const blocked = openIssues.filter((i) => blockedIssueIds.has(i.id));
-            if (unblocked.length > 0) {
-                openIssues = [...unblocked, ...blocked];
-            }
-        }
+        openIssues = partitionBlockedClusterIssues(openIssues, allClusters, state.issues);
     }
-
     if (focusCluster && allClusters[focusCluster]) {
         const memberSet = new Set(allClusters[focusCluster].issue_ids || []);
         openIssues = openIssues.filter((i) => memberSet.has(i.id));
@@ -124,7 +239,7 @@ function collectPrioritizedOpenIssues(state, plan, allClusters, isBacklog, inclu
     return openIssues;
 }
 
-function buildGroupedExecutionQueueItems(state, items, groupMode, explain, baselineScores = null) {
+function buildGroupedExecutionQueueItems(items, groupMode, explain, impactEstimator) {
     if (groupMode !== "file" && groupMode !== "detector") return null;
     const buckets = new Map();
     for (const it of items) {
@@ -138,11 +253,7 @@ function buildGroupedExecutionQueueItems(state, items, groupMode, explain, basel
     }
     const groupedItems = [];
     for (const [gKey, gList] of buckets.entries()) {
-        const gImpact = computeScoreImpact(
-            state,
-            gList.map((i) => i.id),
-            baselineScores,
-        );
+        const gImpact = impactEstimator.estimateForIds(gList.map((i) => i.id));
         const first = gList[0];
         const gDim = first?.dimension || "code_quality";
         groupedItems.push({
@@ -228,11 +339,12 @@ export function buildExecutionQueue(state, plan, opts = {}) {
     );
 
     const scores = computeScoreSnapshot(state);
+    const impactEstimator = createFastScoreImpactEstimator(state, scores);
     const items = [];
     for (const iss of openIssues) {
         const resolveCmd = `plexer health resolve "${iss.id}" --note "<what you fixed>" --confirm`;
         const skipCmd = `plexer health plan skip --permanent "${iss.id}" --note "<why intentional>" --attest "${ATTEST_WONTFIX_EXAMPLE}"`;
-        const impact = computeScoreImpact(state, [iss.id], scores);
+        const impact = impactEstimator.estimateForIds([iss.id]);
         const scoreImpact = impact.deltaStrict;
         const dimId = iss.dimension || "code_quality";
         const dimObj = scores.mechanical_dimensions?.[dimId] || scores.subjective_dimensions?.[dimId];
@@ -254,10 +366,10 @@ export function buildExecutionQueue(state, plan, opts = {}) {
 
     const workflowSteps = buildQueueWorkflowSteps(state, plan, items, isBacklog, opts.totalProdFiles);
     const limit = Number(opts.count) > 0 ? Number(opts.count) : isBacklog ? 20 : 5;
-    const groupedItems = buildGroupedExecutionQueueItems(state, items, groupMode, explain, scores);
+    const groupedItems = buildGroupedExecutionQueueItems(items, groupMode, explain, impactEstimator);
 
     const clustersOut = Object.values(allClusters).map((c) => {
-        const cImpact = computeScoreImpact(state, c.issue_ids || [], scores);
+        const cImpact = impactEstimator.estimateForIds(c.issue_ids || []);
         return {
             name: c.name,
             auto: Boolean(c.auto),
@@ -398,19 +510,99 @@ export function resolveIssues(state, plan, patterns, opts = {}) {
  * Defer (`deferred`) or permanently skip (`wontfix`) issues (`plexer health plan skip`).
  * When `opts.strictAttest` is true on `permanent`, validates that `--attest` contains `"reviewed"` and `"not gaming"`.
  */
-export function skipIssues(state, plan, patterns, opts = {}) {
+function validateSkipAuthority(opts) {
     const isFalsePositive = Boolean(opts.falsePositive || opts.kind === "false_positive");
     const isPermanent = Boolean(opts.permanent || opts.kind === "wontfix");
+    const fpReason = typeof opts.reason === "string" && opts.reason.trim() ? opts.reason.trim() : null;
+    const hasValidAttest = validateAttestation(opts.attest);
+    const hasValidFpReason = isFalsePositive && validateFalsePositiveReason(fpReason);
 
-    if ((isPermanent || isFalsePositive) && !validateAttestation(opts.attest)) {
-        const flagLabel = isFalsePositive ? "False-positive (--false-positive)" : "Permanent skip (--permanent)";
+    if (isFalsePositive && !hasValidAttest && !hasValidFpReason) {
         return {
             ok: false,
-            status: "attestation_invalid",
-            skipped_ids: [],
-            message: `${flagLabel} requires a valid --attest string containing "reviewed" and "not gaming". Example: --attest "${ATTEST_WONTFIX_EXAMPLE}"`,
+            failure: {
+                ok: false,
+                status: "attestation_invalid",
+                skipped_ids: [],
+                message: `False-positive (--false-positive) requires either --reason "<detailed explanation >= 15 chars, >= 3 words>" or a valid --attest string containing "reviewed" and "not gaming". Example: --attest "${ATTEST_WONTFIX_EXAMPLE}"`,
+            },
         };
     }
+    if (!isFalsePositive && isPermanent && !hasValidAttest) {
+        return {
+            ok: false,
+            failure: {
+                ok: false,
+                status: "attestation_invalid",
+                skipped_ids: [],
+                message: `Permanent skip (--permanent) requires a valid --attest string containing "reviewed" and "not gaming". Example: --attest "${ATTEST_WONTFIX_EXAMPLE}"`,
+            },
+        };
+    }
+    const newStatus = isFalsePositive ? "false_positive" : isPermanent ? "wontfix" : "deferred";
+    const note = opts.note || fpReason || (isPermanent || isFalsePositive ? "Intentional pattern" : "Deferred for later");
+    const reviewAfter =
+        opts.reviewAfter !== undefined && opts.reviewAfter !== null && Number(opts.reviewAfter) > 0
+            ? Number(opts.reviewAfter)
+            : null;
+    return {
+        ok: true,
+        newStatus,
+        note,
+        fpReason,
+        attestation: opts.attest || null,
+        reviewAfter,
+    };
+}
+
+function recordSkippedIssuesInStateAndPlan(state, plan, matchedIds, meta) {
+    const nowIso = new Date().toISOString();
+    if (plan && (!plan.skipped || typeof plan.skipped !== "object")) {
+        plan.skipped = {};
+    }
+    for (const id of matchedIds) {
+        const iss = state.issues[id];
+        iss.status = meta.newStatus;
+        iss.note = meta.note;
+        iss.attestation = meta.attestation;
+        if (meta.fpReason) iss.reason = meta.fpReason;
+        iss.skipped_at = nowIso;
+        if (meta.reviewAfter !== null) {
+            iss.resurface_after_scan = (state.scan_count || 0) + meta.reviewAfter;
+        }
+        if (plan?.skipped) {
+            plan.skipped[id] = {
+                id,
+                status: meta.newStatus,
+                note: meta.note,
+                ...(meta.fpReason ? { reason: meta.fpReason } : {}),
+                attestation: meta.attestation,
+                resurface_after_scan: iss.resurface_after_scan ?? null,
+                skipped_at: nowIso,
+            };
+        }
+    }
+    if (plan) {
+        plan.log = [
+            ...(plan.log || []),
+            {
+                action: meta.newStatus,
+                issue_ids: matchedIds,
+                note: meta.note,
+                ...(meta.fpReason ? { reason: meta.fpReason } : {}),
+                at: nowIso,
+            },
+        ];
+    }
+}
+
+/**
+ * Defer (`deferred`) or permanently skip (`wontfix`) issues (`plexer health plan skip`).
+ * When `opts.strictAttest` is true on `permanent`, validates that `--attest` contains `"reviewed"` and `"not gaming"`.
+ */
+export function skipIssues(state, plan, patterns, opts = {}) {
+    const auth = validateSkipAuthority(opts);
+    if (!auth.ok) return auth.failure;
 
     let matchedIds = matchIssueIds(state, patterns, new Set(["open", "deferred"]));
     if (matchedIds.length === 0) {
@@ -424,7 +616,6 @@ export function skipIssues(state, plan, patterns, opts = {}) {
             message: `No open issues matched pattern: ${Array.isArray(patterns) ? patterns.join(", ") : patterns}`,
         };
     }
-
     if (matchedIds.length > 5 && !opts.confirm) {
         return {
             ok: false,
@@ -435,55 +626,10 @@ export function skipIssues(state, plan, patterns, opts = {}) {
         };
     }
 
-    const newStatus = isFalsePositive ? "false_positive" : isPermanent ? "wontfix" : "deferred";
-    const note = opts.note || (isPermanent || isFalsePositive ? "Intentional pattern" : "Deferred for later");
-    const attestation = opts.attest || null;
-    const reviewAfter =
-        opts.reviewAfter !== undefined && opts.reviewAfter !== null && Number(opts.reviewAfter) > 0
-            ? Number(opts.reviewAfter)
-            : null;
-    const nowIso = new Date().toISOString();
-
-    if (plan && (!plan.skipped || typeof plan.skipped !== "object")) {
-        plan.skipped = {};
-    }
-
-    for (const id of matchedIds) {
-        const iss = state.issues[id];
-        iss.status = newStatus;
-        iss.note = note;
-        iss.attestation = attestation;
-        iss.skipped_at = nowIso;
-        if (reviewAfter !== null) {
-            iss.resurface_after_scan = (state.scan_count || 0) + reviewAfter;
-        }
-        if (plan?.skipped) {
-            plan.skipped[id] = {
-                id,
-                status: newStatus,
-                note,
-                attestation,
-                resurface_after_scan: iss.resurface_after_scan ?? null,
-                skipped_at: nowIso,
-            };
-        }
-    }
-
-    if (plan) {
-        plan.log = [
-            ...(plan.log || []),
-            {
-                action: newStatus,
-                issue_ids: matchedIds,
-                note,
-                at: nowIso,
-            },
-        ];
-    }
-
+    recordSkippedIssuesInStateAndPlan(state, plan, matchedIds, auth);
     return {
         ok: true,
-        status: newStatus,
+        status: auth.newStatus,
         skipped_ids: matchedIds,
     };
 }
@@ -525,12 +671,20 @@ export function unskipIssues(state, plan, patterns) {
  * Permanently suppress issues matching a pattern with mandatory attestation (`plexer health suppress <pattern> --attest "..."`).
  */
 export function suppressIssues(state, config, plan, pattern, opts = {}) {
-    const attestation = opts.attest;
-    if (!validateAttestation(attestation)) {
+    const isFalsePositive = Boolean(opts.falsePositive || opts.kind === "false_positive");
+    const targetStatus = isFalsePositive ? "false_positive" : "wontfix";
+    const attestation = opts.attest || null;
+    const reason = typeof opts.reason === "string" && opts.reason.trim() ? opts.reason.trim() : null;
+    const hasValidAttest = validateAttestation(attestation);
+    const hasValidReason = isFalsePositive && validateFalsePositiveReason(reason);
+
+    if (isFalsePositive ? !hasValidAttest && !hasValidReason : !hasValidAttest) {
         return {
             status: "attestation_invalid",
             suppressed_ids: [],
-            message: `Suppress requires a valid --attest string containing "reviewed" and "not gaming". Example: --attest "${ATTEST_WONTFIX_EXAMPLE}"`,
+            message: isFalsePositive
+                ? `Suppress --false-positive requires either --reason "<detailed explanation >= 15 chars, >= 3 words>" or a valid --attest string containing "reviewed" and "not gaming". Example: --attest "${ATTEST_WONTFIX_EXAMPLE}"`
+                : `Suppress requires a valid --attest string containing "reviewed" and "not gaming". Example: --attest "${ATTEST_WONTFIX_EXAMPLE}"`,
         };
     }
 
@@ -546,6 +700,9 @@ export function suppressIssues(state, config, plan, pattern, opts = {}) {
     const matchedIds = matchIssueIds(state, [pat]);
     const fingerprints = [];
     const nowIso = new Date().toISOString();
+    const defaultNote = isFalsePositive
+        ? "Attested false positive via plexer health suppress"
+        : "Permanently suppressed via plexer health suppress";
 
     for (const id of matchedIds) {
         const iss = state.issues[id];
@@ -554,18 +711,21 @@ export function suppressIssues(state, config, plan, pattern, opts = {}) {
             .digest("hex")
             .slice(0, 12);
         fingerprints.push(fp);
-        iss.status = "wontfix";
+        iss.status = targetStatus;
         iss.suppressed = true;
         iss.attestation = attestation;
-        iss.note = opts.note || "Permanently suppressed via plexer health suppress";
+        if (reason) iss.reason = reason;
+        iss.note = opts.note || reason || defaultNote;
         iss.suppressed_at = nowIso;
     }
 
     if (!config.suppressions) config.suppressions = {};
     config.suppressions[pat] = {
         pattern: pat,
+        kind: targetStatus,
         fingerprints,
-        note: opts.note || "Path-independent suppression fingerprint",
+        note: opts.note || reason || "Path-independent suppression fingerprint",
+        ...(reason ? { reason } : {}),
         attestation,
         added_at: nowIso,
     };
@@ -575,7 +735,9 @@ export function suppressIssues(state, config, plan, pattern, opts = {}) {
     state.attestation_log.push({
         timestamp: nowIso,
         command: "suppress",
+        kind: targetStatus,
         pattern: pat,
+        ...(reason ? { reason } : {}),
         attestation,
         affected: matchedIds.length,
     });
@@ -585,8 +747,10 @@ export function suppressIssues(state, config, plan, pattern, opts = {}) {
             ...(plan.log || []),
             {
                 action: "suppress",
+                kind: targetStatus,
                 pattern: pat,
                 issue_ids: matchedIds,
+                ...(reason ? { reason } : {}),
                 at: nowIso,
             },
         ];
@@ -594,6 +758,7 @@ export function suppressIssues(state, config, plan, pattern, opts = {}) {
 
     return {
         status: "suppressed",
+        kind: targetStatus,
         pattern: pat,
         suppressed_ids: matchedIds,
         fingerprints,
@@ -683,73 +848,68 @@ function resolveClusterStepIndex(cluster, rawIdx) {
     return -1;
 }
 
+function appendClusterStepsFromFile(cluster, stepsFile, rootDir) {
+    const raw = readSafeClusterRepoInput(
+        stepsFile,
+        rootDir,
+        "Cluster --steps-file",
+        [(t) => /^-\s*\[[ xX ]?\]/.test(t) || /^\d+\.\s/.test(t)],
+    );
+    for (const st of parseStepsMarkdownText(raw)) {
+        cluster.steps.push({ ...st, index: cluster.steps.length + 1 });
+    }
+}
+
+function appendNewClusterStep(cluster, opts) {
+    const effortCandidate = String(opts.effort || "medium").toLowerCase();
+    const effort = ["trivial", "small", "medium", "large"].includes(effortCandidate) ? effortCandidate : "medium";
+    cluster.steps.push({
+        index: cluster.steps.length + 1,
+        title: String(opts.addStep).trim(),
+        detail: opts.detail ? String(opts.detail) : "",
+        effort,
+        issue_refs: parseDependsOnList(opts.issueRefs, []),
+        done: false,
+        status: "pending",
+    });
+}
+
+function applyExistingClusterStepUpdate(cluster, opts) {
+    const idx = resolveClusterStepIndex(cluster, opts.updateStep);
+    const st = idx >= 0 ? cluster.steps[idx] : null;
+    if (!st) return false;
+    if (opts.title || opts.addStep) st.title = String(opts.title || opts.addStep).trim();
+    if (opts.detail !== undefined) st.detail = String(opts.detail);
+    if (opts.effort !== undefined) st.effort = String(opts.effort).toLowerCase();
+    if (opts.issueRefs !== undefined) st.issue_refs = parseDependsOnList(opts.issueRefs, st.issue_refs || []);
+    return true;
+}
+
+function toggleClusterStepCompletion(cluster, stepRef, done) {
+    if (stepRef === undefined || stepRef === null) return false;
+    const idx = resolveClusterStepIndex(cluster, stepRef);
+    if (idx < 0 || !cluster.steps[idx]) return false;
+    cluster.steps[idx].done = done;
+    cluster.steps[idx].status = done ? "done" : "pending";
+    return true;
+}
+
 function applyClusterStepMutations(cluster, opts = {}) {
     if (!Array.isArray(cluster.steps)) cluster.steps = [];
     let mutated = false;
-
     if (opts.stepsFile) {
-        const raw = existsSync(opts.stepsFile)
-            ? readFileSync(opts.stepsFile, "utf8")
-            : String(opts.stepsFile);
-        const parsedSteps = parseStepsMarkdownText(raw);
-        for (const st of parsedSteps) {
-            cluster.steps.push({
-                ...st,
-                index: cluster.steps.length + 1,
-            });
-        }
+        appendClusterStepsFromFile(cluster, opts.stepsFile, opts.rootDir);
         mutated = true;
     }
-
     if (opts.addStep && opts.updateStep === undefined) {
-        const effortCandidate = String(opts.effort || "medium").toLowerCase();
-        const effort = ["trivial", "small", "medium", "large"].includes(effortCandidate)
-            ? effortCandidate
-            : "medium";
-        cluster.steps.push({
-            index: cluster.steps.length + 1,
-            title: String(opts.addStep).trim(),
-            detail: opts.detail ? String(opts.detail) : "",
-            effort,
-            issue_refs: parseDependsOnList(opts.issueRefs, []),
-            done: false,
-            status: "pending",
-        });
+        appendNewClusterStep(cluster, opts);
         mutated = true;
     }
-
-    if (opts.updateStep !== undefined && opts.updateStep !== null) {
-        const idx = resolveClusterStepIndex(cluster, opts.updateStep);
-        if (idx >= 0 && cluster.steps[idx]) {
-            const st = cluster.steps[idx];
-            if (opts.title || opts.addStep) st.title = String(opts.title || opts.addStep).trim();
-            if (opts.detail !== undefined) st.detail = String(opts.detail);
-            if (opts.effort !== undefined) st.effort = String(opts.effort).toLowerCase();
-            if (opts.issueRefs !== undefined) {
-                st.issue_refs = parseDependsOnList(opts.issueRefs, st.issue_refs || []);
-            }
-            mutated = true;
-        }
+    if (opts.updateStep !== undefined && opts.updateStep !== null && applyExistingClusterStepUpdate(cluster, opts)) {
+        mutated = true;
     }
-
-    if (opts.doneStep !== undefined && opts.doneStep !== null) {
-        const idx = resolveClusterStepIndex(cluster, opts.doneStep);
-        if (idx >= 0 && cluster.steps[idx]) {
-            cluster.steps[idx].done = true;
-            cluster.steps[idx].status = "done";
-            mutated = true;
-        }
-    }
-
-    if (opts.undoneStep !== undefined && opts.undoneStep !== null) {
-        const idx = resolveClusterStepIndex(cluster, opts.undoneStep);
-        if (idx >= 0 && cluster.steps[idx]) {
-            cluster.steps[idx].done = false;
-            cluster.steps[idx].status = "pending";
-            mutated = true;
-        }
-    }
-
+    if (toggleClusterStepCompletion(cluster, opts.doneStep, true)) mutated = true;
+    if (toggleClusterStepCompletion(cluster, opts.undoneStep, false)) mutated = true;
     return mutated;
 }
 
@@ -810,11 +970,14 @@ function serializeClusterExport(cluster, format = "json") {
     return JSON.stringify(clean, null, 2);
 }
 
-function parseClusterImportPayload(rawInput) {
+function parseClusterImportPayload(rawInput, rootDir = null) {
     if (rawInput && typeof rawInput === "object") return rawInput;
-    const text = existsSync(String(rawInput || ""))
-        ? readFileSync(String(rawInput), "utf8")
-        : String(rawInput || "");
+    const text = readSafeClusterRepoInput(
+        rawInput,
+        rootDir,
+        "Cluster import",
+        [(t) => t.startsWith("# Cluster:") || t.startsWith("name:")],
+    );
     const trimmed = text.trim();
     if (trimmed.startsWith("{")) {
         return JSON.parse(trimmed);
@@ -923,73 +1086,53 @@ function mergePlanClusters(plan, allClusters, clusterName, patterns, opts) {
     };
 }
 
+function mutatePlanClusterUpdate(plan, allClusters, clusterName, opts) {
+    const existing = plan.clusters[clusterName] || allClusters[clusterName];
+    if (!existing)
+        return { ok: false, sub_action: "update", status: "not_found", message: `Cluster "${clusterName}" not found` };
+    const updated = {
+        ...existing,
+        name: clusterName,
+        auto: false,
+        depends_on: parseDependsOnList(opts.dependsOn, existing.depends_on || []),
+        steps: Array.isArray(existing.steps) ? [...existing.steps] : [],
+    };
+    applyClusterStepMutations(updated, opts);
+    plan.clusters[clusterName] = updated;
+    return { ok: true, sub_action: "update", cluster: plan.clusters[clusterName], clusters: plan.clusters };
+}
+function mutatePlanClusterMove(state, plan, clusterName, patterns, opts) {
+    const movePatterns = opts.to && clusterName && clusterName !== opts.to ? [clusterName, ...(patterns || [])] : patterns || [];
+    const toCluster = opts.to || clusterName;
+    if (!toCluster)
+        throw new Error("cluster move requires a destination cluster name (e.g. `plexer health plan cluster move <pattern> --to <cluster>`)");
+    const matched = matchIssueIds(state, movePatterns);
+    for (const c of Object.values(plan.clusters))
+        c.issue_ids = (c.issue_ids || []).filter((id) => !matched.includes(id));
+    const existing = plan.clusters[toCluster] || { name: toCluster, auto: false, issue_ids: [], depends_on: [], steps: [] };
+    existing.issue_ids = [...new Set([...(existing.issue_ids || []), ...matched])];
+    plan.clusters[toCluster] = existing;
+    return { ok: true, sub_action: "move", cluster: existing, moved_ids: matched, clusters: plan.clusters };
+}
 function mutatePlanClusterMembers(state, plan, allClusters, sub, clusterName, patterns, opts) {
-    if (sub === "update" && clusterName) {
-        const existing = plan.clusters[clusterName] || allClusters[clusterName];
-        if (!existing) {
-            return { ok: false, sub_action: "update", status: "not_found", message: `Cluster "${clusterName}" not found` };
-        }
-        const updated = {
-            ...existing,
-            name: clusterName,
-            auto: false,
-            depends_on: parseDependsOnList(opts.dependsOn, existing.depends_on || []),
-            steps: Array.isArray(existing.steps) ? [...existing.steps] : [],
-        };
-        applyClusterStepMutations(updated, opts);
-        plan.clusters[clusterName] = updated;
-        return { ok: true, sub_action: "update", cluster: plan.clusters[clusterName], clusters: plan.clusters };
-    }
-
-    if (sub === "move") {
-        const movePatterns =
-            opts.to && clusterName && clusterName !== opts.to
-                ? [clusterName, ...(patterns || [])]
-                : patterns || [];
-        const toCluster = opts.to || clusterName;
-        if (!toCluster) {
-            throw new Error(
-                "cluster move requires a destination cluster name (e.g. `plexer health plan cluster move <pattern> --to <cluster>`)",
-            );
-        }
-        const matched = matchIssueIds(state, movePatterns);
-        for (const c of Object.values(plan.clusters)) {
-            c.issue_ids = (c.issue_ids || []).filter((id) => !matched.includes(id));
-        }
-        const existing = plan.clusters[toCluster] || {
-            name: toCluster,
-            auto: false,
-            issue_ids: [],
-            depends_on: [],
-            steps: [],
-        };
-        existing.issue_ids = [...new Set([...(existing.issue_ids || []), ...matched])];
-        plan.clusters[toCluster] = existing;
-        return { ok: true, sub_action: "move", cluster: existing, moved_ids: matched, clusters: plan.clusters };
-    }
-
+    if (sub === "update" && clusterName)
+        return mutatePlanClusterUpdate(plan, allClusters, clusterName, opts);
+    if (sub === "move")
+        return mutatePlanClusterMove(state, plan, clusterName, patterns, opts);
     if (sub === "add" && clusterName) {
         const matched = matchIssueIds(state, patterns);
-        const existing = plan.clusters[clusterName] || {
-            name: clusterName,
-            auto: false,
-            issue_ids: [],
-            depends_on: [],
-            steps: [],
-        };
+        const existing = plan.clusters[clusterName] || { name: clusterName, auto: false, issue_ids: [], depends_on: [], steps: [] };
         existing.issue_ids = [...new Set([...(existing.issue_ids || []), ...matched])];
         applyClusterStepMutations(existing, opts);
         plan.clusters[clusterName] = existing;
         return { ok: true, sub_action: "add", cluster: existing, clusters: plan.clusters };
     }
-
     if (sub === "remove" && clusterName) {
         const matched = new Set(matchIssueIds(state, patterns));
         const existing = plan.clusters[clusterName];
         if (existing) existing.issue_ids = (existing.issue_ids || []).filter((id) => !matched.has(id));
         return { ok: true, sub_action: "remove", cluster: existing || null, clusters: plan.clusters };
     }
-
     if (clusterName) {
         const existing = plan.clusters[clusterName] || {};
         const created = {
@@ -1006,79 +1149,57 @@ function mutatePlanClusterMembers(state, plan, allClusters, sub, clusterName, pa
     return { ok: true, sub_action: "create", cluster: clusterName ? plan.clusters[clusterName] : null, clusters: plan.clusters };
 }
 
+function listPlanClustersResult(allClusters, state) {
+    return {
+        ok: true,
+        sub_action: "list",
+        clusters: Object.values(allClusters).map((c) => ({
+            name: c.name,
+            auto: Boolean(c.auto),
+            depends_on: c.depends_on || [],
+            steps: c.steps || [],
+            issue_ids: c.issue_ids || [],
+            open_count: (c.issue_ids || []).filter((id) => state.issues?.[id]?.status === "open").length,
+        })),
+    };
+}
+function exportPlanClusterResult(allClusters, clusterName, opts) {
+    const target = allClusters[clusterName];
+    if (!target)
+        return { ok: false, sub_action: "export", status: "not_found", message: `Cluster "${clusterName}" not found` };
+    const fmt = String(opts.exportFormat || opts.format || "json").toLowerCase();
+    const content = serializeClusterExport(target, fmt);
+    if (opts.output)
+        writeSafeClusterRepoOutput(opts.output, content, opts.rootDir);
+    return { ok: true, sub_action: "export", format: fmt, cluster: target, content, exported: content };
+}
 /**
  * Manage living plan clusters (`create`, `add`, `remove`, `move`, `merge`, `export`, `import`, `update`, `delete`, `list`, `show`).
  */
 export function managePlanCluster(state, plan, subAction = "list", clusterName = null, patterns = [], opts = {}) {
     if (!plan.clusters) plan.clusters = {};
-    const autoClusters = buildAutoClusters(state.issues);
-    const allClusters = { ...autoClusters, ...plan.clusters };
+    const allClusters = { ...buildAutoClusters(state.issues), ...plan.clusters };
     const sub = String(subAction || "list").toLowerCase();
-
-    if (sub === "list") {
-        return {
-            ok: true,
-            sub_action: "list",
-            clusters: Object.values(allClusters).map((c) => ({
-                name: c.name,
-                auto: Boolean(c.auto),
-                depends_on: c.depends_on || [],
-                steps: c.steps || [],
-                issue_ids: c.issue_ids || [],
-                open_count: (c.issue_ids || []).filter((id) => state.issues?.[id]?.status === "open").length,
-            })),
-        };
-    }
-
+    if (sub === "list")
+        return listPlanClustersResult(allClusters, state);
     if (sub === "show") {
         const target = allClusters[clusterName];
-        if (!target) {
+        if (!target)
             return { ok: false, sub_action: "show", status: "not_found", message: `Cluster "${clusterName}" not found` };
-        }
-        return {
-            ok: true,
-            sub_action: "show",
-            cluster: {
-                ...target,
-                steps: target.steps || [],
-                issues: (target.issue_ids || []).map((id) => state.issues?.[id]).filter(Boolean),
-            },
-        };
+        return { ok: true, sub_action: "show", cluster: { ...target, steps: target.steps || [], issues: (target.issue_ids || []).map((id) => state.issues?.[id]).filter(Boolean) } };
     }
-
     if (sub === "delete" && clusterName) {
         delete plan.clusters[clusterName];
         if (plan.focus_cluster === clusterName) plan.focus_cluster = null;
         return { ok: true, sub_action: "delete", deleted: clusterName, clusters: plan.clusters };
     }
-
-    if (sub === "merge") {
+    if (sub === "merge")
         return mergePlanClusters(plan, allClusters, clusterName, patterns, opts);
-    }
-
-    if (sub === "export") {
-        const target = allClusters[clusterName];
-        if (!target) {
-            return { ok: false, sub_action: "export", status: "not_found", message: `Cluster "${clusterName}" not found` };
-        }
-        const fmt = String(opts.exportFormat || opts.format || "json").toLowerCase();
-        const content = serializeClusterExport(target, fmt);
-        if (opts.output) {
-            writeFileSync(opts.output, content, "utf8");
-        }
-        return {
-            ok: true,
-            sub_action: "export",
-            format: fmt,
-            cluster: target,
-            content,
-            exported: content,
-        };
-    }
-
+    if (sub === "export")
+        return exportPlanClusterResult(allClusters, clusterName, opts);
     if (sub === "import") {
         const src = opts.file || opts.content || clusterName || (Array.isArray(patterns) ? patterns[0] : patterns);
-        const imported = parseClusterImportPayload(src);
+        const imported = parseClusterImportPayload(src, opts.rootDir);
         const cName = imported.name || "imported_cluster";
         plan.clusters[cName] = {
             name: cName,
@@ -1087,14 +1208,8 @@ export function managePlanCluster(state, plan, subAction = "list", clusterName =
             depends_on: Array.isArray(imported.depends_on) ? imported.depends_on : [],
             steps: Array.isArray(imported.steps) ? imported.steps : [],
         };
-        return {
-            ok: true,
-            sub_action: "import",
-            cluster: plan.clusters[cName],
-            clusters: plan.clusters,
-        };
+        return { ok: true, sub_action: "import", cluster: plan.clusters[cName], clusters: plan.clusters };
     }
-
     return mutatePlanClusterMembers(state, plan, allClusters, sub, clusterName, patterns, opts);
 }
 
@@ -1433,27 +1548,16 @@ export function manageScanGate(state, plan, opts = {}) {
     };
 }
 
-function collectPlanReferencedIssueMetadata(plan) {
-    const referencedIds = new Set();
-
-    for (const c of Object.values(plan?.clusters || {})) {
-        for (const id of c?.issue_ids || []) {
-            if (typeof id === "string" && !id.startsWith("cluster:")) referencedIds.add(id);
-        }
-    }
-    for (const id of plan?.queue_order || []) {
+function collectNonClusterPlanIds(list, referencedIds) {
+    for (const id of list || []) {
         if (typeof id === "string" && !id.startsWith("cluster:")) referencedIds.add(id);
     }
-    for (const id of plan?.promoted_ids || []) {
-        if (typeof id === "string" && !id.startsWith("cluster:")) referencedIds.add(id);
-    }
-    for (const id of plan?.uncommitted_resolved || []) {
-        if (typeof id === "string") referencedIds.add(id);
-    }
+}
 
+function collectSkippedPlanEntries(skipped, referencedIds) {
     const skippedMap = new Map();
-    if (Array.isArray(plan?.skipped)) {
-        for (const item of plan.skipped) {
+    if (Array.isArray(skipped)) {
+        for (const item of skipped) {
             if (typeof item === "string") {
                 referencedIds.add(item);
                 skippedMap.set(item, { status: "deferred" });
@@ -1462,13 +1566,28 @@ function collectPlanReferencedIssueMetadata(plan) {
                 skippedMap.set(item.id, item);
             }
         }
-    } else if (plan?.skipped && typeof plan.skipped === "object") {
-        for (const [id, meta] of Object.entries(plan.skipped)) {
+        return skippedMap;
+    }
+    if (skipped && typeof skipped === "object") {
+        for (const [id, meta] of Object.entries(skipped)) {
             referencedIds.add(id);
             skippedMap.set(id, typeof meta === "object" && meta !== null ? meta : { status: "deferred" });
         }
     }
+    return skippedMap;
+}
 
+function collectPlanReferencedIssueMetadata(plan) {
+    const referencedIds = new Set();
+    for (const c of Object.values(plan?.clusters || {})) {
+        collectNonClusterPlanIds(c?.issue_ids, referencedIds);
+    }
+    collectNonClusterPlanIds(plan?.queue_order, referencedIds);
+    collectNonClusterPlanIds(plan?.promoted_ids, referencedIds);
+    for (const id of plan?.uncommitted_resolved || []) {
+        if (typeof id === "string") referencedIds.add(id);
+    }
+    const skippedMap = collectSkippedPlanEntries(plan?.skipped, referencedIds);
     const annotationsObj =
         plan?.annotations && typeof plan.annotations === "object" ? plan.annotations : {};
     for (const id of Object.keys(annotationsObj)) {
@@ -1481,62 +1600,61 @@ function collectPlanReferencedIssueMetadata(plan) {
  * Reconstruct missing or corrupted entries in `state.issues` from `plan.clusters`,
  * `plan.queue_order`, `plan.skipped`, and `plan.annotations` (`plexer health plan repair-state`).
  */
+function reconstructCorruptIssueRecord(id, existing) {
+    const parts = String(id).split("::");
+    const detector = parts[0] || "unknown";
+    const file = parts[1] || "repo";
+    const identifier = parts.slice(2).join("::") || "item";
+    const resolvedDim =
+        Object.values(MECHANICAL_DIMENSIONS).find((d) => d.detectors.includes(detector))?.id || "code_quality";
+    return {
+        id,
+        detector,
+        category: DETECTOR_CATEGORY[detector] || "code_quality",
+        dimension: resolvedDim,
+        tier: "T3",
+        confidence: "medium",
+        severity: "medium",
+        file,
+        line: 1,
+        end_line: 1,
+        span: "L1-L1",
+        identifier,
+        summary: `Reconstructed ${detector} finding (${identifier})`,
+        status: "open",
+        verified: false,
+        reconstructed: true,
+        ...(existing && typeof existing === "object" ? existing : {}),
+    };
+}
+
+function applyPlanMetaToRepairedIssue(iss, id, skippedMap, annotationsObj) {
+    if (skippedMap.has(id)) {
+        const sk = skippedMap.get(id);
+        iss.status = sk.status || "deferred";
+        if (sk.note) iss.note = sk.note;
+        if (sk.resurface_after_scan != null) iss.resurface_after_scan = sk.resurface_after_scan;
+    }
+    const ann = annotationsObj[id];
+    if (!ann) return;
+    if (ann.custom_description || ann.description) {
+        iss.custom_description = ann.custom_description || ann.description;
+    }
+    if (ann.note) iss.note = ann.note;
+}
+
 export function repairStateFromPlan(state, plan) {
     if (!state.issues || typeof state.issues !== "object") state.issues = {};
     const { referencedIds, skippedMap, annotationsObj } = collectPlanReferencedIssueMetadata(plan);
-
     const repairedIds = [];
+
     for (const id of referencedIds) {
         const existing = state.issues[id];
-        const isCorrupt = !existing || typeof existing !== "object" || !existing.id || !existing.detector;
-        if (isCorrupt) {
-            const parts = String(id).split("::");
-            const detector = parts[0] || "unknown";
-            const file = parts[1] || "repo";
-            const identifier = parts.slice(2).join("::") || "item";
-            const resolvedDim =
-                Object.values(MECHANICAL_DIMENSIONS).find((d) => d.detectors.includes(detector))?.id ||
-                "code_quality";
-            state.issues[id] = {
-                id,
-                detector,
-                category: DETECTOR_CATEGORY[detector] || "code_quality",
-                dimension: resolvedDim,
-                tier: "T3",
-                confidence: "medium",
-                severity: "medium",
-                file,
-                line: 1,
-                end_line: 1,
-                span: "L1-L1",
-                identifier,
-                summary: `Reconstructed ${detector} finding (${identifier})`,
-                status: "open",
-                verified: false,
-                reconstructed: true,
-                ...(existing && typeof existing === "object" ? existing : {}),
-            };
+        if (!existing || typeof existing !== "object" || !existing.id || !existing.detector) {
+            state.issues[id] = reconstructCorruptIssueRecord(id, existing);
             repairedIds.push(id);
         }
-
-        if (skippedMap.has(id)) {
-            const sk = skippedMap.get(id);
-            state.issues[id].status = sk.status || "deferred";
-            if (sk.note) state.issues[id].note = sk.note;
-            if (sk.resurface_after_scan != null) {
-                state.issues[id].resurface_after_scan = sk.resurface_after_scan;
-            }
-        }
-
-        if (annotationsObj[id]) {
-            const ann = annotationsObj[id];
-            if (ann.custom_description || ann.description) {
-                state.issues[id].custom_description = ann.custom_description || ann.description;
-            }
-            if (ann.note) {
-                state.issues[id].note = ann.note;
-            }
-        }
+        applyPlanMetaToRepairedIssue(state.issues[id], id, skippedMap, annotationsObj);
     }
 
     return {
@@ -1719,6 +1837,34 @@ export function updateTriageStage(plan, opts = {}, state = null) {
  * Immediately prune issues matching an exclusion path/pattern from `state.issues`
  * and purge their IDs from `plan` (`queue_order`, `uncommitted_resolved`, `clusters`).
  */
+function excludedFileMatchesPattern(filePath, pat, wildcardRe) {
+    const f = String(filePath || "").replace(/\\/g, "/");
+    if (!f) return false;
+    if (wildcardRe) return wildcardRe.test(f);
+    return f === pat || f.startsWith(`${pat}/`) || f.includes(`/${pat}/`) || f.endsWith(`/${pat}`);
+}
+
+function purgeIdsFromPlan(plan, rmSet) {
+    let purgedPlanCount = 0;
+    if (Array.isArray(plan.queue_order)) {
+        const before = plan.queue_order.length;
+        plan.queue_order = plan.queue_order.filter((id) => !rmSet.has(id));
+        purgedPlanCount += before - plan.queue_order.length;
+    }
+    if (Array.isArray(plan.uncommitted_resolved)) {
+        plan.uncommitted_resolved = plan.uncommitted_resolved.filter((id) => !rmSet.has(id));
+    }
+    if (plan.clusters && typeof plan.clusters === "object") {
+        for (const c of Object.values(plan.clusters)) {
+            if (!Array.isArray(c?.issue_ids)) continue;
+            const b = c.issue_ids.length;
+            c.issue_ids = c.issue_ids.filter((id) => !rmSet.has(id));
+            purgedPlanCount += b - c.issue_ids.length;
+        }
+    }
+    return purgedPlanCount;
+}
+
 export function pruneExcludedIssues(state, plan, rawPattern) {
     const pat = String(rawPattern || "")
         .trim()
@@ -1727,43 +1873,18 @@ export function pruneExcludedIssues(state, plan, rawPattern) {
         .replace(/\/+$/, "");
     if (!pat) return { removed_ids: [], purged_plan_count: 0 };
 
-    const re = pat.includes("*") ? wildcardToRegExp(pat) : null;
-    const matchesFile = (filePath) => {
-        const f = String(filePath || "").replace(/\\/g, "/");
-        if (!f) return false;
-        if (re) return re.test(f);
-        return f === pat || f.startsWith(`${pat}/`) || f.includes(`/${pat}/`) || f.endsWith(`/${pat}`);
-    };
-
+    const wildcardRe = pat.includes("*") ? wildcardToRegExp(pat) : null;
     const removedIds = [];
     for (const [id, iss] of Object.entries(state.issues || {})) {
-        if (matchesFile(iss.file)) {
+        if (excludedFileMatchesPattern(iss.file, pat, wildcardRe)) {
             removedIds.push(id);
             delete state.issues[id];
         }
     }
 
-    let purgedPlanCount = 0;
-    if (removedIds.length > 0 && plan) {
-        const rmSet = new Set(removedIds);
-        if (Array.isArray(plan.queue_order)) {
-            const before = plan.queue_order.length;
-            plan.queue_order = plan.queue_order.filter((id) => !rmSet.has(id));
-            purgedPlanCount += before - plan.queue_order.length;
-        }
-        if (Array.isArray(plan.uncommitted_resolved)) {
-            plan.uncommitted_resolved = plan.uncommitted_resolved.filter((id) => !rmSet.has(id));
-        }
-        if (plan.clusters && typeof plan.clusters === "object") {
-            for (const c of Object.values(plan.clusters)) {
-                if (Array.isArray(c.issue_ids)) {
-                    const b = c.issue_ids.length;
-                    c.issue_ids = c.issue_ids.filter((id) => !rmSet.has(id));
-                    purgedPlanCount += b - c.issue_ids.length;
-                }
-            }
-        }
-    }
+    const purgedPlanCount = removedIds.length > 0 && plan
+        ? purgeIdsFromPlan(plan, new Set(removedIds))
+        : 0;
 
     return {
         removed_ids: removedIds,
@@ -1823,6 +1944,56 @@ function remapSingleIssuePaths(oldId, iss, moveMap) {
     return { mutated, newId };
 }
 
+function remapStateIssueKeys(state, moveMap) {
+    const idMap = new Map();
+    let mutatedCount = 0;
+    if (!state?.issues || typeof state.issues !== "object") return { idMap, mutatedCount };
+    for (const [oldId, iss] of Object.entries(state.issues)) {
+        if (!iss || typeof iss !== "object") continue;
+        const { mutated, newId } = remapSingleIssuePaths(oldId, iss, moveMap);
+        if (newId !== oldId) {
+            idMap.set(oldId, newId);
+            state.issues[newId] = iss;
+            delete state.issues[oldId];
+        }
+        if (mutated) mutatedCount += 1;
+    }
+    return { idMap, mutatedCount };
+}
+
+function remapPlanIssueReferences(plan, idMap) {
+    const remapArr = (arr) => (Array.isArray(arr) ? arr.map((id) => idMap.get(id) || id) : arr);
+    plan.queue_order = remapArr(plan.queue_order);
+    plan.promoted_ids = remapArr(plan.promoted_ids);
+    plan.uncommitted_resolved = remapArr(plan.uncommitted_resolved);
+    plan.deferred_ids = remapArr(plan.deferred_ids);
+    if (plan.triage && Array.isArray(plan.triage.triaged_review_ids)) {
+        plan.triage.triaged_review_ids = remapArr(plan.triage.triaged_review_ids);
+    }
+    for (const c of Object.values(plan.clusters || {})) {
+        if (Array.isArray(c.issue_ids)) c.issue_ids = remapArr(c.issue_ids);
+        for (const s of c.steps || []) {
+            if (s && Array.isArray(s.issue_refs)) s.issue_refs = remapArr(s.issue_refs);
+        }
+    }
+    if (plan.skipped && typeof plan.skipped === "object" && !Array.isArray(plan.skipped)) {
+        for (const [oldId, newId] of idMap.entries()) {
+            if (plan.skipped[oldId]) {
+                plan.skipped[newId] = { ...plan.skipped[oldId], id: newId };
+                delete plan.skipped[oldId];
+            }
+        }
+    }
+    if (plan.annotations && typeof plan.annotations === "object") {
+        for (const [oldId, newId] of idMap.entries()) {
+            if (plan.annotations[oldId]) {
+                plan.annotations[newId] = plan.annotations[oldId];
+                delete plan.annotations[oldId];
+            }
+        }
+    }
+}
+
 /**
  * Remap issue IDs and file paths in `state.issues` and `plan` after `plexer health move`.
  * @param {object} state
@@ -1831,60 +2002,10 @@ function remapSingleIssuePaths(oldId, iss, moveMap) {
  */
 export function remapMovedIssuePaths(state, plan, moveMap) {
     if (!moveMap || moveMap.size === 0) return { remapped_count: 0, id_map: {} };
-    const idMap = new Map();
-    let mutatedCount = 0;
-
-    if (state?.issues && typeof state.issues === "object") {
-        for (const [oldId, iss] of Object.entries(state.issues)) {
-            if (!iss || typeof iss !== "object") continue;
-            const { mutated, newId } = remapSingleIssuePaths(oldId, iss, moveMap);
-            if (newId !== oldId) {
-                idMap.set(oldId, newId);
-                state.issues[newId] = iss;
-                delete state.issues[oldId];
-            }
-            if (mutated) mutatedCount += 1;
-        }
-    }
-
+    const { idMap, mutatedCount } = remapStateIssueKeys(state, moveMap);
     if (idMap.size > 0 && plan && typeof plan === "object") {
-        const remapArr = (arr) => (Array.isArray(arr) ? arr.map((id) => idMap.get(id) || id) : arr);
-        plan.queue_order = remapArr(plan.queue_order);
-        plan.promoted_ids = remapArr(plan.promoted_ids);
-        plan.uncommitted_resolved = remapArr(plan.uncommitted_resolved);
-        plan.deferred_ids = remapArr(plan.deferred_ids);
-        if (plan.triage && Array.isArray(plan.triage.triaged_review_ids)) {
-            plan.triage.triaged_review_ids = remapArr(plan.triage.triaged_review_ids);
-        }
-
-        if (plan.clusters && typeof plan.clusters === "object") {
-            for (const c of Object.values(plan.clusters)) {
-                if (Array.isArray(c.issue_ids)) c.issue_ids = remapArr(c.issue_ids);
-                if (Array.isArray(c.steps)) {
-                    for (const s of c.steps) {
-                        if (s && Array.isArray(s.issue_refs)) s.issue_refs = remapArr(s.issue_refs);
-                    }
-                }
-            }
-        }
-        if (plan.skipped && typeof plan.skipped === "object" && !Array.isArray(plan.skipped)) {
-            for (const [oldId, newId] of idMap.entries()) {
-                if (plan.skipped[oldId]) {
-                    plan.skipped[newId] = { ...plan.skipped[oldId], id: newId };
-                    delete plan.skipped[oldId];
-                }
-            }
-        }
-        if (plan.annotations && typeof plan.annotations === "object") {
-            for (const [oldId, newId] of idMap.entries()) {
-                if (plan.annotations[oldId]) {
-                    plan.annotations[newId] = plan.annotations[oldId];
-                    delete plan.annotations[oldId];
-                }
-            }
-        }
+        remapPlanIssueReferences(plan, idMap);
     }
-
     return {
         remapped_count: Math.max(mutatedCount, idMap.size),
         id_map: Object.fromEntries(idMap),

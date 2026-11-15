@@ -319,11 +319,10 @@ export function computeIssueFingerprints(detector, identifier, summary) {
 }
 
 /**
- * Check whether an issue or issue ID matches any configured suppression pattern or fingerprint.
+ * Find the matching suppression rule entry for an issue or issue ID, or `null` if unmatched.
  * Supports `*` wildcards (e.g. `detector::*::rule` matching `detector::path/to/file.js::rule`).
  */
-export function isSuppressedByPatterns(issueOrId, suppressions) {
-    if (!issueOrId || !suppressions) return false;
+function parseSuppressionTarget(issueOrId) {
     const isObj = typeof issueOrId === "object";
     const id = isObj
         ? issueOrId.id ||
@@ -333,47 +332,60 @@ export function isSuppressedByPatterns(issueOrId, suppressions) {
     const detector = isObj ? issueOrId.detector || idParts[0] || "" : idParts[0] || "";
     const file = isObj ? issueOrId.file || idParts[1] || "" : idParts[1] || "";
     const identifier = isObj ? issueOrId.identifier || idParts.slice(2).join("::") : idParts.slice(2).join("::");
-
-    const entries =
-        Array.isArray(suppressions) || suppressions instanceof Set
-            ? [...suppressions].map((p) => (typeof p === "string" ? { pattern: p } : p))
-            : typeof suppressions === "object"
-              ? Object.entries(suppressions).map(([k, v]) =>
-                    typeof v === "object" && v !== null ? { pattern: v.pattern || k, ...v } : { pattern: k },
-                )
-              : [];
-
     const issueFps =
         isObj && detector && (identifier || issueOrId.summary)
             ? computeIssueFingerprints(detector, identifier, issueOrId.summary)
             : [];
+    return { id, file, identifier, issueFps };
+}
 
-    for (const entry of entries) {
-        if (!entry) continue;
-        const pat = String(entry.pattern || "").trim();
-        if (!pat) continue;
-        if (pat === id) return true;
-        const exactRe = wildcardToRegExp(pat);
-        if (exactRe.test(id)) return true;
-        if (!pat.includes("::") || pat.includes("*")) {
-            const substrRe = wildcardToRegExp(pat.includes("*") ? pat : `*${pat}*`);
-            if (substrRe.test(id)) return true;
-            if (!pat.includes("::") && (substrRe.test(file) || substrRe.test(identifier))) return true;
-        }
-        if (
-            issueFps.length > 0 &&
-            Array.isArray(entry.fingerprints) &&
-            issueFps.some((fp) => entry.fingerprints.includes(fp))
-        ) {
-            return true;
-        }
-        if (Array.isArray(entry.fingerprints) && pat.includes("::")) {
-            const normPat = pat.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
-            const normId = id.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
-            if (normPat && normPat === normId) return true;
-        }
+function normalizeSuppressionEntries(suppressions) {
+    if (Array.isArray(suppressions) || suppressions instanceof Set) {
+        return [...suppressions].map((p) => (typeof p === "string" ? { pattern: p } : p));
+    }
+    if (typeof suppressions === "object") {
+        return Object.entries(suppressions).map(([k, v]) =>
+            typeof v === "object" && v !== null ? { pattern: v.pattern || k, ...v } : { pattern: k },
+        );
+    }
+    return [];
+}
+
+function suppressionEntryMatchesTarget(entry, { id, file, identifier, issueFps }) {
+    if (!entry) return false;
+    const pat = String(entry.pattern || "").trim();
+    if (!pat) return false;
+    if (pat === id || wildcardToRegExp(pat).test(id)) return true;
+    if (!pat.includes("::") || pat.includes("*")) {
+        const substrRe = wildcardToRegExp(pat.includes("*") ? pat : `*${pat}*`);
+        if (substrRe.test(id)) return true;
+        if (!pat.includes("::") && (substrRe.test(file) || substrRe.test(identifier))) return true;
+    }
+    if (issueFps.length > 0 && Array.isArray(entry.fingerprints) && issueFps.some((fp) => entry.fingerprints.includes(fp))) {
+        return true;
+    }
+    if (Array.isArray(entry.fingerprints) && pat.includes("::")) {
+        const normPat = pat.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
+        const normId = id.replace(/(?:\b|_)?L\d+(?:-L?\d+)?\b/g, "");
+        return Boolean(normPat && normPat === normId);
     }
     return false;
+}
+
+export function findMatchingSuppressionEntry(issueOrId, suppressions) {
+    if (!issueOrId || !suppressions) return null;
+    const target = parseSuppressionTarget(issueOrId);
+    for (const entry of normalizeSuppressionEntries(suppressions)) {
+        if (suppressionEntryMatchesTarget(entry, target)) return entry;
+    }
+    return null;
+}
+
+/**
+ * Check whether an issue or issue ID matches any configured suppression pattern or fingerprint.
+ */
+export function isSuppressedByPatterns(issueOrId, suppressions) {
+    return Boolean(findMatchingSuppressionEntry(issueOrId, suppressions));
 }
 
 function toScopeSet(val) {
@@ -453,6 +465,78 @@ function computeSuspectDetectors(
 
 const UNSEEN_ACTIVE_STATUSES = new Set(["open", "deferred", "triaged_out", "wontfix"]);
 
+function resurfaceExpiredDeferredIssue(prev, scanNum) {
+    const resurfaced = {
+        ...prev,
+        status: "open",
+        suspect_hold: false,
+        reopen_count: (prev.reopen_count || 0) + 1,
+        reopened_at_scan: scanNum,
+    };
+    delete resurfaced.resurface_after_scan;
+    return resurfaced;
+}
+
+function resolveMissingSeenIssueTransition(id, prev, scanNum, suspectDetectors, suppressionLedger, out) {
+    if (
+        prev.status === "deferred" &&
+        prev.resurface_after_scan !== undefined &&
+        prev.resurface_after_scan !== null &&
+        scanNum >= Number(prev.resurface_after_scan)
+    ) {
+        out.nextIssues[id] = resurfaceExpiredDeferredIssue(prev, scanNum);
+        out.resurfacedIds.push(id);
+        out.reopenedIds.push(id);
+        return;
+    }
+    const suppressedByKind = suppressionLedger?.matchIssue?.(prev) || null;
+    if (suppressedByKind && UNSEEN_ACTIVE_STATUSES.has(prev.status)) {
+        out.nextIssues[id] = {
+            ...prev,
+            status: "wontfix",
+            suppressed: true,
+            suppressed_by: suppressedByKind,
+            suspect_hold: false,
+            verified: false,
+            suppressed_at_scan: scanNum,
+        };
+        out.suppressedIds.push(id);
+        return;
+    }
+    if (prev.status === "fixed") {
+        out.nextIssues[id] = {
+            ...prev,
+            suspect_hold: false,
+            verified: true,
+            verified_at_scan: prev.verified ? prev.verified_at_scan : scanNum,
+        };
+        if (!prev.verified) out.verifiedFixedIds.push(id);
+        return;
+    }
+    if (!UNSEEN_ACTIVE_STATUSES.has(prev.status)) {
+        out.nextIssues[id] = prev;
+        return;
+    }
+    if (suspectDetectors.has(prev.detector)) {
+        out.nextIssues[id] = {
+            ...prev,
+            suspect_hold: true,
+            suspect_since_scan: prev.suspect_since_scan || scanNum,
+        };
+        out.suspectHeldIds.push(id);
+        return;
+    }
+    out.nextIssues[id] = {
+        ...prev,
+        status: "auto_resolved",
+        suppressed: false,
+        suspect_hold: false,
+        verified: true,
+        verified_at_scan: scanNum,
+    };
+    out.autoResolvedIds.push(id);
+}
+
 function reconcileUnseenScanIssues(
     prevIssues,
     seenIds,
@@ -472,6 +556,7 @@ function reconcileUnseenScanIssues(
 ) {
     const catSet = toScopeSet(scannedCategories);
     const detSet = toScopeSet(scannedDetectors);
+    const out = { nextIssues, verifiedFixedIds, autoResolvedIds, suspectHeldIds, resurfacedIds, reopenedIds, suppressedIds };
 
     for (const [id, prev] of Object.entries(prevIssues)) {
         if (seenIds.has(id)) continue;
@@ -479,69 +564,7 @@ function reconcileUnseenScanIssues(
             nextIssues[id] = prev;
             continue;
         }
-        if (
-            prev.status === "deferred" &&
-            prev.resurface_after_scan !== undefined &&
-            prev.resurface_after_scan !== null &&
-            scanNum >= Number(prev.resurface_after_scan)
-        ) {
-            const resurfaced = {
-                ...prev,
-                status: "open",
-                suspect_hold: false,
-                reopen_count: (prev.reopen_count || 0) + 1,
-                reopened_at_scan: scanNum,
-            };
-            delete resurfaced.resurface_after_scan;
-            nextIssues[id] = resurfaced;
-            resurfacedIds.push(id);
-            reopenedIds.push(id);
-            continue;
-        }
-        const suppressedByKind = suppressionLedger?.matchIssue?.(prev) || null;
-        if (suppressedByKind && UNSEEN_ACTIVE_STATUSES.has(prev.status)) {
-            nextIssues[id] = {
-                ...prev,
-                status: "wontfix",
-                suppressed: true,
-                suppressed_by: suppressedByKind,
-                suspect_hold: false,
-                verified: false,
-                suppressed_at_scan: scanNum,
-            };
-            suppressedIds.push(id);
-            continue;
-        }
-        if (prev.status === "fixed") {
-            nextIssues[id] = {
-                ...prev,
-                suspect_hold: false,
-                verified: true,
-                verified_at_scan: prev.verified ? prev.verified_at_scan : scanNum,
-            };
-            if (!prev.verified) verifiedFixedIds.push(id);
-        } else if (UNSEEN_ACTIVE_STATUSES.has(prev.status)) {
-            if (suspectDetectors.has(prev.detector)) {
-                nextIssues[id] = {
-                    ...prev,
-                    suspect_hold: true,
-                    suspect_since_scan: prev.suspect_since_scan || scanNum,
-                };
-                suspectHeldIds.push(id);
-            } else {
-                nextIssues[id] = {
-                    ...prev,
-                    status: "auto_resolved",
-                    suppressed: false,
-                    suspect_hold: false,
-                    verified: true,
-                    verified_at_scan: scanNum,
-                };
-                autoResolvedIds.push(id);
-            }
-        } else {
-            nextIssues[id] = prev;
-        }
+        resolveMissingSeenIssueTransition(id, prev, scanNum, suspectDetectors, suppressionLedger, out);
     }
 }
 
@@ -552,7 +575,9 @@ export function appendScoreHistory(state, scores, event = "scan") {
     if (!Array.isArray(state.history)) state.history = [];
     const all = Object.values(state.issues || {});
     const openCount = all.filter((i) => i.status === "open" && !i.suppressed).length;
-    const wontfixCount = all.filter((i) => i.status === "wontfix" || i.suppressed).length;
+    const wontfixCount = all.filter(
+        (i) => i.status === "wontfix" || (i.suppressed && i.status !== "false_positive"),
+    ).length;
     state.history.push({
         scan_count: state.scan_count || 0,
         event,
@@ -569,79 +594,83 @@ export function appendScoreHistory(state, scores, event = "scan") {
     }
 }
 
+function buildNewScanIssue(item, id, scanNum, matchedEntry) {
+    const matchedSuppressed = Boolean(matchedEntry);
+    const suppressedStatus = matchedEntry?.kind === "false_positive" ? "false_positive" : "wontfix";
+    return {
+        ...item,
+        id,
+        status: matchedSuppressed ? suppressedStatus : "open",
+        suppressed: matchedSuppressed,
+        suspect_hold: false,
+        verified: false,
+        reopen_count: 0,
+        first_seen_scan: scanNum,
+        last_seen_scan: scanNum,
+        note: matchedSuppressed ? matchedEntry?.note || null : null,
+        attestation: matchedSuppressed ? matchedEntry?.attestation || null : null,
+        ...(matchedSuppressed && matchedEntry?.reason ? { reason: matchedEntry.reason } : {}),
+    };
+}
+
+function buildReopenedScanIssue(item, id, prev, scanNum) {
+    return {
+        ...prev,
+        ...item,
+        id,
+        status: "open",
+        suspect_hold: false,
+        verified: false,
+        reopen_count: (prev.reopen_count || 0) + 1,
+        last_seen_scan: scanNum,
+        reopened_at_scan: scanNum,
+    };
+}
+
 function upsertDetectedScanIssue(item, id, prev, scanNum, nextIssues, newIds, reopenedIds, resurfacedIds = [], suppressions = null) {
-    const matchedSuppressed = suppressions ? isSuppressedByPatterns({ ...item, id }, suppressions) : false;
+    const matchedEntry = suppressions ? findMatchingSuppressionEntry({ ...item, id }, suppressions) : null;
     if (!prev) {
-        nextIssues[id] = {
-            ...item,
-            id,
-            status: matchedSuppressed ? "wontfix" : "open",
-            suppressed: matchedSuppressed,
-            suspect_hold: false,
-            verified: false,
-            reopen_count: 0,
-            first_seen_scan: scanNum,
-            last_seen_scan: scanNum,
-            note: null,
-            attestation: null,
-        };
-        if (!matchedSuppressed) newIds.push(id);
-    } else if (matchedSuppressed) {
+        nextIssues[id] = buildNewScanIssue(item, id, scanNum, matchedEntry);
+        if (!matchedEntry) newIds.push(id);
+        return;
+    }
+    if (matchedEntry) {
         nextIssues[id] = {
             ...prev,
             ...item,
             id,
-            status: prev.status === "false_positive" ? "false_positive" : "wontfix",
+            status: prev.status === "false_positive" || matchedEntry.kind === "false_positive" ? "false_positive" : "wontfix",
             suspect_hold: false,
             suppressed: true,
             last_seen_scan: scanNum,
+            ...(matchedEntry.reason && !prev.reason ? { reason: matchedEntry.reason } : {}),
         };
-    } else if (prev.status === "fixed" || prev.status === "auto_resolved") {
-        nextIssues[id] = {
-            ...prev,
-            ...item,
-            id,
-            status: "open",
-            suspect_hold: false,
-            verified: false,
-            reopen_count: (prev.reopen_count || 0) + 1,
-            last_seen_scan: scanNum,
-            reopened_at_scan: scanNum,
-        };
+        return;
+    }
+    if (prev.status === "fixed" || prev.status === "auto_resolved") {
+        nextIssues[id] = buildReopenedScanIssue(item, id, prev, scanNum);
         reopenedIds.push(id);
-    } else if (
-        prev.status === "deferred" &&
-        prev.resurface_after_scan !== undefined &&
-        prev.resurface_after_scan !== null &&
-        scanNum >= Number(prev.resurface_after_scan)
-    ) {
-        const resurfaced = {
-            ...prev,
-            ...item,
-            id,
-            status: "open",
-            suspect_hold: false,
-            verified: false,
-            reopen_count: (prev.reopen_count || 0) + 1,
-            last_seen_scan: scanNum,
-            reopened_at_scan: scanNum,
-        };
+        return;
+    }
+    const shouldResurface = prev.status === "deferred" && prev.resurface_after_scan !== undefined && prev.resurface_after_scan !== null && scanNum >= Number(prev.resurface_after_scan);
+    if (shouldResurface) {
+        const resurfaced = buildReopenedScanIssue(item, id, prev, scanNum);
         delete resurfaced.resurface_after_scan;
         nextIssues[id] = resurfaced;
         reopenedIds.push(id);
         resurfacedIds.push(id);
-    } else {
-        const isSupp = Boolean(prev.suppressed || matchedSuppressed);
-        nextIssues[id] = {
-            ...prev,
-            ...item,
-            id,
-            status: isSupp ? (prev.status === "false_positive" ? "false_positive" : "wontfix") : prev.status,
-            suspect_hold: false,
-            suppressed: isSupp,
-            last_seen_scan: scanNum,
-        };
+        return;
     }
+    const isSupp = Boolean(prev.suppressed);
+    nextIssues[id] = {
+        ...prev,
+        ...item,
+        id,
+        status: isSupp ? (prev.status === "false_positive" ? "false_positive" : "wontfix") : prev.status,
+        suspect_hold: false,
+        suppressed: isSupp,
+        last_seen_scan: scanNum,
+    };
 }
 
 /**
@@ -989,6 +1018,62 @@ export function detectGitContext(rootDir) {
 /**
  * Generate a Markdown PR body summarizing commit-tracked resolutions and score progression.
  */
+function appendCommitLogScoreSection(lines, scores, history) {
+    if (!scores) return;
+    const firstEntry = history.length > 0 ? history[0] : null;
+    const deltaStr =
+        firstEntry && typeof firstEntry.strict === "number"
+            ? ` (${scores.strict - firstEntry.strict >= 0 ? "+" : ""}${(scores.strict - firstEntry.strict).toFixed(1)} vs baseline ${firstEntry.strict.toFixed(1)}%)`
+            : "";
+    lines.push("| Metric | Score |");
+    lines.push("| :--- | :--- |");
+    lines.push(`| **Strict Score (North Star)** | **${scores.strict.toFixed(1)}%**${deltaStr} |`);
+    lines.push(`| Overall (Lenient) | ${scores.overall.toFixed(1)}% |`);
+    lines.push(`| Objective (Mechanical) | ${scores.objective.toFixed(1)}% |`);
+    lines.push(`| Verified | ${scores.verified.toFixed(1)}% |`);
+    lines.push("");
+}
+
+function appendCommitLogResolvedSection(lines, allTrackedIds, committedCount, uncommittedCount, issues) {
+    lines.push(
+        `### Resolved Findings (${allTrackedIds.length} total: ${committedCount} committed, ${uncommittedCount} uncommitted)`,
+    );
+    lines.push("");
+    if (allTrackedIds.length === 0) {
+        lines.push("_No resolved findings recorded yet._", "");
+        return;
+    }
+    const byDetector = new Map();
+    for (const id of allTrackedIds) {
+        const iss = issues[id];
+        const det = iss?.detector || id.split("::")[0] || "other";
+        if (!byDetector.has(det)) byDetector.set(det, []);
+        byDetector.get(det).push({ id, iss });
+    }
+    for (const [det, list] of byDetector.entries()) {
+        lines.push(`- **\`${det}\`** (${list.length}):`);
+        for (const { id, iss } of list.slice(0, 10)) {
+            const desc = iss ? `${iss.file}:${iss.span || "L1"} — ${iss.summary}` : id;
+            lines.push(`  - \`${id}\`: ${desc}`);
+        }
+        if (list.length > 10) lines.push(`  - _...and ${list.length - 10} more_`);
+    }
+    lines.push("");
+}
+
+function appendCommitLogHistorySection(lines, commitLog) {
+    if (commitLog.length === 0) return;
+    lines.push("### Commit Log", "", "| Commit | Branch | Issues | Note |", "| :--- | :--- | :---: | :--- |");
+    for (const rec of commitLog) {
+        const sha = rec.commit || rec.sha || "?";
+        const branch = rec.branch || "—";
+        const count = Array.isArray(rec.issue_ids) ? rec.issue_ids.length : 0;
+        const note = rec.note || rec.subject || "—";
+        lines.push(`| \`${sha}\` | \`${branch}\` | ${count} | ${note} |`);
+    }
+    lines.push("");
+}
+
 export function generateCommitLogPrBody(plan, state, scores = null) {
     const commitLog = Array.isArray(plan?.commit_log) ? plan.commit_log : [];
     const uncommitted = Array.isArray(plan?.uncommitted_resolved) ? plan.uncommitted_resolved : [];
@@ -996,69 +1081,11 @@ export function generateCommitLogPrBody(plan, state, scores = null) {
     const history = Array.isArray(state?.history) ? state.history : [];
 
     const lines = ["## `plexer health` Quality Report", ""];
-
-    if (scores) {
-        const firstEntry = history.length > 0 ? history[0] : null;
-        const deltaStr =
-            firstEntry && typeof firstEntry.strict === "number"
-                ? ` (${scores.strict - firstEntry.strict >= 0 ? "+" : ""}${(scores.strict - firstEntry.strict).toFixed(1)} vs baseline ${firstEntry.strict.toFixed(1)}%)`
-                : "";
-        lines.push("| Metric | Score |");
-        lines.push("| :--- | :--- |");
-        lines.push(`| **Strict Score (North Star)** | **${scores.strict.toFixed(1)}%**${deltaStr} |`);
-        lines.push(`| Overall (Lenient) | ${scores.overall.toFixed(1)}% |`);
-        lines.push(`| Objective (Mechanical) | ${scores.objective.toFixed(1)}% |`);
-        lines.push(`| Verified | ${scores.verified.toFixed(1)}% |`);
-        lines.push("");
-    }
-
+    appendCommitLogScoreSection(lines, scores, history);
     const committedIds = commitLog.flatMap((r) => r.issue_ids || []);
     const allTrackedIds = [...new Set([...committedIds, ...uncommitted])];
-
-    lines.push(
-        `### Resolved Findings (${allTrackedIds.length} total: ${committedIds.length} committed, ${uncommitted.length} uncommitted)`,
-    );
-    lines.push("");
-
-    if (allTrackedIds.length === 0) {
-        lines.push("_No resolved findings recorded yet._");
-        lines.push("");
-    } else {
-        const byDetector = new Map();
-        for (const id of allTrackedIds) {
-            const iss = issues[id];
-            const det = iss?.detector || id.split("::")[0] || "other";
-            if (!byDetector.has(det)) byDetector.set(det, []);
-            byDetector.get(det).push({ id, iss });
-        }
-        for (const [det, list] of byDetector.entries()) {
-            lines.push(`- **\`${det}\`** (${list.length}):`);
-            for (const { id, iss } of list.slice(0, 10)) {
-                const desc = iss ? `${iss.file}:${iss.span || "L1"} — ${iss.summary}` : id;
-                lines.push(`  - \`${id}\`: ${desc}`);
-            }
-            if (list.length > 10) {
-                lines.push(`  - _...and ${list.length - 10} more_`);
-            }
-        }
-        lines.push("");
-    }
-
-    if (commitLog.length > 0) {
-        lines.push("### Commit Log");
-        lines.push("");
-        lines.push("| Commit | Branch | Issues | Note |");
-        lines.push("| :--- | :--- | :---: | :--- |");
-        for (const rec of commitLog) {
-            const sha = rec.commit || rec.sha || "?";
-            const branch = rec.branch || "—";
-            const count = Array.isArray(rec.issue_ids) ? rec.issue_ids.length : 0;
-            const note = rec.note || rec.subject || "—";
-            lines.push(`| \`${sha}\` | \`${branch}\` | ${count} | ${note} |`);
-        }
-        lines.push("");
-    }
-
+    appendCommitLogResolvedSection(lines, allTrackedIds, committedIds.length, uncommitted.length, issues);
+    appendCommitLogHistorySection(lines, commitLog);
     return lines.join("\n");
 }
 

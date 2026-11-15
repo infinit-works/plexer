@@ -666,6 +666,7 @@ export function buildReviewSystemPrompt(detectedLangs = []) {
         "",
         "IMPORT GUARD RULES:",
         "- Every finding must reduce net complexity (Simplicity Principle: prefer direct over indirect, inline over 1-caller wrappers).",
+        "- Do NOT recommend collapsing cohesive generated/data/registry tables into callers, removing public entrypoints or dynamic loader targets without verifying runtime callers, or deleting wire/payload keys consumed outside the file.",
         "- Any dimension scored < 85 MUST include at least one concrete defect in `findings[]` for that dimension (or explicit rationale in `dimension_judgment`).",
     ];
 

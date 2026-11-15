@@ -13,6 +13,10 @@
       <div id="canvas-empty" class="empty-state hidden"></div>
     </section>
 
+    <section id="treemap-stage" class="treemap-stage hidden">
+      <iframe id="treemap-frame" class="treemap-frame" title="Codebase Health Treemap" sandbox="allow-scripts"></iframe>
+    </section>
+
     <aside id="outline-sidebar" class="outline-sidebar">
       <div class="outline-sidebar-header">
         <div class="outline-sidebar-title-wrap">
@@ -36,15 +40,21 @@
       <span id="repo-name" class="repo-name"></span>
       <span id="repo-subtitle" class="repo-subtitle hidden"></span>
 
+      <select id="workspace-select" class="control-select hidden" title="Active workspace repository">
+        <option value="">Auto workspace</option>
+      </select>
+
       <nav id="view-tabs" class="tabs" role="tablist">
         <button class="tab active" id="tab-modules" data-tab="modules" role="tab" title="Module dependency graph (1)">Modules</button>
         <button class="tab" id="tab-symbols" data-tab="symbols" role="tab" title="Full symbol call/reference graph (2)">Symbols</button>
         <button class="tab hidden" id="tab-context" data-tab="context" role="tab" title="Blast radius & concept graph (3)">Blast</button>
+        <button class="tab hidden" id="tab-treemap" data-tab="treemap" role="tab" title="Codebase health treemap (4)">Treemap</button>
       </nav>
 
       <div class="search-wrap">
-        <input id="search-input" type="search" placeholder="Find… (/)" title="Search nodes (/ to focus, Enter / ↑ / ↓ to cycle matches)" autocomplete="off" spellcheck="false">
+        <input id="search-input" type="search" placeholder="Filter or jump (/ or ⌘K)" title="Search nodes or filter with @issue:<detector>, @zone:<zone>, @swarm:<worker> (/ or Cmd/Ctrl+K)" autocomplete="off" spellcheck="false">
         <span id="search-count" class="search-count"></span>
+        <div id="quick-filter-popover" class="quick-filter-popover hidden" role="listbox" aria-label="Quick filters and symbol jump"></div>
       </div>
 
       <select id="scope-select" class="control-select hidden" title="Filter by directory">
@@ -83,6 +93,9 @@
         <code id="insp-loc" class="inspector-loc"></code>
         <button id="insp-copy" class="btn-xs" title="Copy path:span">Copy</button>
         <button id="insp-focus-symbols" class="btn-xs hidden" title="Focus in Symbols graph">Focus Graph</button>
+        <button id="insp-open-file" class="btn-xs hidden" title="Open file in Auxiliary Pane at exact line">Open file</button>
+        <button id="insp-pin-prompt" class="btn-xs hidden" title="Pin span to prompt">Pin</button>
+        <button id="insp-pin-bundle" class="btn-xs hidden" title="Pin symbol, callers, and open health issues">Pin context</button>
       </div>
       <div id="insp-controls-row" class="inspector-controls-row">
         <span class="insp-controls-label">Reachability</span>

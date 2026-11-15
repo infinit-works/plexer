@@ -248,6 +248,25 @@ function collectHighPriorityReminders(state, scores, plan, config, command, susp
             command: "plexer health show --status wontfix",
         });
     }
+
+    const fpAbuseWarning = Boolean(
+        scores?.ignore_integrity?.false_positive_abuse_warning ||
+            state?.ignore_integrity?.false_positive_abuse_warning,
+    );
+    if (fpAbuseWarning) {
+        const fpCount = Number(
+            scores?.ignore_integrity?.false_positive_count ?? scores?.false_positive_count ?? 0,
+        );
+        const fpPct = Number(scores?.ignore_integrity?.false_positive_pct ?? 0);
+        candidates.push({
+            type: "false_positive_abuse",
+            priority: 1,
+            severity: "high",
+            no_decay: true,
+            message: `${fpCount} finding(s) (${fpPct}% of issues) are dismissed as \`false_positive\`. Audit dismissals to ensure genuine defects are fixed rather than waived.`,
+            command: "plexer health show --status false_positive",
+        });
+    }
 }
 
 function collectMediumAndLowReminders(state, scores, plan, config, command, openIssues, totalProdFiles, candidates) {
@@ -261,12 +280,12 @@ function collectMediumAndLowReminders(state, scores, plan, config, command, open
         });
     }
 
-    if (scores.wontfix_gap >= 3.0) {
+    if (scores.wontfix_gap >= 3.0 && (scores.wontfix_count || 0) > 0) {
         candidates.push({
             type: "wontfix_debt",
             priority: 2,
             severity: "medium",
-            message: `Wontfix/false-positive debt is widening the lenient↔strict gap (${scores.wontfix_gap}% across ${scores.wontfix_count + (scores.false_positive_count || 0)} items). Challenge past skips to raise strict score.`,
+            message: `Wontfix debt is widening the lenient↔strict gap (${scores.wontfix_gap}% across ${scores.wontfix_count} wontfix item(s)). Challenge past skips to raise strict score.`,
             command: "plexer health show --status wontfix",
         });
     }

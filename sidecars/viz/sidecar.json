@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Plexer Graph",
+  "description": "Live 4-tab Plexer Graph (Modules, Symbols, Session/Swarm Blast, Health Treemap). Supports deep-link query params ?tab=modules|symbols|context|treemap&q=<query>.",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "Plexer Graph",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Plexer Graph"
+      }
+    ]
+  }
+}
