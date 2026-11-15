@@ -19,7 +19,6 @@ export const HOSTS = [
         relPath: 'AGENTS.md',
         content: instructionBody,
         detect: (home) => dirExists(join(home, '.codex')) ||
-            dirExists(join(home, '.config', 'opencode')) ||
             dirExists(join(home, '.config', 'agents')),
     },
     {
@@ -80,8 +79,17 @@ export const HOSTS = [
         // its global config dir (`~/.gemini/config/`, where mcp_config.json + hooks.json live)
         // or a workspace `.agents/` dir. Keeps a plain Gemini-CLI user from auto-selecting it.
         detect: (home, repo) => dirExists(join(home, '.gemini', 'config')) ||
+            dirExists(join(home, '.gemini', 'antigravity')) ||
             dirExists(join(home, '.gemini', 'antigravity-cli')) ||
             dirExists(join(repo, '.agents')),
+    },
+    {
+        id: 'opencode',
+        name: 'OpenCode',
+        kind: 'section',
+        relPath: 'AGENTS.md',
+        content: instructionBody,
+        detect: (home, repo) => dirExists(join(home, '.config', 'opencode')) || existsSync(join(repo, 'opencode.json')),
     },
     {
         id: 'copilot',

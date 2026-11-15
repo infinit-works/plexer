@@ -1,0 +1,49 @@
+{
+  "plexer": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./bin/plexer-hook-client.cjs agy-pre-invocation",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "read_file|view_file|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./bin/plexer-hook-client.cjs agy-pre-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file|exit_plan_mode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./bin/plexer-hook-client.cjs agy-post-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./bin/plexer-hook-client.cjs agy-stop",
+        "timeout": 10
+      }
+    ],
+    "PostCascadeResponse": [
+      {
+        "type": "command",
+        "command": "node ./bin/plexer-hook-client.cjs agy-post-cascade-response",
+        "timeout": 10
+      }
+    ]
+  }
+}

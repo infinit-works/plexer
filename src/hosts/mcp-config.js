@@ -10,7 +10,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { BIN_LAUNCH, mergeJsonKey, updateJsonConfig } from '../util/config-write.js';
+import { BIN_LAUNCH, mergeJsonKey } from '../util/config-write.js';
 import { dirExists } from '../util/fs.js';
 export { BIN_LAUNCH, mergeJsonKey };
 /**
@@ -111,6 +111,15 @@ export function mcpTargets(repo, ids, opts = {}) {
                     scope: 'repo', kind: 'mcp', what: '[mcp_servers.plexer]', format: 'toml',
                 });
                 break;
+            case 'copilot':
+                out.push(jsonTarget(id, 'copilot', join(repo, '.vscode', 'mcp.json'), 'servers', { type: 'stdio', ...BIN_LAUNCH }));
+                break;
+            case 'windsurf':
+                out.push(jsonTarget(id, 'windsurf', join(home, '.codeium', 'windsurf', 'mcp_config.json'), 'mcpServers', BIN_LAUNCH, 'global'));
+                break;
+            case 'opencode':
+                out.push(jsonTarget(id, 'opencode', join(repo, 'opencode.json'), 'mcp', opencodeEntry()));
+                break;
             case 'agents':
                 // Guarded on the CLI actually being installed, so a plan only ever
                 // lists files a real run would touch.
@@ -120,12 +129,9 @@ export function mcpTargets(repo, ids, opts = {}) {
                         scope: 'global', kind: 'mcp', what: '[mcp_servers.plexer]', format: 'toml',
                     });
                 }
-                if (dirExists(join(home, '.config', 'opencode'))) {
-                    out.push(jsonTarget(id, 'opencode', join(repo, 'opencode.json'), 'mcp', opencodeEntry()));
-                }
                 break;
             default:
-                break; // copilot / windsurf / adal: no MCP target in this phase
+                break; // adal: no MCP target in this phase
         }
     }
     return out;

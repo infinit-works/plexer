@@ -17,7 +17,7 @@ import { basename, join } from 'node:path';
 import { isGeneratedPath, isTestPath } from '../util/paths.js';
 import { spanRange } from '../util/span.js';
 
-const DEF_KINDS = new Set(['function', 'method', 'class', 'type', 'interface', 'struct', 'enum', 'trait', 'impl', 'variable', 'const', 'constant', 'field']);
+const DEF_KINDS = new Set(['function', 'method', 'class', 'type', 'interface', 'struct', 'enum', 'trait', 'impl', 'variable', 'const', 'constant', 'field', 'doc']);
 /** Value-ish kinds are only worth pinning when they carry a body (a table/struct literal), not a one-line alias. */
 const VALUE_KINDS = new Set(['variable', 'const', 'constant', 'field']);
 /** Words that look like identifiers in prose/backticks but never name a definition worth pinning. */
@@ -128,7 +128,7 @@ function countIncomingPinCallers(graph, nodeId) {
         : (graph?.edges ?? []).filter((e) => e.target === nodeId);
     let count = 0;
     for (const e of inList) {
-        if (e.relation === 'calls' || e.relation === 'references' || e.relation === 'implements')
+        if (e.relation === 'calls' || e.relation === 'interface_dispatch' || e.relation === 'references' || e.relation === 'implements')
             count++;
     }
     return count;
@@ -187,6 +187,10 @@ function filterDefsByQualifier(defs, id) {
 
 function narrowPinDefsForId(id, byBare, graph, fileNamedInPrompt, topHints, hints, hasHintFiles) {
     let defs = byBare.get(id.name) ?? [];
+    if (defs.length > 1) {
+        const codeDefs = defs.filter((n) => n.kind !== 'doc');
+        if (codeDefs.length > 0) defs = codeDefs;
+    }
     if (id.owner) defs = defs.filter((n) => n.owner === id.owner);
     if (!defs.length) return [];
     const compound = isCompoundId(id.name) || Boolean(id.owner || id.qual);
@@ -232,9 +236,7 @@ export function resolveNamedDefinitions(graph, prompt, { maxPins = 3, hintFiles 
     const promptText = String(prompt);
     const hints = new Set(hintFiles);
     const topHints = new Set(hintFiles.slice(0, 2));
-    const cliMentioned = /\bCLI\b/i.test(promptText);
-    const fileNamedInPrompt = (p, node) => {
-        if (cliMentioned && node?.owner === 'Command') return true;
+    const fileNamedInPrompt = (p) => {
         const base = basename(p);
         const stem = base.replace(/\.[a-z0-9]+$/i, '');
         return promptText.includes(p) || promptText.includes(base) || (stem.length >= 8 && isCompoundId(stem) && promptText.includes(stem));
@@ -298,9 +300,9 @@ function appendCrossFileCallersForPin(root, pinNode, crossFileCallers, fileCache
 }
 
 const PIN_CONTRACT_OUT_RELS = new Set(['implements', 'extends', 'types']);
-const PIN_CALL_OUT_RELS = new Set(['calls', 'references']);
-const PIN_IN_RELS = new Set(['calls', 'imports', 'implements', 'extends', 'types', 'references']);
-const PIN_CTOR_KINDS = new Set(['struct', 'type', 'class', 'interface']);
+const PIN_CALL_OUT_RELS = new Set(['calls', 'interface_dispatch', 'references']);
+const PIN_IN_RELS = new Set(['calls', 'interface_dispatch', 'imports', 'implements', 'extends', 'types', 'references']);
+const PIN_CTOR_KINDS = new Set(['struct', 'type', 'class', 'interface', 'trait']);
 
 function readCachedPinFileLines(root, relPath, fileCache) {
     let lines = fileCache.get(relPath);
@@ -368,7 +370,7 @@ function collectIncomingPinRelations(root, pinNode, inList, byId, fileCache, see
         }
         if (!sn.span) continue;
         addUniquePinRelation(related, seenRel, `← ${sn.name} (${sn.path}:${sn.span})`);
-        if (e.relation === 'calls' && sn.path !== pinNode.path && !isTestPath(sn.path)) {
+        if ((e.relation === 'calls' || e.relation === 'interface_dispatch') && sn.path !== pinNode.path && !isTestPath(sn.path)) {
             crossFileCallers.push(sn);
         }
         const delRes = tryInlinePinDelegator(root, pinNode, sn, fileCache, seenDelegators, code, used, budgetBytes);
@@ -559,6 +561,7 @@ export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 
                 keep.push(l);
                 b += lb;
             }
+            if (keep.length < Math.min(4, body.length) || (body.length > 35 && keep.length < Math.min(18, Math.ceil(body.length * 0.25)))) continue;
             const lastLine = start + keep.length - 1;
             keep.push(`… (+${p.b - lastLine} more lines; open ${p.node.path}:L${lastLine + 1}-L${p.b})`);
             code = keep.join('\n');

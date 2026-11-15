@@ -10,8 +10,8 @@ import { normalizePathPrefix } from "../util/paths.js";
 
 const DIR_ARG = ["[dir]", "repository root (default: nearest ancestor with a plexer/ index)"];
 const NO_REFRESH_FLAG = ["--no-refresh", "skip the freshness check — answer from the graph as-is"];
-const VIZ_TABS = ["context", "code", "modules", "symbols", "outline"];
-const KNOWN_AGENT_LIST = "agents, adal, cursor, gemini, grok, hermes, antigravity, copilot, kiro, windsurf, claude";
+const VIZ_TABS = ["context", "code", "modules", "symbols", "outline", "treemap"];
+const KNOWN_AGENT_LIST = "agents, adal, cursor, gemini, grok, hermes, antigravity, copilot, kiro, windsurf, claude, opencode";
 const CLI_BIN_PATH = fileURLToPath(new URL("../../bin/plexer.js", import.meta.url));
 const VIEWER_DIR = fileURLToPath(new URL("../viewer/", import.meta.url));
 
@@ -59,6 +59,7 @@ const HEALTH_OPTIONS = [
     ["--stall-kill-seconds <n>", "kill hung review/triage batch subprocess after N idle seconds (default 120)"],
     ["--max-retries <n>", "retry failed review/triage batch subprocesses N times (default 1)"],
     ["--note <text>", "resolution, skip, suppress, or commit-log note"],
+    ["--reason <text>", "detailed reason for suppress or false-positive skip (>= 15 chars for --false-positive)"],
     ["--confirm", "confirm issue resolution"],
     ["--attest <text>", "explicit attestation for resolve, permanent skip, suppress, or review import"],
     ["--permanent", "mark skipped issue as permanent `wontfix`"],
@@ -118,31 +119,106 @@ const HEALTH_OPTIONS = [
     NO_REFRESH_FLAG,
 ];
 
-async function warnUnsupportedExtensions(exts) {
+async function warnUnsupportedExtensions(exts, ctx) {
     if (!exts?.length) return;
     const { unsupportedExtensions, supportedExtensions } = await import("../graph/source-files.js");
     const bad = unsupportedExtensions(exts);
     if (bad.length === 0) return;
     for (const e of bad) {
         const shown = e.trim().startsWith(".") ? e.trim() : `.${e.trim()}`;
-        console.error(`⚠ -e "${shown}": no parser registered for this extension — ignoring it.`);
+        ctx.errLine(`⚠ -e "${shown}": no parser registered for this extension — ignoring it.`);
     }
-    console.error(`  supported: ${supportedExtensions().join(" ")}`);
+    ctx.errLine(`  supported: ${supportedExtensions().join(" ")}`);
 }
 
-function parseTabs(raw) {
+function parseTabs(raw, ctx) {
     if (raw === undefined) return undefined;
     const want = raw.split(",").map((t) => t.trim()).filter(Boolean);
     const bad = want.filter((t) => !VIZ_TABS.includes(t));
     if (bad.length > 0 || want.length === 0) {
-        console.error(`✗ --tabs takes a comma-separated subset of ${VIZ_TABS.join(", ")}${bad.length ? ` — got "${bad.join('", "')}"` : ""}`);
-        process.exit(1);
+        ctx.errLine(`✗ --tabs takes a comma-separated subset of ${VIZ_TABS.join(", ")}${bad.length ? ` — got "${bad.join('", "')}"` : ""}`);
+        ctx.exit(1);
     }
     return want;
 }
 
-function createCliContext(program, currentVersion) {
+function resolveSessionIdFromEnv(env = process.env) {
+    return (
+        env.PLEXER_SESSION_ID ||
+        env.ANTIGRAVITY_CONVERSATION_ID ||
+        env.CLAUDE_SESSION_ID ||
+        env.CURSOR_TRACE_ID ||
+        null
+    );
+}
+
+function createIoContext(ioCtx = null) {
+    const isCaptured = Boolean(ioCtx?.isCaptured || ioCtx?.writeOut || ioCtx?.writeErr || ioCtx?.exit);
+    const cwd = ioCtx?.cwd || process.cwd();
+    const sessionId = ioCtx?.sessionId ?? null;
+    const writeOut = ioCtx?.writeOut || ((chunk) => process.stdout.write(String(chunk ?? "")));
+    const writeErr = ioCtx?.writeErr || ((chunk) => process.stderr.write(String(chunk ?? "")));
+    const exit = ioCtx?.exit || ((code = 0) => process.exit(code));
+    const outLine = (line = "") => writeOut(`${line}\n`);
+    const errLine = (line = "") => writeErr(`${line}\n`);
+    return { isCaptured, cwd, sessionId, writeOut, writeErr, exit, outLine, errLine };
+}
+
+class ExternalCliExitSignal extends Error {
+    constructor(code = 0) {
+        super(`external CLI exit ${code}`);
+        this.code = code;
+    }
+}
+
+/**
+ * Adapter for CLI modules invoked inside captured daemon/batch `ioCtx`.
+ * Never mutates `process.chdir` or env.
+ */
+async function withCapturedExternalCli(io, fn) {
+    if (!io.isCaptured)
+        return fn();
+    const origOut = process.stdout.write.bind(process.stdout);
+    const origErr = process.stderr.write.bind(process.stderr);
+    const origExit = process.exit;
+    process.stdout.write = (chunk, enc, cb) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString(typeof enc === "string" ? enc : "utf8") : String(chunk ?? "");
+        io.writeOut(text);
+        if (typeof enc === "function") enc();
+        else if (typeof cb === "function") cb();
+        return true;
+    };
+    process.stderr.write = (chunk, enc, cb) => {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString(typeof enc === "string" ? enc : "utf8") : String(chunk ?? "");
+        io.writeErr(text);
+        if (typeof enc === "function") enc();
+        else if (typeof cb === "function") cb();
+        return true;
+    };
+    process.exit = (code = 0) => {
+        throw new ExternalCliExitSignal(Number(code) || 0);
+    };
+    try {
+        return await fn();
+    }
+    catch (err) {
+        if (err instanceof ExternalCliExitSignal) {
+            io.exit(err.code);
+            return undefined;
+        }
+        throw err;
+    }
+    finally {
+        process.stdout.write = origOut;
+        process.stderr.write = origErr;
+        process.exit = origExit;
+    }
+}
+
+function createCliContext(program, currentVersion, ioCtx = null) {
+    const io = createIoContext(ioCtx);
     const getGlobalDir = () => program.opts().dir;
+    const getSessionId = () => program.opts().session || io.sessionId || resolveSessionIdFromEnv() || null;
     const cliConfig = () => ({ contextDir: getGlobalDir() });
     const splitTrailingDir = (arg, { requirePlexerDir = true } = {}) => {
         const rawList = Array.isArray(arg) ? [...arg] : [arg];
@@ -150,8 +226,8 @@ function createCliContext(program, currentVersion) {
         if (rawList.length >= 2) {
             const candidateDir = rawList[rawList.length - 1];
             try {
-                if (existsSync(candidateDir) && statSync(candidateDir).isDirectory()) {
-                    const absCand = resolve(candidateDir);
+                const absCand = resolve(io.cwd, candidateDir);
+                if (existsSync(absCand) && statSync(absCand).isDirectory()) {
                     const hasIndex = hasPlexerIndex(absCand) || existsSync(join(absCand, "plexer")) || Boolean(getGlobalDir());
                     if (hasIndex || (!requirePlexerDir && isAutoBuildableRepo(absCand))) {
                         dirArg = rawList.pop();
@@ -165,7 +241,7 @@ function createCliContext(program, currentVersion) {
     };
     const queryRoot = (dir) => {
         if (dir !== undefined) {
-            const resolved = resolve(dir);
+            const resolved = resolve(io.cwd, dir);
             let isDir = false;
             try {
                 isDir = statSync(resolved).isDirectory();
@@ -173,20 +249,20 @@ function createCliContext(program, currentVersion) {
                 isDir = false;
             }
             if (!isDir) {
-                console.error(`✗ directory not found: ${dir}`);
-                process.exit(1);
+                io.errLine(`✗ directory not found: ${dir}`);
+                io.exit(1);
             }
             const { root, levels } = nearestPlexerRoot(resolved, getGlobalDir());
-            if (levels > 0) console.error(`[plexer] no plexer/ in ${dir} — answering from ${root}/plexer`);
+            if (levels > 0) io.errLine(`[plexer] no plexer/ in ${dir} — answering from ${root}/plexer`);
             return root;
         }
-        const { root, levels } = nearestPlexerRoot(process.cwd(), getGlobalDir());
-        if (levels > 0) console.error(`[plexer] no plexer/ here — answering from ${root}/plexer`);
+        const { root, levels } = nearestPlexerRoot(io.cwd, getGlobalDir());
+        if (levels > 0) io.errLine(`[plexer] no plexer/ here — answering from ${root}/plexer`);
         return root;
     };
     const isBlastRepoDir = (candidate) => {
         try {
-            const abs = resolve(candidate);
+            const abs = resolve(io.cwd, candidate);
             if (!statSync(abs).isDirectory()) return false;
             return Boolean(getGlobalDir()) || hasPlexerIndex(abs) || isAutoBuildableRepo(abs);
         } catch {
@@ -196,7 +272,7 @@ function createCliContext(program, currentVersion) {
     const refreshBefore = async (dir, opts) => {
         if (opts.refresh === false) return;
         const globalDir = getGlobalDir();
-        const root = resolve(dir);
+        const root = resolve(io.cwd, dir);
         const [{ readWorkspace }, { ensureFreshChildren, ensureFreshGraph, refreshNote }] = await Promise.all([
             import("../graph/workspace.js"),
             import("../graph/refresh.js"),
@@ -206,22 +282,40 @@ function createCliContext(program, currentVersion) {
             ? await ensureFreshChildren(root, ws.children, { contextDir: globalDir, disabled: false })
             : await ensureFreshGraph(root, { contextDir: globalDir, disabled: false });
         const note = refreshNote(r);
-        if (note) console.error(note);
+        if (note) io.errLine(note);
     };
-    return { program, currentVersion, getGlobalDir, cliConfig, splitTrailingDir, queryRoot, isBlastRepoDir, refreshBefore };
+    return {
+        program,
+        currentVersion,
+        io,
+        cwd: io.cwd,
+        writeOut: io.writeOut,
+        writeErr: io.writeErr,
+        outLine: io.outLine,
+        errLine: io.errLine,
+        exit: io.exit,
+        runExternal: (fn) => withCapturedExternalCli(io, fn),
+        getGlobalDir,
+        getSessionId,
+        cliConfig,
+        splitTrailingDir,
+        queryRoot,
+        isBlastRepoDir,
+        refreshBefore,
+    };
 }
 
-function parseBuildConfigOptions(opts, command) {
+function parseBuildConfigOptions(opts, command, ctx) {
     const buildConfigPatch = {};
     if (opts.includeDir && opts.includeDir.length > 0) {
         for (const name of opts.includeDir) {
             if (name.startsWith(".")) {
-                console.error(`✗ --include-dir "${name}": dot-directories are never overridable`);
-                process.exit(1);
+                ctx.errLine(`✗ --include-dir "${name}": dot-directories are never overridable`);
+                ctx.exit(1);
             }
             if (name.includes("/") || name.includes("\\")) {
-                console.error(`✗ --include-dir "${name}": expected a bare directory name, not a path`);
-                process.exit(1);
+                ctx.errLine(`✗ --include-dir "${name}": expected a bare directory name, not a path`);
+                ctx.exit(1);
             }
         }
         buildConfigPatch.includeDirs = opts.includeDir;
@@ -230,8 +324,8 @@ function parseBuildConfigOptions(opts, command) {
     if (opts.onlyDir && opts.onlyDir.length > 0) {
         const normalized = opts.onlyDir.map((p) => normalizePathPrefix(p)).filter((p) => p !== "");
         if (normalized.length === 0) {
-            console.error("✗ --only-dir: expected a non-empty repo-relative path");
-            process.exit(1);
+            ctx.errLine("✗ --only-dir: expected a non-empty repo-relative path");
+            ctx.exit(1);
         }
         onlyDirs = normalized;
     }
@@ -249,9 +343,9 @@ function parseBuildConfigOptions(opts, command) {
 async function executeBuildCommand(ctx, dir, opts, command) {
     if (opts.gitignore === false) process.env.PLEXER_NO_GITIGNORE = "1";
     if (opts.ignore === false) process.env.PLEXER_NO_IGNORE = "1";
-    await warnUnsupportedExtensions(opts.extensions);
-    const { buildConfigPatch, onlyDirs, followSubmodulesWasExplicit, followNestedReposWasExplicit } = parseBuildConfigOptions(opts, command);
-    const buildRoot = resolve(dir);
+    await warnUnsupportedExtensions(opts.extensions, ctx);
+    const { buildConfigPatch, onlyDirs, followSubmodulesWasExplicit, followNestedReposWasExplicit } = parseBuildConfigOptions(opts, command, ctx);
+    const buildRoot = resolve(ctx.cwd, dir);
     const buildGlobalDir = ctx.getGlobalDir();
     if (Object.keys(buildConfigPatch).length > 0) {
         const { patchBuildConfig } = await import("../util/state.js");
@@ -260,7 +354,7 @@ async function executeBuildCommand(ctx, dir, opts, command) {
     const { isWorkspaceBuildRoot } = await import("../graph/workspace.js");
     if (isWorkspaceBuildRoot(buildRoot, buildGlobalDir)) {
         const { runWorkspaceBuild } = await import("../graph/workspace-cli.js");
-        await runWorkspaceBuild(buildRoot, {
+        await ctx.runExternal(() => runWorkspaceBuild(buildRoot, {
             extensions: opts.extensions,
             reuse: opts.reuse,
             childConfig: ctx.cliConfig(),
@@ -268,54 +362,54 @@ async function executeBuildCommand(ctx, dir, opts, command) {
             includeDirs: opts.includeDir,
             followSubmodules: followSubmodulesWasExplicit ? opts.followSubmodules : undefined,
             followNestedRepos: followNestedReposWasExplicit ? opts.followNestedRepos : undefined,
-        });
+        }));
         return;
     }
-    const { Plexer } = await import("../index.js");
-    const engine = new Plexer(ctx.cliConfig());
+    const { buildGraph } = await import("../graph/build.js");
     const fmt = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(", ");
-    const g = await engine.graph(dir, {
+    const g = await buildGraph(buildRoot, {
+        contextDir: buildGlobalDir,
         extensions: opts.extensions,
         reuse: opts.reuse,
         onlyDirs,
         cards: Boolean(opts.cards),
         onProgress: ({ index, total, file }) =>
-            process.stderr.write(`\rparsing ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`),
+            ctx.writeErr(`\rparsing ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`),
     });
-    process.stderr.write("\n");
-    console.log(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
-    console.log(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);
-    if (g.seededFrom) console.log(`  seeded: copied a starting graph from ${g.seededFrom} (git worktree)`);
-    console.log(`  → ${g.contextDir}`);
-    for (const e of g.errors) console.error(`✗ ${e}`);
-    const rel = relative(process.cwd(), g.contextDir) || "plexer";
+    ctx.writeErr("\n");
+    ctx.outLine(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
+    ctx.outLine(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);
+    if (g.seededFrom) ctx.outLine(`  seeded: copied a starting graph from ${g.seededFrom} (git worktree)`);
+    ctx.outLine(`  → ${g.contextDir}`);
+    for (const e of g.errors) ctx.errLine(`✗ ${e}`);
+    const rel = relative(ctx.cwd, g.contextDir) || "plexer";
     if (process.env.PLEXER_NO_GITIGNORE) {
-        console.log(`  ${rel}/ is a local cache — add it to your gitignore if you want it untracked.`);
+        ctx.outLine(`  ${rel}/ is a local cache — add it to your gitignore if you want it untracked.`);
     } else {
-        console.log(`  ${rel}/ is git-ignored (added automatically) — a local cache; teammates run \`plexer build\` to get their own.`);
+        ctx.outLine(`  ${rel}/ is git-ignored (added automatically) — a local cache; teammates run \`plexer build\` to get their own.`);
     }
 }
 
 async function executeCheckCommand(ctx, dirArg, opts) {
-    await warnUnsupportedExtensions(opts.extensions);
+    await warnUnsupportedExtensions(opts.extensions, ctx);
     const dir = ctx.queryRoot(dirArg);
     const checkGlobalDir = ctx.getGlobalDir();
     const { readWorkspace } = await import("../graph/workspace.js");
     if (readWorkspace(dir, checkGlobalDir)) {
         const { runWorkspaceCheck } = await import("../graph/workspace-cli.js");
-        await runWorkspaceCheck(dir, checkGlobalDir, { json: opts.json, extensions: opts.extensions });
+        await ctx.runExternal(() => runWorkspaceCheck(dir, checkGlobalDir, { json: opts.json, extensions: opts.extensions }));
         return;
     }
     const { checkGraph, formatGraphCheckReport } = await import("../graph/check.js");
     const g = await checkGraph(dir, { extensions: opts.extensions, contextDir: checkGlobalDir });
     if (opts.json) {
-        console.log(JSON.stringify({ graph: g.missing ? null : g }, null, 2));
+        ctx.outLine(JSON.stringify({ graph: g.missing ? null : g }, null, 2));
     } else if (g.missing) {
-        console.log("plexer check: NO GRAPH\n\nNo plexer/ graph found. Run `plexer build` first.");
+        ctx.outLine("plexer check: NO GRAPH\n\nNo plexer/ graph found. Run `plexer build` first.");
     } else {
-        console.log(formatGraphCheckReport(g));
+        ctx.outLine(formatGraphCheckReport(g));
     }
-    if (g.missing || !g.ok) process.exit(1);
+    if (g.missing || !g.ok) ctx.exit(1);
 }
 
 function registerBuildAndCheckCommands(program, ctx) {
@@ -323,12 +417,12 @@ function registerBuildAndCheckCommands(program, ctx) {
         .command("version")
         .description("Print the installed plexer version")
         .action(() => {
-            console.log(`plexer ${ctx.currentVersion}`);
+            ctx.outLine(`plexer ${ctx.currentVersion}`);
         });
 
     program
         .command("build")
-        .description("Build plexer/ from your code — structural wiring graph + per-file cards ($0, offline)")
+        .description("Build plexer/ from your code — structural wiring graph + SQLite index; pass --cards for optional markdown ($0, offline)")
         .argument("[dir]", "repository root", ".")
         .option("-e, --extensions <exts...>", 'code extensions to include (e.g. ".luau" ".ts" ".py")')
         .option("--no-reuse", "re-parse every file instead of replaying unchanged ones from the extraction cache")
@@ -361,6 +455,78 @@ function splitAskQueries(rawList) {
     });
 }
 
+async function executeWorkspaceAsk(ctx, dir, askGlobalDir, queries, limitOpt, useSource, opts) {
+    const { runWorkspaceAsk } = await import("../graph/workspace-cli.js");
+    try {
+        await ctx.runExternal(() => {
+            for (const query of queries) {
+                runWorkspaceAsk(dir, askGlobalDir, query, {
+                    limit: limitOpt, source: useSource, full: opts.full, in: opts.in, graphRank: opts.graphRank, json: opts.json,
+                });
+            }
+        });
+    } catch (err) {
+        ctx.errLine(`✗ ${err instanceof Error ? err.message : String(err)}`);
+        ctx.exit(1);
+    }
+}
+
+function collectLocalAskResults(ctx, dir, askGlobalDir, askFn, queries, limitOpt, useSource, opts) {
+    const results = [];
+    const perQueryLimit = limitOpt !== undefined ? limitOpt : queries.length > 1 ? 3 : undefined;
+    const seenPointers = queries.length > 1 ? new Set() : undefined;
+    try {
+        for (let i = 0; i < queries.length; i++) {
+            const maxHitsToInline = queries.length > 1 ? 1 : undefined;
+            const maxSourceBytes = queries.length > 1
+                ? (opts.full ? 2800 : Math.max(950, Math.min(2100, Math.floor(7200 / queries.length))))
+                : undefined;
+            results.push(askFn(dir, queries[i], {
+                limit: perQueryLimit, source: useSource, full: opts.full, in: opts.in, graphRank: opts.graphRank,
+                seenPointers, maxSourceBytes, maxHitsToInline, contextDir: askGlobalDir,
+            }));
+        }
+        return results;
+    } catch (err) {
+        ctx.errLine(`✗ ${err instanceof Error ? err.message : String(err)}`);
+        ctx.exit(1);
+        return null;
+    }
+}
+
+async function renderLocalAskOutput(ctx, results, queries, opts, formatAsk) {
+    if (opts.json) {
+        ctx.outLine(JSON.stringify(results.length === 1 ? results[0] : results, null, 2));
+        return;
+    }
+    const sessionId = ctx.getSessionId();
+    let renderResults = results;
+    if (sessionId) {
+        const [{ readAgySession, writeAgySession }, { applySeenSpansFilter, recordRetrievalSpans }] = await Promise.all([
+            import("../agy/session.js"),
+            import("../agy/spans.js"),
+        ]);
+        const agyState = readAgySession(sessionId);
+        if (!agyState.seenSpans || typeof agyState.seenSpans !== "object") agyState.seenSpans = {};
+        renderResults = results.map((r) => {
+            const { ask: filtered } = !opts.full ? applySeenSpansFilter(r, agyState.seenSpans) : { ask: r };
+            recordRetrievalSpans(agyState.seenSpans, r);
+            return filtered;
+        });
+        writeAgySession(sessionId, agyState);
+    }
+    if (queries.length > 1 && !opts.full) {
+        const rendered = renderResults.map((r) => formatAsk(r).trimEnd());
+        for (let i = renderResults.length - 1; i >= 1 && Buffer.byteLength(rendered.join("\n\n"), "utf8") > 9000; i--) {
+            for (const h of renderResults[i].hits ?? []) delete h.code;
+            rendered[i] = formatAsk(renderResults[i]).trimEnd();
+        }
+        ctx.writeOut(rendered.join("\n\n") + "\n");
+        return;
+    }
+    ctx.writeOut(renderResults.map((r) => formatAsk(r).trimEnd()).join("\n\n") + "\n");
+}
+
 async function executeAskAction(ctx, queriesArg, opts) {
     const { rawList, dirArg } = ctx.splitTrailingDir(queriesArg, { requirePlexerDir: false });
     const queries = splitAskQueries(rawList);
@@ -369,48 +535,36 @@ async function executeAskAction(ctx, queriesArg, opts) {
     const askGlobalDir = ctx.getGlobalDir();
     const limitOpt = opts.limit !== undefined ? Number(opts.limit) : undefined;
     if (limitOpt !== undefined && (!Number.isInteger(limitOpt) || limitOpt < 1)) {
-        console.error(`✗ invalid --limit "${opts.limit}" — expected a positive integer`);
-        process.exit(1);
+        ctx.errLine(`✗ invalid --limit "${opts.limit}" — expected a positive integer`);
+        ctx.exit(1);
     }
     const useSource = opts.full ? true : opts.source !== false;
     const { readWorkspace } = await import("../graph/workspace.js");
     if (readWorkspace(dir, askGlobalDir)) {
-        const { runWorkspaceAsk } = await import("../graph/workspace-cli.js");
-        try {
-            for (const query of queries) {
-                runWorkspaceAsk(dir, askGlobalDir, query, {
-                    limit: limitOpt, source: useSource, full: opts.full, in: opts.in, graphRank: opts.graphRank, json: opts.json,
-                });
-            }
-        } catch (err) {
-            console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
-            process.exit(1);
-        }
+        await executeWorkspaceAsk(ctx, dir, askGlobalDir, queries, limitOpt, useSource, opts);
         return;
     }
     const { ask, formatAsk } = await import("../ask/ask.js");
-    const results = [];
-    try {
-        const perQueryLimit = limitOpt !== undefined ? limitOpt : queries.length > 1 ? 3 : undefined;
-        const seenPointers = queries.length > 1 ? new Set() : undefined;
-        for (let i = 0; i < queries.length; i++) {
-            const maxHitsToInline = queries.length > 1 ? 1 : undefined;
-            const maxSourceBytes = queries.length > 1 ? (opts.full ? 2800 : queries.length >= 3 ? 1700 : 2100) : undefined;
-            results.push(ask(dir, queries[i], {
-                limit: perQueryLimit, source: useSource, full: opts.full, in: opts.in, graphRank: opts.graphRank,
-                seenPointers, maxSourceBytes, maxHitsToInline, contextDir: askGlobalDir,
-            }));
-        }
-    } catch (err) {
-        console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
-        process.exit(1);
-        return;
+    const results = collectLocalAskResults(ctx, dir, askGlobalDir, ask, queries, limitOpt, useSource, opts);
+    if (results) await renderLocalAskOutput(ctx, results, queries, opts, formatAsk);
+}
+
+function formatBatchedSkeletons(rawResults, formatSkeleton) {
+    const results = rawResults.flatMap((r) =>
+        Array.isArray(r.files) && r.files.length > 1
+            ? r.files.map((f) => ({ file: f, entries: (r.entries ?? []).filter((e) => e.file === f) }))
+            : [r],
+    );
+    let blocks = results.map((r) => formatSkeleton(r).trimEnd());
+    if (Buffer.byteLength(blocks.join("\n\n"), "utf8") <= 8900)
+        return blocks.join("\n\n") + "\n";
+    blocks = results.map((r) => formatSkeleton(r, { compact: true }).trimEnd());
+    if (Buffer.byteLength(blocks.join("\n\n"), "utf8") <= 8900)
+        return blocks.join("\n\n") + "\n";
+    for (let i = results.length - 1; i >= 1 && Buffer.byteLength(blocks.join("\n\n"), "utf8") > 8900; i--) {
+        blocks[i] = formatSkeleton(results[i], { summaryOnly: true }).trimEnd();
     }
-    if (opts.json) {
-        console.log(JSON.stringify(results.length === 1 ? results[0] : results, null, 2));
-    } else {
-        process.stdout.write(results.map((r) => formatAsk(r).trimEnd()).join("\n\n") + "\n");
-    }
+    return blocks.join("\n\n") + "\n";
 }
 
 async function executeSkeletonAction(ctx, filesArg, opts) {
@@ -427,18 +581,19 @@ async function executeSkeletonAction(ctx, filesArg, opts) {
     const isWs = Boolean(readWorkspace(dir, globalDir));
     if (files.length === 1) {
         const r = isWs ? federateSkeleton(dir, globalDir, files[0], skelOpts) : skeleton(dir, files[0], skelOpts);
-        if (opts.json) console.log(JSON.stringify(r, null, 2));
-        else process.stdout.write(formatSkeleton(r));
-        if (!r.entries?.length && (r.note || r.error)) process.exit(1);
+        if (opts.json) ctx.outLine(JSON.stringify(r, null, 2));
+        else if (Array.isArray(r.files) && r.files.length > 1 && !opts.allMatches) ctx.writeOut(formatBatchedSkeletons([r], formatSkeleton));
+        else ctx.writeOut(formatSkeleton(r));
+        if (!r.entries?.length && (r.note || r.error)) ctx.exit(1);
         return;
     }
     const results = files.map((file) => (isWs ? federateSkeleton(dir, globalDir, file, skelOpts) : skeleton(dir, file, skelOpts)));
     if (opts.json) {
-        console.log(JSON.stringify(results, null, 2));
+        ctx.outLine(JSON.stringify(results, null, 2));
     } else {
-        process.stdout.write(results.map((r) => formatSkeleton(r).trimEnd()).join("\n\n") + "\n");
+        ctx.writeOut(formatBatchedSkeletons(results, formatSkeleton));
     }
-    if (results.every((r) => !r.entries?.length && (r.note || r.error))) process.exit(1);
+    if (results.every((r) => !r.entries?.length && (r.note || r.error))) ctx.exit(1);
 }
 
 async function executeReadAction(ctx, spansArg, opts) {
@@ -450,15 +605,111 @@ async function executeReadAction(ctx, spansArg, opts) {
         import("../graph/workspace.js"),
     ]);
     const globalDir = ctx.getGlobalDir();
+    const full = Boolean(opts.full);
     const r = readWorkspace(dir, globalDir)
-        ? federateRead(dir, globalDir, rawList)
-        : readSpans(dir, rawList, { contextDir: globalDir });
-    if (opts.json) {
-        console.log(JSON.stringify(r, null, 2));
-    } else {
-        process.stdout.write(formatReadSpans(r));
+        ? federateRead(dir, globalDir, rawList, { full })
+        : readSpans(dir, rawList, { contextDir: globalDir, full });
+    const sessionId = ctx.getSessionId();
+    if (sessionId && Array.isArray(r?.blocks)) {
+        const [{ readAgySession, writeAgySession }, { mergeSpan }] = await Promise.all([
+            import("../agy/session.js"),
+            import("../agy/spans.js"),
+        ]);
+        const agyState = readAgySession(sessionId);
+        if (!agyState.seenSpans || typeof agyState.seenSpans !== "object")
+            agyState.seenSpans = {};
+        for (const blk of r.blocks) {
+            if (!blk?.error && blk.file && blk.startLine && blk.endLine)
+                mergeSpan(agyState.seenSpans, blk.file, blk.startLine, blk.endLine);
+        }
+        writeAgySession(sessionId, agyState);
     }
-    if (r.blocks.every((b) => b.error)) process.exit(1);
+    if (opts.json) {
+        ctx.outLine(JSON.stringify(r, null, 2));
+    } else {
+        ctx.writeOut(formatReadSpans(r));
+    }
+    if (r.blocks.every((b) => b.error)) ctx.exit(1);
+}
+
+class BatchExitSignal extends Error {
+    constructor(code = 0) {
+        super(`batch subcommand exit ${code}`);
+        this.code = code;
+    }
+}
+
+async function runBatchSubcommandCaptured(ctx, subArgv) {
+    let stdout = "";
+    let stderr = "";
+    let exitCode = 0;
+
+    try {
+        await runCli(["node", "plexer", ...subArgv], {
+            isCaptured: true,
+            cwd: ctx.cwd,
+            sessionId: ctx.getSessionId(),
+            writeOut: (chunk, enc) => {
+                stdout += Buffer.isBuffer(chunk) ? chunk.toString(typeof enc === "string" ? enc : "utf8") : String(chunk ?? "");
+            },
+            writeErr: (chunk, enc) => {
+                stderr += Buffer.isBuffer(chunk) ? chunk.toString(typeof enc === "string" ? enc : "utf8") : String(chunk ?? "");
+            },
+            exit: (code = 0) => {
+                throw new BatchExitSignal(Number(code) || 0);
+            },
+        });
+    } catch (err) {
+        if (err instanceof BatchExitSignal) {
+            exitCode = err.code;
+        } else {
+            exitCode = 1;
+            stderr += `${err instanceof Error ? err.message : String(err)}\n`;
+        }
+    }
+    return { stdout, stderr, exitCode };
+}
+
+async function executeBatchAction(ctx, payloadArgs) {
+    const { decodeBatchPayload, poolBatchOutputs } = await import("./batch.js");
+    const commands = decodeBatchPayload(payloadArgs);
+    if (commands.length === 0) {
+        ctx.errLine("✗ _batch: no valid read-only commands supplied");
+        ctx.exit(1);
+        return;
+    }
+    const parentSessionId = ctx.getSessionId();
+    const parentDir = ctx.getGlobalDir();
+    const blocks = [];
+    const errors = [];
+    let anySuccess = false;
+    for (let i = 0; i < commands.length; i++) {
+        const subArgv = [];
+        const hasSession = commands[i].some((a) => a === "--session" || a.startsWith("--session="));
+        const hasDir = commands[i].some((a) => a === "--dir" || a.startsWith("--dir="));
+        if (parentSessionId && !hasSession)
+            subArgv.push("--session", parentSessionId);
+        if (parentDir && !hasDir)
+            subArgv.push("--dir", parentDir);
+        subArgv.push(...commands[i]);
+        if (i > 0 && !subArgv.includes("--no-refresh") && !subArgv.includes("--refresh")) {
+            subArgv.push("--no-refresh");
+        }
+        const res = await runBatchSubcommandCaptured(ctx, subArgv);
+        if (res.stdout.trim())
+            blocks.push(res.stdout.trimEnd());
+        if (res.stderr.trim())
+            errors.push(res.stderr.trimEnd());
+        if (res.exitCode === 0)
+            anySuccess = true;
+    }
+    if (errors.length > 0)
+        ctx.writeErr(`${errors.join("\n")}\n`);
+    const pooled = poolBatchOutputs(blocks);
+    if (pooled)
+        ctx.writeOut(pooled);
+    if (!anySuccess)
+        ctx.exit(1);
 }
 
 function registerQueryCommands(program, ctx) {
@@ -489,9 +740,16 @@ function registerQueryCommands(program, ctx) {
         .command("read")
         .description("Read one or more exact file:Lx-Ly line spans or file:symbol spans (or unique basenames) with L<n>: line numbers ($0, offline)")
         .argument("<spans...>", "one or more file:Lx-Ly, file:Lx, file:symbol, or file spans")
+        .option("--full", "return full requested spans without the 9 KB batch cap")
         .option("--json", "output the result as JSON")
         .option(...NO_REFRESH_FLAG)
         .action((spansArg, opts) => executeReadAction(ctx, spansArg, opts));
+
+    program
+        .command("_batch", { hidden: true })
+        .description("Internal batched read-only runner bounded under 9 KB stdout")
+        .argument("<payload...>", "base64url JSON argv list or ';;'-separated commands")
+        .action((payloadArgs) => executeBatchAction(ctx, payloadArgs));
 }
 
 async function runCallersAction(ctx, symbolsArg, opts, forcedDirection) {
@@ -510,14 +768,14 @@ async function runCallersAction(ctx, symbolsArg, opts, forcedDirection) {
     const useSource = opts.full ? true : opts.source !== false;
     if (readWorkspace(dir, globalDir)) {
         const { runWorkspaceCallers } = await import("../graph/workspace-cli.js");
-        runWorkspaceCallers(dir, globalDir, symbolOrList, {
+        await ctx.runExternal(() => runWorkspaceCallers(dir, globalDir, symbolOrList, {
             direction, depth, in: opts.in, source: useSource, full: opts.full, json: opts.json,
-        });
+        }));
         return;
     }
-    runCallersCommand(symbolOrList, dir, {
+    await ctx.runExternal(() => runCallersCommand(symbolOrList, dir, {
         direction, depth: opts.depth, in: opts.in, source: useSource, full: opts.full, json: opts.json, globalDir,
-    });
+    }));
 }
 
 async function executeBlastAction(ctx, firstArg, secondArg, opts) {
@@ -525,8 +783,8 @@ async function executeBlastAction(ctx, firstArg, secondArg, opts) {
     let dirArg;
     if (secondArg !== undefined) {
         if (opts.base !== undefined) {
-            console.error(`✗ cannot pass both --base "${opts.base}" and a positional base ref "${firstArg}"`);
-            process.exit(1);
+            ctx.errLine(`✗ cannot pass both --base "${opts.base}" and a positional base ref "${firstArg}"`);
+            ctx.exit(1);
         }
         base = firstArg;
         dirArg = secondArg;
@@ -541,10 +799,10 @@ async function executeBlastAction(ctx, firstArg, secondArg, opts) {
     await ctx.refreshBefore(dir, opts);
     const format = opts.format ?? (opts.json ? "json" : opts.markdown ? "markdown" : opts.mermaid ? "mermaid" : undefined);
     const { runBlastCommand } = await import("../blast/blast-cli.js");
-    await runBlastCommand(dir, {
+    await ctx.runExternal(() => runBlastCommand(dir, {
         base, depth: opts.depth, format, exportViz: opts.exportViz, title: opts.title,
         owners: opts.owners, prAuthor: opts.prAuthor, globalDir: ctx.getGlobalDir(),
-    });
+    }));
 }
 
 function registerCallersAndBlastCommands(program, ctx) {
@@ -614,8 +872,8 @@ async function executeGrepAction(ctx, patternsArg, opts) {
     if (opts.context !== undefined) {
         parsedContext = Number(opts.context);
         if (!Number.isInteger(parsedContext) || parsedContext < 0) {
-            console.error(`✗ invalid --context "${opts.context}" — expected a non-negative integer`);
-            process.exit(1);
+            ctx.errLine(`✗ invalid --context "${opts.context}" — expected a non-negative integer`);
+            ctx.exit(1);
         }
     }
     const contextLines = parsedContext !== undefined ? parsedContext : opts.source === false ? 0 : opts.full ? 4 : undefined;
@@ -624,33 +882,35 @@ async function executeGrepAction(ctx, patternsArg, opts) {
     if (readWorkspace(dir, globalDir)) {
         const { runWorkspaceGrep } = await import("../graph/workspace-cli.js");
         try {
-            for (const pat of patterns) {
-                runWorkspaceGrep(dir, globalDir, pat, {
-                    ignoreCase: opts.ignoreCase, fixed: opts.fixed, context: contextLines, source: sourceEnabled, in: opts.in, json: opts.json,
-                });
-            }
+            await ctx.runExternal(() => {
+                for (const pat of patterns) {
+                    runWorkspaceGrep(dir, globalDir, pat, {
+                        ignoreCase: opts.ignoreCase, fixed: opts.fixed, context: contextLines, source: sourceEnabled, in: opts.in, json: opts.json,
+                    });
+                }
+            });
         } catch (err) {
-            console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
-            process.exit(1);
+            ctx.errLine(`✗ ${err instanceof Error ? err.message : String(err)}`);
+            ctx.exit(1);
         }
         return;
     }
     const { runGrepCommand } = await import("../search/grep-cli.js");
-    runGrepCommand(patternOrList, dir, {
+    await ctx.runExternal(() => runGrepCommand(patternOrList, dir, {
         ignoreCase: opts.ignoreCase, fixed: opts.fixed, context: contextLines, source: sourceEnabled, in: opts.in, json: opts.json, globalDir,
-    });
+    }));
 }
 
 async function executeMapAction(ctx, dirArg, opts) {
     const dir = ctx.queryRoot(dirArg);
-    const root = resolve(dir);
+    const root = resolve(ctx.cwd, dir);
     const globalDir = ctx.getGlobalDir();
     let maxDirsW;
     if (opts.maxDirs !== undefined) {
         const n = parseInt(opts.maxDirs, 10);
         if (!Number.isFinite(n) || n <= 0) {
-            console.error(`✗ --max-dirs must be a positive integer, got "${opts.maxDirs}"`);
-            process.exit(1);
+            ctx.errLine(`✗ --max-dirs must be a positive integer, got "${opts.maxDirs}"`);
+            ctx.exit(1);
             return;
         }
         maxDirsW = n;
@@ -662,10 +922,10 @@ async function executeMapAction(ctx, dirArg, opts) {
             import("../graph/workspace-cli.js"),
             opts.churn ? import("../blast/history.js") : Promise.resolve({}),
         ]);
-        runWorkspaceMap(root, globalDir, {
+        await ctx.runExternal(() => runWorkspaceMap(root, globalDir, {
             maxDirs: maxDirsW, json: Boolean(opts.json), churn: Boolean(opts.churn), since: opts.since,
             analyzeGitHistory: histMod.analyzeGitHistory,
-        });
+        }));
         return;
     }
     const [{ buildRepoMap, formatRepoMap }, { loadGraphCached }] = await Promise.all([
@@ -680,16 +940,16 @@ async function executeMapAction(ctx, dirArg, opts) {
     }
     const graph = loadGraphCached(contextDir);
     if (!graph) {
-        console.error(`✗ no graph found at ${contextDir} — run \`plexer build\` first`);
-        process.exit(1);
+        ctx.errLine(`✗ no graph found at ${contextDir} — run \`plexer build\` first`);
+        ctx.exit(1);
         return;
     }
     const map = buildRepoMap(graph, { maxDirs: maxDirsW, ...(gitHistory ? { gitHistory } : {}) });
     if (opts.json) {
-        console.log(JSON.stringify(map, null, 2));
+        ctx.outLine(JSON.stringify(map, null, 2));
         return;
     }
-    process.stdout.write(formatRepoMap(map));
+    ctx.writeOut(formatRepoMap(map));
 }
 
 function registerSearchAndMapCommands(program, ctx) {
@@ -720,31 +980,31 @@ function registerSearchAndMapCommands(program, ctx) {
 }
 
 async function executeVizAction(ctx, dirArg, opts) {
-    const tabs = parseTabs(opts.tabs);
+    const tabs = parseTabs(opts.tabs, ctx);
     const dir = ctx.queryRoot(dirArg);
-    const root = resolve(dir);
+    const root = resolve(ctx.cwd, dir);
     const contextDir = contextDirFor(root, ctx.getGlobalDir());
     if (!existsSync(contextDir)) {
-        console.error(`✗ no context graph at ${contextDir} — run \`plexer build\` first`);
-        process.exit(1);
+        ctx.errLine(`✗ no context graph at ${contextDir} — run \`plexer build\` first`);
+        ctx.exit(1);
     }
     if (opts.export) {
         const { exportViz } = await import("../viz/export.js");
         const out = exportViz({
-            contextDir, viewerDir: VIEWER_DIR, outDir: resolve(opts.export), repoName: basename(root), subtitle: opts.title, tabs,
+            contextDir, viewerDir: VIEWER_DIR, outDir: resolve(ctx.cwd, opts.export), repoName: basename(root), subtitle: opts.title, tabs,
         });
         const kb = Math.round(out.bytes / 1024);
         const counts = out.contextNodes > 0 ? `${out.contextNodes} areas, ${out.codeNodes} code nodes` : `${out.codeNodes} code nodes`;
-        console.log(`plexer viz → ${out.file} (${kb} kB, ${counts})`);
+        ctx.outLine(`plexer viz → ${out.file} (${kb} kB, ${counts})`);
         return;
     }
     const { startVizServer } = await import("../viz/serve.js");
     const srv = await startVizServer({
         root, contextDir, viewerDir: VIEWER_DIR, port: Number(opts.port), repoName: basename(root),
     });
-    console.log(`plexer viz → ${srv.url}  (ctrl-c to stop)`);
+    ctx.outLine(`plexer viz → ${srv.url}  (ctrl-c to stop)`);
     const stopViz = () => {
-        srv.close().finally(() => process.exit(0));
+        srv.close().finally(() => ctx.exit(0));
     };
     process.once("SIGINT", stopViz);
     process.once("SIGTERM", stopViz);
@@ -768,7 +1028,7 @@ function registerVizAndMcpCommands(program, ctx) {
         .option("--no-open", "don't open the browser")
         .option("--export <dir>", "write one self-contained index.html instead of serving")
         .option("--title <text>", "subtitle shown beside the repo name in an exported page")
-        .option("--tabs <list>", "tabs the exported page offers, comma separated: context,code,modules,symbols,outline")
+        .option("--tabs <list>", "tabs the exported page offers, comma separated: context,code,modules,symbols,outline,treemap")
         .action((dirArg, opts) => executeVizAction(ctx, dirArg, opts));
 
     program
@@ -789,12 +1049,12 @@ async function executeHealthAction(ctx, positionalArgs, opts) {
         opts.path ||
         (canHavePositionalDir
             ? (positionalArgs || []).find(
-                  (a) => !KNOWN_HEALTH_SUBCOMMANDS.has(String(a).toLowerCase()) && existsSync(a) && statSync(a).isDirectory(),
+                  (a) => !KNOWN_HEALTH_SUBCOMMANDS.has(String(a).toLowerCase()) && existsSync(resolve(ctx.cwd, a)) && statSync(resolve(ctx.cwd, a)).isDirectory(),
               )
             : undefined);
     const dir = ctx.queryRoot(rawTargetPath);
     if (rawTargetPath) {
-        const relSub = relative(dir, resolve(rawTargetPath)).replace(/\\/g, "/");
+        const relSub = relative(dir, resolve(ctx.cwd, rawTargetPath)).replace(/\\/g, "/");
         if (relSub && !relSub.startsWith("..")) {
             opts.in = opts.in || [relSub];
             opts.scanPath = relSub;
@@ -813,12 +1073,12 @@ async function executeHealthAction(ctx, positionalArgs, opts) {
         await ctx.refreshBefore(dir, opts);
     }
     const { runHealthCommand } = await import("../health/health-cli.js");
-    await runHealthCommand(dir, positionalArgs || [], {
+    await ctx.runExternal(() => runHealthCommand(dir, positionalArgs || [], {
         ...opts,
         contextDir: globalDir,
         noBadge: opts.badge === false,
         noBudget: opts.budget === false,
-    });
+    }));
 }
 
 function registerHealthCommand(program, ctx) {
@@ -832,12 +1092,12 @@ function registerHealthCommand(program, ctx) {
     cmd.action((positionalArgs, opts) => executeHealthAction(ctx, positionalArgs, opts));
 }
 
-async function runGlobalOnlyInit(home, opts, explicitMcp) {
+async function runGlobalOnlyInit(ctx, home, opts, explicitMcp) {
     const { globalSetupTargets, runGlobalSetup } = await import("../hosts/setup.js");
     const globalAgents = Array.isArray(opts.agents) ? opts.agents : opts.agents === false ? ["claude"] : undefined;
     if (opts.dryRun) {
-        for (const w of globalSetupTargets({ home, agents: globalAgents, bin: opts.bin, skills: opts.skills })) {
-            console.log(`${w.hostId}: ${w.path} (${w.what})`);
+        for (const w of globalSetupTargets({ home, agents: globalAgents, bin: opts.bin, skills: opts.skills, hooks: opts.hooks, mcp: explicitMcp })) {
+            ctx.outLine(`${w.hostId}: ${w.path} (${w.what})`);
         }
         return;
     }
@@ -846,10 +1106,10 @@ async function runGlobalOnlyInit(home, opts, explicitMcp) {
     });
     for (const group of [res.bin, res.skills, res.hooks, res.mcp]) {
         for (const item of group) {
-            console.log(`${item.action}: ${item.path}`);
+            ctx.outLine(`${item.action}: ${item.path}`);
         }
     }
-    console.error("✓ global plexer binary, skill links, and hooks wired");
+    ctx.errLine("✓ global plexer binary, skill links, and hooks wired");
 }
 
 async function wireInitRepoTargets(ctx, repo, ids, home, explicitMcp, opts) {
@@ -889,13 +1149,13 @@ async function wireInitRepoTargets(ctx, repo, ids, home, explicitMcp, opts) {
             buildGraphIfMissing(target, { build: opts.build, cliPath: CLI_BIN_PATH });
         }
     }
-    console.error(`✓ wired ${ids.join(", ")} in ${repo}`);
+    ctx.errLine(`✓ wired ${ids.join(", ")} in ${repo}`);
 }
 
 async function executeInitCommand(ctx, dir, opts, command) {
     if (opts.listAgents) {
         const { allHostIds } = await import("../hosts/registry.js");
-        for (const id of allHostIds()) console.log(id);
+        for (const id of allHostIds()) ctx.outLine(id);
         return;
     }
     const globalOnly = command.getOptionValueSource("global") === "cli" && opts.global === true;
@@ -903,34 +1163,34 @@ async function executeInitCommand(ctx, dir, opts, command) {
     const explicitMcp = command.getOptionValueSource("mcp") === "cli" ? opts.mcp : undefined;
     const home = homedir();
     if (globalOnly) {
-        await runGlobalOnlyInit(home, opts, explicitMcp);
+        await runGlobalOnlyInit(ctx, home, opts, explicitMcp);
         return;
     }
     const [{ planInit, selectedWrites }, { globalSetupTargets, runGlobalSetup }] = await Promise.all([
         import("../hosts/plan.js"),
         import("../hosts/setup.js"),
     ]);
-    const repo = resolve(dir);
+    const repo = resolve(ctx.cwd, dir);
     const plan = planInit(repo, { home });
     const detectedIds = plan.filter((p) => p.detected).map((p) => p.id);
     const ids = Array.isArray(opts.agents) ? opts.agents : opts.allAgents ? plan.map((p) => p.id) : opts.agents === false ? ["claude"] : detectedIds;
     if (opts.dryRun) {
         const seen = new Set();
         if (allowGlobal && ids.length > 0) {
-            for (const w of globalSetupTargets({ home, agents: ids, bin: opts.bin, skills: opts.skills })) {
+            for (const w of globalSetupTargets({ home, agents: ids, bin: opts.bin, skills: opts.skills, hooks: opts.hooks, mcp: explicitMcp })) {
                 seen.add(w.path);
-                console.log(`${w.hostId}: ${w.path} (${w.what})`);
+                ctx.outLine(`${w.hostId}: ${w.path} (${w.what})`);
             }
         }
         for (const w of selectedWrites(plan, ids, { global: allowGlobal, mcp: explicitMcp, hooks: opts.hooks, skills: opts.skills })) {
             if (seen.has(w.path)) continue;
             seen.add(w.path);
-            console.log(`${w.hostId}: ${w.path} (${w.what})`);
+            ctx.outLine(`${w.hostId}: ${w.path} (${w.what})`);
         }
         return;
     }
     if (ids.length === 0) {
-        console.error("· no agents selected — nothing written");
+        ctx.errLine("· no agents selected — nothing written");
         return;
     }
     if (allowGlobal) {
@@ -939,28 +1199,28 @@ async function executeInitCommand(ctx, dir, opts, command) {
     await wireInitRepoTargets(ctx, repo, ids, home, explicitMcp, opts);
 }
 
-async function executeRetractCommand(dir, opts) {
+async function executeRetractCommand(ctx, dir, opts) {
     const { planRetract, runRetract, changed } = await import("../hosts/retract.js");
-    const repo = resolve(dir);
+    const repo = resolve(ctx.cwd, dir);
     const home = homedir();
     const common = { home, global: opts.global, cache: !opts.keepCache };
     if (!opts.yes || opts.dryRun) {
         const rs = changed(planRetract(repo, common));
         if (opts.json) {
-            console.log(JSON.stringify({ dryRun: true, entries: rs }, null, 2));
+            ctx.outLine(JSON.stringify({ dryRun: true, entries: rs }, null, 2));
             return;
         }
-        for (const r of rs) console.error(`would remove: ${r.path} (${r.what})`);
-        console.error("\nDry run — nothing was touched. Re-run with -y to remove.");
+        for (const r of rs) ctx.errLine(`would remove: ${r.path} (${r.what})`);
+        ctx.errLine("\nDry run — nothing was touched. Re-run with -y to remove.");
         return;
     }
     const done = changed(runRetract(repo, { ...common, apply: true }));
     if (opts.json) {
-        console.log(JSON.stringify({ dryRun: false, entries: done }, null, 2));
+        ctx.outLine(JSON.stringify({ dryRun: false, entries: done }, null, 2));
         return;
     }
-    for (const r of done) console.error(`removed: ${r.path} (${r.what})`);
-    console.error("\n✓ plexer wiring removed.");
+    for (const r of done) ctx.errLine(`removed: ${r.path} (${r.what})`);
+    ctx.errLine("\n✓ plexer wiring removed.");
 }
 
 function registerHostLifecycleCommands(program, ctx) {
@@ -997,7 +1257,7 @@ function registerHostLifecycleCommands(program, ctx) {
         .option("--dry-run", "print every file setup would touch, then exit without writing")
         .action((opts, command) => {
             const explicitMcp = command.getOptionValueSource("mcp") === "cli" ? opts.mcp : undefined;
-            return runGlobalOnlyInit(homedir(), opts, explicitMcp);
+            return runGlobalOnlyInit(ctx, homedir(), opts, explicitMcp);
         });
 
     program
@@ -1010,18 +1270,30 @@ function registerHostLifecycleCommands(program, ctx) {
         .option("--keep-cache", "keep plexer/ and the .gitignore entries — wiring only")
         .option("--no-global", "leave out-of-repo files alone (~/.local/bin, ~/.agents, ~/.claude, ~/.codex, ~/.gemini)")
         .option("--json", "output removed/planned entries as JSON")
-        .action((dir, opts) => executeRetractCommand(dir, opts));
+        .action((dir, opts) => executeRetractCommand(ctx, dir, opts));
 }
 
-export async function runCli(argv = process.argv) {
+export async function runCli(argv = process.argv, ioCtx = null) {
     const program = new Command();
     const currentVersion = readCurrentVersion(import.meta.url);
+    const ctx = createCliContext(program, currentVersion, ioCtx);
+    if (ctx.io.isCaptured) {
+        program.configureOutput({
+            writeOut: (s) => ctx.writeOut(s),
+            writeErr: (s) => ctx.writeErr(s),
+            outputError: (s, write) => write(s),
+        });
+        program.exitOverride((err) => {
+            ctx.exit(err.exitCode ?? 0);
+        });
+    }
     program
         .name("plexer")
-        .description("Build a repo's structural context graph as linked markdown + graph.json ($0, offline).")
+        .description("Build a repo's structural context graph (.graph/wiring.json + SQLite index; $0, offline).")
         .version(currentVersion, "-v, --version")
-        .option("--dir <path>", "context graph directory (default: <repo>/plexer)");
-    const ctx = createCliContext(program, currentVersion);
+        .option("--dir <path>", "context graph directory (default: <repo>/plexer)")
+        .option("--session <id>", "optional session id for seen-span deduplication")
+        .option("--no-daemon", "skip the local plexerd socket fast-path");
     registerBuildAndCheckCommands(program, ctx);
     registerQueryCommands(program, ctx);
     registerCallersAndBlastCommands(program, ctx);

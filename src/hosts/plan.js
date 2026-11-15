@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { HOSTS, detectClaude, detectHosts } from './registry.js';
 import { CLI_MCP_OPT_IN_HOSTS, mcpTargets } from './mcp-config.js';
-import { hookTargets } from './codex-hooks.js';
+import { cursorHookTargets, geminiHookTargets, hookTargets } from './codex-hooks.js';
 import { antigravitySkillTargets } from './antigravity.js';
 import { claudeGlobalTargets, claudeTargets } from '../claude/init.js';
 /** The instruction-file write for one host, derived from its registry entry. */
@@ -43,6 +43,8 @@ export function planInit(repo, opts = {}) {
                 instructionTarget(repo, host),
                 ...mcpTargets(repo, [host.id], { home }),
                 ...(host.id === 'agents' ? hookTargets(home) : []),
+                ...(host.id === 'gemini' ? geminiHookTargets({ home, repo }) : []),
+                ...(host.id === 'cursor' ? cursorHookTargets(repo) : []),
                 ...(host.id === 'antigravity' ? antigravitySkillTargets(home) : []),
             ],
         })),

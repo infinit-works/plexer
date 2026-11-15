@@ -8,7 +8,7 @@ const C = {
     text: (s) => `\x1b[38;5;251m${s}\x1b[0m`,
 };
 const SEP = C.muted(' · ');
-export function freshnessSegment(s) {
+function freshnessSegment(s) {
     if (s.syncing)
         return C.amber('syncing…');
     if (s.dirty && s.staleCount > 0)
@@ -175,76 +175,176 @@ function selectDiverseCallSites(callSites, maxCs) {
     }
     return selected;
 }
+const HIGH_CONFIDENCE_SOURCE_CAP_BYTES = 3800;
+const EXPLORATORY_MAP_CAP_BYTES = 1300;
+
 function hasExplicitPathHitMatch(ask) {
     const q = String(ask.query ?? '').toLowerCase();
     if (!q)
         return false;
-    const refs = q.match(/[a-z0-9_.-]+\/[a-z0-9_./-]+|[a-z0-9_-]+\.(?:py|go|js|ts|tsx|jsx|mjs|cjs|luau|lua|rs|c|cc|cpp|h|hpp|java|rb|php|cs|swift|kt|scala|sh|json|toml|yaml|yml|md)\b/g);
+    const refs = q.match(/[a-z0-9_.-]+\/[a-z0-9_./-]+|[a-z0-9_-]+\.(?:bb|c|cc|cjs|clj|cljc|cljs|cpp|cs|cts|cxx|dart|ex|exs|go|h|hh|hpp|java|js|jsx|kt|kts|lua|luau|mjs|ml|mli|mts|nix|php|py|pyi|r|rb|rs|sc|scala|sol|swift|ts|tsx|vue|zig|svelte|astro|md|sh|json|toml|yaml|yml)\b/g);
     if (!refs)
         return false;
     const hitFiles = (ask.hits ?? []).map((h) => String(h.pointer ?? '').split(':')[0].replace(/\\/g, '/').toLowerCase()).filter(Boolean);
     return refs.some((ref) => hitFiles.some((f) => f === ref || f.endsWith(`/${ref}`) || f.includes(ref)));
 }
-function retrievalBody(hits, isEditPrompt = false) {
+
+function compactPointerMapEdgeSummary(h) {
+    const hasCounts = typeof h.callerCount === 'number' || typeof h.calleeCount === 'number';
+    if (hasCounts && ((h.callerCount ?? 0) > 0 || (h.calleeCount ?? 0) > 0)) {
+        const callers = (h.related ?? []).filter((r) => r.startsWith('←')).map((r) => r.slice(2).split(' (')[0].trim());
+        const callees = (h.related ?? []).filter((r) => r.startsWith('→')).map((r) => r.slice(2).split(' (')[0].trim());
+        const inPart = callers[0] ? `←${callers[0]}` : ((h.callerCount ?? 0) > 0 ? `${h.callerCount}←` : '');
+        const outPart = callees[0] ? `→${callees[0]}` : ((h.calleeCount ?? 0) > 0 ? `${h.calleeCount}→` : '');
+        const combined = [inPart, outPart].filter(Boolean).join(' ');
+        if (combined.length <= 36)
+            return combined;
+        return (inPart && inPart.length <= 36) ? inPart : combined.slice(0, 36);
+    }
+    if (Array.isArray(h.related) && h.related.length > 0) {
+        return h.related
+            .slice(0, 2)
+            .map((r) => r.replace(/\s*\([^)]*\)/g, '').replace(/\s+/g, ''))
+            .join(' ')
+            .slice(0, 36);
+    }
+    return '';
+}
+
+function formatExploratoryPointerMap(candidates, isEditPrompt = false, coEditPointers = undefined) {
+    const list = (candidates ?? []).slice(0, 8);
+    if (!list.length)
+        return null;
+    const renderWithSigCap = (maxCands, sigCap) => {
+        const sub = list.slice(0, maxCands);
+        const lines = sub.map((h, i) => {
+            const ptr = String(h.pointer ?? '').split(',')[0].trim();
+            const spanM = /:((?:L?\d+)(?:-L?\d+)?)$/.exec(ptr);
+            const file = spanM ? ptr.slice(0, spanM.index) : ptr;
+            const span = spanM ? (spanM[1].startsWith('L') ? spanM[1] : `L${spanM[1].replace('-', '-L')}`) : '';
+            const sym = String(h.title ?? '').split(' · ')[0].replace(/\s*\(named in prompt\)\s*$/, '').trim();
+            const isFileHit = sym === file || sym === basename(file) || String(h.title ?? '').endsWith(' · file');
+            const target = isFileHit ? (span ? `${file} (${span})` : file) : `${file}:${sym}${span ? ` (${span})` : ''}`;
+            const rawSig = String(h.snippet ?? '').replace(/\s+/g, ' ').trim();
+            const sig = rawSig ? (rawSig.length > sigCap ? `${rawSig.slice(0, sigCap - 1)}…` : rawSig) : '';
+            const edgeNote = compactPointerMapEdgeSummary(h);
+            return ` ${i + 1}. ${target}${sig ? ` — ${sig}` : ''}${edgeNote ? ` · ${edgeNote}` : ''}`;
+        });
+        const topSpans = sub
+            .slice(0, 3)
+            .map((h) => String(h.pointer ?? '').split(',')[0].trim())
+            .filter(Boolean);
+        const header = '[plexer] exploratory candidate map (broad query — inspect before deep reads; never `&&`-chain `plexer` commands):';
+        const coEdit = isEditPrompt && Array.isArray(coEditPointers) && coEditPointers.length > 0
+            ? `\nlikely co-edits / tests: ${coEditPointers.slice(0, 3).join(', ')}`
+            : '';
+        const hint = topSpans.length > 0 ? `\nhint: plexer read ${topSpans.join(' ')}` : '';
+        return `${header}\n${lines.join('\n')}${coEdit}${hint}`;
+    };
+    for (const [maxCands, sigCap] of [[8, 52], [8, 34], [8, 18], [6, 24], [5, 16]]) {
+        const rendered = renderWithSigCap(maxCands, sigCap);
+        if (Buffer.byteLength(rendered, 'utf8') <= EXPLORATORY_MAP_CAP_BYTES)
+            return rendered;
+    }
+    return renderWithSigCap(4, 16);
+}
+
+function fitHitCodeToBudget(h, n, fileKey, seenSymbolFiles, sourceCapBytes, budgetState) {
+    let codeToRender = h.code;
+    if (!codeToRender)
+        return codeToRender;
+    if (codeToRender.includes('// other symbols in ')) {
+        if (fileKey && seenSymbolFiles.has(fileKey))
+            codeToRender = codeToRender.replace(/\n*\/\/ other symbols in [^\n]+/g, '');
+        else if (fileKey)
+            seenSymbolFiles.add(fileKey);
+    }
+    if (!Number.isFinite(sourceCapBytes)) {
+        budgetState.inlinedCodeBytes += Buffer.byteLength(codeToRender, 'utf8');
+        budgetState.hasAnyCode = true;
+        return codeToRender;
+    }
+    let cBytes = Buffer.byteLength(codeToRender, 'utf8');
+    while ((n > 0 || codeToRender.includes('\n\n// ')) && budgetState.inlinedCodeBytes + cBytes > sourceCapBytes && codeToRender.includes('\n\n// ')) {
+        codeToRender = codeToRender.slice(0, codeToRender.lastIndexOf('\n\n// '));
+        cBytes = Buffer.byteLength(codeToRender, 'utf8');
+    }
+    if (n > 0 && budgetState.inlinedCodeBytes + cBytes > sourceCapBytes)
+        return undefined;
+    budgetState.inlinedCodeBytes += cBytes;
+    budgetState.hasAnyCode = true;
+    return codeToRender;
+}
+
+function formatSingleRetrievalBlock(h, num, i, ptr, fileKey, codeToRender, isEditPrompt, seenSymbolFiles) {
+    const snip = (h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
+    const redundant = isRedundantSnippet(snip, codeToRender);
+    let b = ` ${num}. ${h.title}: ${ptr}`;
+    if (snip && !redundant && (!isEditPrompt || !codeToRender))
+        b += `\n    ${snip}`;
+    if (h.related?.length && (codeToRender || i < 2))
+        b += `\n    related: ${h.related.slice(0, 6).join(', ')}`;
+    if (codeToRender && h.callSites?.length && (h.wantsCallSites || (isEditPrompt && i === 0 && h.callSites.length <= 2))) {
+        const selected = selectDiverseCallSites(h.callSites, h.wantsCallSites ? 12 : 2);
+        b += `\n    call sites (${h.callSites.length}):`;
+        for (const cs of selected)
+            b += `\n      ← ${cs}`;
+        if (h.callSites.length > selected.length) {
+            const symName = String(h.title ?? '').split(' · ')[0].replace(/\s*\(named in prompt\)\s*$/, '').trim() || '<sym>';
+            b += `\n      … +${h.callSites.length - selected.length} more — run \`plexer callers ${symName}\``;
+        }
+    }
+    if (h.otherSymbols && !codeToRender && i < 3 && (!fileKey || !seenSymbolFiles.has(fileKey))) {
+        if (fileKey)
+            seenSymbolFiles.add(fileKey);
+        b += `\n    symbols: ${h.otherSymbols.split(', ').slice(0, 6).join(', ')}`;
+    }
+    if (codeToRender)
+        b += `\n\`\`\`\n${codeToRender}\n\`\`\``;
+    return b;
+}
+
+function retrievalBody(hits, isEditPrompt = false, coEditPointers = undefined, sourceCapBytes = Infinity) {
     let ranked = 0;
+    const budgetState = { inlinedCodeBytes: 0, hasAnyCode: false };
     const seenSymbolFiles = new Set();
     const blocks = hits.map((h, n) => {
         // Pinned hits are numbered but don't consume the ranked hits' "top result" slots
         // (which earn the related / call-site lines below).
         const i = h.pinned ? Infinity : ranked++;
-        const num = n + 1;
         const ptr = (h.pointer ?? '').split(',')[0].trim();
         const fileKey = ptr.split(':')[0];
-        let codeToRender = h.code;
-        if (codeToRender && codeToRender.includes('// other symbols in ')) {
-            if (fileKey && seenSymbolFiles.has(fileKey)) {
-                codeToRender = codeToRender.replace(/\n*\/\/ other symbols in [^\n]+/g, '');
-            }
-            else if (fileKey) {
-                seenSymbolFiles.add(fileKey);
-            }
-        }
-        const snip = (h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
-        const redundant = isRedundantSnippet(snip, codeToRender);
-        let b = ` ${num}. ${h.title}: ${ptr}`;
-        if (snip && !redundant && (!isEditPrompt || !codeToRender))
-            b += `\n    ${snip}`;
-        if (h.related?.length && (codeToRender || i < 2))
-            b += `\n    related: ${h.related.slice(0, 6).join(', ')}`;
-        if (codeToRender && h.callSites?.length && (h.wantsCallSites || (isEditPrompt && i === 0 && h.callSites.length <= 2))) {
-            const maxCs = h.wantsCallSites ? 12 : 2;
-            const selected = selectDiverseCallSites(h.callSites, maxCs);
-            b += `\n    call sites (${h.callSites.length}):`;
-            for (const cs of selected)
-                b += `\n      ← ${cs}`;
-            if (h.callSites.length > selected.length) {
-                const symName = String(h.title ?? '').split(' · ')[0].replace(/\s*\(named in prompt\)\s*$/, '').trim() || '<sym>';
-                b += `\n      … +${h.callSites.length - selected.length} more — run \`plexer callers ${symName}\``;
-            }
-        }
-        if (h.otherSymbols && !codeToRender && i < 3 && (!fileKey || !seenSymbolFiles.has(fileKey))) {
-            if (fileKey)
-                seenSymbolFiles.add(fileKey);
-            b += `\n    symbols: ${h.otherSymbols.split(', ').slice(0, 6).join(', ')}`;
-        }
-        if (codeToRender)
-            b += `\n\`\`\`\n${codeToRender}\n\`\`\``;
-        return b;
+        const codeToRender = fitHitCodeToBudget(h, n, fileKey, seenSymbolFiles, sourceCapBytes, budgetState);
+        return formatSingleRetrievalBlock(h, n + 1, i, ptr, fileKey, codeToRender, isEditPrompt, seenSymbolFiles);
     });
-    const header = hits.some((h) => h.code)
+    const header = budgetState.hasAnyCode
         ? (isEditPrompt
-            ? '[plexer] edit targets localized (edit inlined `L<n>:` spans directly; batch any missing spans into 1 `plexer read` call or 1 parallel turn; never serialize 1 call/turn or read whole files):'
-            : '[plexer] retrieved context (use inlined `L<n>:` spans directly; batch any missing spans into 1 `plexer read` call or 1 parallel turn; never serialize 1 call/turn or read whole files):')
-        : '[plexer] starting points (batch any missing spans into 1 `plexer read` or `plexer callers` call or 1 parallel turn; never serialize 1 call/turn or read whole files):';
-    return `${header}\n${blocks.join('\n')}`;
+            ? '[plexer] edit targets localized (edit inlined `L<n>:` spans directly; batch missing `<=200`-line spans in 1 `plexer read` or read `>200`-line single files in parallel with native file read; never `&&`-chain `plexer` commands):'
+            : '[plexer] retrieved context (use inlined `L<n>:` spans directly; batch missing `<=200`-line spans in 1 `plexer read` or 1 parallel turn; never `&&`-chain `plexer` commands):')
+        : '[plexer] starting points (batch missing `<=200`-line spans in 1 `plexer read` or `plexer callers` call or 1 parallel turn; never `&&`-chain `plexer` commands):';
+    const footer = isEditPrompt && Array.isArray(coEditPointers) && coEditPointers.length > 0
+        ? `\nlikely co-edits / tests: ${coEditPointers.join(', ')}`
+        : '';
+    return `${header}\n${blocks.join('\n')}${footer}`;
 }
 export function formatRetrieval(ask, cap = 5) {
+    const allHits = ask.hits ?? [];
+    const hasPinned = allHits.some((h) => h.pinned);
+    const isEdit = Boolean(ask.isEditPrompt || ask.editEnvelope);
+    if (ask.confidenceTier === 'exploratory' && !hasPinned) {
+        const candidates = (ask.candidateMap?.length ? ask.candidateMap : allHits).slice(0, 8);
+        return formatExploratoryPointerMap(candidates, isEdit, ask.coEditPointers);
+    }
     // Pinned (named-in-prompt) definitions ride on top of the ranked cap.
-    const pinned = (ask.hits ?? []).filter((h) => h.pinned).length;
-    const hits = (ask.hits ?? []).slice(0, cap + pinned);
+    const pinned = allHits.filter((h) => h.pinned).length;
+    const hits = allHits.slice(0, cap + pinned);
     if (!hits.length)
         return null;
-    return retrievalBody(hits, Boolean(ask.isEditPrompt || ask.editEnvelope));
+    const isMergedMultiQuery = !ask.confidenceTier && String(ask.query ?? '').includes(' ; ');
+    const sourceCapBytes = ask.confidenceTier === 'high' && !hasPinned && !isMergedMultiQuery
+        ? HIGH_CONFIDENCE_SOURCE_CAP_BYTES
+        : Infinity;
+    return retrievalBody(hits, isEdit, ask.coEditPointers, sourceCapBytes);
 }
 /** How many recently-injected pointers the novelty gate remembers per session. */
 const INJECTED_POINTERS_CAP = 40;
@@ -255,7 +355,7 @@ export const NUDGE_CAP = 2;
 /** The line injected instead of a weak pack: names the command, says why, once.
  * Deliberately not an imperative about plexer in general — it's a fact about this
  * prompt's match quality plus the command that fixes it. */
-export function weakMatchNudge(s, strong) {
+function weakMatchNudge(s, strong) {
     const spent = s.nudges ?? 0;
     if (spent >= NUDGE_CAP)
         return null;
@@ -263,6 +363,41 @@ export function weakMatchNudge(s, strong) {
     return (`[plexer] no strong match for this prompt (name-field match ${strong.toFixed(2)}) — the graph ` +
         `has more than this probe found. Run \`plexer ask "<your task>" --source\` before grepping.`);
 }
+function trimFollowUpHitCode(h, idx) {
+    if (!h.code)
+        return h;
+    if (idx > 0)
+        return { ...h, code: undefined };
+    if (Buffer.byteLength(h.code, 'utf8') <= 1500)
+        return h;
+    const lines = h.code.split('\n');
+    const acc = [];
+    let bytes = 0;
+    for (const line of lines) {
+        const lb = Buffer.byteLength(line, 'utf8') + 1;
+        if (bytes + lb > 1440 && acc.length > 0)
+            break;
+        acc.push(line);
+        bytes += lb;
+    }
+    if (acc.length < lines.length && h.pointer)
+        acc.push(`… (continued at ${String(h.pointer).split(',')[0].trim()})`);
+    return { ...h, code: acc.join('\n') };
+}
+
+function recordFreshRetrieval(ask, s, fresh, cap, exploratory = false) {
+    if (!fresh.length)
+        return null;
+    const payload = exploratory ? { ...ask, hits: fresh, candidateMap: fresh } : { ...ask, hits: fresh };
+    const txt = formatRetrieval(payload, cap);
+    if (!txt)
+        return null;
+    const recordCap = exploratory ? cap : cap + fresh.filter((h) => h.pinned).length;
+    s.injectedPointers = [...(s.injectedPointers ?? []), ...fresh.slice(0, recordCap).map((h) => h.pointer)]
+        .slice(-INJECTED_POINTERS_CAP);
+    return txt;
+}
+
 export function relevantRetrieval(ask, s, cap = 4, opts = {}) {
     if (!(ask.hits ?? []).length)
         return null;
@@ -272,60 +407,30 @@ export function relevantRetrieval(ask, s, cap = 4, opts = {}) {
     if (lexical && !hasPinned) {
         const strong = ask.coverageStrong ?? 0;
         const broad = ask.coverage ?? 0;
-        const qLen = String(ask.query ?? '').trim().split(/\s+/).filter(Boolean).length;
-        const canTrustBroadAlone = strong > 0 || hasExplicitPathHitMatch(ask);
-        const hasSubstantialMatch = strong >= STRONG_FLOOR ||
-            (strong >= 0.04 && broad >= 0.14) ||
-            (canTrustBroadAlone && (broad >= HIGH_FLOOR || (!isFollowUp && qLen >= 6 && broad >= 0.28)));
+        const hasSubstantialMatch =
+            strong >= 0.15 ||
+            (strong >= STRONG_FLOOR && broad >= 0.18) ||
+            hasExplicitPathHitMatch(ask) ||
+            (strong >= 0.06 && broad >= HIGH_FLOOR);
         if (!hasSubstantialMatch)
-            return isFollowUp ? null : weakMatchNudge(s, strong);
+            return (isFollowUp || opts.suppressNudge) ? null : weakMatchNudge(s, strong);
     }
     const seen = new Set(s.injectedPointers ?? []);
     if (isFollowUp) {
         const freshPins = ask.hits.filter((h) => h.pinned && !seen.has(h.pointer));
-        const rankedHits = ask.hits.filter((h) => !h.pinned);
-        const topRanked = rankedHits[0];
+        const topRanked = ask.hits.find((h) => !h.pinned);
         const strong = ask.coverageStrong ?? 0;
         const freshTopRanked = topRanked && !seen.has(topRanked.pointer) && (!lexical || strong >= 0.20)
             ? [topRanked]
             : [];
-        const followUpHits = [...freshPins, ...freshTopRanked].slice(0, 2).map((h, idx) => {
-            if (!h.code)
-                return h;
-            if (idx > 0)
-                return { ...h, code: undefined };
-            if (Buffer.byteLength(h.code, 'utf8') <= 1500)
-                return h;
-            const lines = h.code.split('\n');
-            let acc = [];
-            let bytes = 0;
-            for (const line of lines) {
-                const lb = Buffer.byteLength(line, 'utf8') + 1;
-                if (bytes + lb > 1500 && acc.length > 0)
-                    break;
-                acc.push(line);
-                bytes += lb;
-            }
-            return { ...h, code: acc.join('\n') };
-        });
-        if (!followUpHits.length)
-            return null;
-        const txt = formatRetrieval({ ...ask, hits: followUpHits }, 2);
-        if (!txt)
-            return null;
-        s.injectedPointers = [...(s.injectedPointers ?? []), ...followUpHits.map((h) => h.pointer)]
-            .slice(-INJECTED_POINTERS_CAP);
-        return txt;
+        const followUpHits = [...freshPins, ...freshTopRanked].slice(0, 2).map(trimFollowUpHitCode);
+        return recordFreshRetrieval(ask, s, followUpHits, 2, false);
     }
-    const fresh = ask.hits.filter((h) => !seen.has(h.pointer));
-    if (!fresh.length)
-        return null;
-    const txt = formatRetrieval({ ...ask, hits: fresh }, cap);
-    if (!txt)
-        return null;
-    s.injectedPointers = [...(s.injectedPointers ?? []), ...fresh.slice(0, cap + fresh.filter((h) => h.pinned).length).map((h) => h.pointer)]
-        .slice(-INJECTED_POINTERS_CAP);
-    return txt;
+    if (ask.confidenceTier === 'exploratory' && !hasPinned) {
+        const pool = ask.candidateMap?.length ? ask.candidateMap : ask.hits;
+        return recordFreshRetrieval(ask, s, pool.filter((h) => !seen.has(h.pointer)), 8, true);
+    }
+    return recordFreshRetrieval(ask, s, ask.hits.filter((h) => !seen.has(h.pointer)), cap, false);
 }
 export function formatOrientation(indexMd, budgetBytes = 0, staleNote) {
     const banner = staleNote ? `${staleNote}\n\n` : "";

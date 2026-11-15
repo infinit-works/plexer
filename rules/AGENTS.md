@@ -1,0 +1,8 @@
+# Plexer Code Graph Rules
+
+Start every repository task from Turn-0 `[plexer]` context before reaching for shell search or piecemeal file reads. This rule already carries the full daily `plexer` contract: skip reading `plexer/SKILL.md`, and activate `plexer-health` only for `plexer health` workflows.
+
+- **Use Turn-0 `[plexer]` context first:** Never re-run `plexer ask` on symbols already inlined in Turn-0 `[plexer]` context, and skip spans marked `[already in session context: file:Lx-Ly]`.
+- **Zero-tool answers when complete:** On diagnosis and caller questions, answer directly with exact `file:Lx-Ly` citations when Turn-0 context already includes the needed `L<n>:` lines and `call sites`.
+- **Batch reads without pagination or `&&` spills:** Edit `(named in prompt)` blocks and inlined `L<n>:` spans directly without re-reading. Check `likely co-edits / tests` and `// other symbols in <file>` footers before searching. Batch 1–6 targeted spans (`<=200` lines/file) in one `plexer read <file:sym|file:Lx-Ly> [...]` call, or read a full file once with `read_file` when editing multiple regions of that file. Never slice one file in small chunks across turns or `&&`-chain `plexer` commands past the 10 KB shell limit.
+- **Daily CLI:** `plexer read <spans...> [--full]`, `plexer ask "<query>" [--in <dir>]`, `plexer callers <symbols...> [--depth 2|all]`, `plexer callees <symbols...> [--depth 2|all]`, `plexer impact <files...>`, `plexer skeleton <files...>`, `plexer grep <patterns...> [--fixed]`, and `plexer map`. Activate the `plexer-health` skill for `plexer health` scans, queues, reviews, and treemaps.

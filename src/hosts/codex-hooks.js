@@ -6,8 +6,19 @@
 import { join } from 'node:path';
 import { hooksShim } from '../claude/shim-template.js';
 import { claudeDistDir } from '../claude/paths.js';
-import { upsertHookEvents, writeOwned } from '../util/config-write.js';
+import { isPlexerEntry, updateJsonConfig, upsertHookEvents, writeOwned } from '../util/config-write.js';
 import { dirExists } from '../util/fs.js';
+
+const GEMINI_HOOK_DEFS = [
+    { event: 'BeforeAgent', matcher: '*', name: 'plexer-before-agent', sub: 'gemini-before-agent', timeout: 15000 },
+    { event: 'BeforeTool', matcher: 'read_file|run_shell_command', name: 'plexer-before-tool', sub: 'gemini-before-tool', timeout: 8000 },
+    { event: 'AfterTool', matcher: 'read_file|write_file|replace', name: 'plexer-after-tool', sub: 'gemini-after-tool', timeout: 8000 },
+];
+
+const CURSOR_HOOK_DEFS = [
+    { event: 'beforeSubmitPrompt', sub: 'cursor-before-submit', timeout: 15 },
+    { event: 'afterFileEdit', sub: 'cursor-after-file-edit', timeout: 10 },
+];
 /**
  * The files installing the Codex hook would touch — pure, no writes. Both live
  * under `~/.codex`, so both are scoped 'global': the hook entries fire in every
@@ -47,6 +58,69 @@ export function installCodexHooks(home) {
     const cfgWrite = upsertHookEvents('codex-hooks', targets[1].path, DESIRED_ENTRIES, (d) => {
         const handler = { type: 'command', command: `node "${shimPath}" ${d.sub}`, timeout: d.timeout };
         return d.matcher ? { matcher: d.matcher, hooks: [handler] } : { hooks: [handler] };
+    });
+    return [shimWrite, cfgWrite];
+}
+
+export function geminiHookTargets({ home, repo } = {}) {
+    const out = [];
+    if (home) {
+        out.push(
+            { id: 'gemini-hook-shim-global', path: join(home, '.gemini', 'hooks', 'plexer', 'plexer-hooks.cjs'), what: 'global Gemini hook shim' },
+            { id: 'gemini-hooks-global', path: join(home, '.gemini', 'settings.json'), what: 'global Gemini CLI hook entries' },
+        );
+    }
+    if (repo) {
+        out.push(
+            { id: 'gemini-hook-shim', path: join(repo, '.gemini', 'helpers', 'plexer-hooks.cjs'), what: 'repo Gemini hook shim' },
+            { id: 'gemini-hooks', path: join(repo, '.gemini', 'settings.json'), what: 'repo Gemini CLI hook entries' },
+        );
+    }
+    return out;
+}
+
+export function installGeminiHooks({ home, repo } = {}) {
+    const writes = [];
+    const shimBody = hooksShim(claudeDistDir());
+    const pairs = [
+        home ? { shim: join(home, '.gemini', 'hooks', 'plexer', 'plexer-hooks.cjs'), cfg: join(home, '.gemini', 'settings.json'), sfx: '-global' } : null,
+        repo ? { shim: join(repo, '.gemini', 'helpers', 'plexer-hooks.cjs'), cfg: join(repo, '.gemini', 'settings.json'), sfx: '' } : null,
+    ].filter(Boolean);
+    for (const pair of pairs) {
+        writes.push(writeOwned(`gemini-hook-shim${pair.sfx}`, pair.shim, shimBody, 0o755));
+        writes.push(upsertHookEvents(`gemini-hooks${pair.sfx}`, pair.cfg, GEMINI_HOOK_DEFS, (d) => ({
+            matcher: d.matcher,
+            hooks: [{ name: d.name, type: 'command', command: `node "${pair.shim}" ${d.sub}`, timeout: d.timeout }],
+        })));
+    }
+    return writes;
+}
+
+export function cursorHookTargets(repo) {
+    if (!repo) return [];
+    return [
+        { id: 'cursor-hook-shim', path: join(repo, '.cursor', 'helpers', 'plexer-hooks.cjs'), what: 'Cursor hook shim' },
+        { id: 'cursor-hooks', path: join(repo, '.cursor', 'hooks.json'), what: 'Cursor hook entries' },
+    ];
+}
+
+export function installCursorHooks(repo) {
+    if (!repo) return [];
+    const shimPath = join(repo, '.cursor', 'helpers', 'plexer-hooks.cjs');
+    const cfgPath = join(repo, '.cursor', 'hooks.json');
+    const shimWrite = writeOwned('cursor-hook-shim', shimPath, hooksShim(claudeDistDir()), 0o755);
+    const cfgWrite = updateJsonConfig('cursor-hooks', cfgPath, (root) => {
+        if (root.version === undefined) root.version = 1;
+        const hooks = (root.hooks ??= {});
+        if (typeof hooks !== 'object' || hooks === null || Array.isArray(hooks)) return 'unparseable';
+        for (const d of CURSOR_HOOK_DEFS) {
+            if (hooks[d.event] !== undefined && !Array.isArray(hooks[d.event])) return 'unparseable';
+            const prior = Array.isArray(hooks[d.event]) ? hooks[d.event] : [];
+            hooks[d.event] = [
+                ...prior.filter((e) => !isPlexerEntry(e)),
+                { command: `node "${shimPath}" ${d.sub}`, timeout: d.timeout },
+            ];
+        }
     });
     return [shimWrite, cfgWrite];
 }

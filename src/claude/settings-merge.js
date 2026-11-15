@@ -24,11 +24,15 @@ function hookCmd(arg, helpers = REPO_HELPERS) {
 /** Claude Code reads a hook's `timeout` in seconds, not milliseconds. */
 function plexerBlocks(helpers) {
     return {
+        PreToolUse: [
+            { matcher: 'Read|Bash', hooks: [{ type: 'command', command: hookCmd('pre-tool-use', helpers), timeout: 8 }] },
+        ],
         PostToolUse: [
             { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd('post-edit', helpers), timeout: 10 }] },
+            { matcher: 'Read|ExitPlanMode', hooks: [{ type: 'command', command: hookCmd('post-tool-use', helpers), timeout: 8 }] },
         ],
         UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('prompt', helpers), timeout: 15 }] }],
-        SessionStart: [{ hooks: [{ type: 'command', command: hookCmd('session-start', helpers), timeout: 8 }] }],
+        SessionStart: [{ matcher: 'startup|resume|compact', hooks: [{ type: 'command', command: hookCmd('session-start', helpers), timeout: 8 }] }],
         Stop: [{ hooks: [{ type: 'command', command: hookCmd('stop', helpers), timeout: 8 }] }],
     };
 }

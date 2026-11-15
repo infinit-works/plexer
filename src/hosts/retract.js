@@ -20,21 +20,21 @@
  *      contribution is deleted, not truncated to `{}` or a blank document —
  *      an orphan file is the very residue this exists to remove.
  */
+import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, lstatSync, rmSync, rmdirSync, readdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { HOSTS } from './registry.js';
 import { PLEXER_START, PLEXER_END, hasSection } from './sections.js';
 import { mcpTargets, stripTomlSection } from './mcp-config.js';
-import { hookTargets } from './codex-hooks.js';
+import { cursorHookTargets, geminiHookTargets, hookTargets } from './codex-hooks.js';
 import { antigravitySkillTargets } from './antigravity.js';
-import { claudeGlobalTargets } from '../claude/init.js';
-import { claudeTargets } from '../claude/init.js';
+import { claudeGlobalTargets, claudeTargets } from '../claude/init.js';
 import { isPlexerAllowEntry, isPlexerFooterRegex, isPlexerStatusline } from '../claude/settings-merge.js';
 import { isPlexerEntry, readJsonObject } from '../util/config-write.js';
 import { dirExists } from '../util/fs.js';
 import { contextDirFor } from '../util/paths.js';
-import { resolveGitExcludePath } from '../util/state.js';
+import { agyTempDir, resolveGitExcludePath } from '../util/state.js';
 // ---------------------------------------------------------------------------
 // primitive operations
 // ---------------------------------------------------------------------------
@@ -263,6 +263,45 @@ function stripClaudeSettings(path, apply) {
         }
     });
 }
+function stripGeminiSettings(path, apply) {
+    return retractJson(path, apply, (root) => {
+        stripHookEvents(root);
+        if (root.mcpServers && typeof root.mcpServers === 'object' && !Array.isArray(root.mcpServers) && 'plexer' in root.mcpServers) {
+            delete root.mcpServers.plexer;
+            if (Object.keys(root.mcpServers).length === 0) delete root.mcpServers;
+        }
+    });
+}
+function removeSkillEntrySafe(path, apply) {
+    try {
+        if (lstatSync(dirname(path)).isSymbolicLink()) return 'absent';
+    }
+    catch { return 'absent'; }
+    const sym = removeSymlink(path, apply);
+    if (sym !== 'absent') return sym;
+    return removeDir(path, apply);
+}
+function resolveRetractSocketPaths(home, opts = {}) {
+    const xdg = process.env.XDG_RUNTIME_DIR;
+    return [...new Set([
+        opts.daemonSocketPath,
+        process.env.PLEXER_DAEMON_SOCK?.trim(),
+        xdg ? join(xdg, 'plexer-daemon.sock') : null,
+        join(home, '.cache', 'plexer', 'daemon.sock'),
+    ].filter(Boolean))];
+}
+
+function stopDaemonSocket(sockPath, apply) {
+    if (!sockPath || sockPath.startsWith('\\\\.\\pipe\\') || !existsSync(sockPath)) return 'absent';
+    if (!apply) return 'deleted';
+    try {
+        const script = `const net=require('node:net');const c=net.connect(${JSON.stringify(sockPath)},()=>{c.write('{"id":1,"type":"shutdown"}\\n');c.end();});c.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),150);`;
+        spawnSync(process.execPath, ['-e', script], { timeout: 300, stdio: 'ignore' });
+    }
+    catch { /* ignore */ }
+    try { if (existsSync(sockPath)) rmSync(sockPath, { force: true }); } catch { /* ignore */ }
+    return 'deleted';
+}
 /** Remove plexer's PostToolUse/SessionStart/etc. entries from Codex's or Cursor's hooks.json. */
 function stripCodexHooks(path, apply) {
     return retractJson(path, apply, (root) => {
@@ -362,16 +401,32 @@ function collectKeptRetractPaths(repo, home, exclude, targetSets) {
     if (exclude.has('agents'))
         for (const t of targetSets.codexHookTargets)
             keptPaths.add(t.path);
+    if (exclude.has('gemini')) {
+        for (const t of targetSets.geminiTargets)
+            keptPaths.add(t.path);
+        keptPaths.add(join(home, '.gemini', 'skills', 'plexer'));
+    }
+    if (exclude.has('cursor'))
+        for (const t of targetSets.cursorTargets)
+            keptPaths.add(t.path);
     if (exclude.has('antigravity'))
         for (const t of targetSets.agySkillTargets)
             keptPaths.add(t.path);
     return keptPaths;
 }
 
-function enqueueGlobalRetractTargets(home, exclude, targetSets, enqueueTarget) {
+function enqueueGlobalRetractTargets(home, exclude, targetSets, opts, enqueueTarget) {
+    const cleanRuntime = !opts.home || resolve(opts.home) === resolve(homedir()) || opts.cleanRuntime === true;
     if (exclude.size === 0) {
         const binLink = join(home, '.local', 'bin', 'plexer');
         enqueueTarget({ hostId: 'global', path: binLink, what: 'plexer CLI symlink', scope: 'global', run: (a) => removeSymlink(binLink, a) });
+        if (cleanRuntime) {
+            for (const sockPath of resolveRetractSocketPaths(home, opts)) {
+                enqueueTarget({ hostId: 'global', path: sockPath, what: 'plexerd IPC socket', scope: 'global', run: (a) => stopDaemonSocket(sockPath, a) });
+            }
+            const agyTmp = agyTempDir();
+            enqueueTarget({ hostId: 'global', path: agyTmp, what: 'plexer temporary session directory', scope: 'global', run: (a) => removeDir(agyTmp, a) });
+        }
     }
     if (!exclude.has('claude')) {
         const [shim, settings, mcp] = targetSets.globalClaudeTargets;
@@ -394,15 +449,33 @@ function enqueueGlobalRetractTargets(home, exclude, targetSets, enqueueTarget) {
         const agentsSkillLink = join(home, '.agents', 'skills', 'plexer');
         enqueueTarget({ hostId: 'agents', path: agentsSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(agentsSkillLink, a) });
     }
+    if (!exclude.has('gemini')) {
+        const geminiGlobalShim = join(home, '.gemini', 'hooks', 'plexer', 'plexer-hooks.cjs');
+        const geminiGlobalSettings = join(home, '.gemini', 'settings.json');
+        const geminiSkillLink = join(home, '.gemini', 'skills', 'plexer');
+        enqueueTarget({ hostId: 'gemini', path: geminiGlobalShim, what: 'global Gemini hook shim', scope: 'global', run: (a) => removeFile(geminiGlobalShim, a) });
+        enqueueTarget({ hostId: 'gemini', path: geminiGlobalSettings, what: 'global Gemini CLI hooks and MCP', scope: 'global', run: (a) => stripGeminiSettings(geminiGlobalSettings, a) });
+        enqueueTarget({ hostId: 'gemini', path: geminiSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSkillEntrySafe(geminiSkillLink, a) });
+    }
     if (!exclude.has('antigravity')) {
         for (const t of targetSets.agySkillTargets) {
             enqueueTarget({
                 hostId: t.hostId, path: t.path, what: t.what, scope: 'global',
-                run: (a) => (t.path.endsWith('hooks.json') ? removeTopLevelJsonKey(t.path, 'plexer-hooks', a) : removeFile(t.path, a)),
+                run: (a) => {
+                    if (t.id === 'antigravity-plugin') {
+                        const sym = removeSymlink(t.path, a);
+                        return sym !== 'absent' ? sym : removeDir(t.path, a);
+                    }
+                    return t.path.endsWith('hooks.json') ? removeTopLevelJsonKey(t.path, 'plexer-hooks', a) : removeFile(t.path, a);
+                },
             });
         }
+        const cfgSkill = join(home, '.gemini', 'config', 'skills', 'plexer');
+        const agySkill = join(home, '.gemini', 'antigravity', 'skills', 'plexer');
         const geminiSkillLink = join(home, '.gemini', 'skills', 'plexer');
-        enqueueTarget({ hostId: 'antigravity', path: geminiSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSymlink(geminiSkillLink, a) });
+        enqueueTarget({ hostId: 'antigravity', path: cfgSkill, what: 'legacy config skill', scope: 'global', run: (a) => removeSkillEntrySafe(cfgSkill, a) });
+        enqueueTarget({ hostId: 'antigravity', path: agySkill, what: 'legacy antigravity skill', scope: 'global', run: (a) => removeSkillEntrySafe(agySkill, a) });
+        enqueueTarget({ hostId: 'antigravity', path: geminiSkillLink, what: 'plexer skill symlink', scope: 'global', run: (a) => removeSkillEntrySafe(geminiSkillLink, a) });
     }
 }
 
@@ -423,6 +496,8 @@ function targets(repo, opts) {
         repoClaudeTargets: claudeTargets(repo),
         globalClaudeTargets: claudeGlobalTargets(home),
         codexHookTargets: hookTargets(home),
+        geminiTargets: geminiHookTargets({ home, repo }),
+        cursorTargets: cursorHookTargets(repo),
         agySkillTargets: antigravitySkillTargets(home),
     };
     const keptPaths = collectKeptRetractPaths(repo, home, exclude, targetSets);
@@ -467,10 +542,22 @@ function targets(repo, opts) {
         ])
             enqueueTarget(t);
     }
+    if (!exclude.has('gemini')) {
+        const gShim = join(repo, '.gemini', 'helpers', 'plexer-hooks.cjs');
+        const gSettings = join(repo, '.gemini', 'settings.json');
+        enqueueTarget({ hostId: 'gemini', path: gShim, what: 'repo Gemini hook shim', scope: 'repo', run: (a) => removeFile(gShim, a) });
+        enqueueTarget({ hostId: 'gemini', path: gSettings, what: 'repo Gemini hooks and MCP', scope: 'repo', run: (a) => stripGeminiSettings(gSettings, a) });
+    }
+    if (!exclude.has('cursor')) {
+        const cShim = join(repo, '.cursor', 'helpers', 'plexer-hooks.cjs');
+        const cHooks = join(repo, '.cursor', 'hooks.json');
+        enqueueTarget({ hostId: 'cursor', path: cShim, what: 'Cursor hook shim', scope: 'repo', run: (a) => removeFile(cShim, a) });
+        enqueueTarget({ hostId: 'cursor', path: cHooks, what: 'Cursor hooks', scope: 'repo', run: (a) => stripCodexHooks(cHooks, a) });
+    }
     // 4. Global: Claude Code's user-level copy, Codex's hook shim + entries,
-    //    Antigravity's shared skill + hooks, and global bin/skill symlinks.
+    //    Gemini/Antigravity shared skill + plugin + hooks, and global bin/skill symlinks.
     if (opts.global !== false) {
-        enqueueGlobalRetractTargets(home, exclude, targetSets, enqueueTarget);
+        enqueueGlobalRetractTargets(home, exclude, targetSets, opts, enqueueTarget);
     }
     // 5. The graph cache and the ignore entries that admit it. Last, so a failure
     //    here can't strand the wiring half-retracted.

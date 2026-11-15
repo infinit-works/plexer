@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { HOSTS, detectHosts } from './registry.js';
 import { upsertSection } from './sections.js';
 import { CLI_MCP_OPT_IN_HOSTS, registerMcpConfigs } from './mcp-config.js';
-import { installCodexHooks } from './codex-hooks.js';
+import { installCodexHooks, installCursorHooks, installGeminiHooks } from './codex-hooks.js';
 import { installAntigravitySkill } from './antigravity.js';
 import { writeOwned } from '../util/config-write.js';
 export function runHostsInit(repo, opts = {}) {
@@ -48,13 +48,20 @@ export function runHostsInit(repo, opts = {}) {
     const mcp = mcpHostIds.length === 0
         ? []
         : registerMcpConfigs(repo, mcpHostIds, { home, global: opts.global });
-    // The Codex hook targets are user-level (~/.codex), so --no-global suppresses them.
-    const hooks = opts.hooks === false || opts.global === false || !selected.some((h) => h.id === 'agents')
+    // Codex hook targets are user-level (~/.codex), so --no-global suppresses them.
+    const wantHooks = opts.hooks !== false;
+    const codexHooks = !wantHooks || opts.global === false || !selected.some((h) => h.id === 'agents')
         ? []
         : installCodexHooks(home);
-    // Antigravity's skill is a global write too, so --no-global suppresses it as well.
+    const geminiHooks = !wantHooks || !selected.some((h) => h.id === 'gemini')
+        ? []
+        : installGeminiHooks({ home: opts.global === false ? undefined : home, repo });
+    const cursorHooks = !wantHooks || !selected.some((h) => h.id === 'cursor')
+        ? []
+        : installCursorHooks(repo);
+    // Antigravity's plugin is a global write too, so --no-global suppresses it as well.
     const antigravitySkill = opts.global === false || !selected.some((h) => h.id === 'antigravity')
         ? []
-        : installAntigravitySkill(home, { hooks: opts.hooks, skills: opts.skills });
-    return { written, skipped, unknown, mcp, hooks: [...hooks, ...antigravitySkill] };
+        : installAntigravitySkill(home, { hooks: opts.hooks, skills: opts.skills === true ? true : false });
+    return { written, skipped, unknown, mcp, hooks: [...codexHooks, ...geminiHooks, ...cursorHooks, ...antigravitySkill] };
 }

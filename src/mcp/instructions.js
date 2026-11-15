@@ -4,15 +4,15 @@
  * This is the one piece of plexer prose that survives **tool deferral**. When a
  * host has more tools than its schema budget allows, it sends tool *names* only
  * and withholds the JSONSchemas until a `ToolSearch`-style lookup fetches them —
- * measured in a real session: 111 tools deferred, of which plexer's eight arrived as
- * eight bare strings with no descriptions at all. The MCP spec's `instructions`
+ * measured in a real session: 111 tools deferred, of which plexer's tools arrived as
+ * bare strings with no descriptions at all. The MCP spec's `instructions`
  * field is delivered on a separate track (Claude Code records it as its own
  * `mcp_instructions_delta` context layer), so it lands whole even then. Other
  * servers already rely on this — `claude-in-chrome` uses it for exactly the
  * batch-your-ToolSearch instruction below; plexer used to send nothing.
  *
  * Two jobs, in this order:
- *   1. Defuse the deferral tax. One lookup loads all eight tools for the whole
+ *   1. Defuse the deferral tax. One lookup loads all nine tools for the whole
  *      session, so the cost is a single round trip, not two calls per use. An
  *      agent that doesn't know this can only assume the worse reading.
  *   2. Say what each tool is FOR as a decision rule, not a feature summary —

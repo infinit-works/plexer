@@ -2,18 +2,21 @@
  * The MCP tools, as pure functions over the existing engine.
  * `callTool` never throws — hosts get soft errors as isError content.
  */
-import { existsSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
+import { isWithinRoot, tryRealpath } from '../util/fs.js';
 import { ask, formatAsk, skeleton, formatSkeleton, readSpans, formatReadSpans, suggestClosestFiles, suggestNearTargets } from '../ask/ask.js';
+import { applySeenSpansFilter, isSpanCovered, mergeSpan, parsePointerSpan, recordRetrievalSpans } from '../agy/spans.js';
+import { resolveAgyWorkspaceDirs } from '../agy/multi-workspace.js';
 import { checkGraph, formatGraphCheckReport } from '../graph/check.js';
 import { loadGraphCached } from '../context/graph-store.js';
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from '../graph/refresh.js';
 import { contextDirFor } from '../context/node-file.js';
 import { resolveSymbol } from '../context/symbol-query.js';
 import { edgeWalk, parseWalkDepth } from '../graph/traverse.js';
-import { headerOf, hitLine, looseNoteFor, quoteFor, renderMatchBlock } from '../graph/traverse-cli.js';
+import { renderMatchBlock } from '../graph/traverse-cli.js';
 import { linkTestsForGraph } from '../graph/test-links.js';
-import { fileReader, wordRe } from '../blast/evidence.js';
+import { fileReader } from '../blast/evidence.js';
 import { blastRadiusIn } from '../blast/blast.js';
 import { changedFiles, refExists } from '../blast/diff.js';
 import { analyzeGitHistory } from '../blast/history.js';
@@ -35,7 +38,7 @@ import {
     loadWorkspaceGraphs,
     readWorkspace,
 } from '../graph/workspace.js';
-import { readAgyLastRepo } from '../hosts/antigravity-hooks.js';
+import { readAgyLastRepo } from '../agy/session.js';
 import { isCanonicalMcpTool } from './tool-names.js';
 
 const NO_GRAPH = 'no graph found — run `plexer build` first';
@@ -117,6 +120,10 @@ export const TOOLS = [
                 spans: {
                     description: 'one or more file:Lx-Ly, file:Lx, file:symbol, or file spans (comma-separated string or array of strings)',
                     oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+                },
+                full: {
+                    type: 'boolean',
+                    description: 'return full requested spans without the 9 KB batch cap',
                 },
                 dir: DIR_PROP,
             },
@@ -521,11 +528,11 @@ function workspaceHealth(root, dirOverride, args) {
     return { text: `${chunks.join('\n\n')}\n`, isError: false };
 }
 
-function workspaceRead(root, dirOverride, args) {
+function workspaceRead(root, dirOverride, args, seenSpans = null) {
     const specs = parseCommaOrArrayList(args.spans ?? args.file);
     if (specs.length === 0)
         return { text: 'plexer_read requires spans', isError: true };
-    const r = federateRead(root, dirOverride, specs);
+    const r = federateRead(root, dirOverride, specs, { full: args.full === true });
     if (r.blocks.some((b) => b.error && !b.error.includes('did you mean:'))) {
         const wsPaths = collectWorkspacePaths(root, dirOverride);
         for (const b of r.blocks) {
@@ -537,6 +544,7 @@ function workspaceRead(root, dirOverride, args) {
             }
         }
     }
+    applyReadSeenSpans(r, seenSpans, args.full === true);
     return {
         text: formatReadSpans(r),
         isError: r.blocks.length > 0 && r.blocks.every((b) => Boolean(b.error)),
@@ -590,7 +598,7 @@ function workspaceTraceCalls(root, dirOverride, args) {
 
 /** When the MCP server is rooted at a workspace parent, the ask/read/callers/grep/
  * map/check/file_api/blast tools federate across the children — identical to the CLI. */
-async function callWorkspaceTool(root, dirOverride, name, args) {
+async function callWorkspaceTool(root, dirOverride, name, args, seenSpans = null) {
     switch (name) {
         case 'plexer_find_code': {
             const queries = parseQueriesList(args.query ?? args.queries);
@@ -602,12 +610,12 @@ async function callWorkspaceTool(root, dirOverride, name, args) {
             const { limit } = parsedLimit;
             const blocks = queries.map((q) => {
                 const r = federateAsk(root, dirOverride, q, { limit, source: true, full: args.full === true, in: optIn(args) });
-                return formatAsk(r).trimEnd();
+                return formatAskWithSeenSpans(r, seenSpans, args.full === true);
             });
             return { text: `${blocks.join('\n\n')}\n`, isError: false };
         }
         case 'plexer_read':
-            return workspaceRead(root, dirOverride, args);
+            return workspaceRead(root, dirOverride, args, seenSpans);
         case 'plexer_file_api':
             return workspaceFileApi(root, dirOverride, args);
         case 'plexer_trace_calls':
@@ -657,7 +665,50 @@ function extractCandidateAbsPath(args) {
     return existsSync(parent) ? parent : null;
 }
 
-function resolveMcpRoot(root, args, dirOverride) {
+function sessionSeenSpansFor(sessionState, targetRoot) {
+    if (!sessionState || typeof sessionState !== 'object') return null;
+    const key = tryRealpath(targetRoot);
+    sessionState.seenSpansByRepo ??= {};
+    if (sessionState.seenSpansByRepo[key]) return sessionState.seenSpansByRepo[key];
+    if (Object.keys(sessionState.seenSpansByRepo).length === 0) {
+        sessionState.seenSpans ??= {};
+        sessionState.seenSpansByRepo[key] = sessionState.seenSpans;
+        return sessionState.seenSpans;
+    }
+    sessionState.seenSpansByRepo[key] = {};
+    return sessionState.seenSpansByRepo[key];
+}
+
+function formatAskWithSeenSpans(askResult, seenSpans, forceFull = false) {
+    let cur = askResult;
+    if (seenSpans && !forceFull) {
+        cur = applySeenSpansFilter(askResult, seenSpans)?.ask ?? askResult;
+    }
+    if (seenSpans) recordRetrievalSpans(seenSpans, cur);
+    return formatAsk(cur).trimEnd();
+}
+
+function applyReadSeenSpans(readResult, seenSpans, forceFull = false) {
+    if (!seenSpans || !Array.isArray(readResult?.blocks)) return;
+    for (const b of readResult.blocks) {
+        if (!b || b.error || !b.file || !b.span) continue;
+        const parsed = parsePointerSpan(`${b.file}:${b.span}`);
+        if (!parsed) continue;
+        if (!forceFull && isSpanCovered(seenSpans, parsed.file, parsed.start, parsed.end)) {
+            b.code = `// [already in session context: ${parsed.file}:L${parsed.start}-L${parsed.end} — pass full:true to force re-read]`;
+        } else {
+            mergeSpan(seenSpans, parsed.file, parsed.start, parsed.end);
+        }
+    }
+}
+
+function isFilesystemRoot(p) {
+    if (!p || typeof p !== 'string') return false;
+    const c = tryRealpath(p);
+    return c === parse(c).root;
+}
+
+function resolveMcpRoot(root, args, dirOverride, sessionState = null, getAgyRoots = null) {
     if (typeof args?.dir === 'string' && args.dir.trim()) {
         return nearestPlexerRoot(args.dir.trim(), dirOverride).root;
     }
@@ -665,48 +716,61 @@ function resolveMcpRoot(root, args, dirOverride) {
         const absDir = extractCandidateAbsPath(args);
         if (absDir) {
             const fromAbs = nearestPlexerRoot(absDir, dirOverride).root;
-            if (hasPlexerIndex(fromAbs) || isAutoBuildableRepo(fromAbs)) {
+            if (!isFilesystemRoot(fromAbs) && (hasPlexerIndex(fromAbs) || isAutoBuildableRepo(fromAbs))) {
                 return fromAbs;
             }
         }
     }
-    const candidate = nearestPlexerRoot(root, dirOverride).root;
-    if (dirOverride !== undefined || hasPlexerIndex(candidate) || isAutoBuildableRepo(candidate)) {
-        return candidate;
+    if (root && !isFilesystemRoot(root)) {
+        const candidate = nearestPlexerRoot(root, dirOverride).root;
+        if (!isFilesystemRoot(candidate) && (dirOverride !== undefined || hasPlexerIndex(candidate) || isAutoBuildableRepo(candidate))) {
+            return candidate;
+        }
     }
-    const lastAgy = readAgyLastRepo();
-    if (lastAgy) {
-        return nearestPlexerRoot(lastAgy, dirOverride).root;
+    const mcpRoots = Array.isArray(sessionState?.roots) ? sessionState.roots : [];
+    for (const mr of mcpRoots) {
+        if (!mr || isFilesystemRoot(mr)) continue;
+        const rc = nearestPlexerRoot(mr, dirOverride).root;
+        if (!isFilesystemRoot(rc) && (hasPlexerIndex(rc) || isAutoBuildableRepo(rc))) return rc;
     }
-    return candidate;
-}
-
-function canonicalPath(p) {
-    const abs = resolve(p);
-    try {
-        return realpathSync(abs);
+    for (const mr of mcpRoots) {
+        if (mr && !isFilesystemRoot(mr)) return nearestPlexerRoot(mr, dirOverride).root;
     }
-    catch {
-        return abs;
+    const agyCandidates = getAgyRoots
+        ? getAgyRoots()
+        : [readAgyLastRepo(), ...resolveAgyWorkspaceDirs({})].filter(Boolean);
+    for (const ac of agyCandidates) {
+        if (isFilesystemRoot(ac)) continue;
+        const ra = nearestPlexerRoot(ac, dirOverride).root;
+        if (!isFilesystemRoot(ra)) return ra;
     }
+    return root ? nearestPlexerRoot(root, dirOverride).root : process.cwd();
 }
 
 function isInsideRoot(base, target) {
-    if (!base || !target)
+    if (!base || !target || isFilesystemRoot(base))
         return false;
-    const rel = relative(canonicalPath(base), canonicalPath(target));
-    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+    return isWithinRoot(target, base);
 }
 
-export async function callTool(root, name, args, dirOverride) {
+export async function callTool(root, name, args, dirOverride, sessionState = null) {
     if (!isCanonicalMcpTool(name)) {
         return { text: `unknown tool: ${name}`, isError: true };
     }
     try {
-        const targetRoot = resolveMcpRoot(root, args, dirOverride);
+        if (sessionState?.pendingRoots) await sessionState.pendingRoots;
+        let cachedAgyRoots = null;
+        const getAgyRoots = () => (cachedAgyRoots ??= [readAgyLastRepo(), ...resolveAgyWorkspaceDirs({})].filter(Boolean));
+        const targetRoot = resolveMcpRoot(root, args, dirOverride, sessionState, getAgyRoots);
+        if (isFilesystemRoot(targetRoot)) {
+            return { text: NO_GRAPH, isError: true };
+        }
         const startupRoot = resolve(root);
-        const agyRoot = readAgyLastRepo();
-        const isTrustedRoot = isInsideRoot(startupRoot, targetRoot) || isInsideRoot(agyRoot, targetRoot);
+        const mcpRoots = Array.isArray(sessionState?.roots) ? sessionState.roots : [];
+        const isTrustedRoot = isInsideRoot(startupRoot, targetRoot)
+            || mcpRoots.some((r) => isInsideRoot(r, targetRoot))
+            || hasPlexerIndex(targetRoot)
+            || getAgyRoots().some((d) => isInsideRoot(d, targetRoot));
         if (!isTrustedRoot) {
             return { text: NO_GRAPH, isError: true };
         }
@@ -718,8 +782,9 @@ export async function callTool(root, name, args, dirOverride) {
                 : await ensureFreshGraph(targetRoot, { contextDir: dirOverride, autoBuild: isTrustedRoot });
             note = refreshNote(r);
         }
-        const fed = ws ? await callWorkspaceTool(targetRoot, dirOverride, name, args) : null;
-        const res = fed ?? (await callSingleTool(targetRoot, name, args, dirOverride));
+        const seenSpans = sessionSeenSpansFor(sessionState, targetRoot);
+        const fed = ws ? await callWorkspaceTool(targetRoot, dirOverride, name, args, seenSpans) : null;
+        const res = fed ?? (await callSingleTool(targetRoot, name, args, dirOverride, seenSpans));
         return note ? { ...res, text: `${note}\n${res.text}` } : res;
     }
     catch (err) {
@@ -727,7 +792,7 @@ export async function callTool(root, name, args, dirOverride) {
     }
 }
 
-function singleFindCode(root, args, dirOverride) {
+function singleFindCode(root, args, dirOverride, seenSpans = null) {
     const queries = parseQueriesList(args.query ?? args.queries);
     if (queries.length === 0)
         return { text: 'plexer_find_code requires a query', isError: true };
@@ -751,7 +816,7 @@ function singleFindCode(root, args, dirOverride) {
             maxSourceBytes,
             maxHitsToInline,
         });
-        return formatAsk(r).trimEnd();
+        return formatAskWithSeenSpans(r, seenSpans, args.full === true);
     });
     return { text: `${blocks.join('\n\n')}\n`, isError: false };
 }
@@ -802,6 +867,7 @@ function singleFindAll(root, args, dirOverride) {
             : args.full === true
                 ? 4
                 : 2;
+    const perPatternBudget = patterns.length >= 2 ? Math.max(950, Math.floor(8600 / patterns.length)) : 4800;
     const chunks = patterns.map((pat) => {
         const result = grepGraph(w, root, pat, {
             ignoreCase: typeof args.ignore_case === 'boolean' ? args.ignore_case : undefined,
@@ -810,7 +876,7 @@ function singleFindAll(root, args, dirOverride) {
             source: contextLines > 0,
             in: optIn(args),
         });
-        return result.totalHits === 0 ? zeroHitNote(result) : formatGrepResult(result);
+        return result.totalHits === 0 ? zeroHitNote(result) : formatGrepResult(result, { maxBytes: perPatternBudget });
     });
     return { text: chunks.join('\n\n'), isError: false };
 }
@@ -982,15 +1048,16 @@ function singleHealth(root, args, dirOverride) {
 }
 
 /** The single-graph path: every tool, answered from one repo's graph. */
-async function callSingleTool(root, name, args, dirOverride) {
+async function callSingleTool(root, name, args, dirOverride, seenSpans = null) {
     switch (name) {
         case 'plexer_find_code':
-            return singleFindCode(root, args, dirOverride);
+            return singleFindCode(root, args, dirOverride, seenSpans);
         case 'plexer_read': {
             const specs = parseCommaOrArrayList(args.spans ?? args.file);
             if (specs.length === 0)
                 return { text: 'plexer_read requires spans', isError: true };
-            const r = readSpans(root, specs, { contextDir: dirOverride });
+            const r = readSpans(root, specs, { contextDir: dirOverride, full: args.full === true });
+            applyReadSeenSpans(r, seenSpans, args.full === true);
             return {
                 text: formatReadSpans(r),
                 isError: r.blocks.length > 0 && r.blocks.every((b) => Boolean(b.error)),

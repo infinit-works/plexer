@@ -4,6 +4,10 @@ export type NodeKind =
     | "method"
     | "class"
     | "interface"
+    | "trait"
+    | "impl"
+    | "field"
+    | "doc"
     | "type"
     | "enum"
     | "struct"
@@ -13,7 +17,16 @@ export type NodeKind =
     | "module"
     | "macro";
 
-export type EdgeRelation = "calls" | "imports" | "implements" | "extends" | "references" | "contains";
+export type EdgeRelation =
+    | "calls"
+    | "imports"
+    | "implements"
+    | "extends"
+    | "references"
+    | "contains"
+    | "types"
+    | "interface_dispatch"
+    | "reexports";
 
 export interface GraphNode {
     id: string;
@@ -37,7 +50,7 @@ export interface GraphEdge {
     source: string;
     target: string;
     relation: EdgeRelation;
-    confidence?: "extracted" | "inferred";
+    confidence?: "extracted" | "inferred" | "interface_dispatch";
     line?: number;
     typeOnly?: boolean;
 }
@@ -147,6 +160,13 @@ export interface AskHit {
     callSites?: string[];
     wantsCallSites?: boolean;
     otherSymbols?: string;
+    pinned?: boolean;
+    alreadySeen?: boolean;
+    repoLabel?: string;
+    repoDir?: string;
+    literals?: string[];
+    callerCount?: number;
+    calleeCount?: number;
 }
 
 export interface AskResult {
@@ -162,6 +182,13 @@ export interface AskResult {
         federated: string[];
         alsoMatched: Array<{ scope: string; bestId?: string; topScore?: number }>;
     };
+    coEditPointers?: string[];
+    isEditPrompt?: boolean;
+    editEnvelope?: boolean;
+    multiRoot?: boolean;
+    federatedRepos?: string[];
+    confidenceTier?: "high" | "exploratory";
+    candidateMap?: AskHit[];
     note?: string;
 }
 
@@ -190,6 +217,8 @@ export interface SkeletonResult {
 
 export interface ReadOptions {
     contextDir?: string;
+    full?: boolean;
+    maxBytes?: number;
 }
 
 export interface ReadSpanBlock {
@@ -197,6 +226,7 @@ export interface ReadSpanBlock {
     file?: string;
     span?: string;
     totalLines?: number;
+    truncated?: boolean;
     code?: string;
     error?: string;
 }
@@ -265,6 +295,7 @@ export interface CallersOptions {
 }
 
 export interface CallersMatch {
+    repo?: string;
     symbol: GraphNode;
     hits: EdgeWalkHit[];
     tests?: Array<{ path: string; confidence: "high" | "medium" | "low"; reason?: string }>;
@@ -456,7 +487,7 @@ export interface BlastResult {
     history?: Record<string, unknown>;
 }
 
-export type VizTab = "context" | "code" | "modules" | "symbols" | "outline";
+export type VizTab = "context" | "modules" | "symbols" | "treemap";
 
 export interface VizServerOptions {
     root?: string;
@@ -563,6 +594,39 @@ export interface HealthResult {
     last_scan_at?: string | null;
 }
 
+export interface WorkspaceSpec {
+    version: 1;
+    children: string[];
+}
+
+export interface LoadedWorkspaceGraphs {
+    loaded: Array<{ child: string; graph: WiringGraph }>;
+    missing: string[];
+}
+
+export interface CodeWorkspaceFolder {
+    label: string;
+    dir: string;
+}
+
+export interface CodeWorkspaceSpec {
+    file: string;
+    repos: CodeWorkspaceFolder[];
+}
+
+export interface FederatedCheckResult {
+    text: string;
+    ok: boolean;
+    repos: Record<string, CheckGraphResult | null>;
+    missing: string[];
+}
+
+export interface FederatedMapJsonResult {
+    repos: Array<RepoMapResult & { repo: string }>;
+    missing: string[];
+    note?: string;
+}
+
 export interface PlexerConfig {
     contextDir?: string;
 }
@@ -574,11 +638,17 @@ export class Plexer {
     checkGraph(dir: string, opts?: CheckGraphOptions): Promise<CheckGraphResult>;
     graph(dir: string, opts?: BuildGraphOptions): Promise<BuildGraphResult>;
     ask(dir: string, query: string, opts?: AskOptions): AskResult;
+    ask(dir: string, query: string[], opts?: AskOptions): AskResult[];
+    ask(dir: string, query: string | string[], opts?: AskOptions): AskResult | AskResult[];
     skeleton(dir: string, file: string, opts?: SkeletonOptions): SkeletonResult;
+    skeleton(dir: string, file: string[], opts?: SkeletonOptions): SkeletonResult[];
+    skeleton(dir: string, file: string | string[], opts?: SkeletonOptions): SkeletonResult | SkeletonResult[];
     read(dir: string, spans: string | string[], opts?: ReadOptions): ReadSpansResult;
     blast(dir: string, opts?: BlastOptions): BlastResult;
     grep(dir: string, pattern: string, opts?: GrepOptions): GrepResult;
-    callers(dir: string, symbol: string, opts?: CallersOptions): CallersMatch[];
+    grep(dir: string, pattern: string[], opts?: GrepOptions): GrepResult[];
+    grep(dir: string, pattern: string | string[], opts?: GrepOptions): GrepResult | GrepResult[];
+    callers(dir: string, symbol: string | string[], opts?: CallersOptions): CallersMatch[];
     map(dir: string, opts?: RepoMapOptions): RepoMapResult;
     health(dir: string, opts?: HealthOptions): HealthResult | Promise<HealthResult>;
     healthAsync(dir: string, opts?: HealthOptions): Promise<HealthResult>;
@@ -594,10 +664,50 @@ export function listSourceFiles(
 ): string[];
 export function checkGraph(dir: string, opts?: CheckGraphOptions): Promise<CheckGraphResult>;
 export function formatGraphCheckReport(report: CheckGraphResult): string;
+export function readCodeWorkspace(dirOrFile: string): CodeWorkspaceSpec | null;
+export function readWorkspace(root: string, override?: string): WorkspaceSpec | null;
+export function loadWorkspaceGraphs(root: string, override?: string): LoadedWorkspaceGraphs;
+export function federateAsk(root: string, override: string | undefined, query: string, opts?: AskOptions): AskResult;
+export function federateSkeleton(root: string, override: string | undefined, file: string, opts?: SkeletonOptions): SkeletonResult;
+export function federateGrep(
+    root: string,
+    override: string | undefined,
+    pattern: string,
+    opts?: GrepOptions,
+): { result: GrepResult; coverage: string };
+export function federateCallers(
+    root: string,
+    override: string | undefined,
+    symbol: string | string[],
+    opts?: CallersOptions & { source?: boolean; full?: boolean },
+): { text: string; found: boolean; matches: Array<Record<string, unknown>>; coverage: string };
+export function federateRead(
+    root: string,
+    override: string | undefined,
+    spanSpecs: string | string[],
+    opts?: ReadOptions,
+): ReadSpansResult;
+export function federateMap(
+    root: string,
+    override: string | undefined,
+    opts?: RepoMapOptions & {
+        json?: false;
+        analyzeGitHistory?: (root: string, contextDir?: string, opts?: { since?: string }) => Record<string, unknown>;
+    },
+): string;
+export function federateMap(
+    root: string,
+    override: string | undefined,
+    opts: RepoMapOptions & {
+        json: true;
+        analyzeGitHistory?: (root: string, contextDir?: string, opts?: { since?: string }) => Record<string, unknown>;
+    },
+): FederatedMapJsonResult;
+export function federateCheck(root: string, override?: string, opts?: CheckGraphOptions): Promise<FederatedCheckResult>;
 export function ask(dir: string, query: string, opts?: AskOptions): AskResult;
 export function formatAsk(result: AskResult): string;
 export function skeleton(dir: string, file: string, opts?: SkeletonOptions): SkeletonResult;
-export function formatSkeleton(result: SkeletonResult): string;
+export function formatSkeleton(result: SkeletonResult, opts?: { compact?: boolean; summaryOnly?: boolean }): string;
 export function readSpans(dir: string, spanSpecs: string | string[], opts?: ReadOptions): ReadSpansResult;
 export function formatReadSpans(result: ReadSpansResult): string;
 export function grepGraph(graph: WiringGraph, root: string, pattern: string, opts?: GrepOptions): GrepResult;

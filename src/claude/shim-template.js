@@ -12,9 +12,8 @@ export function skillTemplate() {
     return cachedSkill;
 }
 
-function shim(entryFile, call, bakedDir, dedupGlobalHooks = false) {
-    const dedupBlock = dedupGlobalHooks
-        ? `const homeResolved = path.resolve(os.homedir());
+function buildShimDedupBlock() {
+    return `const homeResolved = path.resolve(os.homedir());
 function hasLocalPlexerHook(startDir, relConfigPath, checkFile) {
   let cur = path.resolve(startDir);
   for (let i = 0; i < 25 && cur && cur !== homeResolved; i++) {
@@ -31,10 +30,15 @@ function hasLocalPlexerHook(startDir, relConfigPath, checkFile) {
   return false;
 }
 const globalClaudeHelpers = path.join(homeResolved, '.claude', 'helpers') + path.sep;
+const globalGeminiHooks = path.join(homeResolved, '.gemini', 'hooks', 'plexer') + path.sep;
 const globalGeminiHelpers = path.join(homeResolved, '.gemini', 'config', 'helpers') + path.sep;
 const globalCodexHooks = path.join(homeResolved, '.codex', 'hooks', 'plexer') + path.sep;
 if (__filename.startsWith(globalClaudeHelpers)) {
   if (hasLocalPlexerHook(process.env.CLAUDE_PROJECT_DIR || process.cwd(), path.join('.claude', 'settings.json'), path.join('.claude', 'helpers', 'plexer-hooks.cjs'))) {
+    process.exit(0);
+  }
+} else if (__filename.startsWith(globalGeminiHooks)) {
+  if (hasLocalPlexerHook(process.env.GEMINI_PROJECT_DIR || process.cwd(), path.join('.gemini', 'settings.json'), path.join('.gemini', 'helpers', 'plexer-hooks.cjs'))) {
     process.exit(0);
   }
 } else if (__filename.startsWith(globalGeminiHelpers)) {
@@ -46,16 +50,27 @@ if (__filename.startsWith(globalClaudeHelpers)) {
     process.exit(0);
   }
 }
-`
-        : '';
-    return `#!/usr/bin/env node
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const { pathToFileURL } = require('url');
-const BAKED = ${JSON.stringify(bakedDir)};
-${dedupBlock}
-function entry(name) {
+`;
+}
+
+function buildShimInvokeBlock(entryFile, call, preferHookClient) {
+    if (!preferHookClient) {
+        return `import(pathToFileURL(entry(${JSON.stringify(entryFile)})).href).then((m) => ${call}).catch(() => { /* plexer unavailable — no-op */ });`;
+    }
+    return `const claudeTarget = entry(${JSON.stringify(entryFile)});
+const clientTarget = path.resolve(path.dirname(claudeTarget), '..', '..', 'bin', 'plexer-hook-client.cjs');
+if (fs.existsSync(clientTarget)) {
+  const client = require(clientTarget);
+  if (client && typeof client.main === 'function') {
+    client.main().then(() => process.exit(0), () => process.exit(0));
+  }
+} else {
+  import(pathToFileURL(claudeTarget).href).then((m) => ${call}).catch(() => { /* plexer unavailable — no-op */ });
+}`;
+}
+
+function buildShimEntryBlock() {
+    return `function entry(name) {
   const home = os.homedir();
   let binClaudeDir = null;
   try {
@@ -81,10 +96,23 @@ function entry(name) {
     if (d && fs.existsSync(path.join(d, name))) return path.join(d, name);
   }
   return path.join(BAKED, name);
+}`;
 }
 
-import(pathToFileURL(entry(${JSON.stringify(entryFile)})).href).then((m) => ${call}).catch(() => { /* plexer unavailable — no-op */ });
+function shim(entryFile, call, bakedDir, dedupGlobalHooks = false, preferHookClient = false) {
+    const dedupBlock = dedupGlobalHooks ? buildShimDedupBlock() : '';
+    const invokeBlock = buildShimInvokeBlock(entryFile, call, preferHookClient);
+    return `#!/usr/bin/env node
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { pathToFileURL } = require('url');
+const BAKED = ${JSON.stringify(bakedDir)};
+${dedupBlock}
+${buildShimEntryBlock()}
+
+${invokeBlock}
 `;
 }
 export function statuslineShim(bakedDir) { return shim('statusline.js', 'm.main()', bakedDir); }
-export function hooksShim(bakedDir) { return shim('hooks.js', 'm.main(process.argv[2])', bakedDir, true); }
+export function hooksShim(bakedDir) { return shim('hooks.js', 'm.main(process.argv[2])', bakedDir, true, true); }
