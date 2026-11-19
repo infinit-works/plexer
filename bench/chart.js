@@ -107,9 +107,9 @@ const COLORS = Object.fromEntries(ARMS.map((arm, i) => [arm, rainbow(ARMS.length
 
 const PKG_VERSION = (() => {
     try {
-        return JSON.parse(readFileSync(resolve(import.meta.dirname, "../package.json"), "utf8")).version || "1.1.1";
+        return JSON.parse(readFileSync(resolve(import.meta.dirname, "../package.json"), "utf8")).version || "2.0.0";
     } catch {
-        return "1.1.1";
+        return "2.0.0";
     }
 })();
 

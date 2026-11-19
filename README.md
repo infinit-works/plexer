@@ -29,7 +29,7 @@ plexer viz                                           # Launch local Canvas graph
 After initialization, lifecycle hooks run through a shared cross-host dispatcher (`src/hosts/engine/dispatcher.js`) and the local `plexerd` socket daemon. On Turn 0, hooks inject repository orientation, prompt-matched `L<n>:` code spans, and co-edit or test pointers before the first tool call. Before tool execution, `PreToolUse` hooks snap file reads to unseen AST spans, deduplicate repeated searches and `git diff` calls, and route `cat`/`head`/`tail`/`sed`/`grep`/`rg` shell lookups through `plexer`. After edits and plan handoffs, `PostToolUse` hooks refresh changed files incrementally and warn when signature or export edits affect callers. Run `plexer uninstall --yes` (or `plexer retract --yes`) to remove host wiring cleanly.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@1.1.1/assets/how-it-works.svg" alt="How plexer works: your codebase (27 languages and SFCs) is indexed by plexer init into plexer/, powering Turn-0 retrieval, caller traversal, blast radius, and the interactive graph viewer." width="100%" />
+  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@2.0.0/assets/how-it-works.svg" alt="How plexer works: your codebase (27 languages and SFCs) is indexed by plexer init into plexer/, powering Turn-0 retrieval, caller traversal, blast radius, and the interactive graph viewer." width="100%" />
 </p>
 
 ## Architecture
@@ -81,7 +81,7 @@ plexer health prompt          # Output the autonomous review prompt for your age
 We evaluated `plexer` against a cold baseline (no index or hooks) across **168 live runs** on **28 tasks** and **11 repositories** up to **1,350+ files**. Across all 168 runs, `plexer` cuts cumulative input tokens by **64.2%** (`65.4M → 23.4M`), tool output tokens by **61.4%** (`2,189k → 845k`), and uncached input tokens by **50.6%** (`7.07M → 3.49M`). It also cuts tool calls by **53.1%** (`2,595 → 1,218`) and search time by **38.0%** (`18,521s → 11,481s`), while raising task accuracy from `98.7%` to **`99.6%`**. Runs span **Gemini 4 Neon**, **Carbon**, **Argon**, and **Hydrogen** in Google Antigravity alongside **Claude Opus 5.5** and **Sonnet 5.5** in Claude Code (full methodology and per-task tables in [`bench/README.md`](bench/README.md)).
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@1.1.1/assets/chart-small.svg" alt="plexer Benchmark Summary: Engineering Tasks, SWE-bench Pro V2, Large OSS Repositories, and Head-to-Head vs. trail-code" width="100%" />
+  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@2.0.0/assets/chart-small.svg" alt="plexer Benchmark Summary: Engineering Tasks, SWE-bench Pro V2, Large OSS Repositories, and Head-to-Head vs. trail-code" width="100%" />
 </p>
 
 | Benchmark Suite | Input Tokens | Tool Output | Tool Calls | Search Time | Accuracy |
