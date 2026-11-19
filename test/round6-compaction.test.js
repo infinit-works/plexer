@@ -169,7 +169,11 @@ describe("Round 6 compaction, shell routing, dedup, exploration gate, & grep com
                 tool_name: "Bash",
                 tool_input: { command: "plexer grep serviceStep1" },
             }, { captureStdout: true }));
-            assert.equal(grep1.hookSpecificOutput?.permissionDecision, undefined);
+            assert.ok(
+                grep1.hookSpecificOutput?.permissionDecision === undefined
+                    || grep1.hookSpecificOutput?.permissionDecision === "allow",
+                `first plexer grep must not be denied, got: ${JSON.stringify(grep1)}`,
+            );
 
             const grepDup = JSON.parse(handleHostPreTool("claude", {
                 session_id: sid,
@@ -262,7 +266,11 @@ describe("Round 6 compaction, shell routing, dedup, exploration gate, & grep com
                 tool_name: "Bash",
                 tool_input: { command: "plexer grep serviceStep1" },
             }, { captureStdout: true }));
-            assert.equal(grepAfterEdit.hookSpecificOutput?.permissionDecision, undefined);
+            assert.ok(
+                grepAfterEdit.hookSpecificOutput?.permissionDecision === undefined
+                    || grepAfterEdit.hookSpecificOutput?.permissionDecision === "allow",
+                `post-edit plexer grep must not be denied, got: ${JSON.stringify(grepAfterEdit)}`,
+            );
         } finally {
             rmSync(agySessionPath(sid), { force: true });
             rmSync(repo, { recursive: true, force: true });

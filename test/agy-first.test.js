@@ -200,10 +200,12 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
                     { captureStdout: true },
                 ),
             );
+            const BATCH_CMD_RE = /(?:^plexer|plexer\.js['"]?) _batch ([A-Za-z0-9_-]+)$/;
             assert.equal(cmdRes.decision, "allow");
-            assert.match(cmdRes.overwrite?.CommandLine || "", /^plexer _batch [A-Za-z0-9_-]+$/);
+            const smallMatch = String(cmdRes.overwrite?.CommandLine || "").match(BATCH_CMD_RE);
+            assert.ok(smallMatch, `expected _batch rewrite, got: ${cmdRes.overwrite?.CommandLine}`);
 
-            const b64Token = cmdRes.overwrite.CommandLine.split(" ")[2];
+            const b64Token = smallMatch[1];
             const noDaemonEnv = { ...process.env, PLEXER_NO_DAEMON: "1" };
             const outSmallBatch = execFileSync(process.execPath, [CLI_BIN, "_batch", b64Token], {
                 cwd: repo,
@@ -217,8 +219,9 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
             const bigBatchCmd = rewriteChainedPlexerCommand(
                 "plexer read src/ledger.js:1-500 && plexer read src/small.js:1-80 && plexer skeleton src/ledger.js src/small.js src/consumer.js",
             );
-            assert.ok(bigBatchCmd);
-            const bigToken = bigBatchCmd.split(" ")[2];
+            const bigMatch = String(bigBatchCmd || "").match(BATCH_CMD_RE);
+            assert.ok(bigMatch, `expected _batch rewrite, got: ${bigBatchCmd}`);
+            const bigToken = bigMatch[1];
             const outBigBatch = execFileSync(process.execPath, [CLI_BIN, "_batch", bigToken], {
                 cwd: repo,
                 encoding: "utf8",
@@ -495,7 +498,7 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
                 },
             });
             const noDaemonFallback = JSON.parse(noDaemonRes.stdout);
-            assert.match(noDaemonFallback.overwrite?.CommandLine || "", /^plexer _batch /);
+            assert.match(noDaemonFallback.overwrite?.CommandLine || "", /(?:^plexer|plexer\.js['"]?) _batch [A-Za-z0-9_-]+$/);
 
             const summary = buildSidecarSummary(repo, sid);
             assert.equal(summary.indexed, true);

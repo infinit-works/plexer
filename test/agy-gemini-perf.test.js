@@ -481,7 +481,7 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
 
             // Coalesce echo dividers between >=2 plexer commands, leave bare echo untouched
             const echoBatch = rewriteChainedPlexerCommand('plexer skeleton src && echo "---" && plexer grep "targetMethod" src');
-            assert.match(String(echoBatch || ""), /^plexer _batch [A-Za-z0-9_-]+$/);
+            assert.match(String(echoBatch || ""), /(?:^plexer|plexer\.js['"]?) _batch [A-Za-z0-9_-]+$/);
             assert.equal(rewriteChainedPlexerCommand('"echo a" && "echo b"'), null);
         } finally {
             rmSync(agySessionPath(sid), { force: true });
@@ -1346,7 +1346,18 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             assert.ok(Buffer.byteLength(read3Txt, "utf8") < 9500, `3-span read exceeded 9.5KB: ${Buffer.byteLength(read3Txt, "utf8")}`);
             assert.match(read3Txt, /run `plexer read src\/big\d\.js:L\d+-L\d+` or use read_file/);
             assert.doesNotMatch(String(rewriteSingleNpxPlexerCommand("plexer read src/big1.js:L1-L140 src/big2.js:L1-L140 --full") || ""), /--full/);
+            const fakeBin = join(appData, "bin");
+            mkdirSync(fakeBin, { recursive: true });
+            writeFileSync(join(fakeBin, process.platform === "win32" ? "plexer.cmd" : "plexer"), "#!/bin/sh\n");
+            process.env.PATH = `${fakeBin}${process.platform === "win32" ? ";" : ":"}${prevPath || ""}`;
             assert.equal(rewriteSingleNpxPlexerCommand("plexer read src/big1.js:L1-L140 --full"), null, "single-span --full stays intact on PATH");
+            process.env.PATH = "";
+            assert.match(
+                String(rewriteSingleNpxPlexerCommand("plexer read src/big1.js:L1-L140 --full") || ""),
+                /plexer\.js['"]? read src\/big1\.js:L1-L140 --full$/,
+                "single-span --full keeps --full off PATH",
+            );
+            process.env.PATH = prevPath;
 
             const truncSid = mkSid("r5-trunc-read");
             const prevAgyAgent = process.env.ANTIGRAVITY_AGENT;
