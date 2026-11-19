@@ -10,9 +10,10 @@
  *  - TypeScript (`tutao/tutanota`): `S7`, `S8`
  *
  * Supports model configurations across Antigravity (`agy`) and Claude Code (`claude`):
+ *  - `neon-low` / `neon-medium` / `neon-high` / `neon-xhigh` (`agy --model gemini-4-neon-{low,medium,high,xhigh}`)
  *  - `carbon-low` / `carbon-medium` / `carbon-high` (`agy --model gemini-4-carbon-{low,medium,high}`)
- *  - `argon-low` (`agy --model gemini-4-argon-low --effort low`)
- *  - `argon-medium` (`agy --model gemini-4-argon-medium --effort medium`)
+ *  - `argon-low` / `argon-medium` / `argon-high` (`agy --model gemini-4-argon-{low,medium,high}`)
+ *  - `hydrogen-low` / `hydrogen-medium` / `hydrogen-high` / `hydrogen-xhigh` (`agy --model gemini-4-hydrogen-{low,medium,high,xhigh}`)
  *  - `sonnet` (`claude --model sonnet --effort medium`)
  *  - `opus` (`claude --model opus --effort medium`)
  *
@@ -26,8 +27,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseTranscript } from "./grade.js";
 import { buildGraph } from "../src/graph/build.js";
+import { readFingerprint } from "../src/graph/fingerprint.js";
 import { ensureFreshGraph } from "../src/graph/refresh.js";
 import {
+    buildPlexerAgyHooksJson,
+    buildPlexerClaudeSettingsJson,
     buildTrailAgyHooksJson,
     buildTrailClaudeSettingsJson,
     buildTrailMcpConfigJson,
@@ -41,7 +45,7 @@ const SWEBENCH_TASKS = JSON.parse(
 );
 
 const positionals = process.argv.slice(2).filter((a) => !a.startsWith("--"));
-const rawModelArg = positionals[0] || "sonnet"; // "carbon-medium" | "argon-low" | "argon-medium" | "flash-medium" | "sonnet" | "opus"
+const rawModelArg = positionals[0] || "sonnet"; // "neon-medium" | "carbon-medium" | "argon-medium" | "hydrogen-medium" | "sonnet" | "opus"
 export const CLAUDE_MODELS = {
     sonnet: "claude-sonnet-5-5",
     "sonnet-5-5": "claude-sonnet-5-5",
@@ -51,8 +55,9 @@ export const CLAUDE_MODELS = {
     "claude-opus-5-5": "claude-opus-5-5",
 };
 export function normalizeModelArg(raw = "sonnet") {
-    return raw.startsWith("argon") ||
-        raw.startsWith("flash") ||
+    return raw.startsWith("neon") ||
+        raw.startsWith("argon") ||
+        raw.startsWith("hydrogen") ||
         raw.startsWith("carbon") ||
         raw.startsWith("gemini-") ||
         raw.endsWith("-agy")
@@ -77,8 +82,9 @@ export function resolveIsAgy(mArg, env = process.env) {
     return env.FORCE_CLAUDE_CLI === "1"
         ? false
         : env.FORCE_AGY_CLI === "1" ||
+          mArg.startsWith("neon") ||
           mArg.startsWith("argon") ||
-          mArg.startsWith("flash") ||
+          mArg.startsWith("hydrogen") ||
           mArg.startsWith("carbon") ||
           mArg.startsWith("gemini-") ||
           mArg.endsWith("-agy");
@@ -87,12 +93,21 @@ const isAgy =
     process.env.FORCE_CLAUDE_CLI === "1"
         ? false
         : process.env.FORCE_AGY_CLI === "1" ||
+          modelArg.startsWith("neon") ||
           modelArg.startsWith("argon") ||
-          modelArg.startsWith("flash") ||
+          modelArg.startsWith("hydrogen") ||
           modelArg.startsWith("carbon") ||
           modelArg.startsWith("gemini-") ||
           modelArg.endsWith("-agy");
 export const AGY_MODELS = {
+    "neon-low": { model: "gemini-4-neon-low", effort: "low" },
+    "neon-medium": { model: "gemini-4-neon-medium", effort: "medium" },
+    "neon-high": { model: "gemini-4-neon-high", effort: "high" },
+    "neon-xhigh": { model: "gemini-4-neon-xhigh", effort: "xhigh" },
+    "gemini-4-neon-low": { model: "gemini-4-neon-low", effort: "low" },
+    "gemini-4-neon-medium": { model: "gemini-4-neon-medium", effort: "medium" },
+    "gemini-4-neon-high": { model: "gemini-4-neon-high", effort: "high" },
+    "gemini-4-neon-xhigh": { model: "gemini-4-neon-xhigh", effort: "xhigh" },
     "carbon-low": { model: "gemini-4-carbon-low", effort: "low" },
     "carbon-medium": { model: "gemini-4-carbon-medium", effort: "medium" },
     "carbon-high": { model: "gemini-4-carbon-high", effort: "high" },
@@ -102,14 +117,18 @@ export const AGY_MODELS = {
     "argon-low": { model: "gemini-4-argon-low", effort: "low" },
     "argon-medium": { model: "gemini-4-argon-medium", effort: "medium" },
     "argon-high": { model: "gemini-4-argon-high", effort: "high" },
-    "flash-low": { model: "gemini-3.8-flash-low", effort: "low" },
-    "flash-medium": { model: "gemini-3.8-flash-medium", effort: "medium" },
-    "flash-high": { model: "gemini-3.8-flash-high", effort: "high" },
+    "hydrogen-low": { model: "gemini-4-hydrogen-low", effort: "low" },
+    "hydrogen-medium": { model: "gemini-4-hydrogen-medium", effort: "medium" },
+    "hydrogen-high": { model: "gemini-4-hydrogen-high", effort: "high" },
+    "hydrogen-xhigh": { model: "gemini-4-hydrogen-xhigh", effort: "xhigh" },
+    "gemini-4-hydrogen-low": { model: "gemini-4-hydrogen-low", effort: "low" },
+    "gemini-4-hydrogen-medium": { model: "gemini-4-hydrogen-medium", effort: "medium" },
+    "gemini-4-hydrogen-high": { model: "gemini-4-hydrogen-high", effort: "high" },
+    "gemini-4-hydrogen-xhigh": { model: "gemini-4-hydrogen-xhigh", effort: "xhigh" },
     sonnet: { model: "claude-sonnet-5-5-medium", effort: "medium" },
     "sonnet-agy": { model: "claude-sonnet-5-5-medium", effort: "medium" },
     opus: { model: "claude-opus-5-5-medium", effort: "medium" },
     "opus-agy": { model: "claude-opus-5-5-medium", effort: "medium" },
-    "gemini-3.8-flash-medium": { model: "gemini-3.8-flash-medium", effort: "medium" },
     "gemini-4-argon-medium": { model: "gemini-4-argon-medium", effort: "medium" },
 };
 
@@ -135,7 +154,6 @@ const coldSysFile = join(logDir, "cold-system.txt");
 const plexerSysFile = join(logDir, "plexer-system.txt");
 const trailSysFile = join(logDir, "trail-system.txt");
 
-const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
 const plexerHookClient = resolve(import.meta.dirname, "../bin/plexer-hook-client.cjs");
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
 const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
@@ -146,89 +164,10 @@ function initRuntimeFiles() {
     writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
     writeFileSync(trailSysFile, trailSkillBody ? `${basePrompt}\n\n${trailSkillBody}\n` : `${basePrompt}\n`, "utf8");
     writeFileSync(trailMcpConfigFile, buildTrailMcpConfigJson(), "utf8");
-    writeFileSync(
-        plexerHooksSettingsFile,
-        JSON.stringify(
-            {
-                hooks: {
-                    UserPromptSubmit: [
-                        {
-                            hooks: [
-                                {
-                                    type: "command",
-                                    command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook prompt`,
-                                    timeout: 15,
-                                },
-                            ],
-                        },
-                    ],
-                    PostToolUse: [
-                        {
-                            matcher: "Write|Edit|MultiEdit",
-                            hooks: [
-                                {
-                                    type: "command",
-                                    command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook post-edit`,
-                                    timeout: 10,
-                                },
-                            ],
-                        },
-                    ],
-                },
-            },
-            null,
-            2
-        ),
-        "utf8"
-    );
+    writeFileSync(plexerHooksSettingsFile, buildPlexerClaudeSettingsJson(plexerHookClient), "utf8");
     writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
 }
-const agyHooksJson = JSON.stringify(
-    {
-        "plexer-hooks": {
-            PreInvocation: [
-                {
-                    type: "command",
-                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-invocation`,
-                    timeout: 15,
-                },
-            ],
-            PreToolUse: [
-                {
-                    matcher: "read_file|view_file|run_command",
-                    hooks: [
-                        {
-                            type: "command",
-                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-pre-tool`,
-                            timeout: 10,
-                        },
-                    ],
-                },
-            ],
-            PostToolUse: [
-                {
-                    matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file",
-                    hooks: [
-                        {
-                            type: "command",
-                            command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-post-tool`,
-                            timeout: 10,
-                        },
-                    ],
-                },
-            ],
-            Stop: [
-                {
-                    type: "command",
-                    command: `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} agy-stop`,
-                    timeout: 10,
-                },
-            ],
-        },
-    },
-    null,
-    2
-);
+const agyHooksJson = buildPlexerAgyHooksJson(plexerHookClient);
 const trailAgyHooksJson = buildTrailAgyHooksJson();
 
 function makeAgyAgentMd(name, desc, body, hooksPath = null) {
@@ -285,11 +224,11 @@ async function ensureBaseTaskRepo(task, forceReindex = false) {
         execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: cleanDir });
     }
 
-    if (forceReindex || !existsSync(indexedDir)) {
+    if (forceReindex || !existsSync(join(indexedDir, "plexer", ".graph", "wiring.json")) || !readFingerprint(join(indexedDir, "plexer"))) {
         if (existsSync(cleanDir)) {
             rmSync(indexedDir, { recursive: true, force: true });
             mkdirSync(join(BASE_CACHE_DIR, "indexed"), { recursive: true });
-            cpSync(cleanDir, indexedDir, { recursive: true });
+            execFileSync("cp", ["-a", cleanDir, indexedDir]);
         } else {
             rmSync(join(indexedDir, "plexer"), { recursive: true, force: true });
         }
@@ -306,14 +245,14 @@ async function prepareWorktree(task, arm) {
     const srcDir = arm === "plexer" ? indexedDir : cleanDir;
     if (!existsSync(workDir)) {
         mkdirSync(`/tmp/plexer-swebench-${modelArg}-${arm}`, { recursive: true });
-        cpSync(srcDir, workDir, { recursive: true });
+        execFileSync("cp", ["-a", srcDir, workDir]);
     } else {
         execFileSync("git", ["reset", "--hard", task.base_commit], { cwd: workDir, stdio: "ignore" });
         execFileSync("git", ["checkout", "--", "."], { cwd: workDir, stdio: "ignore" });
         execFileSync("git", ["clean", "-fd", "-e", "plexer", "-e", ".agents", "-e", "graft", "-e", ".trail"], { cwd: workDir, stdio: "ignore" });
         if (arm === "plexer") {
             rmSync(join(workDir, "plexer"), { recursive: true, force: true });
-            cpSync(join(indexedDir, "plexer"), join(workDir, "plexer"), { recursive: true });
+            execFileSync("cp", ["-a", join(indexedDir, "plexer"), join(workDir, "plexer")]);
         } else if (existsSync(join(workDir, "plexer"))) {
             rmSync(join(workDir, "plexer"), { recursive: true, force: true });
         }
@@ -703,7 +642,7 @@ async function runOne(task, arm) {
                 ? getTrailEnv()
                 : {
                       ...process.env,
-                      ...(isAgy ? { PLEXER_DAEMON_SOCK: benchDaemonSock } : {}),
+                      ...(arm === "plexer" ? { PLEXER_DAEMON_SOCK: benchDaemonSock } : {}),
                       ...(arm === "plexer"
                           ? (isAgy ? {} : { PLEXER_ENABLE_BENCH_HOOKS: "1" })
                           : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_DISABLE_HOOKS: "1", PLEXER_BENCH_HIDE_CLI: "1" }),
@@ -870,8 +809,7 @@ async function main() {
                 return true;
             });
         } finally {
-            if (isAgy)
-                await shutdownBenchDaemon(benchDaemonSock);
+            await shutdownBenchDaemon(benchDaemonSock);
         }
         if (runs.length === 0) {
             console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing results.`);

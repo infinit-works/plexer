@@ -183,19 +183,22 @@ function run3ArmSummary(benchDir = import.meta.dirname) {
         ["Claude Code Sonnet (S1–S8)", "results-swebench-sonnet.json", "results-swebench-sonnet-trail.json"],
         ["AGY Opus (T4,T5,T9)", "results-opus-agy.json", null],
         ["AGY Sonnet (T4,T5,T9)", "results-sonnet-agy.json", null],
+        ["AGY Neon (T4,T5,T9)", "results-neon-medium.json", null],
         ["AGY Carbon (T4,T5,T9)", "results-carbon-medium.json", null],
         ["AGY Argon (T4,T5,T9)", "results-argon-medium.json", null],
-        ["AGY Flash (T4,T5,T9)", "results-flash-medium.json", null],
+        ["AGY Hydrogen (T4,T5,T9)", "results-hydrogen-medium.json", null],
         ["AGY Opus (S1–S8)", "results-swebench-opus-agy.json", null],
         ["AGY Sonnet (S1–S8)", "results-swebench-sonnet-agy.json", null],
+        ["AGY Neon (S1–S8)", "results-swebench-neon-medium.json", null],
         ["AGY Carbon (S1–S8)", "results-swebench-carbon-medium.json", null],
         ["AGY Argon (S1–S8)", "results-swebench-argon-medium.json", null],
-        ["AGY Flash (S1–S8)", "results-swebench-flash-medium.json", null],
+        ["AGY Hydrogen (S1–S8)", "results-swebench-hydrogen-medium.json", null],
         ["Claude Code Opus (L1–L8)", "results-large-opus.json", null],
         ["Claude Code Sonnet (L1–L8)", "results-large-sonnet.json", null],
+        ["AGY Neon (L1–L8)", "results-large-neon-medium.json", null],
         ["AGY Carbon (L1–L8)", "results-large-carbon-medium.json", null],
         ["AGY Argon (L1–L8)", "results-large-argon-medium.json", null],
-        ["AGY Flash (L1–L8)", "results-large-flash-medium.json", null],
+        ["AGY Hydrogen (L1–L8)", "results-large-hydrogen-medium.json", null],
     ];
     console.log("3-Arm Head-to-Head Summary (Cold vs Trail vs plexer across shared tasks)\n");
     console.log("| Suite | Tasks | Cold Raw Unc | Trail Raw Unc | plexer Raw Unc | Cold Post-T1 Unc | Trail Post-T1 Unc | plexer Post-T1 Unc | Cold Net Growth | Trail Net Growth | plexer Net Growth | Cold Cumul | Trail Cumul | plexer Cumul | Cold Calls | Trail Calls | plexer Calls | Cold Score | Trail Score | plexer Score | Cold Resolved | Trail Resolved | plexer Resolved |");
@@ -318,10 +321,12 @@ function main() {
     if (!s) throw new Error(`unknown suite ${suiteArg}`);
     const modelsIdx = process.argv.indexOf("--models");
     const defaultModels = ["opus", "sonnet"];
-    if (existsSync(resolve(benchDir, `${s.resPrefix}carbon-medium.json`))) {
-        const cj = JSON.parse(readFileSync(resolve(benchDir, `${s.resPrefix}carbon-medium.json`), "utf8"));
+    for (const m of ["neon-medium", "carbon-medium"]) {
+        const p = resolve(benchDir, `${s.resPrefix}${m}.json`);
+        if (!existsSync(p)) continue;
+        const cj = JSON.parse(readFileSync(p, "utf8"));
         const idsPresent = new Set((cj.tasks || []).filter((t) => t.cold && t.plexer).map((t) => t.id));
-        if (s.ids.every((id) => idsPresent.has(id))) defaultModels.push("carbon-medium");
+        if (s.ids.every((id) => idsPresent.has(id))) defaultModels.push(m);
     }
     const models =
         modelsIdx >= 0 && process.argv[modelsIdx + 1]

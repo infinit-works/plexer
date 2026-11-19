@@ -1,12 +1,8 @@
 {
-  "generatedAt": "2026-10-25T13:27:36.820Z",
+  "generatedAt": "2026-11-18T19:11:11.318Z",
   "symmetryCheck": {
-    "passed": false,
-    "violations": [
-      "T9 (plexer): Code-edit task completed without any file-modifying tool call (dirty worktree)",
-      "T11 (plexer): Code-edit task completed without any file-modifying tool call (dirty worktree)",
-      "T12 (plexer): Code-edit task completed without any file-modifying tool call (dirty worktree)"
-    ]
+    "passed": true,
+    "violations": []
   },
   "totals": {
     "cold": {
@@ -16,42 +12,42 @@
       "uncachedInputTokens": 106,
       "cachedInputTokens": 654253,
       "cumulativeInputTokens": 654359,
+      "turn1ContextTokens": 94962,
+      "turn1UncachedTokens": 26395,
+      "postTurn1UncachedTokens": 93000,
+      "netContextGrowthTokens": 92918,
+      "cacheMissTurns": 0,
       "finalContextTokens": 187880,
       "totalModelOutputTokens": 24145,
       "searchMs": 96740,
       "totalMs": 201506,
       "score": 94,
-      "maxScore": 96,
-      "turn1ContextTokens": 94962,
-      "turn1UncachedTokens": 26395,
-      "postTurn1UncachedTokens": 93000,
-      "netContextGrowthTokens": 92918,
-      "cacheMissTurns": 0
+      "maxScore": 96
     },
     "plexer": {
-      "calls": 25,
-      "turns": 21,
-      "toolOutputTokens": 12368,
-      "uncachedInputTokens": 66,
-      "cachedInputTokens": 414469,
-      "cumulativeInputTokens": 414535,
-      "finalContextTokens": 161197,
-      "totalModelOutputTokens": 16831,
-      "searchMs": 62029,
-      "totalMs": 184666,
+      "calls": 27,
+      "turns": 19,
+      "toolOutputTokens": 11021,
+      "uncachedInputTokens": 62,
+      "cachedInputTokens": 409296,
+      "cumulativeInputTokens": 409358,
+      "turn1ContextTokens": 137163,
+      "turn1UncachedTokens": 60860,
+      "postTurn1UncachedTokens": 27204,
+      "netContextGrowthTokens": 27166,
+      "cacheMissTurns": 0,
+      "finalContextTokens": 164329,
+      "totalModelOutputTokens": 16923,
+      "searchMs": 51739,
+      "totalMs": 155677,
       "score": 96,
-      "maxScore": 96,
-      "turn1ContextTokens": 131720,
-      "turn1UncachedTokens": 48601,
-      "postTurn1UncachedTokens": 29519,
-      "netContextGrowthTokens": 29477,
-      "cacheMissTurns": 0
+      "maxScore": 96
     },
     "tokenWins": 12,
     "tokenTies": 0,
     "tokenLosses": 0,
-    "callWins": 10,
-    "callTies": 2,
+    "callWins": 11,
+    "callTies": 1,
     "callLosses": 0,
     "speedWins": 11,
     "speedTies": 0,
@@ -72,6 +68,11 @@
         "uncachedInputTokens": 6,
         "cachedInputTokens": 32687,
         "cumulativeInputTokens": 32693,
+        "turn1ContextTokens": 7883,
+        "turn1UncachedTokens": 2880,
+        "postTurn1UncachedTokens": 5622,
+        "netContextGrowthTokens": 5618,
+        "cacheMissTurns": 0,
         "finalContextTokens": 13501,
         "totalModelOutputTokens": 1072,
         "searchMs": 1677,
@@ -103,12 +104,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7883,
-        "turn1UncachedTokens": 2880,
-        "postTurn1UncachedTokens": 5622,
-        "netContextGrowthTokens": 5618,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "f5d6e033-a2b1-4d09-b88d-53f021e271d6",
@@ -118,6 +114,11 @@
         "uncachedInputTokens": 2,
         "cachedInputTokens": 11573,
         "cumulativeInputTokens": 11575,
+        "turn1ContextTokens": 11575,
+        "turn1UncachedTokens": 3413,
+        "postTurn1UncachedTokens": 0,
+        "netContextGrowthTokens": 0,
+        "cacheMissTurns": 0,
         "finalContextTokens": 11575,
         "totalModelOutputTokens": 852,
         "searchMs": 0,
@@ -149,12 +150,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 11575,
-        "turn1UncachedTokens": 3413,
-        "postTurn1UncachedTokens": 0,
-        "netContextGrowthTokens": 0,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -171,6 +167,11 @@
         "uncachedInputTokens": 12,
         "cachedInputTokens": 86093,
         "cumulativeInputTokens": 86105,
+        "turn1ContextTokens": 7825,
+        "turn1UncachedTokens": 2822,
+        "postTurn1UncachedTokens": 11565,
+        "netContextGrowthTokens": 11555,
+        "cacheMissTurns": 0,
         "finalContextTokens": 19380,
         "totalModelOutputTokens": 2514,
         "searchMs": 9044,
@@ -202,12 +203,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7825,
-        "turn1UncachedTokens": 2822,
-        "postTurn1UncachedTokens": 11565,
-        "netContextGrowthTokens": 11555,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "a7211430-8eb1-4d89-aa1e-084e6fba3f2a",
@@ -217,6 +213,11 @@
         "uncachedInputTokens": 6,
         "cachedInputTokens": 39425,
         "cumulativeInputTokens": 39431,
+        "turn1ContextTokens": 11499,
+        "turn1UncachedTokens": 6496,
+        "postTurn1UncachedTokens": 3222,
+        "netContextGrowthTokens": 3218,
+        "cacheMissTurns": 0,
         "finalContextTokens": 14717,
         "totalModelOutputTokens": 1444,
         "searchMs": 4461,
@@ -248,12 +249,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 11499,
-        "turn1UncachedTokens": 6496,
-        "postTurn1UncachedTokens": 3222,
-        "netContextGrowthTokens": 3218,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -270,6 +266,11 @@
         "uncachedInputTokens": 6,
         "cachedInputTokens": 25854,
         "cumulativeInputTokens": 25860,
+        "turn1ContextTokens": 7845,
+        "turn1UncachedTokens": 2842,
+        "postTurn1UncachedTokens": 1919,
+        "netContextGrowthTokens": 1915,
+        "cacheMissTurns": 0,
         "finalContextTokens": 9760,
         "totalModelOutputTokens": 872,
         "searchMs": 1554,
@@ -301,12 +302,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7845,
-        "turn1UncachedTokens": 2842,
-        "postTurn1UncachedTokens": 1919,
-        "netContextGrowthTokens": 1915,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "96c3d8df-93ad-40ae-a3aa-958b130e4670",
@@ -316,6 +312,11 @@
         "uncachedInputTokens": 2,
         "cachedInputTokens": 10984,
         "cumulativeInputTokens": 10986,
+        "turn1ContextTokens": 10986,
+        "turn1UncachedTokens": 5983,
+        "postTurn1UncachedTokens": 0,
+        "netContextGrowthTokens": 0,
+        "cacheMissTurns": 0,
         "finalContextTokens": 10986,
         "totalModelOutputTokens": 612,
         "searchMs": 0,
@@ -347,12 +348,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 10986,
-        "turn1UncachedTokens": 5983,
-        "postTurn1UncachedTokens": 0,
-        "netContextGrowthTokens": 0,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -369,6 +365,11 @@
         "uncachedInputTokens": 8,
         "cachedInputTokens": 42696,
         "cumulativeInputTokens": 42704,
+        "turn1ContextTokens": 7856,
+        "turn1UncachedTokens": 2853,
+        "postTurn1UncachedTokens": 5751,
+        "netContextGrowthTokens": 5745,
+        "cacheMissTurns": 0,
         "finalContextTokens": 13601,
         "totalModelOutputTokens": 1257,
         "searchMs": 4304,
@@ -400,12 +401,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7856,
-        "turn1UncachedTokens": 2853,
-        "postTurn1UncachedTokens": 5751,
-        "netContextGrowthTokens": 5745,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "a08fc92a-7668-4651-a63f-b2463eb085f1",
@@ -415,6 +411,11 @@
         "uncachedInputTokens": 2,
         "cachedInputTokens": 10491,
         "cumulativeInputTokens": 10493,
+        "turn1ContextTokens": 10493,
+        "turn1UncachedTokens": 2353,
+        "postTurn1UncachedTokens": 0,
+        "netContextGrowthTokens": 0,
+        "cacheMissTurns": 0,
         "finalContextTokens": 10493,
         "totalModelOutputTokens": 699,
         "searchMs": 0,
@@ -446,12 +447,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 10493,
-        "turn1UncachedTokens": 2353,
-        "postTurn1UncachedTokens": 0,
-        "netContextGrowthTokens": 0,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -468,6 +464,11 @@
         "uncachedInputTokens": 8,
         "cachedInputTokens": 56653,
         "cumulativeInputTokens": 56661,
+        "turn1ContextTokens": 7819,
+        "turn1UncachedTokens": 2816,
+        "postTurn1UncachedTokens": 12128,
+        "netContextGrowthTokens": 12122,
+        "cacheMissTurns": 0,
         "finalContextTokens": 19941,
         "totalModelOutputTokens": 2486,
         "searchMs": 6326,
@@ -499,25 +500,30 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7819,
-        "turn1UncachedTokens": 2816,
-        "postTurn1UncachedTokens": 12128,
-        "netContextGrowthTokens": 12122,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
-        "conversationId": "2e237fef-2833-450a-bf7e-b80ac8a97d07",
+        "conversationId": "3afe641f-7b75-4626-a06b-321325f6df94",
         "calls": 3,
         "turns": 3,
-        "toolOutputTokens": 3037,
+        "toolNames": [
+          "Bash",
+          "Bash",
+          "Bash"
+        ],
+        "toolOutputTokens": 1435,
         "uncachedInputTokens": 8,
-        "cachedInputTokens": 63289,
-        "cumulativeInputTokens": 63297,
-        "finalContextTokens": 18000,
-        "totalModelOutputTokens": 1921,
-        "searchMs": 7903,
-        "totalMs": 23138,
+        "cachedInputTokens": 52659,
+        "cumulativeInputTokens": 52667,
+        "turn1ContextTokens": 11566,
+        "turn1UncachedTokens": 6409,
+        "postTurn1UncachedTokens": 3067,
+        "netContextGrowthTokens": 3061,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 14627,
+        "totalModelOutputTokens": 1840,
+        "searchMs": 4499,
+        "totalMs": 14797,
         "score": 8,
         "maxScore": 8,
         "checks": [
@@ -545,12 +551,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 12463,
-        "turn1UncachedTokens": 7460,
-        "postTurn1UncachedTokens": 5543,
-        "netContextGrowthTokens": 5537,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -567,6 +568,11 @@
         "uncachedInputTokens": 6,
         "cachedInputTokens": 27275,
         "cumulativeInputTokens": 27281,
+        "turn1ContextTokens": 7868,
+        "turn1UncachedTokens": 1156,
+        "postTurn1UncachedTokens": 2175,
+        "netContextGrowthTokens": 2171,
+        "cacheMissTurns": 0,
         "finalContextTokens": 10039,
         "totalModelOutputTokens": 1350,
         "searchMs": 1528,
@@ -598,12 +604,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7868,
-        "turn1UncachedTokens": 1156,
-        "postTurn1UncachedTokens": 2175,
-        "netContextGrowthTokens": 2171,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "a2699370-76c8-466f-843b-1bacb3260498",
@@ -613,6 +614,11 @@
         "uncachedInputTokens": 2,
         "cachedInputTokens": 13143,
         "cumulativeInputTokens": 13145,
+        "turn1ContextTokens": 13145,
+        "turn1UncachedTokens": 5806,
+        "postTurn1UncachedTokens": 0,
+        "netContextGrowthTokens": 0,
+        "cacheMissTurns": 0,
         "finalContextTokens": 13145,
         "totalModelOutputTokens": 1101,
         "searchMs": 0,
@@ -644,12 +650,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 13145,
-        "turn1UncachedTokens": 5806,
-        "postTurn1UncachedTokens": 0,
-        "netContextGrowthTokens": 0,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -666,6 +667,11 @@
         "uncachedInputTokens": 8,
         "cachedInputTokens": 43766,
         "cumulativeInputTokens": 43774,
+        "turn1ContextTokens": 7871,
+        "turn1UncachedTokens": 1163,
+        "postTurn1UncachedTokens": 5425,
+        "netContextGrowthTokens": 5419,
+        "cacheMissTurns": 0,
         "finalContextTokens": 13290,
         "totalModelOutputTokens": 1262,
         "searchMs": 4757,
@@ -697,12 +703,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7871,
-        "turn1UncachedTokens": 1163,
-        "postTurn1UncachedTokens": 5425,
-        "netContextGrowthTokens": 5419,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "c488449d-9950-4abd-9f87-c82c7065f573",
@@ -712,6 +713,11 @@
         "uncachedInputTokens": 4,
         "cachedInputTokens": 24545,
         "cumulativeInputTokens": 24549,
+        "turn1ContextTokens": 11036,
+        "turn1UncachedTokens": 3701,
+        "postTurn1UncachedTokens": 2479,
+        "netContextGrowthTokens": 2477,
+        "cacheMissTurns": 0,
         "finalContextTokens": 13513,
         "totalModelOutputTokens": 1254,
         "searchMs": 851,
@@ -743,12 +749,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 11036,
-        "turn1UncachedTokens": 3701,
-        "postTurn1UncachedTokens": 2479,
-        "netContextGrowthTokens": 2477,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -765,6 +766,11 @@
         "uncachedInputTokens": 8,
         "cachedInputTokens": 54660,
         "cumulativeInputTokens": 54668,
+        "turn1ContextTokens": 7829,
+        "turn1UncachedTokens": 2826,
+        "postTurn1UncachedTokens": 13295,
+        "netContextGrowthTokens": 13289,
+        "cacheMissTurns": 0,
         "finalContextTokens": 21118,
         "totalModelOutputTokens": 3414,
         "searchMs": 7844,
@@ -796,12 +802,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7829,
-        "turn1UncachedTokens": 2826,
-        "postTurn1UncachedTokens": 13295,
-        "netContextGrowthTokens": 13289,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "9766b6e6-0a7a-416d-b34e-d475b4e561f6",
@@ -811,6 +812,11 @@
         "uncachedInputTokens": 4,
         "cachedInputTokens": 23709,
         "cumulativeInputTokens": 23713,
+        "turn1ContextTokens": 11190,
+        "turn1UncachedTokens": 6187,
+        "postTurn1UncachedTokens": 1335,
+        "netContextGrowthTokens": 1333,
+        "cacheMissTurns": 0,
         "finalContextTokens": 12523,
         "totalModelOutputTokens": 1909,
         "searchMs": 365,
@@ -842,12 +848,7 @@
             "weight": 2,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 11190,
-        "turn1UncachedTokens": 6187,
-        "postTurn1UncachedTokens": 1335,
-        "netContextGrowthTokens": 1333,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -864,6 +865,11 @@
         "uncachedInputTokens": 8,
         "cachedInputTokens": 44213,
         "cumulativeInputTokens": 44221,
+        "turn1ContextTokens": 8180,
+        "turn1UncachedTokens": 3177,
+        "postTurn1UncachedTokens": 5689,
+        "netContextGrowthTokens": 5683,
+        "cacheMissTurns": 0,
         "finalContextTokens": 13863,
         "totalModelOutputTokens": 2094,
         "searchMs": 10570,
@@ -877,25 +883,30 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 8180,
-        "turn1UncachedTokens": 3177,
-        "postTurn1UncachedTokens": 5689,
-        "netContextGrowthTokens": 5683,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
-        "conversationId": "1056141d-e2b8-4feb-b27a-3ac30b917c64",
-        "calls": 4,
+        "conversationId": "b5b2f162-3e99-46ad-acfa-d75a1c33eb18",
+        "calls": 3,
         "turns": 3,
-        "toolOutputTokens": 2079,
+        "toolNames": [
+          "Read",
+          "Bash",
+          "Bash"
+        ],
+        "toolOutputTokens": 1245,
         "uncachedInputTokens": 8,
-        "cachedInputTokens": 51728,
-        "cumulativeInputTokens": 51736,
-        "finalContextTokens": 15386,
-        "totalModelOutputTokens": 2111,
-        "searchMs": 9966,
-        "totalMs": 15801,
+        "cachedInputTokens": 57760,
+        "cumulativeInputTokens": 57768,
+        "turn1ContextTokens": 12243,
+        "turn1UncachedTokens": 4731,
+        "postTurn1UncachedTokens": 3606,
+        "netContextGrowthTokens": 3600,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 15843,
+        "totalModelOutputTokens": 2124,
+        "searchMs": 12978,
+        "totalMs": 18608,
         "score": 8,
         "maxScore": 8,
         "checks": [
@@ -905,12 +916,7 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 10126,
-        "turn1UncachedTokens": 2,
-        "postTurn1UncachedTokens": 5266,
-        "netContextGrowthTokens": 5260,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -927,6 +933,11 @@
         "uncachedInputTokens": 10,
         "cachedInputTokens": 65646,
         "cumulativeInputTokens": 65656,
+        "turn1ContextTokens": 7980,
+        "turn1UncachedTokens": 1272,
+        "postTurn1UncachedTokens": 9457,
+        "netContextGrowthTokens": 9449,
+        "cacheMissTurns": 0,
         "finalContextTokens": 17429,
         "totalModelOutputTokens": 1921,
         "searchMs": 13089,
@@ -940,12 +951,7 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7980,
-        "turn1UncachedTokens": 1272,
-        "postTurn1UncachedTokens": 9457,
-        "netContextGrowthTokens": 9449,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
         "conversationId": "642b78a2-a850-4371-964e-1d6f9672e545",
@@ -955,6 +961,11 @@
         "uncachedInputTokens": 6,
         "cachedInputTokens": 34535,
         "cumulativeInputTokens": 34541,
+        "turn1ContextTokens": 9727,
+        "turn1UncachedTokens": 2392,
+        "postTurn1UncachedTokens": 3244,
+        "netContextGrowthTokens": 3240,
+        "cacheMissTurns": 0,
         "finalContextTokens": 12967,
         "totalModelOutputTokens": 1191,
         "searchMs": 6070,
@@ -968,12 +979,7 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 9727,
-        "turn1UncachedTokens": 2392,
-        "postTurn1UncachedTokens": 3244,
-        "netContextGrowthTokens": 3240,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -990,6 +996,11 @@
         "uncachedInputTokens": 12,
         "cachedInputTokens": 84025,
         "cumulativeInputTokens": 84037,
+        "turn1ContextTokens": 8029,
+        "turn1UncachedTokens": 1321,
+        "postTurn1UncachedTokens": 10924,
+        "netContextGrowthTokens": 10914,
+        "cacheMissTurns": 0,
         "finalContextTokens": 18943,
         "totalModelOutputTokens": 3138,
         "searchMs": 17670,
@@ -1003,25 +1014,31 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 8029,
-        "turn1UncachedTokens": 1321,
-        "postTurn1UncachedTokens": 10924,
-        "netContextGrowthTokens": 10914,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
-        "conversationId": "e4cc8654-d330-4578-a2da-792134dfe20d",
+        "conversationId": "b8a858b1-6dad-4f32-a672-05f8f0b2a918",
         "calls": 4,
         "turns": 4,
-        "toolOutputTokens": 2050,
+        "toolNames": [
+          "Bash",
+          "Bash",
+          "Bash",
+          "Bash"
+        ],
+        "toolOutputTokens": 1737,
         "uncachedInputTokens": 10,
-        "cachedInputTokens": 63048,
-        "cumulativeInputTokens": 63058,
-        "finalContextTokens": 15518,
-        "totalModelOutputTokens": 2341,
-        "searchMs": 17517,
-        "totalMs": 28349,
+        "cachedInputTokens": 70774,
+        "cumulativeInputTokens": 70784,
+        "turn1ContextTokens": 12096,
+        "turn1UncachedTokens": 6939,
+        "postTurn1UncachedTokens": 4997,
+        "netContextGrowthTokens": 4989,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 17085,
+        "totalModelOutputTokens": 2352,
+        "searchMs": 14262,
+        "totalMs": 19647,
         "score": 8,
         "maxScore": 8,
         "checks": [
@@ -1031,12 +1048,7 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 9770,
-        "turn1UncachedTokens": 2435,
-        "postTurn1UncachedTokens": 5756,
-        "netContextGrowthTokens": 5748,
-        "cacheMissTurns": 0
+        ]
       }
     },
     {
@@ -1053,6 +1065,11 @@
         "uncachedInputTokens": 14,
         "cachedInputTokens": 90685,
         "cumulativeInputTokens": 90699,
+        "turn1ContextTokens": 7977,
+        "turn1UncachedTokens": 1267,
+        "postTurn1UncachedTokens": 9050,
+        "netContextGrowthTokens": 9038,
+        "cacheMissTurns": 0,
         "finalContextTokens": 17015,
         "totalModelOutputTokens": 2765,
         "searchMs": 18377,
@@ -1066,25 +1083,35 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 7977,
-        "turn1UncachedTokens": 1267,
-        "postTurn1UncachedTokens": 9050,
-        "netContextGrowthTokens": 9038,
-        "cacheMissTurns": 0
+        ]
       },
       "plexer": {
-        "conversationId": "b6930b5f-2d4e-45a5-bba9-08ebaa6c11b3",
-        "calls": 5,
-        "turns": 5,
-        "toolOutputTokens": 741,
-        "uncachedInputTokens": 12,
-        "cachedInputTokens": 67999,
-        "cumulativeInputTokens": 68011,
-        "finalContextTokens": 12374,
-        "totalModelOutputTokens": 1396,
-        "searchMs": 14896,
-        "totalMs": 26897,
+        "conversationId": "9cfba21c-1f5c-49a4-a0ea-517dfe0df6a3",
+        "calls": 8,
+        "turns": 3,
+        "toolNames": [
+          "Read",
+          "Grep",
+          "Edit",
+          "Edit",
+          "Edit",
+          "Edit",
+          "Edit",
+          "Bash"
+        ],
+        "toolOutputTokens": 2143,
+        "uncachedInputTokens": 8,
+        "cachedInputTokens": 59698,
+        "cumulativeInputTokens": 59706,
+        "turn1ContextTokens": 11607,
+        "turn1UncachedTokens": 6450,
+        "postTurn1UncachedTokens": 5254,
+        "netContextGrowthTokens": 5248,
+        "cacheMissTurns": 0,
+        "finalContextTokens": 16855,
+        "totalModelOutputTokens": 1545,
+        "searchMs": 8253,
+        "totalMs": 12144,
         "score": 8,
         "maxScore": 8,
         "checks": [
@@ -1094,12 +1121,7 @@
             "weight": 8,
             "passed": true
           }
-        ],
-        "turn1ContextTokens": 9710,
-        "turn1UncachedTokens": 2373,
-        "postTurn1UncachedTokens": 2674,
-        "netContextGrowthTokens": 2664,
-        "cacheMissTurns": 0
+        ]
       }
     }
   ]

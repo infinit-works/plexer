@@ -6,6 +6,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -378,6 +379,77 @@ export function buildTrailMcpConfigJson() {
                         GRAFT_TELEMETRY: "0",
                     },
                 },
+            },
+        },
+        null,
+        2
+    );
+}
+
+export async function shutdownBenchDaemon(sockPath) {
+    await new Promise((resolveDone) => {
+        if (!existsSync(sockPath)) {
+            resolveDone();
+            return;
+        }
+        const sock = createConnection(sockPath);
+        const timer = setTimeout(() => {
+            sock.destroy();
+            resolveDone();
+        }, 200);
+        sock.on("connect", () => {
+            sock.write(`${JSON.stringify({ id: 1, type: "shutdown" })}\n`);
+            clearTimeout(timer);
+            sock.end();
+            resolveDone();
+        });
+        sock.on("error", () => {
+            clearTimeout(timer);
+            resolveDone();
+        });
+    });
+    rmSync(sockPath, { force: true });
+}
+
+export function buildPlexerClaudeSettingsJson(plexerHookClient) {
+    const cmd = (ev) => `env PLEXER_DISABLE_HOOKS=0 PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} ${ev}`;
+    return JSON.stringify(
+        {
+            hooks: {
+                UserPromptSubmit: [{ hooks: [{ type: "command", command: cmd("prompt"), timeout: 15 }] }],
+                PreToolUse: [
+                    { matcher: "Read|Bash|Grep|Glob", hooks: [{ type: "command", command: cmd("pre-tool-use"), timeout: 10 }] },
+                ],
+                PostToolUse: [
+                    { matcher: "Write|Edit|MultiEdit", hooks: [{ type: "command", command: cmd("post-edit"), timeout: 10 }] },
+                    { matcher: "Read|ExitPlanMode", hooks: [{ type: "command", command: cmd("post-tool-use"), timeout: 8 }] },
+                ],
+            },
+        },
+        null,
+        2
+    );
+}
+
+export function buildPlexerAgyHooksJson(plexerHookClient) {
+    const cmd = (ev) => `env PLEXER_ENABLE_BENCH_HOOKS=1 ${process.execPath} ${JSON.stringify(plexerHookClient)} ${ev}`;
+    return JSON.stringify(
+        {
+            "plexer-hooks": {
+                PreInvocation: [{ type: "command", command: cmd("agy-pre-invocation"), timeout: 15 }],
+                PreToolUse: [
+                    {
+                        matcher: "read_file|view_file|run_command|grep_search|find_by_name",
+                        hooks: [{ type: "command", command: cmd("agy-pre-tool"), timeout: 10 }],
+                    },
+                ],
+                PostToolUse: [
+                    {
+                        matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file|exit_plan_mode",
+                        hooks: [{ type: "command", command: cmd("agy-post-tool"), timeout: 10 }],
+                    },
+                ],
+                Stop: [{ type: "command", command: cmd("agy-stop"), timeout: 10 }],
             },
         },
         null,

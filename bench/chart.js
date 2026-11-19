@@ -287,11 +287,12 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
     // 1. T1–T12 12-task engineering suite
     const tModelSpecs = [
-        { label: "sonnet-5.5", file: "results-sonnet.json", isClaude: true },
-        { label: "opus-5.5", file: "results-opus.json", isClaude: true },
+        { label: "neon-medium", file: "results-neon-medium.json", isClaude: false, isNeon: true },
         { label: "carbon-medium", file: "results-carbon-medium.json", isClaude: false, isCarbon: true },
         { label: "argon-medium", file: "results-argon-medium.json", isClaude: false },
-        { label: "argon-low", file: "results-argon-low.json", isClaude: false },
+        { label: "hydrogen-medium", file: "results-hydrogen-medium.json", isClaude: false },
+        { label: "opus-5.5", file: "results-opus.json", isClaude: true },
+        { label: "sonnet-5.5", file: "results-sonnet.json", isClaude: true },
     ];
     const tModels = [];
     for (const spec of tModelSpecs) {
@@ -317,8 +318,8 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
     const tMaxScore = sum(tAllRows, "plexer", (x) => x.maxScore || 8);
 
     const tHeadline = {
-        title: "12-task engineering suite",
-        sub: `T1–T12 · ${tAllRows.length} paired A/B evaluations across 6 repos · ${tColdScore}/${tMaxScore} → ${tPlexerScore}/${tMaxScore} (${((tPlexerScore / Math.max(1, tMaxScore)) * 100).toFixed(0)}%) correctness`,
+        title: "Engineering tasks",
+        sub: `12 tasks across 6 repos (${tAllRows.length} paired runs) · ${tColdScore}/${tMaxScore} → ${tPlexerScore}/${tMaxScore} (${((tPlexerScore / Math.max(1, tMaxScore)) * 100).toFixed(0)}%) task score`,
         groups: [
             {
                 label: "tool output",
@@ -329,11 +330,11 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
                 ],
             },
             {
-                label: "cum. input",
+                label: "input tokens",
                 baseline: fmtTok(tPlexerCum),
                 bars: [
-                    { arm: "plexer", val: tPlexerCum, delta: pctDelta(tColdCum, tPlexerCum), amount: fmtTok(tPlexerCum), extra: `${(tPlexerCtx / 1e3).toFixed(1)}k final ctx (${pctDelta(tColdCtx, tPlexerCtx)})` },
-                    { arm: "cold", val: tColdCum, amount: fmtTok(tColdCum), extra: `${(tColdCtx / 1e3).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}k final ctx` },
+                    { arm: "plexer", val: tPlexerCum, delta: pctDelta(tColdCum, tPlexerCum), amount: fmtTok(tPlexerCum), extra: `${(tPlexerCtx / 1e3).toFixed(1)}k final context (${pctDelta(tColdCtx, tPlexerCtx)})` },
+                    { arm: "cold", val: tColdCum, amount: fmtTok(tColdCum), extra: `${(tColdCtx / 1e3).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}k final context` },
                 ],
             },
             {
@@ -389,11 +390,12 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
     // 2. ScaleAI/SWE-bench_Pro V2 (S1–S8)
     const sweModelSpecs = [
+        { label: "neon-medium", file: "results-swebench-neon-medium.json", isClaude: false, isNeon: true },
         { label: "carbon-medium", file: "results-swebench-carbon-medium.json", isClaude: false, isCarbon: true },
         { label: "argon-medium", file: "results-swebench-argon-medium.json", isClaude: false },
-        { label: "sonnet-5.5", file: "results-swebench-sonnet.json", isClaude: true },
+        { label: "hydrogen-medium", file: "results-swebench-hydrogen-medium.json", isClaude: false },
         { label: "opus-5.5", file: "results-swebench-opus.json", isClaude: true },
-        { label: "argon-low", file: "results-swebench-argon-low.json", isClaude: false },
+        { label: "sonnet-5.5", file: "results-swebench-sonnet.json", isClaude: true },
     ];
     const sweModels = [];
     for (const spec of sweModelSpecs) {
@@ -415,8 +417,8 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
     const sMaxScore = sum(sAllRows, "plexer", (x) => x.maxScore || 8);
 
     const sweHeadline = {
-        title: "ScaleAI/SWE-bench_Pro V2",
-        sub: `S1–S8 · ${sAllRows.length} paired evaluations · Python, Go, JavaScript, TypeScript · 100% gold file recall`,
+        title: "SWE-bench Pro V2",
+        sub: `8 OSS issues across Python, Go, JS, and TS (${sAllRows.length} paired runs) · 100% gold file recall`,
         groups: [
             {
                 label: "tool output",
@@ -427,7 +429,7 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
                 ],
             },
             {
-                label: "cum. input",
+                label: "input tokens",
                 baseline: fmtTok(sPlexerCum),
                 bars: [
                     { arm: "plexer", val: sPlexerCum, delta: pctDelta(sColdCum, sPlexerCum), amount: fmtTok(sPlexerCum), extra: `${sPlexerCalls} calls (${pctDelta(sColdCalls, sPlexerCalls)})` },
@@ -479,11 +481,12 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
     // 3. Large-repo & discriminative suite (L1–L8)
     const largeModelSpecs = [
-        { label: "sonnet-5.5", file: "results-large-sonnet.json", isCarbon: false },
-        { label: "opus-5.5", file: "results-large-opus.json", isCarbon: false },
+        { label: "neon-medium", file: "results-large-neon-medium.json", isNeon: true, isCarbon: false },
         { label: "carbon-medium", file: "results-large-carbon-medium.json", isCarbon: true },
         { label: "argon-medium", file: "results-large-argon-medium.json", isCarbon: false },
-        { label: "flash-3.8", file: "results-large-flash-medium.json", isCarbon: false },
+        { label: "hydrogen-medium", file: "results-large-hydrogen-medium.json", isCarbon: false },
+        { label: "opus-5.5", file: "results-large-opus.json", isCarbon: false },
+        { label: "sonnet-5.5", file: "results-large-sonnet.json", isCarbon: false },
     ];
     const largeModels = [];
     for (const spec of largeModelSpecs) {
@@ -509,8 +512,8 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
         const lColdRes = sum(lAllRows, "cold", isStrictResolved);
 
         largeHeadline = {
-            title: "Large-repo & discriminative suite",
-            sub: `L1–L8 · ${lAllRows.length} 3-arm evaluations (440–1,350+ files) · ${lPlexerRes}/${lAllRows.length} strict resolved`,
+            title: "Large OSS repositories",
+            sub: `8 multi-file tasks across 440–1,350+ file repos (${lAllRows.length} 3-arm runs) · ${lPlexerRes}/${lAllRows.length} solved`,
             groups: [
                 {
                     label: "tool output",
@@ -522,7 +525,7 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
                     ],
                 },
                 {
-                    label: "post-t1 uncached",
+                    label: "new file tokens",
                     baseline: fmtTok(lPlexerPost),
                     bars: [
                         { arm: "plexer", val: lPlexerPost, delta: `${pctDelta(lTrailPost, lPlexerPost)} vs trail`, amount: fmtTok(lPlexerPost), extra: `${pctDelta(lColdPost, lPlexerPost)} vs cold` },
@@ -575,8 +578,16 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
     };
     const threeModelSpecs = [
         {
-            label: "sonnet-5.5",
-            files: [["results-swebench-sonnet.json", "results-swebench-sonnet-trail.json"], "results-sonnet-agy.json", "results-swebench-sonnet-agy.json", "results-large-sonnet.json"],
+            label: "neon-med",
+            files: ["results-neon-medium.json", "results-swebench-neon-medium.json", "results-large-neon-medium.json"],
+            isNeon: true,
+            isCarbon: false,
+        },
+        { label: "carbon-med", files: ["results-carbon-medium.json", "results-swebench-carbon-medium.json", "results-large-carbon-medium.json"], isCarbon: true },
+        { label: "argon-med", files: ["results-argon-medium.json", "results-swebench-argon-medium.json", "results-large-argon-medium.json"], isCarbon: false },
+        {
+            label: "hydrogen-med",
+            files: ["results-hydrogen-medium.json", "results-swebench-hydrogen-medium.json", "results-large-hydrogen-medium.json"],
             isCarbon: false,
         },
         {
@@ -584,9 +595,11 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
             files: [["results-swebench-opus.json", "results-swebench-opus-trail.json"], "results-opus-agy.json", "results-swebench-opus-agy.json", "results-large-opus.json"],
             isCarbon: false,
         },
-        { label: "carbon-med", files: ["results-carbon-medium.json", "results-swebench-carbon-medium.json", "results-large-carbon-medium.json"], isCarbon: true },
-        { label: "argon-med", files: ["results-argon-medium.json", "results-swebench-argon-medium.json", "results-large-argon-medium.json"], isCarbon: false },
-        { label: "flash-3.8", files: ["results-flash-medium.json", "results-swebench-flash-medium.json", "results-large-flash-medium.json"], isCarbon: false },
+        {
+            label: "sonnet-5.5",
+            files: [["results-swebench-sonnet.json", "results-swebench-sonnet-trail.json"], "results-sonnet-agy.json", "results-swebench-sonnet-agy.json", "results-large-sonnet.json"],
+            isCarbon: false,
+        },
     ];
     const threeModels = [];
     for (const spec of threeModelSpecs) {
@@ -612,11 +625,11 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
     const m3ColdGrowth = sum(threeAllRows, "cold", growthOf);
 
     const threeHeadline = {
-        title: "3-arm comparison vs. trail-code",
-        sub: `T4, T5, T9 + S1–S8 + L1–L8 across ${threeModels.length} models (${threeAllRows.length} sessions/arm) + Turn-0 & 24-query retrieval`,
+        title: "Head-to-head vs. trail-code",
+        sub: `${threeAllRows.length} shared 3-arm runs across ${threeModels.length} models + offline Turn-0 & 24-query retrieval`,
         groups: [
             {
-                label: "3-arm output",
+                label: "tool output",
                 baseline: fmtTok(m3PlexerTok),
                 bars: [
                     { arm: "plexer", val: m3PlexerTok, delta: `${pctDelta(m3TrailTok, m3PlexerTok)} vs trail`, amount: fmtTok(m3PlexerTok), extra: `${m3PlexerCalls.toLocaleString("en-US")} calls · ${m3PlexerScore}/${m3MaxScore}` },
@@ -625,20 +638,20 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
                 ],
             },
             {
-                label: "post-t1 uncached",
+                label: "new file tokens",
                 baseline: fmtTok(m3PlexerPost),
                 bars: [
-                    { arm: "plexer", val: m3PlexerPost, delta: `${pctDelta(m3TrailPost, m3PlexerPost)} vs trail`, amount: `${Math.round(m3PlexerPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3PlexerGrowth / 1e3).toLocaleString("en-US")}k net ctx growth (${pctDelta(m3ColdGrowth, m3PlexerGrowth)})` },
-                    { arm: "trail", val: m3TrailPost, amount: `${Math.round(m3TrailPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3TrailGrowth / 1e3).toLocaleString("en-US")}k net ctx growth (${pctDelta(m3ColdGrowth, m3TrailGrowth)})` },
-                    { arm: "cold", val: m3ColdPost, amount: `${Math.round(m3ColdPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3ColdGrowth / 1e3).toLocaleString("en-US")}k net ctx growth` },
+                    { arm: "plexer", val: m3PlexerPost, delta: `${pctDelta(m3TrailPost, m3PlexerPost)} vs trail`, amount: `${Math.round(m3PlexerPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3PlexerGrowth / 1e3).toLocaleString("en-US")}k context growth (${pctDelta(m3ColdGrowth, m3PlexerGrowth)})` },
+                    { arm: "trail", val: m3TrailPost, amount: `${Math.round(m3TrailPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3TrailGrowth / 1e3).toLocaleString("en-US")}k context growth (${pctDelta(m3ColdGrowth, m3TrailGrowth)})` },
+                    { arm: "cold", val: m3ColdPost, amount: `${Math.round(m3ColdPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3ColdGrowth / 1e3).toLocaleString("en-US")}k context growth` },
                 ],
             },
             {
-                label: "turn-0 bundle",
+                label: "turn-0 context",
                 baseline: "2,889 tok",
                 bars: [
-                    { arm: "plexer", val: 2889, delta: "-43.2% vs trail-push", amount: "2,889 tok", extra: "100% file recall · 34.3% NeedCov · 24/24 R@1" },
-                    { arm: "trail", val: 5086, amount: "5,086 tok", extra: "81.2% file recall · 26.4% NeedCov · 4/24 R@1" },
+                    { arm: "plexer", val: 2889, delta: "-43.2% vs trail-push", amount: "2,889 tok", extra: "100% file recall · 24/24 Recall@1" },
+                    { arm: "trail", val: 5086, amount: "5,086 tok", extra: "81.2% file recall · 4/24 Recall@1" },
                 ],
             },
         ],
@@ -677,6 +690,12 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
     const liveDetailSuites = [tDetail, sweDetail, ...(largeDetail ? [largeDetail] : []), threeDetail];
     const detailSuites = [...liveDetailSuites, COMPACTION_SUITE];
 
+    const hasNeon =
+        tModels.some((m) => m.isNeon) ||
+        sweModels.some((m) => m.isNeon) ||
+        largeModels.some((m) => m.isNeon) ||
+        threeModels.some((m) => m.isNeon);
+
     const hasCarbon =
         tModels.some((m) => m.isCarbon) ||
         sweModels.some((m) => m.isCarbon) ||
@@ -706,6 +725,7 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
         detailSuites,
         geo,
         rowCount: allAgentGroups.length,
+        hasNeon,
         hasCarbon,
         totalPairedCount,
         hasLarge: lAllRows.length > 0,
@@ -713,7 +733,7 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 }
 
 export function renderChart(includeDetail, benchDir = import.meta.dirname) {
-    const { headlineSuites, detailSuites, geo, rowCount, hasCarbon, totalPairedCount, hasLarge } = buildBenchmarkData(benchDir);
+    const { headlineSuites, detailSuites, geo, rowCount, hasNeon, hasCarbon, totalPairedCount, hasLarge } = buildBenchmarkData(benchDir);
     const front = [];
     const behind = [];
 
@@ -795,9 +815,16 @@ export function renderChart(includeDetail, benchDir = import.meta.dirname) {
 
     // ---- hero: overall geometric mean (doubles as the legend) ------------------
     y = axisTop + 18;
-    const modelLineup = hasCarbon
-        ? "Gemini 4 Carbon, Gemini 4 Argon, Gemini 3.8 Flash, Claude Opus 5.5, Claude Sonnet 5.5"
-        : "Gemini 4 Argon, Gemini 3.8 Flash, Claude Opus 5.5, Claude Sonnet 5.5";
+    const modelLineup = [
+        hasNeon && "Gemini 4 Neon",
+        hasCarbon && "Gemini 4 Carbon",
+        "Gemini 4 Argon",
+        "Gemini 4 Hydrogen",
+        "Claude Opus 5.5",
+        "Claude Sonnet 5.5",
+    ]
+        .filter(Boolean)
+        .join(", ");
     front.push(`<text x="${M_L}" y="${y}" class="tl b s11" letter-spacing="0.5">OVERALL · GEOMETRIC MEAN</text>`);
     front.push(
         `<text x="${X1}" y="${y}" class="tm e" font-size="10">over ${rowCount} live benchmark rows · ${modelLineup}</text>`

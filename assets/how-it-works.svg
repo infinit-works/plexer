@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 260" width="100%" height="100%" role="img" aria-label="How Plexer Works: Your Codebase (25 languages) is indexed by plexer init (offline, $0, seconds) into a Live Code Graph in plexer/, powering Turn-1 Code Search, Callers &amp; Blast Radius, and an Interactive Web Graph.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 260" width="100%" height="100%" role="img" aria-label="How Plexer Works: Your Codebase (27 languages and SFCs) is indexed by plexer init (offline, $0, seconds) into a Live Code Graph in plexer/, powering Turn-0 Code Search, Callers &amp; Blast Radius, and an Interactive Web Graph.">
   <title>How Plexer Works</title>
-  <desc>Four-stage overview: 1. Your Codebase (25 languages supported) flows into 2. plexer init (offline, $0, in seconds: parses symbols and links, and wires 12 AI coding tools), which builds 3. Live Code Graph in plexer/ (exact file:line symbol spans, cross-file call and import graph, re-parsing changed files in milliseconds), powering 4. Turn-1 Code Search, Callers and Blast Radius, and Interactive Web Graph.</desc>
+  <desc>Four-stage overview: 1. Your Codebase (27 languages and SFCs supported) flows into 2. plexer init (offline, $0, in seconds: parses symbols and links, and wires 12 AI coding tools), which builds 3. Live Code Graph in plexer/ (exact file:line symbol spans, cross-file call and import graph, re-parsing changed files in milliseconds), powering 4. Turn-0 Code Search, Pre-Tool Routing and Blast Radius, and Interactive Web Graph.</desc>
 
   <defs>
     <style>
@@ -281,7 +281,7 @@
 
     <!-- Header Text -->
     <text x="64" y="32" class="font-sans title">Your Codebase</text>
-    <text x="64" y="49" class="font-sans subtitle">25 languages</text>
+    <text x="64" y="49" class="font-sans subtitle">27 languages</text>
 
     <line x1="18" y1="68" x2="174" y2="68" stroke="#1c2536" stroke-width="1" />
 
@@ -303,7 +303,7 @@
       <text x="37" y="122" text-anchor="middle" class="font-mono pill-text">Luau</text>
 
       <rect x="82" y="100" width="74" height="36" rx="6" fill="#132032" stroke="#1e3a5f" stroke-width="1" />
-      <text x="119" y="122" text-anchor="middle" class="font-sans pill-more">+19 more</text>
+      <text x="119" y="122" text-anchor="middle" class="font-sans pill-more">+21 more</text>
     </g>
   </g>
 
@@ -385,7 +385,7 @@
     <rect x="18" y="19" width="34" height="34" rx="8" fill="#151e2e" stroke="#26354d" stroke-width="1" />
     <path d="M 35 26 Q 35 36 45 36 Q 35 36 35 46 Q 35 36 25 36 Q 35 36 35 26 Z" fill="none" stroke="#38bdf8" stroke-width="1.6" stroke-linejoin="round" />
 
-    <text x="64" y="33" class="font-sans title">Turn-1 Code Search</text>
+    <text x="64" y="33" class="font-sans title">Turn-0 Code Search</text>
     <text x="64" y="51" class="font-sans item-sub">Exact <tspan class="font-mono code-inline">file:line</tspan> spans in one call</text>
   </g>
 
@@ -398,7 +398,7 @@
     <path d="M 29 31 L 34 36 L 29 41 M 36 41 H 42" fill="none" stroke="#38bdf8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
 
     <text x="64" y="33" class="font-sans title">Callers &amp; Blast Radius</text>
-    <text x="64" y="51" class="font-sans item-sub">Trace every caller &amp; what edits affect</text>
+    <text x="64" y="51" class="font-sans item-sub">Pre-tool routing, callers &amp; blast radius</text>
   </g>
 
   <!-- Output 3: Interactive Web Graph -->

@@ -1,0 +1,34 @@
+{
+  "T1": {},
+  "T2": {},
+  "T3": {},
+  "T4": {},
+  "T5": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-claude-logs/sonnet/T5-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-plexer/plexer"
+    }
+  },
+  "T6": {},
+  "T7": {},
+  "T8": {},
+  "T9": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-claude-logs/sonnet/T9-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-plexer/plexer"
+    }
+  },
+  "T10": {},
+  "T11": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-claude-logs/sonnet/T11-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-plexer/sert"
+    }
+  },
+  "T12": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-claude-logs/sonnet/T12-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-sonnet-plexer/building-tools"
+    }
+  }
+}

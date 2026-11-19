@@ -1,0 +1,134 @@
+{
+  "T1": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T1-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/kohls-admin"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T1-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/kohls-admin"
+    }
+  },
+  "T2": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T2-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T2-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/flux"
+    }
+  },
+  "T3": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T3-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/sert"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T3-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/sert"
+    }
+  },
+  "T4": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T4-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/z"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T4-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/z"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T4-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-trail/z"
+    }
+  },
+  "T5": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T5-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/plexer"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T5-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T5-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-trail/plexer"
+    }
+  },
+  "T6": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T6-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/kohls-admin"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T6-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/kohls-admin"
+    }
+  },
+  "T7": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T7-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T7-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/flux"
+    }
+  },
+  "T8": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T8-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/building-tools"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T8-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/building-tools"
+    }
+  },
+  "T9": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T9-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/plexer"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T9-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/plexer"
+    },
+    "trail": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T9-trail.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-trail/plexer"
+    }
+  },
+  "T10": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T10-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/flux"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T10-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/flux"
+    }
+  },
+  "T11": {
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T11-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/sert"
+    },
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T11-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/sert"
+    }
+  },
+  "T12": {
+    "cold": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T12-cold.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-cold/building-tools"
+    },
+    "plexer": {
+      "conversationId": "/tmp/plexer-agy-logs/hydrogen-medium/T12-plexer.jsonl",
+      "cloneDir": "/tmp/plexer-ab-hydrogen-medium-plexer/building-tools"
+    }
+  }
+}

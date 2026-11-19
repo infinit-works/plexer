@@ -24,6 +24,11 @@ export const RESULT_FILES = {
 };
 
 export const OPTIONAL_RESULT_FILES = {
+    "neon-medium": [
+        "results-neon-medium.json",
+        "results-swebench-neon-medium.json",
+        "results-large-neon-medium.json",
+    ],
     "carbon-medium": [
         "results-carbon-medium.json",
         "results-swebench-carbon-medium.json",
@@ -34,10 +39,10 @@ export const OPTIONAL_RESULT_FILES = {
         "results-swebench-argon-medium.json",
         "results-large-argon-medium.json",
     ],
-    "flash-medium": [
-        "results-flash-medium.json",
-        "results-swebench-flash-medium.json",
-        "results-large-flash-medium.json",
+    "hydrogen-medium": [
+        "results-hydrogen-medium.json",
+        "results-swebench-hydrogen-medium.json",
+        "results-large-hydrogen-medium.json",
     ],
 };
 
@@ -92,7 +97,7 @@ const WARM_PREFIX_TOKENS = {
  * Load per-task live rows: {family, suite, id, arm, turns, calls, out, ms, apiMs, cum, final, unc, cost}.
  * `t0Tok` is filled in later by the caller (it is an offline quantity).
  * Default `opus`/`sonnet` rows stay strictly pinned to `RESULT_FILES` for `eval-fast.js` calibration,
- * while optional families (`carbon-medium`, `argon-medium`, `flash-medium`) are loaded when present.
+ * while optional families (`neon-medium`, `carbon-medium`, `argon-medium`, `hydrogen-medium`) are loaded when present.
  */
 export function loadRows(benchDir = import.meta.dirname, options = {}) {
     const { includeOptional = true, families = null } = options;

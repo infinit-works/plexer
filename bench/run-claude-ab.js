@@ -20,11 +20,13 @@ import { gradeManifest, parseTranscript } from "./grade.js";
 import { ensureFreshGraph } from "../src/graph/refresh.js";
 import { ensureAbBaseRepos } from "./ensure-base.js";
 import {
+    buildPlexerClaudeSettingsJson,
     buildTrailClaudeSettingsJson,
     buildTrailMcpConfigJson,
     getTrailEnv,
     getTrailSkillBody,
     prepareTrailWorktreeDir,
+    shutdownBenchDaemon,
 } from "./trail-live-helper.js";
 
 const rawModelArg = process.argv[2] || "sonnet";
@@ -66,7 +68,8 @@ const coldSysFile = join(logDir, "cold-system.txt");
 const plexerSysFile = join(logDir, "plexer-system.txt");
 const trailSysFile = join(logDir, "trail-system.txt");
 
-const plexerBin = resolve(import.meta.dirname, "../bin/plexer.js");
+const plexerHookClient = resolve(import.meta.dirname, "../bin/plexer-hook-client.cjs");
+const benchDaemonSock = `/tmp/plexer-claude-bench-${process.pid}.sock`;
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
 const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
 const trailMcpConfigFile = join(logDir, "trail-mcp-config.json");
@@ -76,41 +79,7 @@ function initRuntimeFiles() {
     writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
     writeFileSync(trailSysFile, trailSkillBody ? `${basePrompt}\n\n${trailSkillBody}\n` : `${basePrompt}\n`, "utf8");
     writeFileSync(trailMcpConfigFile, buildTrailMcpConfigJson(), "utf8");
-    writeFileSync(
-        plexerHooksSettingsFile,
-        JSON.stringify(
-            {
-                hooks: {
-                    UserPromptSubmit: [
-                        {
-                            hooks: [
-                                {
-                                    type: "command",
-                                    command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook prompt`,
-                                    timeout: 15,
-                                },
-                            ],
-                        },
-                    ],
-                    PostToolUse: [
-                        {
-                            matcher: "Write|Edit|MultiEdit",
-                            hooks: [
-                                {
-                                    type: "command",
-                                    command: `${process.execPath} ${JSON.stringify(plexerBin)} _hook post-edit`,
-                                    timeout: 10,
-                                },
-                            ],
-                        },
-                    ],
-                },
-            },
-            null,
-            2
-        ),
-        "utf8"
-    );
+    writeFileSync(plexerHooksSettingsFile, buildPlexerClaudeSettingsJson(plexerHookClient), "utf8");
     writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
 }
 
@@ -194,6 +163,7 @@ async function runOne(task, arm) {
                 ? getTrailEnv()
                 : {
                       ...process.env,
+                      PLEXER_DAEMON_SOCK: benchDaemonSock,
                       PLEXER_DISABLE_HOOKS: arm === "plexer" ? "0" : "1",
                       ...(arm === "plexer"
                           ? { PLEXER_ENABLE_BENCH_HOOKS: "1" }
@@ -276,10 +246,15 @@ async function main() {
         }
     }
 
-    const allRuns = [
-        ...(await runWave(readOnlyJobs, concurrency)),
-        ...(await runWave(editJobs, concurrency)),
-    ];
+    let allRuns;
+    try {
+        allRuns = [
+            ...(await runWave(readOnlyJobs, concurrency)),
+            ...(await runWave(editJobs, concurrency)),
+        ];
+    } finally {
+        await shutdownBenchDaemon(benchDaemonSock);
+    }
 
     const manifestPath = resolve(import.meta.dirname, `manifest-${modelArg}.json`);
     const resultsPath = resolve(import.meta.dirname, `results-${modelArg}.json`);

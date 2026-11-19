@@ -11,6 +11,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, write
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildGraph } from "../src/graph/build.js";
+import { readFingerprint } from "../src/graph/fingerprint.js";
 
 export const AB_BASE_DIR = "/tmp/plexer-ab-base";
 export const SWEBENCH_BASE_DIR = "/tmp/plexer-swebench-base";
@@ -44,7 +45,7 @@ const STRIP = [
 async function buildIndexedFromClean(cleanDir, idxDir, buildOpts) {
     rmSync(idxDir, { recursive: true, force: true });
     mkdirSync(join(idxDir, ".."), { recursive: true });
-    cpSync(cleanDir, idxDir, { recursive: true });
+    execFileSync("cp", ["-a", cleanDir, idxDir]);
     const prevNoGitignore = process.env.PLEXER_NO_GITIGNORE;
     const prevNoIgnore = process.env.PLEXER_NO_IGNORE;
     process.env.PLEXER_NO_GITIGNORE = "1";
@@ -74,7 +75,13 @@ export async function ensureAbBaseRepos(onlyRepos = null, opts = {}) {
         }
         const pinStampPath = join(idxDir, "plexer", ".pinned_ref");
         const currentPin = existsSync(pinStampPath) ? readFileSync(pinStampPath, "utf8").trim() : "";
-        if (!forceReindex && existsSync(join(idxDir, "plexer", ".graph", "wiring.json")) && existsSync(cleanDir) && currentPin === ref) {
+        if (
+            !forceReindex &&
+            existsSync(join(idxDir, "plexer", ".graph", "wiring.json")) &&
+            readFingerprint(join(idxDir, "plexer")) &&
+            existsSync(cleanDir) &&
+            currentPin === ref
+        ) {
             continue;
         }
         if (forceReindex && existsSync(cleanDir)) {
@@ -111,6 +118,33 @@ export async function ensureAbBaseRepos(onlyRepos = null, opts = {}) {
             if (existsSync(pinnedSertSrc) && existsSync(join(cleanDir, ".sert", "sert"))) {
                 rmSync(localSertSrc, { recursive: true, force: true });
                 cpSync(pinnedSertSrc, localSertSrc, { recursive: true });
+            }
+            const rootLuauRcPath = join(cleanDir, ".luaurc");
+            const rootLuauRc = existsSync(rootLuauRcPath) ? readFileSync(rootLuauRcPath, "utf8") : "";
+            if (rootLuauRc.includes("./.sert/pkg/")) {
+                const pkgDir = join(cleanDir, ".sert", "pkg");
+                mkdirSync(pkgDir, { recursive: true });
+                const fluxPkgSrc = existsSync(join(AB_BASE_DIR, "clean", "flux"))
+                    ? join(AB_BASE_DIR, "clean", "flux")
+                    : join(r.src, "Packages", "Flux");
+                if (!existsSync(join(pkgDir, "flux")) && existsSync(fluxPkgSrc)) {
+                    cpSync(fluxPkgSrc, join(pkgDir, "flux"), { recursive: true });
+                }
+                const fluxUiPkgSrc = existsSync(join(cleanDir, ".sert", "local", "flux-ui"))
+                    ? join(cleanDir, ".sert", "local", "flux-ui")
+                    : join(r.src, "Packages", "FluxUI");
+                if (!existsSync(join(pkgDir, "flux-ui")) && existsSync(fluxUiPkgSrc)) {
+                    cpSync(fluxUiPkgSrc, join(pkgDir, "flux-ui"), { recursive: true });
+                }
+                const sertLuauRcPath = join(cleanDir, ".sert", ".luaurc");
+                if (existsSync(sertLuauRcPath)) {
+                    const parsed = JSON.parse(readFileSync(sertLuauRcPath, "utf8"));
+                    if (parsed && typeof parsed.aliases === "object") {
+                        if (existsSync(join(pkgDir, "flux", "src"))) parsed.aliases.flux = "./pkg/flux/src";
+                        if (existsSync(join(pkgDir, "flux-ui", "src"))) parsed.aliases.fluxui = "./pkg/flux-ui/src";
+                        writeFileSync(sertLuauRcPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+                    }
+                }
             }
         }
         execFileSync("git", ["init", "-q"], { cwd: cleanDir });
@@ -171,10 +205,10 @@ export async function ensureSwebenchBaseRepos(onlyIds = null, opts = {}) {
             });
             execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: cleanDir });
         }
-        if (forceReindex || !existsSync(join(indexedDir, "plexer", ".graph", "wiring.json"))) {
+        if (forceReindex || !existsSync(join(indexedDir, "plexer", ".graph", "wiring.json")) || !readFingerprint(join(indexedDir, "plexer"))) {
             rmSync(indexedDir, { recursive: true, force: true });
             mkdirSync(join(SWEBENCH_BASE_DIR, "indexed"), { recursive: true });
-            cpSync(cleanDir, indexedDir, { recursive: true });
+            execFileSync("cp", ["-a", cleanDir, indexedDir]);
             await buildGraph(indexedDir, { force: true });
         }
     }
