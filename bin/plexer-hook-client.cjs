@@ -111,7 +111,9 @@ function buildHookRequest({ event, parsedInput, version, codeStamp, pkgRoot }) {
         envFlags: {
             disableHooks: process.env.PLEXER_DISABLE_HOOKS === '1' ? true : undefined,
             enableBenchHooks: process.env.PLEXER_ENABLE_BENCH_HOOKS === '1' ? true : undefined,
-            enableUserMarkdown: process.env.PLEXER_AGY_USER_MARKDOWN === '1' ? true : undefined,
+            enableUserMarkdown: process.env.PLEXER_AGY_USER_MARKDOWN === '1'
+                ? true
+                : (process.env.PLEXER_AGY_USER_MARKDOWN === '0' ? false : undefined),
             pluginRoot: process.env.PLUGIN_ROOT || pkgRoot,
             callerCwd: process.cwd(),
             claudeProjectDir: process.env.CLAUDE_PROJECT_DIR || undefined,
@@ -202,6 +204,28 @@ async function spawnAndRetryDaemon(ctx) {
     return false;
 }
 
+function canFastBypassPreTool(event, parsedInput) {
+    if (
+        event !== 'agy-pre-tool'
+        && event !== 'pre-tool-use'
+        && event !== 'claude-pre-tool'
+        && event !== 'gemini-before-tool'
+    ) {
+        return false;
+    }
+    const toolName = String(
+        parsedInput?.toolCall?.name
+        ?? parsedInput?.tool_name
+        ?? parsedInput?.toolName
+        ?? '',
+    ).trim();
+    if (!/^(?:run_command|Bash|run_shell_command)$/i.test(toolName))
+        return false;
+    const args = parsedInput?.toolCall?.args ?? parsedInput?.tool_input ?? parsedInput?.args ?? {};
+    const cmd = String(args?.CommandLine ?? args?.command ?? '');
+    return !/(?:^|[\s;/\\"'`])(?:plexer|cat|head|tail|sed|e?grep|fgrep|rg|find)\b|\bgit\s+(?:grep|diff|log)\b/.test(cmd);
+}
+
 async function main() {
     const startedAt = Date.now();
     const event = process.argv[2] || 'agy-pre-invocation';
@@ -213,6 +237,10 @@ async function main() {
 
     const rawStdin = readRawStdin();
     const parsedInput = parseStdinJson(rawStdin);
+    if (canFastBypassPreTool(event, parsedInput)) {
+        writeAll(fallbackOut);
+        return;
+    }
     const pkgRoot = path.resolve(__dirname, '..');
     const connectTimeoutMs = Math.max(10, Number(process.env.PLEXER_HOOK_CONNECT_TIMEOUT_MS) || 120);
     const defaultRpcMs = TURN0_EVENTS.has(event) ? 12000 : 7500;

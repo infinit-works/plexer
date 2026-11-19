@@ -322,32 +322,45 @@ function droppedNote(dropped) {
 export function formatRepoMap(map) {
     const { totals } = map;
     const header = `repo map — ${totals.files} files · ${totals.symbols} symbols · ${totals.edges} edges · ${totals.languages.join(", ")}`;
-    const lines = [header, ""];
-    if (map.scopes) {
-        for (const sg of map.scopes) {
-            lines.push(`## ${sg.scope}`);
-            for (const d of sg.dirs)
+    const render = (maxDirsPerGroup = Infinity) => {
+        const lines = [header, ""];
+        if (map.scopes) {
+            for (const sg of map.scopes) {
+                lines.push(`## ${sg.scope}`);
+                const shown = sg.dirs.slice(0, maxDirsPerGroup);
+                for (const d of shown)
+                    lines.push(formatDirLine(d));
+                const extraDropped = sg.dropped + (sg.dirs.length - shown.length);
+                const note = droppedNote(extraDropped);
+                if (note)
+                    lines.push(note);
+                lines.push("");
+            }
+        }
+        else {
+            const shown = map.dirs.slice(0, maxDirsPerGroup);
+            for (const d of shown)
                 lines.push(formatDirLine(d));
-            const note = droppedNote(sg.dropped);
+            const extraDropped = map.dropped + (map.dirs.length - shown.length);
+            const note = droppedNote(extraDropped);
             if (note)
                 lines.push(note);
             lines.push("");
         }
+        lines.push(`hotspots: ${map.hotspots.map(formatHotspot).join("  ")}`);
+        if (Array.isArray(map.churnHotspots) && map.churnHotspots.length > 0) {
+            lines.push(`churn hotspots: ${map.churnHotspots.map(formatChurnHotspot).join("  ")}`);
+        }
+        if (Array.isArray(map.coupling) && map.coupling.length > 0) {
+            lines.push(`coupling: ${map.coupling.map((c) => `${c.a} ↔ ${c.b} (${c.weight})`).join("  ")}`);
+        }
+        return lines.join("\n") + "\n";
+    };
+    let out = render(Infinity);
+    for (const cap of [12, 8, 5, 3]) {
+        if (Buffer.byteLength(out, "utf8") <= 8800)
+            break;
+        out = render(cap);
     }
-    else {
-        for (const d of map.dirs)
-            lines.push(formatDirLine(d));
-        const note = droppedNote(map.dropped);
-        if (note)
-            lines.push(note);
-        lines.push("");
-    }
-    lines.push(`hotspots: ${map.hotspots.map(formatHotspot).join("  ")}`);
-    if (Array.isArray(map.churnHotspots) && map.churnHotspots.length > 0) {
-        lines.push(`churn hotspots: ${map.churnHotspots.map(formatChurnHotspot).join("  ")}`);
-    }
-    if (Array.isArray(map.coupling) && map.coupling.length > 0) {
-        lines.push(`coupling: ${map.coupling.map((c) => `${c.a} ↔ ${c.b} (${c.weight})`).join("  ")}`);
-    }
-    return lines.join("\n") + "\n";
+    return out;
 }

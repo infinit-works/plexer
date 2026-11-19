@@ -1,9 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, lstatSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, lstatSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { installAntigravitySkill } from "../src/hosts/antigravity.js";
 import { installCodexHooks } from "../src/hosts/codex-hooks.js";
 import { mergePlexerHooks } from "../src/claude/settings-merge.js";
@@ -361,6 +361,74 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
         } finally {
             rmSync(home, { recursive: true, force: true });
             rmSync(repo, { recursive: true, force: true });
+        }
+    });
+
+    it("fails open with valid JSON on runtime exit 127 across plugin, Claude, and Codex hook commands, and propagates script exit codes", () => {
+        if (process.platform === "win32") return;
+        const tmp = mkdtempSync(join(tmpdir(), "plexer-hook-run-"));
+        const home = mkdtempSync(join(tmpdir(), "plexer-hook-home-"));
+        try {
+            const fakeNode = join(tmp, "fake-node.sh");
+            writeFileSync(
+                fakeNode,
+                "#!/bin/sh\necho 'node: error while loading shared libraries: libsimdjson.so.36: cannot open shared object file' >&2\nexit 127\n",
+            );
+            chmodSync(fakeNode, 0o755);
+
+            const exit2Script = join(tmp, "exit2.js");
+            writeFileSync(exit2Script, "process.exit(2);\n");
+
+            const pkgRoot = new URL("..", import.meta.url).pathname;
+            const runnerPath = join(pkgRoot, "bin", "plexer-hook-run.sh");
+            const clientPath = join(pkgRoot, "bin", "plexer-hook-client.cjs");
+
+            for (const [ev, expected] of [
+                ["agy-pre-tool", { decision: "allow" }],
+                ["agy-stop", { decision: "allow" }],
+                ["agy-pre-invocation", {}],
+                ["agy-post-tool", {}],
+            ]) {
+                const res = spawnSync("sh", [runnerPath, clientPath, ev], {
+                    cwd: pkgRoot,
+                    encoding: "utf8",
+                    env: { ...process.env, AGENT_HOOK_NODE: fakeNode },
+                });
+                assert.equal(res.status, 0, `${ev}: expected fail-open exit 0, stderr=${res.stderr}`);
+                assert.deepEqual(JSON.parse(res.stdout), expected, `${ev}: expected valid fallback JSON`);
+                assert.match(res.stderr, /warning:/, `${ev}: expected warning on stderr`);
+            }
+
+            const non127 = spawnSync("sh", [runnerPath, exit2Script], {
+                cwd: pkgRoot,
+                encoding: "utf8",
+                env: { ...process.env, AGENT_HOOK_NODE: process.execPath },
+            });
+            assert.equal(non127.status, 2, "non-127 script exit code must propagate");
+
+            const claudeCmd = mergePlexerHooks({}, join(tmp, "helpers")).merged.hooks.PreToolUse[0].hooks[0].command;
+            const claudeRes = spawnSync("sh", ["-c", claudeCmd], {
+                encoding: "utf8",
+                env: { ...process.env, AGENT_HOOK_NODE: fakeNode },
+            });
+            assert.equal(claudeRes.status, 0, `Claude command failed: ${claudeRes.stderr}`);
+            assert.deepEqual(JSON.parse(claudeRes.stdout), {});
+            assert.match(claudeRes.stderr, /warning:/);
+
+            mkdirSync(join(home, ".codex"), { recursive: true });
+            installCodexHooks(home);
+            const codexHooks = JSON.parse(readFileSync(join(home, ".codex", "hooks.json"), "utf8")).hooks;
+            const codexCmd = codexHooks.SessionStart[0].hooks[0].command;
+            const codexRes = spawnSync("sh", ["-c", codexCmd], {
+                encoding: "utf8",
+                env: { ...process.env, AGENT_HOOK_NODE: fakeNode },
+            });
+            assert.equal(codexRes.status, 0, `Codex command failed: ${codexRes.stderr}`);
+            assert.deepEqual(JSON.parse(codexRes.stdout), {});
+            assert.match(codexRes.stderr, /warning:/);
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+            rmSync(home, { recursive: true, force: true });
         }
     });
 });

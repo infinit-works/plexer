@@ -6,12 +6,12 @@
 import { join } from 'node:path';
 import { hooksShim } from '../claude/shim-template.js';
 import { claudeDistDir } from '../claude/paths.js';
-import { isPlexerEntry, updateJsonConfig, upsertHookEvents, writeOwned } from '../util/config-write.js';
+import { formatPlexerHookCommand, isPlexerEntry, updateJsonConfig, upsertHookEvents, writeOwned } from '../util/config-write.js';
 import { dirExists } from '../util/fs.js';
 
 const GEMINI_HOOK_DEFS = [
     { event: 'BeforeAgent', matcher: '*', name: 'plexer-before-agent', sub: 'gemini-before-agent', timeout: 15000 },
-    { event: 'BeforeTool', matcher: 'read_file|run_shell_command', name: 'plexer-before-tool', sub: 'gemini-before-tool', timeout: 8000 },
+    { event: 'BeforeTool', matcher: 'read_file|run_shell_command|grep_search', name: 'plexer-before-tool', sub: 'gemini-before-tool', timeout: 8000 },
     { event: 'AfterTool', matcher: 'read_file|write_file|replace', name: 'plexer-after-tool', sub: 'gemini-after-tool', timeout: 8000 },
 ];
 
@@ -56,7 +56,7 @@ export function installCodexHooks(home) {
     const shimPath = targets[0].path;
     const shimWrite = writeOwned('codex-hook-shim', shimPath, hooksShim(claudeDistDir()), 0o755);
     const cfgWrite = upsertHookEvents('codex-hooks', targets[1].path, DESIRED_ENTRIES, (d) => {
-        const handler = { type: 'command', command: `node "${shimPath}" ${d.sub}`, timeout: d.timeout };
+        const handler = { type: 'command', command: formatPlexerHookCommand(shimPath, d.sub), timeout: d.timeout };
         return d.matcher ? { matcher: d.matcher, hooks: [handler] } : { hooks: [handler] };
     });
     return [shimWrite, cfgWrite];
@@ -90,7 +90,7 @@ export function installGeminiHooks({ home, repo } = {}) {
         writes.push(writeOwned(`gemini-hook-shim${pair.sfx}`, pair.shim, shimBody, 0o755));
         writes.push(upsertHookEvents(`gemini-hooks${pair.sfx}`, pair.cfg, GEMINI_HOOK_DEFS, (d) => ({
             matcher: d.matcher,
-            hooks: [{ name: d.name, type: 'command', command: `node "${pair.shim}" ${d.sub}`, timeout: d.timeout }],
+            hooks: [{ name: d.name, type: 'command', command: formatPlexerHookCommand(pair.shim, d.sub), timeout: d.timeout }],
         })));
     }
     return writes;
@@ -118,7 +118,7 @@ export function installCursorHooks(repo) {
             const prior = Array.isArray(hooks[d.event]) ? hooks[d.event] : [];
             hooks[d.event] = [
                 ...prior.filter((e) => !isPlexerEntry(e)),
-                { command: `node "${shimPath}" ${d.sub}`, timeout: d.timeout },
+                { command: formatPlexerHookCommand(shimPath, d.sub), timeout: d.timeout },
             ];
         }
     });

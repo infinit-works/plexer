@@ -1,7 +1,8 @@
 import { Command } from "commander";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { contextDirFor } from "../context/node-file.js";
 import { hasPlexerIndex, isAutoBuildableRepo, nearestPlexerRoot } from "../graph/root.js";
@@ -152,16 +153,71 @@ function resolveSessionIdFromEnv(env = process.env) {
     );
 }
 
+function collectRepeatableIn(val, prev) {
+    const list = Array.isArray(prev) ? [...prev] : (prev ? [prev] : []);
+    for (const part of String(val).split(",").map((s) => s.trim()).filter(Boolean)) {
+        if (!list.includes(part)) list.push(part);
+    }
+    return list.length === 1 ? list[0] : list;
+}
+
+const DASH_POS_CMD_OPTS = {
+    grep: {
+        bools: new Set(["-i", "--ignore-case", "--fixed", "--source", "--no-source", "--full", "--json", "--no-refresh", "--refresh", "--no-daemon", "-h", "--help"]),
+        values: new Set(["--dir", "--session", "--in", "-C", "--context"]),
+    },
+    ask: {
+        bools: new Set(["--source", "--no-source", "--full", "--json", "--no-graph-rank", "--graph-rank", "--no-refresh", "--refresh", "--no-daemon", "-h", "--help"]),
+        values: new Set(["--dir", "--session", "--in", "-n", "--limit"]),
+    },
+};
+
+function normalizeLeadingDashPositionalArgs(argv) {
+    if (!Array.isArray(argv) || argv.length <= 3) return argv;
+    let cmdIdx = -1;
+    for (let i = 2; i < argv.length; i++) {
+        const a = String(argv[i]);
+        if (a === "--no-daemon" || a === "-v" || a === "-V" || a === "--version" || a === "-h" || a === "--help" || a.startsWith("--dir=") || a.startsWith("--session=")) continue;
+        if ((a === "--dir" || a === "--session") && i + 1 < argv.length) { i++; continue; }
+        if (!a.startsWith("-")) cmdIdx = i;
+        break;
+    }
+    if (cmdIdx === -1) return argv;
+    const spec = DASH_POS_CMD_OPTS[String(argv[cmdIdx])];
+    if (!spec) return argv;
+    const rest = argv.slice(cmdIdx + 1);
+    const optTokens = [];
+    const posTokens = [];
+    let tailAfterDash = null;
+    for (let i = 0; i < rest.length; i++) {
+        const tok = String(rest[i]);
+        if (tok === "--") { tailAfterDash = rest.slice(i); break; }
+        const eqIdx = tok.indexOf("=");
+        const flagName = eqIdx > 0 ? tok.slice(0, eqIdx) : tok;
+        const attachedVal = /^-(?:C\d+|n\d+)$/.test(tok) || (spec.values.has(flagName) && eqIdx > 0);
+        if (spec.bools.has(tok) || attachedVal) { optTokens.push(tok); continue; }
+        if (spec.values.has(tok)) {
+            optTokens.push(tok);
+            if (i + 1 < rest.length) optTokens.push(String(rest[++i]));
+            continue;
+        }
+        posTokens.push(tok);
+    }
+    if (!posTokens.some((t) => t.startsWith("-"))) return argv;
+    return [...argv.slice(0, cmdIdx + 1), ...optTokens, "--", ...posTokens, ...(tailAfterDash ? tailAfterDash.slice(1) : [])];
+}
+
 function createIoContext(ioCtx = null) {
     const isCaptured = Boolean(ioCtx?.isCaptured || ioCtx?.writeOut || ioCtx?.writeErr || ioCtx?.exit);
     const cwd = ioCtx?.cwd || process.cwd();
     const sessionId = ioCtx?.sessionId ?? null;
+    const antigravityPipeCap = Boolean(ioCtx?.antigravityPipeCap);
     const writeOut = ioCtx?.writeOut || ((chunk) => process.stdout.write(String(chunk ?? "")));
     const writeErr = ioCtx?.writeErr || ((chunk) => process.stderr.write(String(chunk ?? "")));
     const exit = ioCtx?.exit || ((code = 0) => process.exit(code));
     const outLine = (line = "") => writeOut(`${line}\n`);
     const errLine = (line = "") => writeErr(`${line}\n`);
-    return { isCaptured, cwd, sessionId, writeOut, writeErr, exit, outLine, errLine };
+    return { isCaptured, cwd, sessionId, antigravityPipeCap, writeOut, writeErr, exit, outLine, errLine };
 }
 
 class ExternalCliExitSignal extends Error {
@@ -171,17 +227,20 @@ class ExternalCliExitSignal extends Error {
     }
 }
 
-/**
- * Adapter for CLI modules invoked inside captured daemon/batch `ioCtx`.
- * Never mutates `process.chdir` or env.
- */
-async function withCapturedExternalCli(io, fn) {
-    if (!io.isCaptured)
-        return fn();
+const capturedIoStorage = new AsyncLocalStorage();
+let capturedStdioBridgeInstalled = false;
+
+function installCapturedStdioBridge() {
+    if (capturedStdioBridgeInstalled)
+        return;
+    capturedStdioBridgeInstalled = true;
     const origOut = process.stdout.write.bind(process.stdout);
     const origErr = process.stderr.write.bind(process.stderr);
-    const origExit = process.exit;
+    const origExit = process.exit.bind(process);
     process.stdout.write = (chunk, enc, cb) => {
+        const io = capturedIoStorage.getStore();
+        if (!io)
+            return origOut(chunk, enc, cb);
         const text = Buffer.isBuffer(chunk) ? chunk.toString(typeof enc === "string" ? enc : "utf8") : String(chunk ?? "");
         io.writeOut(text);
         if (typeof enc === "function") enc();
@@ -189,6 +248,9 @@ async function withCapturedExternalCli(io, fn) {
         return true;
     };
     process.stderr.write = (chunk, enc, cb) => {
+        const io = capturedIoStorage.getStore();
+        if (!io)
+            return origErr(chunk, enc, cb);
         const text = Buffer.isBuffer(chunk) ? chunk.toString(typeof enc === "string" ? enc : "utf8") : String(chunk ?? "");
         io.writeErr(text);
         if (typeof enc === "function") enc();
@@ -196,10 +258,22 @@ async function withCapturedExternalCli(io, fn) {
         return true;
     };
     process.exit = (code = 0) => {
-        throw new ExternalCliExitSignal(Number(code) || 0);
+        if (capturedIoStorage.getStore())
+            throw new ExternalCliExitSignal(Number(code) || 0);
+        return origExit(code);
     };
+}
+
+/**
+ * Adapter for CLI modules invoked inside captured daemon/batch `ioCtx`.
+ * Isolates concurrent calls via AsyncLocalStorage without mutating `process.chdir` or env.
+ */
+async function withCapturedExternalCli(io, fn) {
+    if (!io.isCaptured)
+        return fn();
+    installCapturedStdioBridge();
     try {
-        return await fn();
+        return await capturedIoStorage.run(io, fn);
     }
     catch (err) {
         if (err instanceof ExternalCliExitSignal) {
@@ -207,11 +281,6 @@ async function withCapturedExternalCli(io, fn) {
             return undefined;
         }
         throw err;
-    }
-    finally {
-        process.stdout.write = origOut;
-        process.stderr.write = origErr;
-        process.exit = origExit;
     }
 }
 
@@ -269,7 +338,7 @@ function createCliContext(program, currentVersion, ioCtx = null) {
             return false;
         }
     };
-    const refreshBefore = async (dir, opts) => {
+    const refreshBefore = async (dir, opts, { bounded = false } = {}) => {
         if (opts.refresh === false) return;
         const globalDir = getGlobalDir();
         const root = resolve(io.cwd, dir);
@@ -278,9 +347,49 @@ function createCliContext(program, currentVersion, ioCtx = null) {
             import("../graph/refresh.js"),
         ]);
         const ws = readWorkspace(root, globalDir);
-        const r = ws
-            ? await ensureFreshChildren(root, ws.children, { contextDir: globalDir, disabled: false })
-            : await ensureFreshGraph(root, { contextDir: globalDir, disabled: false });
+        if (ws) {
+            const r = await ensureFreshChildren(root, ws.children, { contextDir: globalDir, disabled: false });
+            const note = refreshNote(r);
+            if (note) io.errLine(note);
+            return;
+        }
+        if (bounded) {
+            const outDir = contextDirFor(root, globalDir);
+            const [{ wiringPath }, { probeDrift, isClean, driftCount }, { triggerBackgroundSync }] = await Promise.all([
+                import("../context/node-file.js"),
+                import("../graph/fingerprint.js"),
+                import("../claude/hooks.js"),
+            ]);
+            if (existsSync(wiringPath(outDir))) {
+                const drift = probeDrift(root, outDir);
+                if (drift !== null && isClean(drift)) return;
+                if (drift === null || driftCount(drift) > 3) {
+                    if (!globalDir) triggerBackgroundSync(root);
+                    return;
+                }
+                let timedOut = false;
+                let timer = null;
+                const timeoutPromise = new Promise((resolveTimeout) => {
+                    timer = setTimeout(() => {
+                        timedOut = true;
+                        resolveTimeout({ timedOut: true });
+                    }, 400);
+                    if (typeof timer.unref === "function") timer.unref();
+                });
+                const refreshPromise = ensureFreshGraph(root, { contextDir: globalDir, disabled: false });
+                refreshPromise.catch(() => {});
+                const winner = await Promise.race([refreshPromise, timeoutPromise]);
+                if (timer) clearTimeout(timer);
+                if (winner?.timedOut || timedOut) {
+                    if (!globalDir) triggerBackgroundSync(root);
+                    return;
+                }
+                const note = refreshNote(winner);
+                if (note) io.errLine(note);
+                return;
+            }
+        }
+        const r = await ensureFreshGraph(root, { contextDir: globalDir, disabled: false });
         const note = refreshNote(r);
         if (note) io.errLine(note);
     };
@@ -517,7 +626,7 @@ async function renderLocalAskOutput(ctx, results, queries, opts, formatAsk) {
     }
     if (queries.length > 1 && !opts.full) {
         const rendered = renderResults.map((r) => formatAsk(r).trimEnd());
-        for (let i = renderResults.length - 1; i >= 1 && Buffer.byteLength(rendered.join("\n\n"), "utf8") > 9000; i--) {
+        for (let i = renderResults.length - 1; i >= 1 && Buffer.byteLength(rendered.join("\n\n"), "utf8") > 7800; i--) {
             for (const h of renderResults[i].hits ?? []) delete h.code;
             rendered[i] = formatAsk(renderResults[i]).trimEnd();
         }
@@ -531,7 +640,7 @@ async function executeAskAction(ctx, queriesArg, opts) {
     const { rawList, dirArg } = ctx.splitTrailingDir(queriesArg, { requirePlexerDir: false });
     const queries = splitAskQueries(rawList);
     const dir = ctx.queryRoot(dirArg);
-    await ctx.refreshBefore(dir, opts);
+    await ctx.refreshBefore(dir, opts, { bounded: true });
     const askGlobalDir = ctx.getGlobalDir();
     const limitOpt = opts.limit !== undefined ? Number(opts.limit) : undefined;
     if (limitOpt !== undefined && (!Number.isInteger(limitOpt) || limitOpt < 1)) {
@@ -552,17 +661,37 @@ async function executeAskAction(ctx, queriesArg, opts) {
 function formatBatchedSkeletons(rawResults, formatSkeleton) {
     const results = rawResults.flatMap((r) =>
         Array.isArray(r.files) && r.files.length > 1
-            ? r.files.map((f) => ({ file: f, entries: (r.entries ?? []).filter((e) => e.file === f) }))
-            : [r],
+            ? r.files.map((f) => ({ file: f, entries: (r.entries ?? []).filter((e) => e.file === f), isDirExpanded: true }))
+            : [{ ...r, isDirExpanded: false }],
     );
     let blocks = results.map((r) => formatSkeleton(r).trimEnd());
-    if (Buffer.byteLength(blocks.join("\n\n"), "utf8") <= 8900)
+    if (Buffer.byteLength(blocks.join("\n\n"), "utf8") <= 7800)
         return blocks.join("\n\n") + "\n";
     blocks = results.map((r) => formatSkeleton(r, { compact: true }).trimEnd());
-    if (Buffer.byteLength(blocks.join("\n\n"), "utf8") <= 8900)
+    if (Buffer.byteLength(blocks.join("\n\n"), "utf8") <= 7800)
         return blocks.join("\n\n") + "\n";
-    for (let i = results.length - 1; i >= 1 && Buffer.byteLength(blocks.join("\n\n"), "utf8") > 8900; i--) {
+    const downgradeIndices = [
+        ...results.map((r, i) => (r.isDirExpanded ? i : -1)).filter((i) => i >= 0).reverse(),
+        ...results.map((r, i) => (!r.isDirExpanded ? i : -1)).filter((i) => i >= 1).reverse(),
+    ];
+    for (const i of downgradeIndices) {
+        if (Buffer.byteLength(blocks.join("\n\n"), "utf8") <= 7800)
+            break;
         blocks[i] = formatSkeleton(results[i], { summaryOnly: true }).trimEnd();
+    }
+    if (Buffer.byteLength(blocks.join("\n\n"), "utf8") > 7800) {
+        let dropped = 0;
+        const dirIndices = results.map((r, i) => (r.isDirExpanded ? i : -1)).filter((i) => i >= 0).reverse();
+        for (const i of dirIndices) {
+            if (Buffer.byteLength(blocks.filter(Boolean).join("\n\n"), "utf8") <= 7600)
+                break;
+            blocks[i] = null;
+            dropped++;
+        }
+        const kept = blocks.filter(Boolean);
+        if (dropped > 0)
+            kept.push(`… (+${dropped} more files — narrow directory or run \`plexer skeleton <file>\`)`);
+        return `${kept.join("\n\n")}\n`;
     }
     return blocks.join("\n\n") + "\n";
 }
@@ -571,7 +700,7 @@ async function executeSkeletonAction(ctx, filesArg, opts) {
     const { rawList, dirArg } = ctx.splitTrailingDir(filesArg);
     const files = rawList.flatMap((f) => String(f).split(",").map((x) => x.trim()).filter(Boolean));
     const dir = ctx.queryRoot(dirArg);
-    await ctx.refreshBefore(dir, opts);
+    await ctx.refreshBefore(dir, opts, { bounded: true });
     const [{ skeleton, formatSkeleton }, { federateSkeleton, readWorkspace }] = await Promise.all([
         import("../ask/ask.js"),
         import("../graph/workspace.js"),
@@ -599,35 +728,68 @@ async function executeSkeletonAction(ctx, filesArg, opts) {
 async function executeReadAction(ctx, spansArg, opts) {
     const { rawList, dirArg } = ctx.splitTrailingDir(spansArg);
     const dir = ctx.queryRoot(dirArg);
-    await ctx.refreshBefore(dir, opts);
-    const [{ readSpans, formatReadSpans }, { federateRead, readWorkspace }] = await Promise.all([
+    const globalDir = ctx.getGlobalDir();
+    const [{ canFastSliceExplicitSpans, readSpans, formatReadSpans }, { federateRead, readWorkspace }] = await Promise.all([
         import("../ask/ask.js"),
         import("../graph/workspace.js"),
     ]);
-    const globalDir = ctx.getGlobalDir();
+    const isWs = Boolean(readWorkspace(dir, globalDir));
+    if (isWs || !canFastSliceExplicitSpans(dir, rawList)) {
+        await ctx.refreshBefore(dir, opts, { bounded: true });
+    }
     const full = Boolean(opts.full);
-    const r = readWorkspace(dir, globalDir)
-        ? federateRead(dir, globalDir, rawList, { full })
-        : readSpans(dir, rawList, { contextDir: globalDir, full });
+    const agyPipeCap = Boolean(ctx.io.antigravityPipeCap);
     const sessionId = ctx.getSessionId();
+    let agyState = null;
+    if (!full && sessionId) {
+        const { readAgySession } = await import("../agy/session.js");
+        agyState = readAgySession(sessionId);
+    }
+    const r = isWs
+        ? federateRead(dir, globalDir, rawList, { full, seenSpans: agyState?.seenSpans, antigravityPipeCap: agyPipeCap })
+        : readSpans(dir, rawList, { contextDir: globalDir, full, seenSpans: agyState?.seenSpans, antigravityPipeCap: agyPipeCap });
+    const rendered = opts.json ? "" : formatReadSpans(r);
     if (sessionId && Array.isArray(r?.blocks)) {
         const [{ readAgySession, writeAgySession }, { mergeSpan }] = await Promise.all([
             import("../agy/session.js"),
             import("../agy/spans.js"),
         ]);
-        const agyState = readAgySession(sessionId);
-        if (!agyState.seenSpans || typeof agyState.seenSpans !== "object")
-            agyState.seenSpans = {};
-        for (const blk of r.blocks) {
-            if (!blk?.error && blk.file && blk.startLine && blk.endLine)
-                mergeSpan(agyState.seenSpans, blk.file, blk.startLine, blk.endLine);
+        const targetState = agyState ?? readAgySession(sessionId);
+        if (!targetState.seenSpans || typeof targetState.seenSpans !== "object")
+            targetState.seenSpans = {};
+        const overAgyPipe = (agyPipeCap || process.env.ANTIGRAVITY_AGENT === "1") && rendered && Buffer.byteLength(rendered, "utf8") > 9500;
+        let touched = false;
+        if (!overAgyPipe) {
+            for (const blk of r.blocks) {
+                if (!blk?.error && !blk.alreadySeen && blk.file && blk.startLine && blk.endLine) {
+                    mergeSpan(targetState.seenSpans, blk.file, blk.startLine, blk.endLine);
+                    touched = true;
+                }
+            }
+        } else {
+            const first = r.blocks.find((b) => b && !b.error && !b.alreadySeen && b.file && b.code);
+            if (first) {
+                let bytes = Buffer.byteLength(`${first.file}:${first.span} (of ${first.totalLines} lines)\n\`\`\`\n`, "utf8");
+                let safeEnd = first.startLine - 1;
+                for (const ln of String(first.code).split("\n")) {
+                    const lb = Buffer.byteLength(ln, "utf8") + 1;
+                    if (bytes + lb > 4200) break;
+                    const m = /^L(\d+):/.exec(ln);
+                    if (m) safeEnd = Number(m[1]);
+                    bytes += lb;
+                }
+                if (safeEnd >= first.startLine) {
+                    mergeSpan(targetState.seenSpans, first.file, first.startLine, safeEnd);
+                    touched = true;
+                }
+            }
         }
-        writeAgySession(sessionId, agyState);
+        if (touched) writeAgySession(sessionId, targetState);
     }
     if (opts.json) {
         ctx.outLine(JSON.stringify(r, null, 2));
     } else {
-        ctx.writeOut(formatReadSpans(r));
+        ctx.writeOut(rendered);
     }
     if (r.blocks.every((b) => b.error)) ctx.exit(1);
 }
@@ -649,6 +811,7 @@ async function runBatchSubcommandCaptured(ctx, subArgv) {
             isCaptured: true,
             cwd: ctx.cwd,
             sessionId: ctx.getSessionId(),
+            antigravityPipeCap: ctx.io.antigravityPipeCap,
             writeOut: (chunk, enc) => {
                 stdout += Buffer.isBuffer(chunk) ? chunk.toString(typeof enc === "string" ? enc : "utf8") : String(chunk ?? "");
             },
@@ -721,7 +884,7 @@ function registerQueryCommands(program, ctx) {
         .option("--source", "inline the source at each file:line hit (default: true)")
         .option("--no-source", "return file:line pointers only without inlined source")
         .option("--full", "inline whole definition spans instead of compact crux excerpts")
-        .option("--in <path>", "narrow to nodes under this path prefix, filtered before scoring")
+        .option("--in <path>", "narrow to nodes under this path prefix — repeatable", collectRepeatableIn)
         .option("--json", "output the result as JSON")
         .option("--no-graph-rank", "rank by lexical relevance only, without the graph-connectivity re-rank")
         .option(...NO_REFRESH_FLAG)
@@ -757,7 +920,7 @@ async function runCallersAction(ctx, symbolsArg, opts, forcedDirection) {
     const symbols = rawList.flatMap((s) => String(s).split(",").map((x) => x.trim()).filter(Boolean));
     const symbolOrList = symbols.length === 1 ? symbols[0] : symbols;
     const dir = ctx.queryRoot(dirArg);
-    await ctx.refreshBefore(dir, opts);
+    await ctx.refreshBefore(dir, opts, { bounded: true });
     const globalDir = ctx.getGlobalDir();
     const [{ runCallersCommand, resolveDirection, resolveCliDepth }, { readWorkspace }] = await Promise.all([
         import("../graph/traverse-cli.js"),
@@ -815,7 +978,7 @@ function registerCallersAndBlastCommands(program, ctx) {
         .option("--source", "inline definition and call-site source excerpts for the target and top callers (default: true)")
         .option("--no-source", "return symbol headers and 1-line call quotes only without full source blocks")
         .option("--full", "inline extended source excerpts")
-        .option("--in <path>", "narrow matches to nodes at or under this path prefix")
+        .option("--in <path>", "narrow matches to nodes at or under this path prefix — repeatable", collectRepeatableIn)
         .option("--json", "output as JSON")
         .option(...NO_REFRESH_FLAG)
         .action((symbols, opts) => runCallersAction(ctx, symbols, opts));
@@ -833,7 +996,7 @@ function registerCallersAndBlastCommands(program, ctx) {
         cmd.option("--source", "inline definition and call-site source excerpts (default: true)")
             .option("--no-source", "return symbol headers and 1-line call quotes only")
             .option("--full", "inline extended source excerpts")
-            .option("--in <path>", "narrow matches to nodes at or under this path prefix")
+            .option("--in <path>", "narrow matches to nodes at or under this path prefix — repeatable", collectRepeatableIn)
             .option("--json", "output as JSON")
             .option(...NO_REFRESH_FLAG)
             .action((symbols, opts) => runCallersAction(ctx, symbols, opts, direction));
@@ -861,12 +1024,54 @@ function registerCallersAndBlastCommands(program, ctx) {
         .action((firstArg, secondArg, opts) => executeBlastAction(ctx, firstArg, secondArg, opts));
 }
 
+function resolveGrepArgsAndDir(ctx, patternsArg) {
+    const globalDir = ctx.getGlobalDir();
+    let cwdRoot = null;
+    try {
+        const nearest = nearestPlexerRoot(ctx.cwd, globalDir);
+        if (nearest?.root && (hasPlexerIndex(nearest.root) || existsSync(contextDirFor(nearest.root, globalDir)))) {
+            cwdRoot = nearest.root;
+        }
+    } catch { cwdRoot = null; }
+    if (cwdRoot && Array.isArray(patternsArg) && patternsArg.length >= 2) {
+        const tail = patternsArg[patternsArg.length - 1];
+        try {
+            const absTail = resolve(ctx.cwd, tail);
+            const relToCwd = relative(cwdRoot, absTail).replace(/\\/g, "/");
+            const hasOwnIndex = existsSync(join(absTail, "plexer")) || existsSync(join(absTail, ".git"));
+            if (relToCwd && !relToCwd.startsWith("..") && !isAbsolute(relToCwd) && !hasOwnIndex) {
+                return { rawList: [...patternsArg], dirArg: undefined };
+            }
+        } catch { /* fall back to splitTrailingDir */ }
+    }
+    return ctx.splitTrailingDir(patternsArg);
+}
+
 async function executeGrepAction(ctx, patternsArg, opts) {
-    const { rawList, dirArg } = ctx.splitTrailingDir(patternsArg);
+    const { rawList, dirArg } = resolveGrepArgsAndDir(ctx, patternsArg);
     const patterns = rawList.map((p) => String(p)).filter(Boolean);
-    const patternOrList = patterns.length === 1 ? patterns[0] : patterns;
     const dir = ctx.queryRoot(dirArg);
-    await ctx.refreshBefore(dir, opts);
+    const peeledScopes = [];
+    const absDir = resolve(dir);
+    while (patterns.length >= 2) {
+        const tail = patterns[patterns.length - 1];
+        if (/[*?^${}()|[\]\\]/.test(tail)) break;
+        const absTail = resolve(absDir, tail);
+        const relCheck = relative(absDir, absTail).replace(/\\/g, "/");
+        if (!relCheck || relCheck.startsWith("..") || relCheck.startsWith("/") || !existsSync(absTail)) break;
+        let isDir = false;
+        try { isDir = statSync(absTail).isDirectory(); } catch { isDir = false; }
+        if (!isDir && !/[\\/]/.test(tail) && !/\.[a-z0-9]{1,8}$/i.test(tail)) break;
+        patterns.pop();
+        peeledScopes.unshift(relCheck);
+    }
+    const optScopes = Array.isArray(opts.in)
+        ? opts.in.map((s) => String(s).trim()).filter(Boolean)
+        : (opts.in ? String(opts.in).split(",").map((s) => s.trim()).filter(Boolean) : []);
+    const combinedScopes = [...new Set([...optScopes, ...peeledScopes])];
+    const inScope = combinedScopes.length === 0 ? undefined : (combinedScopes.length === 1 ? combinedScopes[0] : combinedScopes);
+    const patternOrList = patterns.length === 1 ? patterns[0] : patterns;
+    await ctx.refreshBefore(dir, opts, { bounded: true });
     const globalDir = ctx.getGlobalDir();
     let parsedContext;
     if (opts.context !== undefined) {
@@ -876,6 +1081,7 @@ async function executeGrepAction(ctx, patternsArg, opts) {
             ctx.exit(1);
         }
     }
+    const explicitContext = parsedContext !== undefined || Boolean(opts.full);
     const contextLines = parsedContext !== undefined ? parsedContext : opts.source === false ? 0 : opts.full ? 4 : undefined;
     const sourceEnabled = opts.source !== false && (contextLines === undefined || contextLines > 0);
     const { readWorkspace } = await import("../graph/workspace.js");
@@ -885,7 +1091,7 @@ async function executeGrepAction(ctx, patternsArg, opts) {
             await ctx.runExternal(() => {
                 for (const pat of patterns) {
                     runWorkspaceGrep(dir, globalDir, pat, {
-                        ignoreCase: opts.ignoreCase, fixed: opts.fixed, context: contextLines, source: sourceEnabled, in: opts.in, json: opts.json,
+                        ignoreCase: opts.ignoreCase, fixed: opts.fixed, context: contextLines, source: sourceEnabled, explicitContext, in: inScope, json: opts.json,
                     });
                 }
             });
@@ -897,7 +1103,7 @@ async function executeGrepAction(ctx, patternsArg, opts) {
     }
     const { runGrepCommand } = await import("../search/grep-cli.js");
     await ctx.runExternal(() => runGrepCommand(patternOrList, dir, {
-        ignoreCase: opts.ignoreCase, fixed: opts.fixed, context: contextLines, source: sourceEnabled, in: opts.in, json: opts.json, globalDir,
+        ignoreCase: opts.ignoreCase, fixed: opts.fixed, context: contextLines, source: sourceEnabled, explicitContext, in: inScope, json: opts.json, globalDir,
     }));
 }
 
@@ -915,7 +1121,7 @@ async function executeMapAction(ctx, dirArg, opts) {
         }
         maxDirsW = n;
     }
-    await ctx.refreshBefore(dir, opts);
+    await ctx.refreshBefore(dir, opts, { bounded: true });
     const { readWorkspace } = await import("../graph/workspace.js");
     if (readWorkspace(root, globalDir)) {
         const [{ runWorkspaceMap }, histMod] = await Promise.all([
@@ -963,7 +1169,7 @@ function registerSearchAndMapCommands(program, ctx) {
         .option("--source", "show surrounding source context around each hit (default: true)")
         .option("--no-source", "show 1-line matches only without surrounding context")
         .option("--full", "show extended surrounding source context around each hit")
-        .option("--in <path>", "narrow to files at or under this path prefix")
+        .option("--in <path>", "narrow to files at or under this path prefix — repeatable", collectRepeatableIn)
         .option("--json", "output as JSON")
         .option(...NO_REFRESH_FLAG)
         .action((patternsArg, opts) => executeGrepAction(ctx, patternsArg, opts));
@@ -1301,5 +1507,5 @@ export async function runCli(argv = process.argv, ioCtx = null) {
     registerVizAndMcpCommands(program, ctx);
     registerHealthCommand(program, ctx);
     registerHostLifecycleCommands(program, ctx);
-    await program.parseAsync(argv);
+    await program.parseAsync(normalizeLeadingDashPositionalArgs(argv));
 }

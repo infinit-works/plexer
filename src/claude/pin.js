@@ -15,6 +15,7 @@
 import { readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { isGeneratedPath, isTestPath } from '../util/paths.js';
+import { GENERIC_MEMBER_NAMES } from '../util/id.js';
 import { spanRange } from '../util/span.js';
 
 const DEF_KINDS = new Set(['function', 'method', 'class', 'type', 'interface', 'struct', 'enum', 'trait', 'impl', 'variable', 'const', 'constant', 'field', 'doc']);
@@ -167,6 +168,7 @@ function disambiguateOverloadedDefs(graph, defs, fileNamedInPrompt, topHints, hi
     if (defs.length <= 2) {
         return compound ? defs.filter((n) => hints.has(n.path)) : [];
     }
+    if (!compound) return [];
     const dominant = selectDominantOverloadedHub(graph, defs, hints);
     if (dominant.length > 0) return dominant;
     const hinted = compound ? defs.filter((n) => hints.has(n.path)) : [];
@@ -182,7 +184,10 @@ function filterDefsByQualifier(defs, id) {
     const qualDefs = ownerDefs.length > 0
         ? ownerDefs
         : defs.filter((n) => basename(n.path).replace(/\.[a-z0-9]+$/i, '').toLowerCase() === qLower);
-    return qualDefs.length > 0 ? qualDefs : defs;
+    return {
+        defs: qualDefs.length > 0 ? qualDefs : defs,
+        matched: qualDefs.length > 0,
+    };
 }
 
 function narrowPinDefsForId(id, byBare, graph, fileNamedInPrompt, topHints, hints, hasHintFiles) {
@@ -193,10 +198,14 @@ function narrowPinDefsForId(id, byBare, graph, fileNamedInPrompt, topHints, hint
     }
     if (id.owner) defs = defs.filter((n) => n.owner === id.owner);
     if (!defs.length) return [];
-    const compound = isCompoundId(id.name) || Boolean(id.owner || id.qual);
-    if (defs.length > 1 && id.qual) {
-        defs = filterDefsByQualifier(defs, id);
+    let qualMatched = false;
+    if (id.qual) {
+        const qRes = filterDefsByQualifier(defs, id);
+        qualMatched = qRes.matched;
+        if (defs.length > 1 && !qualMatched && (!isCompoundId(id.name) || GENERIC_MEMBER_NAMES.has(id.name.toLowerCase()))) return [];
+        if (defs.length > 1) defs = qRes.defs;
     }
+    const compound = isCompoundId(id.name) || Boolean(id.owner || qualMatched || defs.length === 1 && id.qual);
     if (defs.length > 1) {
         defs = disambiguateOverloadedDefs(graph, defs, fileNamedInPrompt, topHints, hints, compound);
         return defs.length > 0 && defs.length <= 2 ? defs : [];
@@ -258,13 +267,20 @@ export function resolveNamedDefinitions(graph, prompt, { maxPins = 3, hintFiles 
     return orderResolvedPins(pruneOverlappingPinContainers(out, hints), maxPins);
 }
 
-function appendCrossFileCallersForPin(root, pinNode, crossFileCallers, fileCache, seenDelegators, pinnedFileSet, code, used, budgetBytes) {
-    if (crossFileCallers.length < 1 || crossFileCallers.length > 3 || !pinNode.name || pinNode.name.length < 3) {
+function appendCrossFileCallersForPin(root, pinNode, crossFileCallers, fileCache, seenDelegators, pinnedFileSet, code, used, budgetBytes, geminiProfile = false) {
+    if (crossFileCallers.length < 1 || (!geminiProfile && crossFileCallers.length > 3) || !pinNode.name || pinNode.name.length < 3) {
         return { code, used };
     }
+    if (geminiProfile && crossFileCallers.length > 3 && GENERIC_MEMBER_NAMES.has(pinNode.name.toLowerCase())) {
+        return { code, used };
+    }
+    const MAX_CALLER_INLINE_BYTES = geminiProfile ? 1100 : Infinity;
+    let addedCallerBytes = 0;
+    let addedCallers = 0;
     const escaped = pinNode.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const callRe = new RegExp(`\\b${escaped}\\b`);
     for (const sn of crossFileCallers) {
+        if (geminiProfile && addedCallers >= 3) break;
         if (pinnedFileSet?.has(sn.path) || seenDelegators.has(sn.path)) continue;
         const dsp = spanRange(sn.span);
         if (!dsp) continue;
@@ -287,10 +303,12 @@ function appendCrossFileCallersForPin(root, pinNode, crossFileCallers, fileCache
             const cBody = dLines.slice(cStart - 1, cEnd).map((l, i) => `L${cStart + i}: ${l}`).join('\n');
             const cBlock = `\n\n// caller in ${sn.path}:L${cStart}-L${cEnd}\n${cBody}`;
             const cBytes = Buffer.byteLength(cBlock, 'utf8');
-            if (used + cBytes <= budgetBytes) {
+            if (used + cBytes <= budgetBytes && addedCallerBytes + cBytes <= MAX_CALLER_INLINE_BYTES) {
                 seenDelegators.add(sn.path);
                 code += cBlock;
                 used += cBytes;
+                addedCallerBytes += cBytes;
+                addedCallers++;
             }
         } catch {
             // ignore
@@ -380,15 +398,62 @@ function collectIncomingPinRelations(root, pinNode, inList, byId, fileCache, see
     return { crossFileCallers, code, used };
 }
 
-function collectPinRelationsAndDelegators(root, pinNode, graph, byId, fileCache, seenDelegators, pinnedFileSet, code, used, budgetBytes) {
+function appendCompactCalleesForPin(root, pinNode, pBounds, outList, byId, fileCache, pinnedFileSet, seenDelegators, code, used, budgetBytes) {
+    const MAX_CALLEE_INLINE_BYTES = 1100;
+    let addedBytes = 0;
+    let addedCount = 0;
+    const seenIds = new Set();
+    for (const e of outList) {
+        if (addedCount >= 2 || addedBytes >= MAX_CALLEE_INLINE_BYTES) break;
+        if (e.relation !== 'calls' && e.relation !== 'interface_dispatch') continue;
+        const tn = byId.get(e.target);
+        if (!tn?.path || !tn?.span || tn.kind === 'file' || seenIds.has(tn.id) || isTestPath(tn.path)) continue;
+        seenIds.add(tn.id);
+        const sp = spanRange(tn.span);
+        if (!sp) continue;
+        const spanLines = sp.end - sp.start + 1;
+        const isSameFile = tn.path === pinNode.path;
+        if (isSameFile) {
+            if (sp.start <= pBounds.b && pBounds.a <= sp.end) continue;
+            if (spanLines > 35 || code.includes(`L${sp.start}:`)) continue;
+        } else {
+            if (pinnedFileSet?.has(tn.path) || seenDelegators.has(tn.path)) continue;
+            if (spanLines > 36 || code.includes(`// cross-file callee:`) && code.includes(`(${tn.path}:L${sp.start}`)) continue;
+        }
+        try {
+            const cLines = readCachedPinFileLines(root, tn.path, fileCache);
+            const cEnd = Math.min(cLines.length, sp.end);
+            if (sp.start > cEnd) continue;
+            const label = isSameFile ? 'same-file helper' : 'cross-file callee';
+            const body = cLines.slice(sp.start - 1, cEnd).map((l, i) => `L${sp.start + i}: ${l}`).join('\n');
+            const cBlock = `\n\n// ${label}: ${tn.name} (${tn.path}:L${sp.start}-L${cEnd})\n${body}`;
+            const bLen = Buffer.byteLength(cBlock, 'utf8');
+            if (addedBytes + bLen <= MAX_CALLEE_INLINE_BYTES && used + bLen <= budgetBytes) {
+                code += cBlock;
+                used += bLen;
+                addedBytes += bLen;
+                addedCount++;
+                if (!isSameFile) seenDelegators.add(tn.path);
+            }
+        } catch {
+            // ignore unreadable callee
+        }
+    }
+    return { code, used };
+}
+
+function collectPinRelationsAndDelegators(root, pinNode, pBounds, graph, byId, fileCache, seenDelegators, pinnedFileSet, code, used, budgetBytes, geminiProfile = false) {
     const related = [];
     const seenRel = new Set();
     const outList = graph?._outEdges ? (graph._outEdges.get(pinNode.id) ?? []) : (graph?.edges ?? []).filter((e) => e.source === pinNode.id);
     const inList = graph?._inEdges ? (graph._inEdges.get(pinNode.id) ?? []) : (graph?.edges ?? []).filter((e) => e.target === pinNode.id);
     collectOutgoingPinRelations(outList, byId, related, seenRel);
     const inRes = collectIncomingPinRelations(root, pinNode, inList, byId, fileCache, seenDelegators, related, seenRel, code, used, budgetBytes);
-    const callerRes = appendCrossFileCallersForPin(root, pinNode, inRes.crossFileCallers, fileCache, seenDelegators, pinnedFileSet, inRes.code, inRes.used, budgetBytes);
-    return { related, code: callerRes.code, used: callerRes.used };
+    const callerRes = appendCrossFileCallersForPin(root, pinNode, inRes.crossFileCallers, fileCache, seenDelegators, pinnedFileSet, inRes.code, inRes.used, budgetBytes, geminiProfile);
+    const calleeRes = geminiProfile
+        ? appendCompactCalleesForPin(root, pinNode, pBounds, outList, byId, fileCache, pinnedFileSet, seenDelegators, callerRes.code, callerRes.used, budgetBytes)
+        : callerRes;
+    return { related, code: calleeRes.code, used: calleeRes.used };
 }
 
 function findConstructorSiteBounds(lines, idx) {
@@ -510,7 +575,7 @@ function buildPinnedBodyLines(p, lines, graph, promptIds, start, end, maxLinesPe
  * Turn pinned definitions into hook hits with inlined `L<n>:` bodies, within `budgetBytes`.
  * Long bodies are cut at `MAX_PIN_LINES` with an explicit continuation pointer.
  */
-export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 3, hintFiles = [] } = {}) {
+export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 3, hintFiles = [], geminiProfile = false } = {}) {
     const pins = resolveNamedDefinitions(graph, prompt, { maxPins, hintFiles });
     const upperConstants = [...String(prompt ?? '').matchAll(/\b[A-Z][A-Z0-9_]{2,}\b/g)].map((m) => m[0]);
     const promptIds = [...new Set([...namedIdentifiers(prompt).map((x) => x.name).filter((n) => n.length >= 4), ...upperConstants])];
@@ -568,7 +633,7 @@ export function pinnedHits(root, graph, prompt, { budgetBytes = 4000, maxPins = 
             bytes = Buffer.byteLength(code, 'utf8');
         }
         used += bytes;
-        const relRes = collectPinRelationsAndDelegators(root, p.node, graph, byId, fileCache, seenDelegators, pinnedFileSet, code, used, budgetBytes);
+        const relRes = collectPinRelationsAndDelegators(root, p.node, p, graph, byId, fileCache, seenDelegators, pinnedFileSet, code, used, budgetBytes, geminiProfile);
         code = relRes.code;
         used = relRes.used;
         const litRes = appendPinStructLiteralSites(p, lines, code, used, budgetBytes);

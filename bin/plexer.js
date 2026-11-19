@@ -101,7 +101,19 @@ else {
                 import("../src/util/cli-meta.js"),
             ]);
             const sockPath = resolveDaemonSocketPath();
-            if (process.platform === "win32" || sockPath.startsWith("\\\\.\\pipe\\") || existsSync(sockPath)) {
+            const isPipe = process.platform === "win32" || sockPath.startsWith("\\\\.\\pipe\\");
+            if (!isPipe && !existsSync(sockPath)) {
+                try {
+                    const cliPath = fileURLToPath(import.meta.url);
+                    const child = spawn(process.execPath, [cliPath, "_daemon"], {
+                        detached: true,
+                        stdio: "ignore",
+                        env: { ...process.env, PLEXER_DAEMON_SOCK: sockPath },
+                    });
+                    child.unref();
+                } catch { /* fall back to local CLI */ }
+            }
+            if (isPipe || existsSync(sockPath)) {
                 const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
                 const version = readCurrentVersion(import.meta.url);
                 const codeStamp = computeCodeStamp(pkgRoot);

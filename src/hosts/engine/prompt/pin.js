@@ -1,7 +1,10 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { loadGraphCached } from '../../../context/graph-store.js';
+import { tokenize } from '../../../ask/index-file.js';
 import { nearestPlexerRoot } from '../../../graph/root.js';
 import { contextDirFor } from '../../../util/paths.js';
-import { HOOK_BUDGETS } from './budget.js';
+import { countHitSubsystemDirs, resolveHookBudgets } from './budget.js';
 import { detectPromptIntent } from './intent.js';
 import { computeCoEditPointers, searchPromptContext } from './search.js';
 
@@ -82,7 +85,8 @@ function trimOneOverflowHit(h, mp, totalCodeBytes, maxTotalBytes) {
     return 0;
 }
 
-export function trimRestHitCodeToBudget(rest, pins, rawPins, { pointerCovers, pointersOverlap }) {
+export function trimRestHitCodeToBudget(rest, pins, rawPins, { pointerCovers, pointersOverlap }, opts = {}) {
+    const budgets = resolveHookBudgets(opts);
     for (const h of rest) {
         if (h.pinned || !h.code) continue;
         const coveredPinBytes = pins.filter((p) => pointerCovers(h.pointer, p.pointer))
@@ -92,8 +96,8 @@ export function trimRestHitCodeToBudget(rest, pins, rawPins, { pointerCovers, po
     const pinnedRestCount = rest.filter((h) => h.pinned).length;
     let totalCodeBytes = pins.reduce((a, p) => a + Buffer.byteLength(p.code ?? '', 'utf8'), 0)
         + rest.filter((h) => h.pinned && h.code).reduce((a, h) => a + Buffer.byteLength(h.code, 'utf8'), 0);
-    const maxTotalBytes = HOOK_BUDGETS.editTotalBytes ?? 4600;
-    const maxRestInlined = (pins.length + pinnedRestCount) >= 2 ? 2 : 3;
+    const maxTotalBytes = opts?.maxTotalBytesOverride ?? budgets.editTotalBytes ?? 4600;
+    const maxRestInlined = opts?.geminiProfile ? 3 : ((pins.length + pinnedRestCount) >= 2 ? 2 : 3);
     let restInlined = 0;
     const matchPin = (h) => h.code ? rawPins.find((p) => p.a && p.b && (h.pointer ?? '').split(':')[0] === (p.pointer ?? '').split(':')[0] && h.code.includes(`L${p.a}:`) && h.code.includes(`L${p.b}:`)) : null;
     for (const pass of [true, false]) {
@@ -109,27 +113,143 @@ export function trimRestHitCodeToBudget(rest, pins, rawPins, { pointerCovers, po
     }
 }
 
-export function finalizePinnedPromptContext(dir, prompt, opts, pinApi) {
+function extractQueryWindowSnippet(lines, file, a, end, qTokens, maxBytes = 1050) {
+    if (end - a + 1 <= 20) {
+        const out = [];
+        for (let ln = a; ln <= end; ln++) out.push(`L${ln}: ${lines[ln - 1]}`);
+        const full = out.join('\n');
+        if (Buffer.byteLength(full, 'utf8') <= maxBytes) return full;
+    }
+    let bestLine = a;
+    let bestScore = -1;
+    for (let ln = a; ln <= end; ln++) {
+        const lower = lines[ln - 1].toLowerCase();
+        let sc = 0;
+        for (const t of qTokens) if (lower.includes(t)) sc += 1;
+        if (sc > bestScore) {
+            bestScore = sc;
+            bestLine = ln;
+        }
+    }
+    const wStart = bestScore > 0 ? Math.max(a, bestLine - 4) : a;
+    let wEnd = Math.min(end, wStart + 14);
+    const build = (stopLn) => {
+        const out = [];
+        if (wStart > a + 1) {
+            out.push(`L${a}: ${lines[a - 1]}`);
+            out.push(`  … (${wStart - a - 1} lines omitted)`);
+        }
+        for (let ln = wStart > a + 1 ? wStart : a; ln <= stopLn; ln++) {
+            out.push(`L${ln}: ${lines[ln - 1]}`);
+        }
+        if (stopLn < end) out.push(`… (+${end - stopLn} more lines; read ${file}:L${stopLn + 1}-L${end})`);
+        return out.join('\n');
+    };
+    let rendered = build(wEnd);
+    while (wEnd > Math.max(wStart, bestLine) && Buffer.byteLength(rendered, 'utf8') > maxBytes) {
+        wEnd -= 2;
+        rendered = build(Math.max(wStart, bestLine, wEnd));
+    }
+    return rendered;
+}
+
+function loadCachedFileLines(root, file, fileLinesCache) {
+    let lines = fileLinesCache.get(file);
+    if (lines === undefined) {
+        const abs = join(root, file);
+        if (!existsSync(abs)) { fileLinesCache.set(file, null); return null; }
+        try {
+            lines = readFileSync(abs, 'utf8').split(/\r?\n/);
+            fileLinesCache.set(file, lines);
+        } catch {
+            fileLinesCache.set(file, null);
+            return null;
+        }
+    }
+    return lines;
+}
+
+export function backfillCompactPointerHits(root, hits, maxTotalBytes, pointerCovers, promptQuery = '') {
+    if (!root || !Array.isArray(hits) || hits.length === 0) return;
+    let totalBytes = hits.reduce((a, h) => a + (h?.code ? Buffer.byteLength(h.code, 'utf8') : 0), 0);
+    if (totalBytes >= maxTotalBytes) return;
+    const fileLinesCache = new Map();
+    const candidates = [];
+    for (const h of hits) {
+        if (!h || h.code || !h.pointer) continue;
+        const m = /^([^:,]+):L(\d+)(?:-L(\d+))?/.exec(String(h.pointer).split(',')[0].trim());
+        if (!m) continue;
+        const file = m[1];
+        const a = Number(m[2]);
+        const b = m[3] ? Number(m[3]) : a;
+        if (!Number.isFinite(a) || !Number.isFinite(b) || b < a || (b - a + 1) > 140) continue;
+        const normPtr = `${file}:L${a}-L${b}`;
+        const alreadyCovered = hits.some((other) => other?.code
+            && (pointerCovers(other.pointer, normPtr)
+                || ((other.pointer ?? '').split(':')[0] === file && other.code.includes(`L${a}:`) && other.code.includes(`L${b}:`))));
+        if (alreadyCovered) continue;
+        candidates.push({ h, file, a, b, spanLen: b - a + 1 });
+    }
+    for (const c of candidates) {
+        if (c.spanLen > 28) continue;
+        const lines = loadCachedFileLines(root, c.file, fileLinesCache);
+        if (!lines) continue;
+        const end = Math.min(lines.length, c.b);
+        if (c.a < 1 || c.a > end) continue;
+        const snippet = [];
+        for (let ln = c.a; ln <= end; ln++) snippet.push(`L${ln}: ${lines[ln - 1]}`);
+        const block = snippet.join('\n');
+        const bytes = Buffer.byteLength(block, 'utf8');
+        if (bytes > 1100 || totalBytes + bytes > maxTotalBytes) continue;
+        c.h.code = block;
+        totalBytes += bytes;
+    }
+    if (maxTotalBytes - totalBytes < 350) return;
+    const qTokens = [...new Set(tokenize(promptQuery).filter((t) => t.length >= 3))];
+    for (const c of candidates) {
+        if (c.h.code || c.spanLen <= 28) continue;
+        if (maxTotalBytes - totalBytes < 350) break;
+        const lines = loadCachedFileLines(root, c.file, fileLinesCache);
+        if (!lines) continue;
+        const end = Math.min(lines.length, c.b);
+        if (c.a < 1 || c.a > end) continue;
+        const block = extractQueryWindowSnippet(lines, c.file, c.a, end, qTokens, 1050);
+        const bytes = Buffer.byteLength(block, 'utf8');
+        if (bytes > 1050 || totalBytes + bytes > maxTotalBytes) continue;
+        c.h.code = block;
+        totalBytes += bytes;
+    }
+}
+
+export function finalizePinnedPromptContext(dir, prompt, opts = {}, pinApi) {
+    opts = opts ?? {};
     const { pinnedHits, pointerCovers, pointersOverlap } = pinApi;
+    const geminiProfile = Boolean(opts?.geminiProfile);
+    const budgets = resolveHookBudgets(opts);
     const res = searchPromptContext(dir, prompt, opts);
     const isEdit = !opts.forceReadOnly && (res?.isEditPrompt ?? detectPromptIntent(prompt, opts).editEnvelope);
-    let pins = [], rawPins = [], graph = null, ctxDir = null;
+    let pins = [], rawPins = [], graph = null, ctxDir = null, root = dir;
     try {
-        const root = nearestPlexerRoot(dir)?.root ?? dir;
+        root = nearestPlexerRoot(dir)?.root ?? dir;
         ctxDir = contextDirFor(root);
         graph = loadGraphCached(ctxDir);
         const rankedHits = res?.hits ?? [];
         const hintFiles = res?.allFiles ?? [...new Set(rankedHits.map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean))];
-        rawPins = (isEdit && HOOK_BUDGETS.pinMax > 0)
-            ? pinnedHits(root, graph, prompt, { budgetBytes: HOOK_BUDGETS.pinBytes, maxPins: HOOK_BUDGETS.pinMax, hintFiles })
-            : [];
+        if (isEdit && budgets.pinMax > 0) {
+            rawPins = pinnedHits(root, graph, prompt, { budgetBytes: budgets.pinBytes, maxPins: budgets.pinMax, hintFiles, geminiProfile });
+        } else if (geminiProfile && !isEdit && !opts.forceReadOnly && budgets.pinMax > 0) {
+            const qaCandidates = pinnedHits(root, graph, prompt, { budgetBytes: Math.min(4800, budgets.qaMergedBytes), maxPins: budgets.pinMax, hintFiles, geminiProfile: true });
+            if (qaCandidates.length >= 2) rawPins = qaCandidates;
+        }
         for (const p of rawPins) {
             if (isPinCoveredByRankedHits(p, rankedHits, pointerCovers)) continue;
             inheritRankedHitEnrichments(p, rankedHits, pointersOverlap);
             pins.push(p);
         }
     } catch { pins = []; }
+    const geminiMaxTotalBytes = isEdit ? budgets.editTotalBytes : budgets.qaMergedBytes;
     if (!pins.length) {
+        if (geminiProfile && res?.hits?.length) backfillCompactPointerHits(root, res.hits, geminiMaxTotalBytes, pointerCovers, prompt);
         if (isEdit && res?.hits?.length && graph) {
             const coEditPointers = computeCoEditPointers(ctxDir, graph, res.hits);
             if (coEditPointers.length > 0) res.coEditPointers = coEditPointers;
@@ -137,14 +257,20 @@ export function finalizePinnedPromptContext(dir, prompt, opts, pinApi) {
         return res;
     }
     const rest = (res?.hits ?? []).filter((h) => !pins.some((p) => pointerCovers(p.pointer, h.pointer)));
-    trimRestHitCodeToBudget(rest, pins, rawPins, { pointerCovers, pointersOverlap });
+    const isMultiSubsystemQa = !geminiProfile && !isEdit && countHitSubsystemDirs(res?.hits) >= 3;
+    const qaCap = isMultiSubsystemQa
+        ? Math.min(budgets.qaMergedBytes, budgets.qaMultiSubsystemMergedBytes ?? 4600)
+        : budgets.qaMergedBytes;
+    trimRestHitCodeToBudget(rest, pins, rawPins, { pointerCovers, pointersOverlap }, !isEdit ? { ...opts, maxTotalBytesOverride: qaCap } : opts);
     const pinnedRestCount = rest.filter((h) => h.pinned).length;
     const pinnedFiles = new Set([...pins, ...rest.filter((h) => h.pinned)].map((p) => (p.pointer ?? '').split(':')[0]).filter(Boolean));
     const novelRest = rest.filter((h) => h.pinned || !pinnedFiles.has((h.pointer ?? '').split(':')[0]));
-    const keptRest = ((pins.length + pinnedRestCount) >= 3 && !rest.some((h) => !h.pinned && h.code))
-        ? novelRest.slice(0, 2 + pinnedRestCount)
+    const keepCap = (geminiProfile ? 3 : 2) + pinnedRestCount;
+    const keptRest = ((pins.length + pinnedRestCount) >= (geminiProfile ? 4 : 3) && !rest.some((h) => !h.pinned && h.code))
+        ? novelRest.slice(0, keepCap)
         : rest;
     const finalHits = [...pins, ...keptRest];
+    if (geminiProfile) backfillCompactPointerHits(root, finalHits, geminiMaxTotalBytes, pointerCovers, prompt);
     const coEditPointers = isEdit && graph ? computeCoEditPointers(ctxDir, graph, finalHits) : [];
     return {
         ...(res ?? { query: prompt, mode: 'lexical', isEditPrompt: isEdit }),

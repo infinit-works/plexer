@@ -35,6 +35,16 @@ export function scopesOfGraph(graph) {
 
 /** Validate a normalized `--in` prefix against the graph before a query runs. */
 export function assertPrefixIndexed(graph, prefix) {
+    if (Array.isArray(prefix)) {
+        if (prefix.length === 0)
+            return;
+        for (const p of prefix) {
+            if (!p || graph.nodes.some((n) => pathUnderPrefix(n.path, p)))
+                continue;
+            throw new Error(`nothing indexed under "${p}/"${scopesHereClause(scopesOfGraph(graph))} (or any path prefix)`);
+        }
+        return;
+    }
     if (!prefix || graph.nodes.some((n) => pathUnderPrefix(n.path, prefix)))
         return;
     throw new Error(`nothing indexed under "${prefix}/"${scopesHereClause(scopesOfGraph(graph))} (or any path prefix)`);

@@ -210,6 +210,24 @@ function buildGrepContextBlocks(group, fileLines, contextLines, candTerms) {
         return { start: w.start, end: w.end, lines: blockLines };
     });
 }
+function normalizeInFilter(rawIn) {
+    if (!rawIn)
+        return undefined;
+    const rawList = Array.isArray(rawIn) ? rawIn : String(rawIn).split(",");
+    const list = [];
+    for (const item of rawList) {
+        for (const part of String(item ?? "").split(",")) {
+            const norm = normalizePathPrefix(part);
+            if (norm)
+                list.push(norm);
+        }
+    }
+    if (list.length === 0)
+        return undefined;
+    const unique = [...new Set(list)];
+    return unique.length === 1 ? unique[0] : unique;
+}
+
 export function grepGraph(graph, repoRoot, pattern, opts = {}) {
     const maxHits = opts.maxHits ?? DEFAULT_MAX_HITS;
     const maxHitsPerSymbol = opts.maxHitsPerSymbol ?? DEFAULT_MAX_HITS_PER_SYMBOL;
@@ -222,7 +240,7 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
         : pattern;
     const regex = compileSafeUserRegex(source, opts.ignoreCase ? "i" : "");
     const inDegree = computeInDegree(graph);
-    const inPrefix = opts.in ? normalizePathPrefix(opts.in) : undefined;
+    const inPrefix = normalizeInFilter(opts.in);
     if (inPrefix)
         assertPrefixIndexed(graph, inPrefix);
     const { fileNodes, symbolsByPath } = getOrBuildGrepSymbolIndex(graph, inPrefix);

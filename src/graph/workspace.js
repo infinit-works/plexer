@@ -346,6 +346,14 @@ export function federateAsk(root, override, query, opts = {}) {
 function resolveWorkspaceIn(wg, rawIn, strict = false) {
     if (!rawIn)
         return { onlyChild: undefined, childIn: undefined };
+    if (Array.isArray(rawIn)) {
+        const list = rawIn.map((x) => normalizePathPrefix(x)).filter(Boolean);
+        if (list.length === 0)
+            return { onlyChild: undefined, childIn: undefined };
+        if (list.length === 1)
+            return resolveWorkspaceIn(wg, list[0], strict);
+        return { onlyChild: undefined, childIn: list };
+    }
     const prefix = normalizePathPrefix(rawIn);
     if (!prefix)
         return { onlyChild: undefined, childIn: undefined };

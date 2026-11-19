@@ -198,7 +198,12 @@ export function buildMidLoopHint(repoRoot, ctxDir, relFile, opts = {}) {
     } catch { return null; }
 }
 
-export function fitAgyEphemeral(text, maxChars = 7200) {
+export function isInteractiveAgyAppInput(input) {
+    const marker = String(input?.transcriptPath || input?.artifactDirectoryPath || '');
+    return /(?:^|[\\/])antigravity(?:-ide)?[\\/]/.test(marker);
+}
+
+export function fitAgyEphemeral(text, maxChars = 12000) {
     if (!text || text.length <= maxChars) return text;
     let out = String(text);
     const dropLast = (re) => {
@@ -208,11 +213,26 @@ export function fitAgyEphemeral(text, maxChars = 7200) {
         out = `${out.slice(0, last.index)}${out.slice(last.index + last[0].length)}`.trim();
         return true;
     };
-    while (out.length > maxChars && (dropLast(/\n\n\/\/ [^\n]+\n(?:L\d+:[^\n]*\n?)+/g) || dropLast(/\n\n## [^\n]+\n[\s\S]*?(?=\n\n## |$)/g)));
-    return out.length <= maxChars ? out : `${out.slice(0, maxChars - 16)}\n...(truncated)`;
+    while (out.length > maxChars && (
+        dropLast(/\n\n\/\/ [^\n]+\n(?:L\d+:[^\n]*\n?)+/g)
+        || dropLast(/\n\s*\d+\.\s[^\n]+(?:\n(?!\s*\d+\.\s|likely co-edits \/ tests:)[^\n]*)*/g)
+        || dropLast(/\n\n## [^\n]+\n[\s\S]*?(?=\n\n## |$)/g)
+    ));
+    if (out.length <= maxChars) return out;
+    let sliced = out.slice(0, maxChars - 16).replace(/\s+$/, '');
+    const fences = (sliced.match(/^```/gm) || []).length;
+    if (fences % 2 === 1) {
+        const lastOpen = sliced.lastIndexOf('\n```');
+        if (lastOpen > maxChars * 0.5) sliced = sliced.slice(0, lastOpen);
+        else sliced += '\n```';
+    }
+    return `${sliced}\n...(truncated)`;
 }
 
-export function formatAgyUserMarkdown({ retrievalCount = 0, files = [], coEditCount = 0, blastFile = null, midLoopFile = null, oriented = false, weakScore = null } = {}) {
+export function formatAgyUserMarkdown(
+    { retrievalCount = 0, files = [], coEditCount = 0, blastFile = null, midLoopFile = null, oriented = false, weakScore = null } = {},
+    { includeSidecarLink = false } = {},
+) {
     const parts = [];
     const fl = files.slice(0, 3).map((f) => `\`${basename(f)}\``).join(', ');
     if (retrievalCount > 0) parts.push(`${retrievalCount} span${retrievalCount === 1 ? '' : 's'}${fl ? ` in ${fl}` : ''}`);
@@ -221,5 +241,7 @@ export function formatAgyUserMarkdown({ retrievalCount = 0, files = [], coEditCo
     if (midLoopFile) parts.push(`graph context for \`${basename(midLoopFile)}\``);
     if (oriented) parts.push('repo orientation');
     if (weakScore !== null && weakScore < 0.25 && retrievalCount === 0) parts.push('low lexical match');
-    return parts.length > 0 ? `[plexer] ${parts.join(' · ')}` : '';
+    if (parts.length === 0) return '';
+    const link = includeSidecarLink ? ' · [Graph](sidecar://plexer/viz/?tab=context)' : '';
+    return `[plexer] ${parts.join(' · ')}${link}`;
 }

@@ -2,9 +2,9 @@
  * Subagent prompt normalization and sandbox posture detection for Antigravity.
  */
 
-const BOILERPLATE_LINE_RE = /^(?:\s*[-*]?\s*(?:Output contract|Assigned paths?|Deliverables?|Coordination|Messaging|Communication|Swarm protocol|Reporting)\s*:|\s*(?:Do not edit outside|Never modify files outside|Call `?(?:send_message|invoke_subagent)`?|Use `?(?:send_message)`? to|You must call `?send_message`?|Return a concise summary|Report back to|End your turn by))/i;
+const BOILERPLATE_LINE_RE = /^(?:\s*[-*]?\s*(?:Output contract|Assigned paths?|Deliverables?|Coordination|Messaging|Communication|Swarm protocol|Reporting|Workflow step|Stage)\s*:|\s*(?:Do not edit outside|Never modify files outside|Call `?(?:send_message|invoke_subagent|run_workflow)`?|Use `?(?:send_message)`? to|You must call `?send_message`?|Return a concise summary|Report back to|End your turn by))/i;
 
-const INLINE_BOILERPLATE_RE = /\b(?:use|call)\s+`?send_message`?\b[^.\n]*(?:\.|$)/gi;
+const INLINE_BOILERPLATE_RE = /\b(?:use|call)\s+`?(?:send_message|run_workflow)`?\b[^.\n]*(?:\.|$)/gi;
 
 const READ_ONLY_SANDBOX_RE = /\b(?:read-only sandbox|without `?(?:run_command|shell)`?|no (?:shell|command|terminal) tool|cannot run commands|you do not have `?(?:run_command)`?)\b/i;
 
@@ -17,7 +17,7 @@ export function stripSubagentBoilerplate(prompt) {
         return '';
 
     let text = prompt
-        .replace(/<\/?(?:SUBAGENT_BRIEF|SWARM_BRIEF|ASSIGNMENT|TASK_CONTEXT)>/gi, '\n')
+        .replace(/<\/?(?:SUBAGENT_BRIEF|SWARM_BRIEF|ASSIGNMENT|TASK_CONTEXT|WORKFLOW_STEP)>/gi, '\n')
         .replace(INLINE_BOILERPLATE_RE, ' ');
 
     const keptLines = [];
@@ -51,7 +51,7 @@ export function isReadOnlySubagentInput(input, rawPrompt = '') {
     if (input?.readOnly === true || input?.readonly === true || input?.sandboxMode === 'read-only')
         return true;
     const agent = String(input?.agentName ?? input?.agent_name ?? input?.subagentType ?? input?.mode ?? '').trim().toLowerCase();
-    if (agent === 'research' || agent === 'ask' || agent === 'plan')
+    if (agent === 'research' || agent === 'ask' || agent === 'plan' || agent === 'code-reviewer' || agent === 'reviewer')
         return true;
     const tools = Array.isArray(input?.tools) ? input.tools.map((t) => String(t).toLowerCase()) : null;
     if (tools && !tools.some((t) => /^(?:run_command|bash|shell|run_shell_command|execute_command)$/.test(t)))
@@ -68,6 +68,6 @@ export function stripCliNudges(text) {
     return text
         .replace(/\n\s*… \+\d+ more — run `plexer callers [^`\n]+`/g, '')
         .replace(/ — run `plexer [^`\n]+`/g, '')
-        .replace(/\s*\(batch missing `<=200`-line spans in 1 `plexer read`[^)]*\)/g, '')
+        .replace(/\s*\([^)\n]*`plexer [^)\n]*\)/g, '')
         .replace(/\s*Run `plexer [^`\n]+`\./g, '');
 }

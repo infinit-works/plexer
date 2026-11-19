@@ -78,18 +78,26 @@ export function handlePostEdit(input, dir, opts = {}) {
     return payload;
 }
 
-export function handleStop(_input, dir) {
+export function triggerBackgroundSync(dir) {
     const ctxDir = contextDirFor(dir);
-    if (!existsSync(dir) || !existsSync(ctxDir) || !readStats(dir)?.dirty || !acquireLock(dir)) return;
+    if (!existsSync(dir) || !existsSync(ctxDir) || !acquireLock(dir)) return false;
     patchStats(dir, { syncing: true });
     try {
         const child = spawn(process.execPath, [claudeScriptPath('sync-run.js'), dir], { detached: true, stdio: 'ignore' });
         if (child.pid) updateLockPid(dir, child.pid);
         child.unref();
+        return true;
     } catch {
         patchStats(dir, { syncing: false });
         releaseLock(dir);
+        return false;
     }
+}
+
+export function handleStop(_input, dir) {
+    const ctxDir = contextDirFor(dir);
+    if (!existsSync(dir) || !existsSync(ctxDir) || !readStats(dir)?.dirty) return;
+    triggerBackgroundSync(dir);
 }
 
 export async function handleHook(event, input = undefined, opts = {}) {

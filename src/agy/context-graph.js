@@ -36,7 +36,7 @@ function statMtimeMs(p) {
  * Locate Antigravity appData directories (`brain/`, `.system_generated/swarm`).
  * Mirrors `swarm_board` resolution and falls back to `~/.gemini/antigravity`.
  */
-function findAppDataDirs(opts = {}) {
+export function findAppDataDirs(opts = {}) {
     if (Array.isArray(opts.appDataDirs)) {
         return [...new Set(opts.appDataDirs.filter(Boolean).map((p) => resolve(p)))];
     }
@@ -197,29 +197,64 @@ function readTranscriptTouchSets(transcriptPath, repoRoot, realRepoRoot, altRoot
     return { edited, read };
 }
 
+const brainSwarmIndexCache = new Map();
+
+function indexRosterFileMembers(entry, coordinatorId, membersPath) {
+    const prevMtime = entry.rosterFiles.get(membersPath);
+    const curMtime = statMtimeMs(membersPath);
+    if (curMtime === 0 || (prevMtime !== undefined && prevMtime === curMtime))
+        return;
+    entry.rosterFiles.set(membersPath, curMtime);
+    for (const [k, v] of entry.memberToCoord) {
+        if (v.coordinatorId === coordinatorId)
+            entry.memberToCoord.delete(k);
+    }
+    const roster = readJson(membersPath);
+    const members = roster?.members && typeof roster.members === 'object' ? Object.values(roster.members) : [];
+    for (const m of members) {
+        if (m?.conversation_id)
+            entry.memberToCoord.set(m.conversation_id, { coordinatorId, membersPath });
+    }
+}
+
 function scanAppDataRosterForWorker(appData, conversationId) {
     const brainDir = join(appData, 'brain');
     if (!existsSync(brainDir))
         return null;
-    let ids = [];
-    try {
-        ids = readdirSync(brainDir);
-    } catch {
+    const dirMtime = statMtimeMs(brainDir);
+    let entry = brainSwarmIndexCache.get(brainDir);
+    if (!entry) {
+        entry = { dirMtime: -1, seenIds: new Set(), rosterFiles: new Map(), memberToCoord: new Map() };
+        brainSwarmIndexCache.set(brainDir, entry);
+    }
+    if (entry.dirMtime !== dirMtime) {
+        entry.dirMtime = dirMtime;
+        let ids = [];
+        try {
+            ids = readdirSync(brainDir);
+        } catch {
+            return null;
+        }
+        for (const id of ids) {
+            const membersPath = join(brainDir, id, '.system_generated', 'swarm', 'members.json');
+            if (existsSync(membersPath))
+                indexRosterFileMembers(entry, id, membersPath);
+        }
+    }
+    for (const membersPath of entry.rosterFiles.keys()) {
+        const coordinatorId = basename(dirname(dirname(dirname(membersPath))));
+        indexRosterFileMembers(entry, coordinatorId, membersPath);
+    }
+    const hit = entry.memberToCoord.get(conversationId);
+    if (!hit)
         return null;
-    }
-    for (const id of ids) {
-        const membersPath = join(brainDir, id, '.system_generated', 'swarm', 'members.json');
-        if (!existsSync(membersPath))
-            continue;
-        const roster = readJson(membersPath);
-        const members = roster?.members && typeof roster.members === 'object' ? Object.values(roster.members) : [];
-        if (members.some((m) => m?.conversation_id === conversationId))
-            return { appData, coordinatorId: id, membersPath, roster };
-    }
-    return null;
+    const roster = readJson(hit.membersPath);
+    return roster && typeof roster === 'object'
+        ? { appData, coordinatorId: hit.coordinatorId, membersPath: hit.membersPath, roster }
+        : null;
 }
 
-function locateSwarmRoster(conversationId, appDataDirs) {
+export function locateSwarmRoster(conversationId, appDataDirs) {
     if (!conversationId)
         return null;
     for (const appData of appDataDirs) {

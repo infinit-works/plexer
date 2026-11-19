@@ -14,11 +14,12 @@
  * output is markdown so it drops straight into an agent's context.
  */
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { loadGraphCached, registerGraphCacheClearer } from "../context/graph-store.js";
 import { contextDirFor } from "../context/node-file.js";
 import { assertPrefixIndexed, scopeLabel, scopeOf, scopesHereClause, scopesOfGraph } from "../context/scopes.js";
 import { resolveSymbol } from "../context/symbol-query.js";
+import { isSpanCovered, normalizeRelFile } from "../agy/spans.js";
 import { isGeneratedPath, isTestPath, normalizePathPrefix, pathUnderPrefix, pushMap } from "../util/paths.js";
 import { combineComparableScopes, rankScopesAndFuse, } from "./fuse.js";
 import { rankFilesBounded, } from "./file-rank.js";
@@ -3289,7 +3290,7 @@ function recordInlinedCode(defaultPath, code, inlinedLinesByPath) {
         return;
     let curPath = defaultPath;
     for (const line of code.split("\n")) {
-        const hdr = /^\/\/ (?:same-file helper|cross-file callee|exported type): .+ \(([^():]+):L\d+/.exec(line) ??
+        const hdr = /^\/\/ (?:same-file (?:helper|caller)|cross-file (?:callee|caller)|exported type): .+ \(([^():]+):L\d+/.exec(line) ??
             /^\/\/ module (?:context|return) \(([^():]+)(?::L\d+[^)]*)?\):/.exec(line);
         if (hdr?.[1]) {
             curPath = hdr[1];
@@ -3477,7 +3478,7 @@ function inlinePrimaryHitSpan(h, hitIdx, hits, state) {
     primaryMeta.set(state.inlinedHitCount, { h, node, s, lines, spanLen, effStart, effEnd, maxContiguous: params.maxContiguous, hitQTerms });
     state.inlinedHitCount++;
 }
-function addGraphHelperNeighbours(fromId, hop, allowCallers, viaTinyCallee, node, sPath, srcIdx, shownPointers, sameFileCands) {
+function addGraphHelperNeighbours(fromId, hop, allowCallers, viaTinyCallee, node, sPath, srcIdx, shownPointers, sameFileCands, allowCrossCallers = false) {
     const { outCallsById, inCallsById, byId } = srcIdx;
     const outIds = outCallsById.get(fromId) ?? [];
     const inIds = allowCallers ? (inCallsById.get(fromId) ?? []) : [];
@@ -3488,13 +3489,22 @@ function addGraphHelperNeighbours(fromId, hop, allowCallers, viaTinyCallee, node
         if (!nn || nn.kind === "file")
             continue;
         const isSameFile = nn.path === sPath;
-        if (!isSameFile && !outIds.includes(nid))
+        const isCallee = outIds.includes(nid);
+        if (!isSameFile && !isCallee && !(allowCrossCallers && hop === 1 && !isTestPath(nn.path)))
             continue;
         const ptr = `${nn.path}:${nn.span}`;
         if (shownPointers.has(ptr))
             continue;
-        const isCallee = outIds.includes(nid);
-        sameFileCands.set(nid, { node: nn, ptr, hop, isSameFile, isCallee, viaTinyCallee: viaTinyCallee && isCallee, fromGraph: true });
+        sameFileCands.set(nid, {
+            node: nn,
+            ptr,
+            hop,
+            isSameFile,
+            isCallee,
+            allowCrossCaller: Boolean(allowCrossCallers && !isCallee && hop === 1),
+            viaTinyCallee: viaTinyCallee && isCallee,
+            fromGraph: true,
+        });
     }
 }
 function ensureNodeHelperMatcher(nn) {
@@ -3657,12 +3667,12 @@ function expandSecondHopSameFileHelpers(meta, srcIdx, shownPointers, sameFileCan
     }
 }
 
-function collectSameFileCandidatesForHit(meta, hitIdx, srcIdx, shownPointers, qTerms, qStems, wantsCallSites = false) {
+function collectSameFileCandidatesForHit(meta, hitIdx, srcIdx, shownPointers, qTerms, qStems, wantsCallSites = false, isSmallLeafCallerTopHit = false) {
     const { node, s, lines, spanLen } = meta;
     const { nodesByPath } = srcIdx;
     const sameFileCands = new Map();
-    const allowCallers = wantsCallSites ? spanLen <= 35 : spanLen <= 55;
-    addGraphHelperNeighbours(node.id, 1, allowCallers, false, node, s.path, srcIdx, shownPointers, sameFileCands);
+    const allowCallers = isSmallLeafCallerTopHit || (wantsCallSites ? spanLen <= 35 : spanLen <= 55);
+    addGraphHelperNeighbours(node.id, 1, allowCallers, false, node, s.path, srcIdx, shownPointers, sameFileCands, isSmallLeafCallerTopHit);
     scanTextHelperCalls(lines, s.path, node.id, s.start, s.end, 1, false, nodesByPath, shownPointers, sameFileCands);
     if (sameFileCands.size === 0 || node.kind === "type" || node.kind === "interface" || node.kind === "struct" || hitIdx === 0)
         addLexicalFallbackSameFileCands(meta, nodesByPath, shownPointers, qTerms, qStems, sameFileCands);
@@ -3775,13 +3785,15 @@ function scoreSingleHelperCandidate(cand, meta, candLines, cs, hSpanLen, qTerms,
         hScore += scoreSameFileHelperBonuses(cand, node, hSpanLen, spanLen);
     else if (cand.isCallee && cand.hop === 1 && (hSpanLen <= 20 || (cand.node.name === node.name && hSpanLen <= 28)))
         hScore += cand.node.name === node.name ? 11.5 : (hSpanLen <= 12 ? 6.5 : 5.0);
+    if (cand.allowCrossCaller && !cand.isCallee && cand.fromGraph && cand.hop === 1)
+        hScore += 9.0;
     hScore += scoreHelperNameAndSummaryBonuses(cand, node, s.path, hSpanLen, qTerms, qStems);
     const bodyRes = scoreHelperBodyTokens(cand, candLines, cs, hSpanLen, qTerms, qStems);
     hScore += bodyRes.score;
     const qMatchCount = bodyRes.qMatchCount;
-    if (cand.isSameFile && hSpanLen > 52 && (cand.hop !== 1 || (qMatchCount < 2 && !cand.viaTinyCallee && !(cand.fromGraph && cand.isCallee && qMatchCount >= 1))))
+    if (cand.isSameFile && hSpanLen > 52 && (cand.hop !== 1 || (!cand.allowCrossCaller && qMatchCount < 2 && !cand.viaTinyCallee && !(cand.fromGraph && cand.isCallee && qMatchCount >= 1))))
         return null;
-    if (qMatchCount === 0 && !(cand.fromGraph && cand.isSameFile) && !(cand.isSameFile && (hSpanLen <= 12 || (cand.viaTinyCallee && hSpanLen <= 90))))
+    if (qMatchCount === 0 && !cand.allowCrossCaller && !(cand.fromGraph && cand.isSameFile) && !(cand.isSameFile && (hSpanLen <= 12 || (cand.viaTinyCallee && hSpanLen <= 90))))
         return null;
     return hScore;
 }
@@ -3793,7 +3805,8 @@ function evaluateHelperCandidate(cand, meta, readLines, qTerms, qStems, wantsCal
     const hSpanLen = cs.end - cs.start + 1;
     const isTypedFactory = (node.kind === "type" || node.kind === "interface") && /^(?:new|create)$/.test(cand.node.name);
     const maxSameFileHelperSpan = isTypedFactory ? 260 : 120;
-    if (cand.isSameFile ? hSpanLen > maxSameFileHelperSpan : hSpanLen > 28)
+    const maxCrossSpan = cand.allowCrossCaller ? 95 : 28;
+    if (cand.isSameFile ? hSpanLen > maxSameFileHelperSpan : hSpanLen > maxCrossSpan)
         return null;
     const isNested = Boolean(cand.isSameFile && cs.start > effStart && cs.end <= effEnd);
     if (isNested && spanLen <= maxContiguous)
@@ -3832,9 +3845,9 @@ function computeAttachHelperLimits(scoredHelpers, node, hitIdx, spanLen, editEnv
     }
     if (isTinyTypeHit && hitIdx <= 2)
         return { maxHelpers: 5, maxHelperBytesForHit: 1500, singleHelperBonus };
-    const topQualifies = hitIdx <= 1 && spanLen <= 28 && (scoredHelpers[0]?.hScore ?? 0) >= 16 && (scoredHelpers[0]?.hSpanLen ?? 99) <= 28;
+    const topQualifies = hitIdx <= 1 && spanLen <= 45 && (scoredHelpers[0]?.hScore ?? 0) >= 16 && (scoredHelpers[0]?.hSpanLen ?? 99) <= 36;
     const maxHelpers = topQualifies ? (hasSecondTinySameFileCallee ? 2 : 1) : 0;
-    const maxHelperBytesForHit = hitIdx <= 1 ? (hasSecondTinySameFileCallee ? 850 : 600) : 0;
+    const maxHelperBytesForHit = hitIdx <= 1 ? (hasSecondTinySameFileCallee ? 1050 : 750) : 0;
     return { maxHelpers, maxHelperBytesForHit, singleHelperBonus };
 }
 
@@ -3850,19 +3863,21 @@ function renderSingleHelperBlock(hCand, hIdx, sStart, hitQTerms, maxHelperBytesF
         ? Math.max(1, hCand.cs.start - (hCand.node.summary ? Math.min(5, hCand.node.summary.split("\n").length + 1) : 2))
         : hCand.cs.start;
     const hEnd = hCand.isSameFile && sStart > hCand.cs.end && sStart - hCand.cs.end <= 15 ? sStart - 1 : hCand.cs.end;
-    const hContig = hCand.constructsTypeLit && hCand.hSpanLen > 16 ? 12 : (hIdx === 0 && hCand.hSpanLen <= 48 ? 48 : 26);
+    const hContig = hCand.constructsTypeLit && hCand.hSpanLen > 16 ? 12 : (hCand.allowCrossCaller ? 24 : (hIdx === 0 && hCand.hSpanLen <= 48 ? 48 : 26));
     const hCrux = hCand.constructsTypeLit && hCand.hSpanLen > 16 ? 10 : 22;
     const hCode = full
         ? sliceSpan(hCand.candLines, hCand.node.path, hStart, hEnd, 48)
         : synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hEnd, hitQTerms, qStems, hContig, null, hCrux, state.qExactCode, state.qLiterals);
     if (!hCode)
         return null;
-    const label = hCand.isSameFile ? "same-file helper" : "cross-file callee";
+    const label = hCand.isSameFile
+        ? (hCand.isCallee === false ? "same-file caller" : "same-file helper")
+        : (hCand.isCallee === false ? "cross-file caller" : "cross-file callee");
     const dispName = hCand.node.owner && !hCand.node.name.includes(".") ? `${hCand.node.owner}.${hCand.node.name}` : hCand.node.name;
     let block = `// ${label}: ${dispName} (${hCand.ptr})\n${hCode}`;
     let bLen = Buffer.byteLength(block, "utf8");
     const effMaxTotal = (full || editEnvelope) && hIdx === 0 ? maxTotalBytes + singleHelperBonus : maxTotalBytes;
-    const effMaxHit = hIdx === 0 ? maxHelperBytesForHit + singleHelperBonus : maxHelperBytesForHit;
+    const effMaxHit = hCand.allowCrossCaller ? Math.min(1150, maxHelperBytesForHit) : (hIdx === 0 ? maxHelperBytesForHit + singleHelperBonus : maxHelperBytesForHit);
     if (!full && (state.totalInlinedBytes + bLen > effMaxTotal || hitHelperBytes + bLen > effMaxHit)) {
         const compactH = synthesizeCrux(hCand.candLines, hCand.node.path, hStart, hCand.cs.end, hitQTerms, qStems, 16, null, 16, state.qExactCode, state.qLiterals);
         if (compactH) {
@@ -4144,6 +4159,7 @@ function createInlineSourceState(root, graph, full, query, opts) {
         constsByPath: new Map(), qTerms, qStems, qExactCode, qLiterals, full, opts,
         isMultiQuery: Boolean(opts.maxHitsToInline && opts.maxHitsToInline <= 2),
         editEnvelope: Boolean(opts.editEnvelope),
+        geminiProfile: Boolean(opts.geminiProfile),
         wantsCallSites,
         maxHitsToInline: opts.maxHitsToInline ?? SOURCE_TOP_HITS,
         maxTotalBytes: opts.maxSourceBytes ?? (full ? 5200 : 3800),
@@ -4158,8 +4174,12 @@ function attachHelpersAndEnvelopeForPrimaryHit(meta, i, hits, state) {
     if (!node || node.kind === "file" || !lines || !h.code)
         return;
     const isTinyTypeHit = (node.kind === "struct" || node.kind === "type" || node.kind === "interface") && meta.spanLen <= 12;
+    const directNonTestCallers = (state.geminiProfile && !state.opts.subQueryIndex && i === 0 && !editEnvelope && meta.spanLen <= 50)
+        ? (srcIdx.inCallsById.get(node.id) ?? []).filter((cid) => !isTestPath(srcIdx.byId.get(cid)?.path ?? ""))
+        : [];
+    const isSmallLeafCallerTopHit = directNonTestCallers.length >= 1 && directNonTestCallers.length <= 3;
     if (state.totalInlinedBytes < maxTotalBytes + (isTinyTypeHit ? 1400 : 0)) {
-        const sameFileCands = collectSameFileCandidatesForHit(meta, i, srcIdx, shownPointers, qTerms, qStems, wantsCallSites);
+        const sameFileCands = collectSameFileCandidatesForHit(meta, i, srcIdx, shownPointers, qTerms, qStems, wantsCallSites, isSmallLeafCallerTopHit);
         if (sameFileCands.size > 0) {
             const scoredHelpers = scoreHelperCandidatesForHit(sameFileCands, meta, readLines, qTerms, qStems, wantsCallSites);
             attachScoredHelpersToHit(meta, i, scoredHelpers, state);
@@ -4559,10 +4579,46 @@ function filterPathsByStem(paths, normStem, caseInsensitive) {
         return cmp === target || cmp.endsWith(suffix);
     });
 }
+function resolveSkeletonDirectoryPrefix(file, normFile, byPath) {
+    const normDir = normFile.replace(/^\.?\/+/, "").replace(/\/+$/, "");
+    if (!normDir)
+        return null;
+    const allPaths = [...byPath.keys()].sort();
+    const dirPrefix = `${normDir}/`;
+    let dirPaths = allPaths.filter((p) => p.startsWith(dirPrefix));
+    if (!dirPaths.length) {
+        const lowerPrefix = dirPrefix.toLowerCase();
+        dirPaths = allPaths.filter((p) => p.toLowerCase().startsWith(lowerPrefix));
+    }
+    if (!dirPaths.length)
+        return null;
+    const nonTest = dirPaths.filter((p) => !isTestPath(p));
+    const chosen = (nonTest.length > 0 ? nonTest : dirPaths).slice(0, 12);
+    const dirMap = new Map(chosen.map((p) => [p, byPath.get(p) ?? []]));
+    return resolveMultipleSkeletonSuffixMatches(file, dirMap, true);
+}
+
 function resolveSkeletonStemFallback(file, normFile, byPath, allMatches) {
+    if (String(file ?? "").endsWith("/") || normFile.endsWith("/")) {
+        const dirHit = resolveSkeletonDirectoryPrefix(file, normFile, byPath);
+        if (dirHit)
+            return dirHit;
+    }
     const allPaths = [...byPath.keys()].sort();
     const normStem = stripFileExtension(normFile.replace(/^\.?\/+/, "").replace(/\/+$/, ""));
     if (normStem) {
+        const exactStem = allPaths.filter((p) => stripFileExtension(p) === normStem || stripFileExtension(p).toLowerCase() === normStem.toLowerCase());
+        if (exactStem.length === 1) {
+            const onlyDefs = byPath.get(exactStem[0]) ?? [];
+            if (!onlyDefs.length)
+                return { file: exactStem[0], entries: [], note: "no definitions indexed for this file" };
+            return { file: exactStem[0], entries: onlyDefs.map(toSkeletonEntry) };
+        }
+        // Prefer an indexed directory prefix at the exact path (e.g. `cmd` -> `cmd/...`) over basename stem matches (`sub/cmd.go`).
+        const dirBeforeSuffix = resolveSkeletonDirectoryPrefix(file, normFile, byPath);
+        if (dirBeforeSuffix)
+            return dirBeforeSuffix;
+
         let stemPaths = filterPathsByStem(allPaths, normStem, false);
         if (!stemPaths.length)
             stemPaths = filterPathsByStem(allPaths, normStem, true);
@@ -4585,21 +4641,9 @@ function resolveSkeletonStemFallback(file, normFile, byPath, allMatches) {
             };
         }
     }
-    const normDir = normFile.replace(/^\.?\/+/, "").replace(/\/+$/, "");
-    if (normDir) {
-        const dirPrefix = `${normDir}/`;
-        let dirPaths = allPaths.filter((p) => p.startsWith(dirPrefix));
-        if (!dirPaths.length) {
-            const lowerPrefix = dirPrefix.toLowerCase();
-            dirPaths = allPaths.filter((p) => p.toLowerCase().startsWith(lowerPrefix));
-        }
-        if (dirPaths.length > 0) {
-            const nonTest = dirPaths.filter((p) => !isTestPath(p));
-            const chosen = (nonTest.length > 0 ? nonTest : dirPaths).slice(0, 12);
-            const dirMap = new Map(chosen.map((p) => [p, byPath.get(p) ?? []]));
-            return resolveMultipleSkeletonSuffixMatches(file, dirMap, true);
-        }
-    }
+    const dirFallback = resolveSkeletonDirectoryPrefix(file, normFile, byPath);
+    if (dirFallback)
+        return dirFallback;
     const suggestions = suggestClosestFiles(normFile || file, allPaths, 3);
     if (suggestions.length > 0) {
         const hint = `did you mean: ${suggestions.join(", ")}?`;
@@ -4699,6 +4743,22 @@ export function formatSkeleton(r, opts = {}) {
     if (out.length > 6000 && !opts.compact) {
         out = `${head}\n${renderLines(r.entries, 72, 0, true).join("\n")}\n`;
     }
+    if (Buffer.byteLength(out, "utf8") > 8800) {
+        const compactLines = renderLines(r.entries, 72, 0, true);
+        const kept = [];
+        let bytes = Buffer.byteLength(`${head}\n`, "utf8");
+        for (const ln of compactLines) {
+            const lb = Buffer.byteLength(ln, "utf8") + 1;
+            if (kept.length > 0 && bytes + lb > 8650)
+                break;
+            kept.push(ln);
+            bytes += lb;
+        }
+        const omitted = compactLines.length - kept.length;
+        if (omitted > 0)
+            kept.push(`- … (+${omitted} more symbols — run \`plexer read ${r.file}:Lx-Ly\`)`);
+        out = `${head}\n${kept.join("\n")}\n`;
+    }
     return out;
 }
 export function isRedundantSnippet(snippet, code) {
@@ -4782,8 +4842,14 @@ function parseReadSpanSpec(spec) {
     return { raw: trimmed, file: rawPath, start: 1, end: 120, hasExplicitRange: false, symbol: null };
 }
 function lookupSpanTarget(fileNodes, targetName) {
+    const rawBare = targetName.split(/[.:#]/).pop() || targetName;
+    const exact = fileNodes.find((n) => n.name === targetName) ??
+        fileNodes.find((n) => n.name === rawBare || n.name.endsWith(`.${rawBare}`) || n.name.endsWith(`:${rawBare}`)) ??
+        fileNodes.find((n) => n.id.endsWith(`#${targetName}`) || n.id.endsWith(`.${rawBare}`));
+    if (exact)
+        return exact;
     const symLower = targetName.toLowerCase();
-    const symBare = symLower.split(/[.:#]/).pop() || symLower;
+    const symBare = rawBare.toLowerCase();
     return (fileNodes.find((n) => n.name.toLowerCase() === symLower) ??
         fileNodes.find((n) => n.name.toLowerCase() === symBare || n.name.toLowerCase().endsWith(`.${symBare}`) || n.name.toLowerCase().endsWith(`:${symBare}`)) ??
         fileNodes.find((n) => n.id.toLowerCase().endsWith(`#${symLower}`) || n.id.toLowerCase().endsWith(`.${symBare}`)));
@@ -4821,6 +4887,75 @@ function resolveIndexedReadPath(fileQuery, indexedPaths, rootPrefix, read) {
 }
 const DEFAULT_READ_BUDGET_BYTES = 9000;
 const MAX_SINGLE_SPAN_LINES = 320;
+const MIN_READ_SEEN_EDGE_TRIM_LINES = 20;
+
+export function canFastSliceExplicitSpans(dir, rawSpecs) {
+    const specs = (Array.isArray(rawSpecs) ? rawSpecs : [rawSpecs])
+        .flatMap((s) => String(s ?? "").split(","))
+        .map((s) => s.trim())
+        .filter(Boolean);
+    if (specs.length === 0)
+        return false;
+    const root = resolve(dir);
+    for (const rawSpec of specs) {
+        const parsed = parseReadSpanSpec(rawSpec);
+        if (!parsed || !parsed.hasExplicitRange || parsed.symbol || isSensitiveOrDotPath(parsed.file))
+            return false;
+        const abs = resolve(root, parsed.file);
+        const rel = relative(root, abs).replace(/\\/g, "/");
+        if (!rel || rel.startsWith("..") || isAbsolute(rel))
+            return false;
+        try {
+            if (!existsSync(abs) || !statSync(abs).isFile())
+                return false;
+        }
+        catch {
+            return false;
+        }
+    }
+    return true;
+}
+
+function getSeenIntervalsForRead(seenSpans, relFile) {
+    if (!seenSpans || typeof seenSpans !== "object")
+        return null;
+    const norm = normalizeRelFile(relFile);
+    if (Array.isArray(seenSpans[norm]))
+        return { key: norm, intervals: seenSpans[norm] };
+    for (const [k, intervals] of Object.entries(seenSpans)) {
+        if (!Array.isArray(intervals))
+            continue;
+        const nk = normalizeRelFile(k);
+        if (nk === norm || nk.endsWith(`/${norm}`) || norm.endsWith(`/${nk}`))
+            return { key: nk, intervals };
+    }
+    return null;
+}
+
+function applySeenSpansToReadItem(item, seenSpans) {
+    if (!seenSpans || item.error)
+        return;
+    const matched = getSeenIntervalsForRead(seenSpans, item.file);
+    if (!matched || matched.intervals.length === 0)
+        return;
+    const spanLines = item.unpooledEnd - item.start + 1;
+    const spanBytes = item.lines
+        .slice(item.start - 1, item.unpooledEnd)
+        .reduce((sum, line) => sum + Buffer.byteLength(line ?? "", "utf8") + 1, 0);
+    if ((spanLines >= 15 || spanBytes >= 600) && isSpanCovered(seenSpans, matched.key, item.start, item.unpooledEnd, 0.85)) {
+        item.alreadySeen = true;
+        return;
+    }
+    for (const [s, e] of matched.intervals) {
+        if (s <= item.start && e >= item.start + MIN_READ_SEEN_EDGE_TRIM_LINES - 1 && e < item.unpooledEnd && (item.unpooledEnd - e) >= 10) {
+            item.start = e + 1;
+        }
+        if (s > item.start + 9 && s <= item.unpooledEnd && e >= item.unpooledEnd && (item.unpooledEnd - s + 1) >= MIN_READ_SEEN_EDGE_TRIM_LINES) {
+            item.unpooledEnd = s - 1;
+            item.targetEnd = Math.min(item.targetEnd, item.unpooledEnd);
+        }
+    }
+}
 
 function resolveSpanBlockRequest(rawSpec, resolvePath, read, graph, indexedPaths, opts = {}) {
     const parsed = parseReadSpanSpec(rawSpec);
@@ -4891,12 +5026,30 @@ function coalesceResolvedSpanRequests(items) {
 }
 
 function materializeSpanBlock(item, end) {
+    if (item.alreadySeen) {
+        const span = `L${item.start}-L${item.targetEnd}`;
+        const code = `// [already in session context: ${item.file}:${span} — pass --full to re-read]`;
+        return {
+            block: {
+                spec: item.spec,
+                file: item.file,
+                span,
+                startLine: item.start,
+                endLine: item.targetEnd,
+                totalLines: item.totalLines,
+                truncated: false,
+                alreadySeen: true,
+                code,
+            },
+            bytes: Buffer.byteLength(`${code}\n\n`, "utf8"),
+        };
+    }
     const slice = [];
     for (let ln = item.start; ln <= end; ln++) {
         slice.push(`L${ln}: ${item.lines[ln - 1]}`);
     }
     if (end < item.targetEnd) {
-        slice.push(`… (+${item.targetEnd - end} more lines in ${item.file}:L${end + 1}-L${item.targetEnd} — pass --full or use read_file)`);
+        slice.push(`… (+${item.targetEnd - end} more lines — run \`plexer read ${item.file}:L${end + 1}-L${item.targetEnd}\` or use read_file)`);
     }
     const span = `L${item.start}-L${end}`;
     const code = slice.join("\n");
@@ -4906,6 +5059,8 @@ function materializeSpanBlock(item, end) {
             spec: item.spec,
             file: item.file,
             span,
+            startLine: item.start,
+            endLine: end,
             totalLines: item.totalLines,
             truncated: end < item.targetEnd,
             code,
@@ -4933,17 +5088,26 @@ function fitItemToByteShare(item, byteBudget, minLinesFloor) {
     return materializeSpanBlock(item, chosenEnd);
 }
 
+function defaultReadBudgetForSpanCount(spanCount) {
+    if (spanCount <= 1)
+        return 8600;
+    if (spanCount === 2)
+        return 8900;
+    return 9100;
+}
+
 /** Read one or more `<file>[:L<start>[-L<end>] | :<symbol>]` spans (matching exact repo-relative paths
  * or unique basenames from the graph) with `L<n>:` line prefixes. */
 export function readSpans(dir, spanSpecs, opts = {}) {
     const root = resolve(dir);
     const outDir = contextDirFor(root, opts.contextDir);
-    const graph = loadGraphCached(outDir);
     const read = fileReader(root);
     const specs = (Array.isArray(spanSpecs) ? spanSpecs : [spanSpecs])
         .flatMap((s) => String(s).split(","))
         .map((s) => s.trim())
         .filter(Boolean);
+    const fastExplicit = canFastSliceExplicitSpans(root, specs);
+    const graph = fastExplicit ? null : loadGraphCached(outDir);
     const indexedPaths = graph
         ? (graph._nodesByPath
             ? [...graph._nodesByPath.keys()].sort()
@@ -4953,34 +5117,51 @@ export function readSpans(dir, spanSpecs, opts = {}) {
     const resolvePath = (fileQuery) => resolveIndexedReadPath(fileQuery, indexedPaths, rootPrefix, read);
     const rawResolved = specs.map((rawSpec) => resolveSpanBlockRequest(rawSpec, resolvePath, read, graph, indexedPaths, opts));
     const items = coalesceResolvedSpanRequests(rawResolved);
+    if (!opts.full && opts.seenSpans) {
+        for (const it of items) applySeenSpansToReadItem(it, opts.seenSpans);
+    }
     const fullResults = items.map((it) =>
         it.error
             ? { block: it, bytes: Buffer.byteLength(`✗ ${it.error}\n\n`, "utf8"), item: it }
             : { ...materializeSpanBlock(it, it.unpooledEnd), item: it },
     );
-    const maxBytes = opts.full ? Infinity : (opts.maxBytes ?? DEFAULT_READ_BUDGET_BYTES);
+    const activeIndices = fullResults
+        .map((r, idx) => (!r.item.error && !r.item.alreadySeen ? idx : -1))
+        .filter((idx) => idx >= 0);
+    const agyMultiFullCap = Boolean(
+        opts.full &&
+        activeIndices.length >= 2 &&
+        opts.antigravityPipeCap === true,
+    );
+    const maxBytes = opts.full
+        ? (agyMultiFullCap ? 9100 : Infinity)
+        : (opts.maxBytes ?? defaultReadBudgetForSpanCount(activeIndices.length));
     const totalBytes = fullResults.reduce((acc, r) => acc + r.bytes, 0);
     if (totalBytes <= maxBytes) {
         return { blocks: fullResults.map((r) => r.block) };
     }
-    const validIndices = fullResults
-        .map((r, idx) => (!r.item.error ? idx : -1))
-        .filter((idx) => idx >= 0);
+    const fixedOverhead = fullResults
+        .filter((r) => r.item.error || r.item.alreadySeen)
+        .reduce((a, r) => a + r.bytes, 0);
     const minLinesFloor = 5;
-    let remainingPool = Math.max(1200, maxBytes - fullResults.filter((r) => r.item.error).reduce((a, r) => a + r.bytes, 0));
-    const sortedValid = [...validIndices].sort((a, b) => fullResults[a].bytes - fullResults[b].bytes);
+    let remainingPool = Math.max(1200, maxBytes - fixedOverhead);
     const finalBlocks = fullResults.map((r) => r.block);
-    for (let k = 0; k < sortedValid.length; k++) {
-        const idx = sortedValid[k];
+    for (let pos = 0; pos < activeIndices.length; pos++) {
+        const idx = activeIndices[pos];
         const entry = fullResults[idx];
-        const lineCount = entry.item.unpooledEnd - entry.item.start + 1;
-        const fairShare = Math.floor(remainingPool / (sortedValid.length - k));
-        if (entry.bytes <= fairShare || (lineCount <= 60 && entry.bytes <= 2200 && entry.bytes <= remainingPool)) {
+        const remCount = activeIndices.length - pos;
+        const fairShare = Math.floor(remainingPool / remCount);
+        const reserveForTail = (remCount - 1) * 550;
+        const protectedFloor = pos < 2 && remCount > 1
+            ? Math.min(3000, Math.floor(remainingPool * (pos === 0 ? 0.42 : 0.48)))
+            : fairShare;
+        const targetBudget = Math.max(400, Math.min(remainingPool - reserveForTail, Math.max(fairShare, protectedFloor)));
+        if (entry.bytes <= targetBudget || (entry.bytes <= 1400 && entry.bytes <= remainingPool - reserveForTail)) {
             finalBlocks[idx] = entry.block;
             remainingPool = Math.max(0, remainingPool - entry.bytes);
             continue;
         }
-        const fitted = fitItemToByteShare(entry.item, Math.max(400, fairShare), minLinesFloor);
+        const fitted = fitItemToByteShare(entry.item, targetBudget, minLinesFloor);
         finalBlocks[idx] = fitted.block;
         remainingPool = Math.max(0, remainingPool - fitted.bytes);
     }
@@ -4991,6 +5172,10 @@ export function formatReadSpans(result) {
     for (const b of result.blocks ?? []) {
         if (b.error) {
             out.push(`✗ ${b.error}`);
+            continue;
+        }
+        if (b.alreadySeen) {
+            out.push(b.code);
             continue;
         }
         out.push(`${b.file}:${b.span} (of ${b.totalLines} lines)\n\`\`\`\n${b.code}\n\`\`\``);

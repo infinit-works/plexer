@@ -1,5 +1,5 @@
-import { isPlexerEntry } from '../util/config-write.js';
-const SL_CMD = 'node "${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/plexer-statusline.cjs"';
+import { formatPlexerHookCommand, isPlexerEntry } from '../util/config-write.js';
+const SL_CMD = formatPlexerHookCommand('${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/plexer-statusline.cjs', '', { fallbackJson: '' });
 /** Stable marker for "this statusLine is Plexer's", not the full command string —
  * an older shim path or a PLEXER_DIR wrapper still names this file. */
 const PLEXER_STATUSLINE_HELPER = 'plexer-statusline.cjs';
@@ -19,13 +19,13 @@ const REPO_HELPERS = '${CLAUDE_PROJECT_DIR:-.}/.claude/helpers';
  * global copy exists to cover, so it cannot reuse the repo form.
  */
 function hookCmd(arg, helpers = REPO_HELPERS) {
-    return `node "${helpers}/plexer-hooks.cjs" ${arg}`;
+    return formatPlexerHookCommand(`${helpers}/plexer-hooks.cjs`, arg);
 }
 /** Claude Code reads a hook's `timeout` in seconds, not milliseconds. */
 function plexerBlocks(helpers) {
     return {
         PreToolUse: [
-            { matcher: 'Read|Bash', hooks: [{ type: 'command', command: hookCmd('pre-tool-use', helpers), timeout: 8 }] },
+            { matcher: 'Read|Bash|Grep|Glob', hooks: [{ type: 'command', command: hookCmd('pre-tool-use', helpers), timeout: 8 }] },
         ],
         PostToolUse: [
             { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd('post-edit', helpers), timeout: 10 }] },

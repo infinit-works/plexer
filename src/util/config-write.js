@@ -23,6 +23,21 @@ export function isPlexerEntry(entry) {
     return JSON.stringify(entry ?? "").includes("plexer-hooks.cjs");
 }
 
+/**
+ * Format a portable hook/statusline command that prefers an isolated self-contained
+ * Node runtime (`$AGENT_HOOK_NODE`, then `$XDG_DATA_HOME/agent-node/current/bin/node`)
+ * before `node` on `PATH`, and fails open with valid JSON on exit 126/127.
+ */
+export function formatPlexerHookCommand(scriptPathExpr, arg = "", opts = {}) {
+    const { fallbackJson = "{}" } = opts;
+    const argSuffix = arg ? ` ${arg}` : "";
+    if (process.platform === "win32") {
+        return `node "${scriptPathExpr}"${argSuffix}`;
+    }
+    const emitFallback = fallbackJson ? `printf '%s\\n' '${fallbackJson}'; ` : "";
+    return `_n="\${AGENT_HOOK_NODE:-}"; [ -z "$_n" ] && [ -x "\${XDG_DATA_HOME:-$HOME/.local/share}/agent-node/current/bin/node" ] && _n="\${XDG_DATA_HOME:-$HOME/.local/share}/agent-node/current/bin/node"; _n="\${_n:-node}"; "$_n" "${scriptPathExpr}"${argSuffix}; _rc=$?; if [ "$_rc" -eq 126 ] || [ "$_rc" -eq 127 ]; then if [ -z "\${AGENT_HOOK_NODE:-}" ] && [ "$_n" != "node" ]; then node "${scriptPathExpr}"${argSuffix}; _rc=$?; fi; if [ "$_rc" -eq 126 ] || [ "$_rc" -eq 127 ]; then echo "[plexer-hook] warning: node failed to launch (exit $_rc); failing open" >&2; ${emitFallback}exit 0; fi; fi; exit "$_rc"`;
+}
+
 export function readJsonObject(path) {
     if (!existsSync(path))
         return { root: {}, existed: false };

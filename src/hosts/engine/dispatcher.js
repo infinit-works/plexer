@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { computeReadPreToolWidening, evaluateAgyPreTool, rewriteChainedPlexerCommand } from '../../agy/pre-tool.js';
+import { evaluateAgyPreTool } from '../../agy/pre-tool.js';
 import { pickRepoForTargetPath } from '../../agy/multi-workspace.js';
 import { nearestPlexerRoot } from '../../graph/root.js';
 import { contextDirFor } from '../../util/paths.js';
@@ -17,6 +17,13 @@ function formatHostPreToolAllow(hostKind, updatedInput) {
         return { decision: 'allow', hookSpecificOutput: { hookEventName: 'BeforeTool', tool_input: updatedInput } };
     }
     return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', updatedInput } };
+}
+
+function formatHostPreToolDeny(hostKind, reason) {
+    if (hostKind === 'gemini') {
+        return { decision: 'deny', reason };
+    }
+    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
 }
 
 export function handleAgyPreTool(input, opts = {}) {
@@ -43,30 +50,45 @@ export function handleHostPreTool(hostKind, input, opts = {}) {
     const rawDir = resolveHostProjectDir(input, opts.envFlags);
     const root = nearestPlexerRoot(rawDir)?.root ?? rawDir;
     if (isIsolatedBenchDir(root, opts.envFlags)) return emitHookPayload('{}\n', opts);
-    const toolName = String(input?.tool_name ?? input?.toolName ?? input?.toolCall?.name ?? '');
+    const toolName = String(input?.tool_name ?? input?.toolName ?? input?.toolCall?.name ?? '').trim();
     const toolInput = input?.tool_input ?? input?.toolCall?.args ?? input?.args ?? {};
     const sid = resolveHostSessionId(input, opts.envFlags);
 
-    if (/^(?:Bash|run_shell_command)$/i.test(toolName)) {
-        const cmd = String(toolInput?.command ?? toolInput?.CommandLine ?? '');
-        const rewritten = rewriteChainedPlexerCommand(cmd, sid);
-        if (!rewritten) return emitHookPayload('{}\n', opts);
-        return emitHookPayload(`${JSON.stringify(formatHostPreToolAllow(hostKind, { ...toolInput, command: rewritten }))}\n`, opts);
+    if (!/^(?:Read|read_file|Bash|run_shell_command|Grep|grep_search|Glob|find_by_name)$/i.test(toolName)) {
+        return emitHookPayload('{}\n', opts);
+    }
+    const targetPath = unquoteArg(
+        toolInput?.file_path ?? toolInput?.path ?? toolInput?.Path ?? toolInput?.SearchDirectory ?? toolInput?.SearchPath ?? '',
+    );
+    const targetRepo = targetPath ? (nearestPlexerRoot(targetPath)?.root ?? root) : root;
+    if (isIsolatedBenchDir(targetRepo, opts.envFlags) || !existsSync(contextDirFor(targetRepo))) {
+        return emitHookPayload('{}\n', opts);
     }
 
-    if (!/^(?:Read|read_file)$/i.test(toolName)) return emitHookPayload('{}\n', opts);
-    const targetPath = unquoteArg(toolInput?.file_path ?? toolInput?.path ?? toolInput?.Path ?? '');
-    const targetRepo = nearestPlexerRoot(targetPath || root)?.root ?? root;
-    if (isIsolatedBenchDir(targetRepo, opts.envFlags) || !existsSync(contextDirFor(targetRepo))) return emitHookPayload('{}\n', opts);
-
     const agyState = readEngineSession(sid, opts);
-    const widened = computeReadPreToolWidening(toolInput, targetRepo, agyState, { getGraph: opts.getGraph });
+    const result = evaluateAgyPreTool(
+        { tool_name: toolName, tool_input: toolInput, conversationId: sid },
+        { repoRoot: targetRepo, agyState, getGraph: opts.getGraph, sessionId: sid },
+    );
     saveAgyContext(sid, agyState, opts);
-    if (!widened) return emitHookPayload('{}\n', opts);
 
+    if (result?.decision === 'deny') {
+        return emitHookPayload(`${JSON.stringify(formatHostPreToolDeny(hostKind, result.reason))}\n`, opts);
+    }
+    if (!result?.overwrite) {
+        return emitHookPayload('{}\n', opts);
+    }
+    if (/^(?:Bash|run_shell_command)$/i.test(toolName)) {
+        const rewrittenCmd = result.overwrite.CommandLine ?? result.overwrite.command;
+        if (!rewrittenCmd) return emitHookPayload('{}\n', opts);
+        return emitHookPayload(`${JSON.stringify(formatHostPreToolAllow(hostKind, { ...toolInput, command: rewrittenCmd }))}\n`, opts);
+    }
+    const startLine = result.overwrite.StartLine;
+    const endLine = result.overwrite.EndLine;
+    const limit = Math.max(1, endLine - startLine + 1);
     const updated = hostKind === 'gemini'
-        ? { ...toolInput, start_line: widened.startLine, end_line: widened.endLine, offset: widened.startLine, limit: widened.limit }
-        : { ...toolInput, offset: widened.startLine, limit: widened.limit };
+        ? { ...toolInput, start_line: startLine, end_line: endLine, offset: startLine, limit }
+        : { ...toolInput, offset: startLine, limit };
     return emitHookPayload(`${JSON.stringify(formatHostPreToolAllow(hostKind, updated))}\n`, opts);
 }
 

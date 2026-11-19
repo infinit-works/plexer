@@ -216,7 +216,7 @@ function collectReceiverScanContext(graph, symbol, hits) {
         if (e.relation === "calls" && homonymIds.has(e.target))
             alreadyLinkedCallerIds.add(e.source);
     }
-    return { leaf, candidateFiles, byPath, alreadyLinkedCallerIds };
+    return { leaf, candidateFiles, byPath, alreadyLinkedCallerIds, homonymIds };
 }
 
 function filterScanFilesBySqlitePostings(candidateFiles, leafToks, contextDir) {
@@ -308,12 +308,18 @@ function scanSingleFileReceiverSites(fn, symsInFile, ctx, state) {
         if (isSelfFile && ln >= ctx.symRange.start && ln <= ctx.symRange.end)
             continue;
         const rawLine = lines[idx];
-        if (!rawLine.includes(ctx.leaf) || !ctx.callRe.test(rawLine) || ctx.defLineRe.test(rawLine))
+        if (!rawLine.includes(ctx.leaf) || !ctx.callRe.test(rawLine) || ctx.defLineRe.test(rawLine) || ctx.methodDefRe?.test(rawLine))
             continue;
         const trimmed = rawLine.trim();
         if (isCommentOnlyLine(trimmed))
             continue;
         const encNode = findEnclosingCallNode(symsInFile, ln, fn);
+        if (
+            encNode.kind !== "file" &&
+            ctx.homonymIds?.has(encNode.id) &&
+            spanRange(encNode.span)?.start === ln
+        )
+            continue;
         if (ctx.alreadyLinkedCallerIds.has(encNode.id) || ctx.alreadyLinkedCallerIds.has(fn.path))
             continue;
         const siteKey = `${encNode.id}:${ln}`;
@@ -327,20 +333,30 @@ function scanSingleFileReceiverSites(fn, symsInFile, ctx, state) {
             span: encNode.kind !== "file" ? encNode.span : null,
             text: trimmed.length > 120 ? `${trimmed.slice(0, 117)}…` : trimmed,
         });
-        if (state.sites.length > 8)
+        if (state.sites.length > 16)
             return true;
     }
     return false;
 }
 
-function scanReceiverCallSitesInFiles(filesToScan, symbol, leaf, byPath, alreadyLinkedCallerIds, read) {
+function scanReceiverCallSitesInFiles(filesToScan, symbol, leaf, byPath, alreadyLinkedCallerIds, read, scannedFiles = null, homonymIds = null) {
+    const esc = escapeRegExp(leaf);
+    const isGeneric = GENERIC_MEMBER_NAMES.has(leaf.toLowerCase());
+    const callParts = [
+        `(?:\\.|::|:|->)\\s*${esc}\\s*\\(`,
+        `(?:\\.|::)\\s*${esc}\\b(?!\\s*[=(:])`,
+    ];
+    if (!isGeneric && leaf.length >= 4)
+        callParts.push(`(?<![A-Za-z0-9_$.])\\b${esc}\\s*\\(`);
     const ctx = {
         symbol,
         symRange: spanRange(symbol.span),
         leaf,
-        callRe: new RegExp(`(?:\\.|::|:|->)\\s*${escapeRegExp(leaf)}\\s*\\(`),
-        defLineRe: new RegExp(`\\b(?:function|def|fn|func)\\b[^(\\n]*\\b${escapeRegExp(leaf)}\\s*\\(`),
+        callRe: new RegExp(callParts.join("|")),
+        defLineRe: new RegExp(`\\b(?:function|def|fn|func)\\b[^(\\n]*\\b${esc}\\s*\\(`),
+        methodDefRe: new RegExp(`^\\s*(?:(?:public|private|protected|static|async|export|override)\\s+)*${esc}\\s*\\([^)\\n]*\\)\\s*(?::[^={;\\n]+)?(?:\\{|;)`),
         alreadyLinkedCallerIds,
+        homonymIds,
         read,
     };
     const state = { sites: [], seenEnclosing: new Set() };
@@ -351,9 +367,9 @@ function scanReceiverCallSitesInFiles(filesToScan, symbol, leaf, byPath, already
             break;
         }
     }
-    if (GENERIC_MEMBER_NAMES.has(leaf.toLowerCase()) && truncated)
-        return { sites: [], truncated: false };
-    return { sites: state.sites.slice(0, 8), truncated };
+    if (isGeneric && truncated)
+        return { sites: [], truncated: false, scannedFiles };
+    return { sites: state.sites.slice(0, 16), truncated, scannedFiles };
 }
 
 function collectUnlinkedReceiverCallSites(graph, symbol, hits, direction, read, contextDir = null, preloadedAskIdx = undefined) {
@@ -368,14 +384,22 @@ function collectUnlinkedReceiverCallSites(graph, symbol, hits, direction, read, 
         return { sites: [], truncated: false };
     const ctx = collectReceiverScanContext(graph, symbol, hits);
     const filesToScan = filterScanFilesByAskIndex(ctx.candidateFiles, ctx.leaf, graph, contextDir, preloadedAskIdx);
-    return scanReceiverCallSitesInFiles(filesToScan, symbol, ctx.leaf, ctx.byPath, ctx.alreadyLinkedCallerIds, read);
+    return scanReceiverCallSitesInFiles(filesToScan, symbol, ctx.leaf, ctx.byPath, ctx.alreadyLinkedCallerIds, read, ctx.candidateFiles.length, ctx.homonymIds);
 }
 
 function formatUnlinkedReceiverFooter(symbol, unlinked) {
-    if (!unlinked?.sites?.length)
-        return null;
     const leaf = String(symbol.name ?? "").split(/[.:#]/).pop() ?? symbol.name;
-    const lines = [`  unlinked .${leaf}() call sites (${unlinked.sites.length}${unlinked.truncated ? "+" : ""}):`];
+    const isGeneric = GENERIC_MEMBER_NAMES.has(String(leaf ?? "").toLowerCase());
+    if (!unlinked?.sites?.length) {
+        if (!isGeneric && typeof unlinked?.scannedFiles === "number") {
+            return `  unlinked scan: 0 unlinked references across ${unlinked.scannedFiles} reachable files`;
+        }
+        return null;
+    }
+    const scanNote = typeof unlinked.scannedFiles === "number"
+        ? `, scanned ${unlinked.scannedFiles} reachable files`
+        : "";
+    const lines = [`  unlinked .${leaf}() call sites (${unlinked.sites.length}${unlinked.truncated ? "+" : ""}${scanNote}):`];
     for (const s of unlinked.sites) {
         const label = s.enclosing ? `${s.enclosing} (${s.path}:${s.span})` : s.path;
         lines.push(`    ? ${label} → L${s.line}: ${s.text}`);
@@ -732,7 +756,7 @@ function renderCallersTextBlocks(allResults, graph, direction, showDepth, read, 
     const seenHomonymKeys = new Set();
     const seenDepth = new Map();
     const testLinks = direction === "in" ? linkTestsForGraph(graph) : null;
-    const totalHardCap = 8800;
+    const totalHardCap = 8600;
     const quotePoolCap = allResults.length > 1 ? 5600 : 7200;
     const maxBytesPerSymbol = allResults.length > 1 ? Math.max(900, Math.floor(quotePoolCap / allResults.length)) : quotePoolCap;
     let totalBytes = 0;

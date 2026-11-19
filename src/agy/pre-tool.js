@@ -3,22 +3,60 @@
  *  - Widens or AST-snaps narrow `read_file`/`view_file` slices so pagination collapses into 1 turn.
  *  - Coalesces `&&`/`;`-chained read-only `plexer` invocations into a single 9 KB-budgeted `plexer _batch` call.
  */
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { extname, isAbsolute, relative, resolve } from 'node:path';
 import { loadGraphCached } from '../context/graph-store.js';
 import { hasPlexerIndex } from '../graph/root.js';
 import { contextDirFor } from '../util/paths.js';
 import { parseNodeSpan, unquoteArg } from '../util/span.js';
 import { mergeSpan, normalizeRelFile } from './spans.js';
+import {
+    PKG_BIN_PLEXER,
+    evaluateSearchAndGatePreTool,
+    getSeenIntervalsForFile,
+    hasPlexerOnPath,
+    isIgnoredRepoSubpath,
+    isSyncFastPlexerCommand,
+    normalizeSessionId,
+    parsePlexerCommandTokens,
+    quoteShellToken,
+    readTextLinesSafe,
+    resolvePlexerFallbackBin,
+    rewriteShellExplorationCommand,
+    splitSafeChainedCommands,
+    tokenizeShellSegment,
+    trackPreEditTurn,
+    unquoteCommandLine,
+} from './shell-rewrite.js';
+
+export { evaluateSearchAndGatePreTool, rewriteShellExplorationCommand };
 
 const ALLOW_RESULT = Object.freeze({ decision: 'allow' });
 
-const FULL_WIDEN_MAX_LINES = 350;
-const FULL_WIDEN_MAX_BYTES = 22000;
-const SECOND_SLICE_MAX_LINES = 750;
-const SECOND_SLICE_MAX_BYTES = 42000;
+const FULL_WIDEN_MAX_LINES = 260;
+const FULL_WIDEN_MAX_BYTES = 16000;
+const UNCOVERED_WIDEN_MAX_LINES = 520;
+const UNCOVERED_WIDEN_MAX_BYTES = 26000;
+const LARGE_FILE_SLICE_WINDOW_LINES = 400;
+const LARGE_FILE_SLICE_MAX_BYTES = 20000;
 const AST_SNAP_MAX_LINES = 320;
-const AST_SNAP_MAX_BYTES = 24000;
+const AST_SNAP_MAX_BYTES = 18000;
+const HEADER_PEEK_MAX_LINES = 50;
+const HEADER_PEEK_MIN_FILE_LINES = 120;
+const HEADER_SNAP_MAX_LINES = 120;
+const MIN_WIDEN_ADD_LINES = 20;
+const TOP_PAGE_MIN_LINES = 60;
+const TOP_PAGE_MAX_LINES = 220;
+const TOP_PAGE_WIDEN_LINES = 360;
+const TOP_PAGE_WIDEN_MAX_BYTES = 16000;
+const MIN_EDGE_TRIM_LINES = 25;
+const SURGICAL_MICRO_READ_MAX_LINES = 59;
+const SURGICAL_EDGE_TRIM_MIN_LINES = 35;
+const DUPLICATE_BLOCK_MIN_LINES = 90;
+const DUPLICATE_BLOCK_MIN_BYTES = 3200;
+const MIN_UNBOUNDED_TRIM_LINES = 40;
+const AGY_READ_MAX_LINES = 800;
+const AGY_READ_MAX_BYTES = 46080;
 
 const BINARY_OR_MEDIA_EXTS = new Set([
     '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.tiff',
@@ -28,17 +66,6 @@ const BINARY_OR_MEDIA_EXTS = new Set([
     '.ttf', '.otf', '.eot', '.sqlite', '.db',
 ]);
 
-const PLEXER_BATCHABLE_SUBCOMMANDS = new Set(['read', 'ask', 'callers', 'callees', 'impact', 'skeleton', 'grep', 'map', 'blast']);
-
-const PLEXER_PREFIX_RE = /^((?:npx\s+)?plexer|node\s+(?:"[^"]*plexer\.js"|\S*plexer\.js))\s+([a-z0-9_-]+)(?:\s+([\s\S]*))?$/i;
-
-function isIgnoredRepoSubpath(relNorm) {
-    if (!relNorm || relNorm.startsWith('..') || isAbsolute(relNorm))
-        return true;
-    const parts = relNorm.split('/');
-    return parts.some((seg) => seg === '.git' || seg === 'node_modules' || seg === '.system_generated' || seg === 'plexer' || seg === '.agents');
-}
-
 function parsePositiveInt(raw) {
     if (raw === undefined || raw === null || raw === '')
         return null;
@@ -46,30 +73,6 @@ function parsePositiveInt(raw) {
     if (!Number.isFinite(n) || n < 1)
         return null;
     return Math.floor(n);
-}
-
-function readTextLinesSafe(absPath, maxStatBytes = 256 * 1024) {
-    let st;
-    try {
-        st = statSync(absPath);
-    }
-    catch {
-        return null;
-    }
-    if (!st.isFile() || st.size === 0 || st.size > maxStatBytes)
-        return null;
-    const buf = readFileSync(absPath);
-    // Skip binary files containing NUL bytes.
-    const probeLen = Math.min(buf.length, 4096);
-    for (let i = 0; i < probeLen; i++) {
-        if (buf[i] === 0)
-            return null;
-    }
-    const text = buf.toString('utf8');
-    const lines = text.split(/\r\n|\n/);
-    if (lines.length > 1 && lines[lines.length - 1] === '')
-        lines.pop();
-    return { bytes: st.size, lines };
 }
 
 function getFileSymbolsFromGraph(graph, relNorm) {
@@ -137,9 +140,75 @@ function resolveSafeReadTarget(toolArgs, repoRoot) {
     return { absRepo, relNorm, bytes: loaded.bytes, lines: loaded.lines };
 }
 
-function computeAstSnapBounds(absRepo, relNorm, lines, reqStart, reqEnd, opts) {
+function computeUnboundedReadEndLine(lines, startLine = 1) {
+    const maxEnd = Math.min(lines.length, startLine + AGY_READ_MAX_LINES - 1);
+    let bytes = 0;
+    let end = startLine - 1;
+    for (let ln = startLine; ln <= maxEnd; ln++) {
+        const lb = Buffer.byteLength(lines[ln - 1], 'utf8') + 1;
+        if (end >= startLine && bytes + lb > AGY_READ_MAX_BYTES)
+            break;
+        bytes += lb;
+        end = ln;
+    }
+    return Math.max(startLine, end);
+}
+
+function uncoveredWindowAround(totalLines, reqStart, reqEnd, seenIntervals, allowPartialEdgeTrim = false, minEdgeTrimLines = MIN_EDGE_TRIM_LINES) {
+    let winStart = 1;
+    let winEnd = totalLines;
+    let trimmedStart = reqStart;
+    let trimmedEnd = reqEnd;
+    for (const [s, e] of seenIntervals) {
+        const seenLen = e - s + 1;
+        const seenPrefixSubstantial = s <= 1 && seenLen >= minEdgeTrimLines;
+        const seenSuffixSubstantial = e >= totalLines && seenLen >= minEdgeTrimLines;
+        if (s <= 1 && e < reqStart && e + 1 > winStart)
+            winStart = e + 1;
+        else if (seenPrefixSubstantial && e < trimmedEnd && e >= reqStart) {
+            const tailCandidate = (trimmedEnd - e) >= MIN_WIDEN_ADD_LINES ? e + 1 : Math.min(e + 1, reqStart);
+            if (tailCandidate > winStart)
+                winStart = tailCandidate;
+        }
+        if (e >= totalLines && s > reqEnd && s - 1 < winEnd)
+            winEnd = s - 1;
+        else if (seenSuffixSubstantial && s > trimmedStart && s <= reqEnd) {
+            const headCandidate = (s - trimmedStart) >= MIN_WIDEN_ADD_LINES ? s - 1 : Math.max(s - 1, reqEnd);
+            if (headCandidate < winEnd)
+                winEnd = headCandidate;
+        }
+        if (allowPartialEdgeTrim && s <= trimmedStart && e >= trimmedStart && e < trimmedEnd) {
+            if (((e - trimmedStart + 1) >= minEdgeTrimLines || seenPrefixSubstantial) && (trimmedEnd - e) >= MIN_WIDEN_ADD_LINES)
+                trimmedStart = e + 1;
+        }
+        if (allowPartialEdgeTrim && s > trimmedStart && s <= trimmedEnd && e >= trimmedEnd) {
+            if (((trimmedEnd - s + 1) >= minEdgeTrimLines || seenSuffixSubstantial) && (s - trimmedStart) >= MIN_WIDEN_ADD_LINES)
+                trimmedEnd = s - 1;
+        }
+    }
+    return {
+        winStart: Math.min(winStart, trimmedStart),
+        winEnd: Math.max(winEnd, trimmedEnd),
+        trimmedStart,
+        trimmedEnd,
+    };
+}
+
+function trySnapSymbolSet(symbols, lines, reqStart, reqEnd, minClamp, maxClamp, maxLines) {
+    if (!symbols.length)
+        return null;
+    const snapStart = Math.max(minClamp, Math.min(reqStart, ...symbols.map((sym) => sym.start)));
+    const snapEnd = Math.min(maxClamp, Math.max(reqEnd, ...symbols.map((sym) => sym.end)));
+    const fitsLines = (snapEnd - snapStart + 1) <= maxLines;
+    const fitsBytes = byteLengthOfLines(lines, snapStart, snapEnd) <= AST_SNAP_MAX_BYTES;
+    if (fitsLines && fitsBytes && (snapStart < reqStart || snapEnd > reqEnd))
+        return { start: snapStart, end: snapEnd, snappedAst: true };
+    return null;
+}
+
+function computeAstSnapBounds(absRepo, relNorm, lines, reqStart, reqEnd, opts, maxLines = AST_SNAP_MAX_LINES) {
     if (!hasPlexerIndex(absRepo))
-        return { start: reqStart, end: reqEnd };
+        return { start: reqStart, end: reqEnd, snappedAst: false };
     let graph = null;
     try {
         graph = typeof opts.getGraph === 'function'
@@ -147,57 +216,253 @@ function computeAstSnapBounds(absRepo, relNorm, lines, reqStart, reqEnd, opts) {
             : loadGraphCached(contextDirFor(absRepo));
     }
     catch {
-        return { start: reqStart, end: reqEnd };
+        return { start: reqStart, end: reqEnd, snappedAst: false };
     }
     const symbols = getFileSymbolsFromGraph(graph, relNorm);
     const overlapping = symbols.filter((sym) => sym.end >= reqStart && sym.start <= reqEnd);
     if (overlapping.length === 0)
-        return { start: reqStart, end: reqEnd };
-    const snapStart = Math.max(1, Math.min(reqStart, ...overlapping.map((sym) => sym.start)));
-    const snapEnd = Math.min(lines.length, Math.max(reqEnd, ...overlapping.map((sym) => sym.end)));
-    const fitsLines = (snapEnd - snapStart + 1) <= AST_SNAP_MAX_LINES;
-    const fitsBytes = byteLengthOfLines(lines, snapStart, snapEnd) <= AST_SNAP_MAX_BYTES;
-    if (fitsLines && fitsBytes && (snapStart < reqStart || snapEnd > reqEnd))
-        return { start: snapStart, end: snapEnd };
-    return { start: reqStart, end: reqEnd };
+        return { start: reqStart, end: reqEnd, snappedAst: false };
+    const clamp = opts?.clampWindow;
+    const minClamp = clamp ? Math.max(1, clamp.winStart) : 1;
+    const maxClamp = clamp ? Math.min(lines.length, clamp.winEnd) : lines.length;
+
+    const fullSnap = trySnapSymbolSet(overlapping, lines, reqStart, reqEnd, minClamp, maxClamp, maxLines);
+    if (fullSnap)
+        return fullSnap;
+
+    // When an enclosing class/module exceeds AST_SNAP_MAX_LINES, snap to overlapping inner methods/functions instead.
+    const inner = overlapping.filter((sym) =>
+        (sym.end - sym.start + 1) <= maxLines && byteLengthOfLines(lines, sym.start, sym.end) <= AST_SNAP_MAX_BYTES,
+    );
+    if (inner.length > 0 && inner.length < overlapping.length) {
+        const innerSnap = trySnapSymbolSet(inner, lines, reqStart, reqEnd, minClamp, maxClamp, maxLines);
+        if (innerSnap)
+            return innerSnap;
+    }
+    return { start: reqStart, end: reqEnd, snappedAst: false };
+}
+
+function checkDuplicateCoveredRead(agyState, relNorm, lines, seenIntervals, effStart, effEnd, keyTag) {
+    if (!seenIntervals.some(([s, e]) => s <= effStart && e >= effEnd))
+        return { covered: false, blocked: false, retryAllowed: false };
+    const spanLines = effEnd - effStart + 1;
+    const spanBytes = byteLengthOfLines(lines, effStart, effEnd);
+    if (spanLines < DUPLICATE_BLOCK_MIN_LINES && spanBytes < DUPLICATE_BLOCK_MIN_BYTES) {
+        if (agyState) agyState.lastBlockedReadKey = null;
+        return { covered: true, blocked: false, retryAllowed: false };
+    }
+    const blockKey = `${relNorm}:${keyTag}`;
+    if (agyState?.lastBlockedReadKey === blockKey) {
+        agyState.lastBlockedReadKey = null;
+        return { covered: true, blocked: false, retryAllowed: true };
+    }
+    if (agyState)
+        agyState.lastBlockedReadKey = blockKey;
+    return {
+        covered: true,
+        blocked: true,
+        retryAllowed: false,
+        relNorm,
+        startLine: effStart,
+        endLine: effEnd,
+        reason: `[plexer] ${relNorm}:L${effStart}-L${effEnd} is already in your context window (unedited); reuse those lines directly or retry once to force re-reading.`,
+    };
+}
+
+function computeUnboundedGapTrim(seenIntervals, totalLines, effEnd) {
+    if (seenIntervals.length === 0 || totalLines <= DUPLICATE_BLOCK_MIN_LINES)
+        return null;
+    let uStart = 1;
+    let uEnd = effEnd;
+    for (const [s, e] of seenIntervals) {
+        if (s <= uStart && e >= uStart && e < uEnd && (e - uStart + 1) >= MIN_UNBOUNDED_TRIM_LINES) {
+            uStart = e + 1;
+        }
+    }
+    for (const [s, e] of seenIntervals) {
+        if (s > uStart && s <= uEnd && e >= uEnd && (uEnd - s + 1) >= MIN_UNBOUNDED_TRIM_LINES) {
+            uEnd = s - 1;
+        }
+    }
+    if ((uStart === 1 && uEnd === effEnd) || (uEnd - uStart + 1) < MIN_WIDEN_ADD_LINES)
+        return null;
+    if (seenIntervals.some(([s, e]) => s > uStart && e < uEnd && (e - s + 1) >= MIN_UNBOUNDED_TRIM_LINES))
+        return null;
+    return { startLine: uStart, endLine: uEnd };
+}
+
+function computeLargeFileSliceWindow(absRepo, relNorm, lines, baseStart, baseEnd, winStart, winEnd, opts) {
+    const snapAnchor = (baseStart - winStart) <= 80 ? winStart : Math.max(winStart, baseStart - 40);
+    const bStart = Math.min(baseStart, snapAnchor);
+    let bEnd = Math.min(winEnd, Math.max(baseEnd, bStart + LARGE_FILE_SLICE_WINDOW_LINES - 1));
+    while (bEnd > baseEnd && byteLengthOfLines(lines, bStart, bEnd) > LARGE_FILE_SLICE_MAX_BYTES) {
+        bEnd = Math.max(baseEnd, bEnd - 10);
+    }
+    const astBounds = computeAstSnapBounds(absRepo, relNorm, lines, bStart, bEnd, { ...opts, clampWindow: { winStart, winEnd } }, LARGE_FILE_SLICE_WINDOW_LINES);
+    if (astBounds.end > bEnd && astBounds.end <= winEnd && (astBounds.end - bEnd) <= 30 && byteLengthOfLines(lines, bStart, astBounds.end) <= LARGE_FILE_SLICE_MAX_BYTES) {
+        bEnd = astBounds.end;
+    }
+    return { start: bStart, end: bEnd };
 }
 
 export function computeReadPreToolWidening(toolArgs, repoRoot, agyState, opts = {}) {
+    const hasByteOffset = toolArgs?.ByteOffset !== undefined && toolArgs?.ByteOffset !== null && toolArgs?.ByteOffset !== '';
     const bounds = extractRequestedReadBounds(toolArgs);
-    if (!bounds)
-        return null;
     const target = resolveSafeReadTarget(toolArgs, repoRoot);
     if (!target)
         return null;
 
     const { absRepo, relNorm, bytes: fileBytes, lines } = target;
     const totalLines = lines.length;
+    const spanKey = opts.relPrefix ? `${opts.relPrefix}${relNorm}` : relNorm;
+    const seenIntervals = getSeenIntervalsForFile(agyState?.seenSpans, relNorm);
+
+    if (!bounds) {
+        if (hasByteOffset)
+            return null;
+        const effEnd = computeUnboundedReadEndLine(lines, 1);
+        const dup = checkDuplicateCoveredRead(agyState, relNorm, lines, seenIntervals, 1, effEnd, 'unbounded');
+        if (dup.blocked)
+            return dup;
+        if (!dup.retryAllowed && agyState)
+            agyState.lastBlockedReadKey = null;
+        if (!agyState)
+            return null;
+        if (!agyState.seenSpans || typeof agyState.seenSpans !== 'object')
+            agyState.seenSpans = {};
+        if (!agyState.lastFileReadEnd || typeof agyState.lastFileReadEnd !== 'object')
+            agyState.lastFileReadEnd = {};
+        const trimmed = dup.retryAllowed ? null : computeUnboundedGapTrim(seenIntervals, totalLines, effEnd);
+        mergeSpan(agyState.seenSpans, spanKey, 1, effEnd);
+        agyState.lastReadRelFile = relNorm;
+        agyState.lastFileReadEnd[relNorm] = trimmed ? Number(trimmed.endLine) : effEnd;
+        if (!trimmed)
+            return null;
+        return {
+            relNorm,
+            startLine: Number(trimmed.startLine),
+            endLine: Number(trimmed.endLine),
+            limit: Number(trimmed.endLine - trimmed.startLine + 1),
+        };
+    }
+
     const reqStart = parsePositiveInt(bounds.rawStart) ?? 1;
     const reqEnd = Math.min(totalLines, Math.max(reqStart, parsePositiveInt(bounds.rawEnd) ?? totalLines));
+
+    const dup = checkDuplicateCoveredRead(agyState, relNorm, lines, seenIntervals, reqStart, reqEnd, `${reqStart}-${reqEnd}`);
+    if (dup.blocked)
+        return dup;
+    if (dup.covered)
+        return null;
+    if (agyState)
+        agyState.lastBlockedReadKey = null;
+
+    if (!agyState.lastFileReadEnd || typeof agyState.lastFileReadEnd !== 'object')
+        agyState.lastFileReadEnd = {};
+    const reqLines = reqEnd - reqStart + 1;
+    const prevEnd = agyState.lastFileReadEnd[relNorm];
+    const isSequentialPage = reqStart === 1
+        || (typeof prevEnd === 'number' && reqStart >= prevEnd - 5 && reqStart <= prevEnd + 20);
+    const isSurgicalMidFileRead = !isSequentialPage && reqLines > SURGICAL_MICRO_READ_MAX_LINES;
+    if (isSurgicalMidFileRead) {
+        const { trimmedStart, trimmedEnd } = uncoveredWindowAround(
+            totalLines,
+            reqStart,
+            reqEnd,
+            seenIntervals,
+            true,
+            SURGICAL_EDGE_TRIM_MIN_LINES,
+        );
+        const trimmed = trimmedStart > reqStart || trimmedEnd < reqEnd;
+        const effStart = trimmed ? trimmedStart : reqStart;
+        const effEnd = trimmed ? trimmedEnd : reqEnd;
+        if (!agyState.seenSpans || typeof agyState.seenSpans !== 'object')
+            agyState.seenSpans = {};
+        mergeSpan(agyState.seenSpans, spanKey, effStart, effEnd);
+        agyState.lastReadRelFile = relNorm;
+        agyState.lastFileReadEnd[relNorm] = effEnd;
+        if (!trimmed)
+            return null;
+        return {
+            relNorm,
+            startLine: Number(effStart),
+            endLine: Number(effEnd),
+            limit: Number(effEnd - effStart + 1),
+        };
+    }
 
     if (!agyState.fileSliceCounts || typeof agyState.fileSliceCounts !== 'object')
         agyState.fileSliceCounts = {};
     const sliceCount = (agyState.fileSliceCounts[relNorm] ?? 0) + 1;
     agyState.fileSliceCounts[relNorm] = sliceCount;
 
-    const smallFileWiden = totalLines <= FULL_WIDEN_MAX_LINES && fileBytes <= FULL_WIDEN_MAX_BYTES;
-    const repeatedSliceWiden = sliceCount >= 2 && totalLines <= SECOND_SLICE_MAX_LINES && fileBytes <= SECOND_SLICE_MAX_BYTES;
-    let newStart = reqStart;
-    let newEnd = reqEnd;
-    if (smallFileWiden || repeatedSliceWiden) {
-        newStart = 1;
-        newEnd = totalLines;
+    const hasSubstantialSeenInterval = seenIntervals.some(([s, e]) => (e - s + 1) >= MIN_EDGE_TRIM_LINES);
+    const allowEdgeTrim = totalLines > FULL_WIDEN_MAX_LINES || hasSubstantialSeenInterval;
+    const { winStart, winEnd, trimmedStart, trimmedEnd } = uncoveredWindowAround(totalLines, reqStart, reqEnd, seenIntervals, allowEdgeTrim);
+    const edgeTrimmed = trimmedStart > reqStart || trimmedEnd < reqEnd;
+    const baseStart = edgeTrimmed ? trimmedStart : reqStart;
+    const baseEnd = edgeTrimmed ? trimmedEnd : reqEnd;
+    const snapOpts = { ...opts, clampWindow: { winStart, winEnd } };
+    const isHeaderPeek = reqStart === 1 && reqEnd <= HEADER_PEEK_MAX_LINES && totalLines > HEADER_PEEK_MIN_FILE_LINES;
+    let newStart = baseStart;
+    let newEnd = baseEnd;
+    let snappedAst = false;
+    if (isHeaderPeek) {
+        ({ start: newStart, end: newEnd, snappedAst } = computeAstSnapBounds(absRepo, relNorm, lines, baseStart, baseEnd, snapOpts, HEADER_SNAP_MAX_LINES));
     }
     else {
-        ({ start: newStart, end: newEnd } = computeAstSnapBounds(absRepo, relNorm, lines, reqStart, reqEnd, opts));
+        const winLines = winEnd - winStart + 1;
+        const winBytes = (winStart === 1 && winEnd === totalLines)
+            ? fileBytes
+            : byteLengthOfLines(lines, winStart, winEnd);
+        const smallFileWiden = totalLines <= FULL_WIDEN_MAX_LINES && fileBytes <= FULL_WIDEN_MAX_BYTES;
+        const repeatedSliceWiden = sliceCount >= 2 && winLines <= UNCOVERED_WIDEN_MAX_LINES && winBytes <= UNCOVERED_WIDEN_MAX_BYTES;
+        if (smallFileWiden || repeatedSliceWiden) {
+            newStart = winStart;
+            newEnd = winEnd;
+        }
+        else if (sliceCount >= 2 && winLines > UNCOVERED_WIDEN_MAX_LINES) {
+            ({ start: newStart, end: newEnd } = computeLargeFileSliceWindow(absRepo, relNorm, lines, baseStart, baseEnd, winStart, winEnd, opts));
+        }
+        else {
+            ({ start: newStart, end: newEnd, snappedAst } = computeAstSnapBounds(absRepo, relNorm, lines, baseStart, baseEnd, snapOpts));
+            if (
+                !snappedAst
+                && sliceCount === 1
+                && reqStart === 1
+                && reqEnd >= TOP_PAGE_MIN_LINES
+                && reqEnd <= TOP_PAGE_MAX_LINES
+                && totalLines > FULL_WIDEN_MAX_LINES
+            ) {
+                let pageEnd = Math.min(winEnd, Math.max(baseEnd, TOP_PAGE_WIDEN_LINES));
+                while (pageEnd > baseEnd && byteLengthOfLines(lines, 1, pageEnd) > TOP_PAGE_WIDEN_MAX_BYTES) {
+                    pageEnd = Math.max(baseEnd, pageEnd - 10);
+                }
+                if (pageEnd > baseEnd) {
+                    const pageSnap = computeAstSnapBounds(absRepo, relNorm, lines, 1, pageEnd, snapOpts, TOP_PAGE_WIDEN_LINES);
+                    newStart = 1;
+                    newEnd = Math.max(pageEnd, pageSnap.end);
+                    snappedAst = pageSnap.snappedAst;
+                }
+            }
+        }
     }
 
     if (!agyState.seenSpans || typeof agyState.seenSpans !== 'object')
         agyState.seenSpans = {};
-    mergeSpan(agyState.seenSpans, relNorm, newStart, newEnd);
+    mergeSpan(agyState.seenSpans, spanKey, newStart, newEnd);
     agyState.lastReadRelFile = relNorm;
+    agyState.lastFileReadEnd[relNorm] = newEnd;
 
     if (newStart === reqStart && newEnd === reqEnd)
+        return null;
+    if (newStart > reqStart || newEnd < reqEnd) {
+        return edgeTrimmed
+            ? { relNorm, startLine: Number(newStart), endLine: Number(newEnd), limit: Number(newEnd - newStart + 1) }
+            : null;
+    }
+    const addedLines = (reqStart - newStart) + (newEnd - reqEnd);
+    if (addedLines < MIN_WIDEN_ADD_LINES && !snappedAst)
         return null;
     return {
         relNorm,
@@ -211,6 +476,12 @@ function handleReadPreTool(toolArgs, repoRoot, agyState, opts) {
     const plan = computeReadPreToolWidening(toolArgs, repoRoot, agyState, opts);
     if (!plan)
         return ALLOW_RESULT;
+    if (plan.blocked) {
+        return {
+            decision: 'deny',
+            reason: plan.reason,
+        };
+    }
     return {
         decision: 'allow',
         overwrite: {
@@ -220,220 +491,150 @@ function handleReadPreTool(toolArgs, repoRoot, agyState, opts) {
     };
 }
 
-function stepQuotedCommandChar(state, s, i) {
-    const ch = s[i];
-    const next = s[i + 1];
-    if (state.quote === '"' && ch === '\\' && i + 1 < s.length) {
-        state.cur += ch + s[i + 1];
-        return i + 1;
-    }
-    if (state.quote === '"' && (ch === '`' || (ch === '$' && next === '('))) {
-        state.abort = true;
-        return i;
-    }
-    if (ch === state.quote)
-        state.quote = null;
-    state.cur += ch;
-    return i;
+function isHarmlessDividerSegment(tokens) {
+    return Boolean(tokens && tokens.length >= 1 && (tokens[0] === 'echo' || tokens[0] === 'printf'));
 }
 
-function stepUnquotedCommandChar(state, s, i) {
-    const ch = s[i];
-    const next = s[i + 1];
-    if (ch === '\'' || ch === '"') {
-        state.quote = ch;
-        state.cur += ch;
-        return i;
+function countReadSpanArgs(argv) {
+    let count = 0;
+    for (let i = 1; i < argv.length; i++) {
+        const tok = String(argv[i]);
+        if (tok === '--dir' || tok === '--session') {
+            i++;
+            continue;
+        }
+        if (tok.startsWith('-'))
+            continue;
+        count += tok.split(',').map((s) => s.trim()).filter(Boolean).length;
     }
-    if (ch === '\\' && i + 1 < s.length) {
-        state.cur += ch + s[i + 1];
-        return i + 1;
-    }
-    if (ch === '|' || ch === '>' || ch === '<' || ch === '`' || (ch === '$' && next === '(')) {
-        state.abort = true;
-        return i;
-    }
-    if ((ch === '&' && next === '&') || ch === ';') {
-        state.segments.push(state.cur.trim());
-        state.cur = '';
-        return ch === '&' ? i + 1 : i;
-    }
-    if (ch === '&') {
-        state.abort = true;
-        return i;
-    }
-    state.cur += ch;
-    return i;
+    return count;
 }
 
-/**
- * Split a shell command on `&&` / `;` only outside quotes.
- * Returns null if unquoted pipes, redirects, subshells, or background `&` are present.
- */
-function splitSafeChainedCommands(cmd) {
-    if (typeof cmd !== 'string')
+function stripMultiSpanReadFullArgv(argv) {
+    if (!Array.isArray(argv) || argv[0] !== 'read' || !argv.includes('--full'))
         return null;
-    const s = cmd.trim();
-    if (!s)
+    if (countReadSpanArgs(argv) < 2)
         return null;
-
-    const state = { segments: [], cur: '', quote: null, abort: false };
-    for (let i = 0; i < s.length; i++) {
-        i = state.quote
-            ? stepQuotedCommandChar(state, s, i)
-            : stepUnquotedCommandChar(state, s, i);
-        if (state.abort)
-            return null;
-    }
-    if (state.quote)
-        return null;
-    if (state.cur.trim())
-        state.segments.push(state.cur.trim());
-    return state.segments.filter(Boolean);
-}
-
-/**
- * Tokenize a single shell segment respecting single/double quotes and backslash escapes.
- */
-function tokenizeShellSegment(seg) {
-    const tokens = [];
-    let cur = '';
-    let hasTok = false;
-    let quote = null;
-    for (let i = 0; i < seg.length; i++) {
-        const ch = seg[i];
-        if (quote) {
-            if (quote === '"' && ch === '\\' && i + 1 < seg.length) {
-                cur += seg[++i];
-                continue;
-            }
-            if (ch === quote) {
-                quote = null;
-                continue;
-            }
-            cur += ch;
-            continue;
-        }
-        if (ch === '\'' || ch === '"') {
-            quote = ch;
-            hasTok = true;
-            continue;
-        }
-        if (ch === '\\' && i + 1 < seg.length) {
-            cur += seg[++i];
-            hasTok = true;
-            continue;
-        }
-        if (/\s/.test(ch)) {
-            if (hasTok) {
-                tokens.push(cur);
-                cur = '';
-                hasTok = false;
-            }
-            continue;
-        }
-        cur += ch;
-        hasTok = true;
-    }
-    if (quote)
-        return null;
-    if (hasTok)
-        tokens.push(cur);
-    return tokens;
-}
-
-function parsePlexerCommandTokens(tokens) {
-    if (!tokens || tokens.length < 2)
-        return null;
-    let prefix = null;
-    let restStart = 1;
-    if (tokens[0] === 'plexer') {
-        prefix = 'plexer';
-    }
-    else if (tokens[0] === 'npx' && tokens[1] === 'plexer' && tokens.length >= 3) {
-        prefix = 'npx plexer';
-        restStart = 2;
-    }
-    else if ((tokens[0] === 'node' || tokens[0].endsWith('/node')) && /plexer\.js$/i.test(tokens[1]) && tokens.length >= 3) {
-        const quotedBin = /\s/.test(tokens[1]) ? JSON.stringify(tokens[1]) : tokens[1];
-        const quotedNode = /\s/.test(tokens[0]) ? JSON.stringify(tokens[0]) : tokens[0];
-        prefix = `${quotedNode} ${quotedBin}`;
-        restStart = 2;
-    }
-    else {
-        return null;
-    }
-    const sub = tokens[restStart];
-    if (!PLEXER_BATCHABLE_SUBCOMMANDS.has(sub))
-        return null;
-    if (tokens.includes('--json'))
-        return null;
-    return { prefix, argv: tokens.slice(restStart) };
+    return argv.filter((tok) => tok !== '--full');
 }
 
 export function rewriteChainedPlexerCommand(cmd, sessionId = null) {
     if (typeof cmd !== 'string' || (!cmd.includes('&&') && !cmd.includes(';')))
         return null;
-    if (!PLEXER_PREFIX_RE.test(cmd.trim()) && !/\bplexer\b/.test(cmd))
+    if (!/\bplexer\b/.test(cmd))
         return null;
     const segments = splitSafeChainedCommands(cmd);
     if (!segments || segments.length < 2)
         return null;
 
-    const cleanSid = typeof sessionId === 'string' && sessionId.trim() && sessionId.trim() !== 'default'
-        ? sessionId.trim().replace(/[^A-Za-z0-9_.-]/g, '_')
-        : '';
+    const cleanSid = normalizeSessionId(sessionId);
     const batchItems = [];
     let prefix = null;
+    let sharedEnvCwd;
+    let seenPlexer = false;
     for (const seg of segments) {
         const tokens = tokenizeShellSegment(seg);
+        if (isHarmlessDividerSegment(tokens))
+            continue;
         const parsed = parsePlexerCommandTokens(tokens);
         if (!parsed)
             return null;
-        if (!prefix)
-            prefix = parsed.prefix;
-        const hasSession = parsed.argv.some((a) => a === '--session' || a.startsWith('--session='));
-        const subArgv = cleanSid && !hasSession ? [...parsed.argv, '--session', cleanSid] : parsed.argv;
+        if (!seenPlexer) {
+            seenPlexer = true;
+            const offPathBare = (parsed.prefix === 'plexer' || parsed.prefix === 'npx plexer') && !hasPlexerOnPath();
+            prefix = offPathBare ? resolvePlexerFallbackBin() : parsed.prefix;
+            sharedEnvCwd = parsed.envCwd ?? null;
+        }
+        else if ((parsed.envCwd ?? null) !== sharedEnvCwd) {
+            return null;
+        }
+        const strippedArgv = stripMultiSpanReadFullArgv(parsed.argv) ?? parsed.argv;
+        const hasSession = strippedArgv.some((a) => a === '--session' || a.startsWith('--session='));
+        const subArgv = cleanSid && !hasSession ? [...strippedArgv, '--session', cleanSid] : strippedArgv;
         batchItems.push(subArgv);
     }
+    if (batchItems.length < 2 || !prefix)
+        return null;
     const encoded = Buffer.from(JSON.stringify(batchItems), 'utf8').toString('base64url');
-    return `${prefix} _batch ${encoded}`;
+    const envPart = sharedEnvCwd ? `env -C ${/\s/.test(sharedEnvCwd) ? JSON.stringify(sharedEnvCwd) : sharedEnvCwd} ` : '';
+    return `${envPart}${prefix} _batch ${encoded}`;
 }
 
-function unquoteCommandLine(val) {
-    if (typeof val !== 'string')
+export function rewriteSingleNpxPlexerCommand(cmd, sessionId = null) {
+    if (typeof cmd !== 'string' || !/\bplexer(?:\.js)?\b/.test(cmd))
         return null;
-    const trimmed = val.trim();
-    if (!trimmed)
+    const segments = splitSafeChainedCommands(cmd);
+    if (!segments || segments.length !== 1)
         return null;
-    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-        try {
-            const parsed = JSON.parse(trimmed);
-            if (typeof parsed === 'string')
-                return parsed;
-        }
-        catch {
-            return trimmed;
-        }
+    const tokens = tokenizeShellSegment(segments[0]);
+    const parsed = parsePlexerCommandTokens(tokens, { allowAnySub: true });
+    if (!parsed)
+        return null;
+    const strippedArgv = stripMultiSpanReadFullArgv(parsed.argv);
+    let finalArgv = strippedArgv ?? parsed.argv;
+    const cleanSid = normalizeSessionId(sessionId);
+    const hasSession = finalArgv.some((a) => a === '--session' || a.startsWith('--session='));
+    const appendSession = Boolean(cleanSid && finalArgv[0] === 'read' && !finalArgv.includes('--full') && !hasSession);
+    if (appendSession)
+        finalArgv = [...finalArgv, '--session', cleanSid];
+
+    const onPath = hasPlexerOnPath();
+    const hasFallbackBin = existsSync(PKG_BIN_PLEXER);
+    if (parsed.prefix !== 'npx plexer' && parsed.prefix !== 'plexer') {
+        if (!strippedArgv && !appendSession)
+            return null;
+        const envPart = parsed.envCwd ? `env -C ${quoteShellToken(parsed.envCwd)} ` : '';
+        return `${envPart}${parsed.prefix} ${finalArgv.map(quoteShellToken).join(' ')}`;
     }
-    return trimmed;
+    if (parsed.prefix === 'plexer' && onPath && !strippedArgv && !appendSession)
+        return null;
+    if (!onPath && !hasFallbackBin && (!strippedArgv && !appendSession || parsed.prefix !== 'plexer'))
+        return null;
+    const binPart = onPath
+        ? 'plexer'
+        : (hasFallbackBin ? resolvePlexerFallbackBin() : (parsed.prefix === 'npx plexer' ? 'npx plexer' : 'plexer'));
+    const envPart = parsed.envCwd ? `env -C ${quoteShellToken(parsed.envCwd)} ` : '';
+    return `${envPart}${binPart} ${finalArgv.map(quoteShellToken).join(' ')}`;
 }
 
-function handleRunCommandPreTool(toolArgs, sessionId = null) {
+function handleRunCommandPreTool(toolArgs, sid = null, ctx = {}) {
     const cmd = unquoteCommandLine(toolArgs?.CommandLine ?? toolArgs?.command);
-    const rewritten = rewriteChainedPlexerCommand(cmd, sessionId);
-    if (!rewritten)
+    const rewritten = rewriteChainedPlexerCommand(cmd, sid)
+        ?? rewriteSingleNpxPlexerCommand(cmd, sid)
+        ?? rewriteShellExplorationCommand(cmd, { repoRoot: ctx.repoRoot, sessionId: sid, getGraph: ctx.getGraph });
+    const effectiveCmd = rewritten ?? cmd;
+    const gated = evaluateSearchAndGatePreTool({
+        toolName: 'run_command',
+        toolArgs,
+        effectiveCmd,
+        repoRoot: ctx.repoRoot ?? '',
+        relPrefix: ctx.relPrefix ?? '',
+        agyState: ctx.agyState ?? null,
+    });
+    if (gated)
+        return gated;
+    const rawWait = toolArgs?.WaitMsBeforeAsync;
+    const waitNum = rawWait !== undefined && rawWait !== null && rawWait !== '' ? Number(rawWait) : NaN;
+    const bumpWait = Number.isFinite(waitNum) && waitNum > 0 && waitNum < 5000 && isSyncFastPlexerCommand(effectiveCmd)
+        ? 5000
+        : null;
+    if (!rewritten && !bumpWait)
         return ALLOW_RESULT;
+    const overwrite = {};
+    if (rewritten) {
+        const key = toolArgs?.CommandLine !== undefined || toolArgs?.command === undefined ? 'CommandLine' : 'command';
+        overwrite[key] = rewritten;
+    }
+    if (bumpWait)
+        overwrite.WaitMsBeforeAsync = bumpWait;
     return {
         decision: 'allow',
-        overwrite: {
-            CommandLine: rewritten,
-        },
+        overwrite,
     };
 }
 
 /**
- * Process an Antigravity `PreToolUse` event and return a decision payload (`{ decision: "allow", overwrite? }`).
+ * Process an Antigravity `PreToolUse` event and return a decision payload (`{ decision: "allow" | "deny", overwrite?, reason? }`).
  */
 export function evaluateAgyPreTool(input, ctx = {}) {
     try {
@@ -450,10 +651,20 @@ export function evaluateAgyPreTool(input, ctx = {}) {
             ctx?.envFlags?.antigravityConversationId ||
             null;
         if (name === 'read_file' || name === 'view_file' || name === 'Read' || name === 'read') {
+            trackPreEditTurn(ctx.agyState, name, Date.now());
             return handleReadPreTool(args, ctx.repoRoot, ctx.agyState, ctx);
         }
         if (name === 'run_command' || name === 'Bash' || name === 'run_shell_command') {
-            return handleRunCommandPreTool(args, sid);
+            return handleRunCommandPreTool(args, sid, ctx);
+        }
+        if (/^(?:grep_search|Grep|find_by_name|Glob)$/i.test(name)) {
+            return evaluateSearchAndGatePreTool({
+                toolName: name,
+                toolArgs: args,
+                repoRoot: ctx.repoRoot ?? '',
+                relPrefix: ctx.relPrefix ?? '',
+                agyState: ctx.agyState ?? null,
+            }) ?? ALLOW_RESULT;
         }
         return ALLOW_RESULT;
     }

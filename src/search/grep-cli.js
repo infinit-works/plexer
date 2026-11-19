@@ -42,7 +42,8 @@ function formatGroup(g, allowContext = true) {
 /** `"<pattern>" — N hits in M symbols across K files (searched T indexed files)` */
 function formatGrepHeader(result) {
     const filesHit = new Set(result.groups.map((g) => g.path)).size;
-    return `"${result.pattern}" — ${result.totalHits} hits in ${result.groups.length} symbols across ${filesHit} files (searched ${result.filesSearched} indexed files)`;
+    const noteSuffix = result.regexFallbackNote ? `  ${result.regexFallbackNote}` : "";
+    return `"${result.pattern}" — ${result.totalHits} hits in ${result.groups.length} symbols across ${filesHit} files (searched ${result.filesSearched} indexed files)${noteSuffix}`;
 }
 /** Loud truncation note — dropped counts are never silent. */
 function truncationNote(result) {
@@ -59,18 +60,24 @@ function truncationNote(result) {
 /** Full human report: header, blank line, then one block per group (header +
  * indented hit lines), each block separated by a blank line. */
 export function formatGrepResult(result, opts = {}) {
-    const maxBytes = opts.maxBytes ?? 4800;
-    const contextCapBytes = opts.contextCapBytes ?? Math.min(3600, Math.floor(maxBytes * 0.75));
+    const explicitCtx = Boolean(opts.explicitContext);
+    const totalHits = result.totalHits ?? result.hits ?? 0;
+    const defaultMaxBytes = explicitCtx ? 4800 : 3000;
+    const maxBytes = opts.maxBytes ?? defaultMaxBytes;
+    const contextCapBytes = opts.contextCapBytes ?? Math.min(explicitCtx ? 3600 : 2100, Math.floor(maxBytes * 0.72));
     const note = truncationNote(result);
     const head = note ? `${formatGrepHeader(result)}\n${note}` : formatGrepHeader(result);
     const hasContext = result.groups.some((g) => g.contextBlocks && g.contextBlocks.length > 0);
-    const maxGroups = hasContext ? 12 : 20;
+    const maxContextGroups = explicitCtx
+        ? 10
+        : (totalHits > 16 ? 0 : (totalHits > 8 || result.groups.length > 5 ? 3 : 10));
+    const maxGroups = (!hasContext || maxContextGroups === 0) ? 20 : 12;
     const shown = result.groups.slice(0, maxGroups);
     const blocks = [head, ""];
     let totalBytes = Buffer.byteLength(head, "utf8");
     for (let idx = 0; idx < shown.length; idx++) {
         const g = shown[idx];
-        const allowContext = idx < 10 && totalBytes < contextCapBytes;
+        const allowContext = idx < maxContextGroups && totalBytes < contextCapBytes;
         const formatted = formatGroup(g, allowContext) + "\n";
         const fb = Buffer.byteLength(formatted, "utf8");
         if (idx > 0 && totalBytes + fb > maxBytes)
@@ -106,12 +113,30 @@ export function zeroHitNote(result) {
         return base;
     return `${base} — note: ${notes.join("; ")}`;
 }
+export function runGrepWithRegexFallback(grepFn, pattern, opts) {
+    try {
+        return grepFn(pattern, opts);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isSafeSyntaxErr = !opts.fixed && err instanceof SyntaxError && !/catastrophic backtracking|exceeds max length/i.test(msg);
+        if (!isSafeSyntaxErr)
+            throw err;
+        const literalPattern = String(pattern).replace(/\\([().+?^${}[\]|])/g, "$1");
+        const res = grepFn(literalPattern, { ...opts, fixed: true });
+        if (res && typeof res === "object") {
+            const target = res.result && typeof res.result === "object" ? res.result : res;
+            target.regexFallbackNote = `(invalid regex; matched literal "${literalPattern}")`;
+        }
+        return res;
+    }
+}
+
 /**
  * Resolve the graph at `dir` (respecting `--dir`), run `grepGraph`, and print
  * either the human report or `--json`. Exits the process (code 1) when
- * there's no graph at all or the pattern fails to compile as a regex — both
- * are caller-facing mistakes, not recoverable states. Zero hits is NOT an
- * error: it prints a loud note to stderr and exits 0.
+ * there's no graph at all or the pattern fails ReDoS validation.
+ * Unescaped regex syntax errors automatically fall back to literal search.
  */
 export function runGrepCommand(patternInput, dir, opts) {
     const root = resolve(dir);
@@ -125,18 +150,21 @@ export function runGrepCommand(patternInput, dir, opts) {
     const results = [];
     for (const pattern of patterns) {
         try {
-            const r = grepGraph(graph, root, pattern, {
-                ignoreCase: opts.ignoreCase,
-                fixed: opts.fixed,
-                in: opts.in,
-                context: opts.context !== undefined ? Number(opts.context) : undefined,
-                source: opts.source,
-            });
+            const r = runGrepWithRegexFallback(
+                (pat, gOpts) => grepGraph(graph, root, pat, {
+                    ignoreCase: gOpts.ignoreCase,
+                    fixed: gOpts.fixed,
+                    in: gOpts.in,
+                    context: gOpts.context !== undefined ? Number(gOpts.context) : undefined,
+                    source: gOpts.source,
+                }),
+                pattern,
+                opts,
+            );
             results.push(r);
         }
         catch (err) {
-            // `new RegExp` throws SyntaxError; anything else (an unindexed `--in` prefix)
-            // is a different mistake and must not be reported as a bad pattern.
+            // ReDoS or unindexed `--in` prefix errors still exit 1 loudly.
             const message = err instanceof Error ? err.message : String(err);
             console.error(err instanceof SyntaxError ? `✗ invalid pattern "${pattern}": ${message}` : `✗ ${message}`);
             process.exit(1);
@@ -160,8 +188,9 @@ export function runGrepCommand(patternInput, dir, opts) {
         }
     }
     if (hitResults.length > 0) {
-        const perPatternBudget = hitResults.length >= 2 ? Math.max(950, Math.floor(8600 / hitResults.length)) : 4800;
-        const outBlocks = hitResults.map((r) => formatGrepResult(r, { maxBytes: perPatternBudget }).trimEnd());
+        const singleBudget = opts.explicitContext ? 4800 : 3000;
+        const perPatternBudget = hitResults.length >= 2 ? Math.max(850, Math.floor(7200 / hitResults.length)) : singleBudget;
+        const outBlocks = hitResults.map((r) => formatGrepResult(r, { maxBytes: perPatternBudget, explicitContext: Boolean(opts.explicitContext) }).trimEnd());
         process.stdout.write(`${outBlocks.join("\n\n")}\n`);
     }
 }

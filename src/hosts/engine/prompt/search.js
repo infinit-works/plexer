@@ -9,7 +9,7 @@ import { contextDirFor, isTestPath } from '../../../util/paths.js';
 import { readJson, readStats } from '../../../util/state.js';
 import { detectPromptIntent } from './intent.js';
 import { distillPromptQueries } from './distill.js';
-import { HOOK_BUDGETS, enforceMergedHitsBudget, mergeMultiQueryHits } from './budget.js';
+import { enforceMergedHitsBudget, mergeMultiQueryHits, resolveHookBudgets } from './budget.js';
 
 export function lastFileScopeHint(dir, lastFile) {
     if (!lastFile) return null;
@@ -118,15 +118,17 @@ export function computeCoEditPointers(ctxDir, graph, hits) {
     return pointers.slice(0, 4);
 }
 
-function runScopedPromptQueries(root, contextDir, queries, intent, scope) {
+function runScopedPromptQueries(root, contextDir, queries, intent, scope, opts = {}) {
     if (readWorkspace(root, contextDir)) {
         return federateAsk(root, contextDir, queries[0], { limit: 3, source: true, in: scope ?? undefined });
     }
+    const budgets = resolveHookBudgets(opts);
+    const geminiProfile = Boolean(opts?.geminiProfile);
     if (queries.length === 1) {
         const single = runAsk(root, queries[0], {
-            limit: 3, source: true, maxHitsToInline: HOOK_BUDGETS.singleQueryInline,
-            maxSourceBytes: intent.editEnvelope ? HOOK_BUDGETS.editSingleHitBytes : HOOK_BUDGETS.qaSingleHitBytes,
-            wantsCallSites: intent.wantsCallSites, editEnvelope: intent.editEnvelope,
+            limit: (geminiProfile && intent.editEnvelope) ? 4 : 3, source: true, maxHitsToInline: budgets.singleQueryInline,
+            maxSourceBytes: intent.editEnvelope ? budgets.editSingleHitBytes : budgets.qaSingleHitBytes,
+            wantsCallSites: intent.wantsCallSites, editEnvelope: intent.editEnvelope, geminiProfile,
             includeRankingMetadata: false, contextDir, in: scope ?? undefined,
         });
         if (single) single.isEditPrompt = intent.editEnvelope;
@@ -135,16 +137,16 @@ function runScopedPromptQueries(root, contextDir, queries, intent, scope) {
     const seen = new Set();
     const results = queries.map((q, qIdx) => runAsk(root, q, {
         limit: 3, source: true, subQueryIndex: qIdx,
-        maxHitsToInline: (qIdx === 0 && !intent.editEnvelope && intent.wantsCallSites) ? 2 : HOOK_BUDGETS.multiQueryInline,
-        maxSourceBytes: intent.editEnvelope ? HOOK_BUDGETS.editMultiHitBytes
-            : (qIdx === 0 && intent.wantsCallSites ? HOOK_BUDGETS.qaMultiHitBytes + 1100
-                : (qIdx > 0 && intent.wantsCallSites ? 2600 : HOOK_BUDGETS.qaMultiHitBytes)),
-        wantsCallSites: intent.wantsCallSites, editEnvelope: intent.editEnvelope,
+        maxHitsToInline: (qIdx === 0 && !intent.editEnvelope && intent.wantsCallSites) ? 2 : budgets.multiQueryInline,
+        maxSourceBytes: intent.editEnvelope ? budgets.editMultiHitBytes
+            : (qIdx === 0 && intent.wantsCallSites ? budgets.qaMultiHitBytes + 1100
+                : (qIdx > 0 && intent.wantsCallSites ? 2600 : budgets.qaMultiHitBytes)),
+        wantsCallSites: intent.wantsCallSites, editEnvelope: intent.editEnvelope, geminiProfile,
         includeRankingMetadata: false, seenPointers: seen, contextDir, in: scope ?? undefined,
     }));
-    const mergedHits = mergeMultiQueryHits(results, intent.editEnvelope);
-    enforceMergedHitsBudget(mergedHits, intent, queries.length);
-    const topHits = mergedHits.slice(0, queries.length >= 4 ? 5 : 4);
+    const mergedHits = mergeMultiQueryHits(results, intent.editEnvelope, { geminiProfile });
+    enforceMergedHitsBudget(mergedHits, intent, queries.length, budgets);
+    const topHits = mergedHits.slice(0, (geminiProfile && intent.editEnvelope) ? 5 : (queries.length >= 4 ? 5 : 4));
     const fileQueryCount = new Map();
     for (const r of results) {
         for (const f of new Set((r?.hits ?? []).map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean))) {
@@ -167,9 +169,9 @@ export function searchPromptContext(dir, prompt, opts = {}) {
     try {
         const intent = detectPromptIntent(prompt, opts);
         const queries = distillPromptQueries(root, contextDir, prompt);
-        const scoped = runScopedPromptQueries(root, contextDir, queries, intent, scopeHint);
+        const scoped = runScopedPromptQueries(root, contextDir, queries, intent, scopeHint, opts);
         if (scopeHint && (!scoped?.hits?.length || (scoped.coverageStrong ?? 0) < 0.25)) {
-            const unscoped = runScopedPromptQueries(root, contextDir, queries, intent, null);
+            const unscoped = runScopedPromptQueries(root, contextDir, queries, intent, null, opts);
             const uS = unscoped?.coverageStrong ?? 0, sS = scoped?.coverageStrong ?? 0;
             if (unscoped?.hits?.length && (!scoped?.hits?.length || uS > sS || (uS === sS && (unscoped.coverage ?? 0) > (scoped.coverage ?? 0)))) return unscoped;
         }

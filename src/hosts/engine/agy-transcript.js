@@ -75,6 +75,32 @@ export function extractPathsFromEntry(obj, sessionState) {
             sessionState.lastTouchedPath = p;
             if ((key === 'Path' || key === 'TargetFile') && /^(?:edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file)$/i.test(name)) {
                 sessionState.lastEditedFile = p;
+                sessionState.editedInPrompt = true;
+            }
+        }
+    }
+}
+
+export function extractMetadataContext(raw, sessionState) {
+    if (!raw || typeof raw !== 'string' || !sessionState || typeof sessionState !== 'object')
+        return;
+    const metaMatch = /<ADDITIONAL_METADATA>([\s\S]*?)(?:<\/ADDITIONAL_METADATA>|<USER_SETTINGS_CHANGE>|$)/i.exec(raw);
+    if (metaMatch?.[1]) {
+        extractPathsFromText(metaMatch[1], sessionState);
+    }
+    const settingsMatch = /<USER_SETTINGS_CHANGE>([\s\S]*?)(?:<\/USER_SETTINGS_CHANGE>|$)/i.exec(raw);
+    if (settingsMatch?.[1]) {
+        const ms = /`Model Selection`\s+from\s+[^\n]+?\s+to\s+([^\n.]+)/i.exec(settingsMatch[1]);
+        if (ms?.[1]) {
+            const targetModel = ms[1].trim();
+            if (/orchestrator/i.test(targetModel)) {
+                sessionState.isOrchestratorModel = true;
+                if (!sessionState.orchestratorPhase)
+                    sessionState.orchestratorPhase = 'plan';
+            }
+            else if (/claude|gemini|neon|carbon|argon|hydrogen|flash|gpt/i.test(targetModel)) {
+                sessionState.isOrchestratorModel = false;
+                sessionState.orchestratorPhase = null;
             }
         }
     }
@@ -118,16 +144,79 @@ function readTranscriptSlice(transcriptPath, sessionState) {
     return { processable: chunk, offset, consumed: bytesRead, size };
 }
 
+function extractRawTextContent(parsed) {
+    const raw = parsed?.content ?? parsed?.text ?? parsed?.user_input ?? parsed?.userPrompt ?? parsed?.message?.content ?? '';
+    return Array.isArray(raw)
+        ? raw.map((c) => (typeof c === 'string' ? c : c?.text ?? '')).join('\n')
+        : (typeof raw === 'string' ? raw : '');
+}
+
+function extractSubagentSystemMessage(parsed, sessionState = null) {
+    if (sessionState?.hasDirectUserInput) return '';
+    const stepType = String(parsed?.type ?? '').toUpperCase();
+    const stepSrc = String(parsed?.source ?? '').toUpperCase();
+    if (stepSrc !== 'SYSTEM' || stepType !== 'SYSTEM_MESSAGE') return '';
+    const text = extractRawTextContent(parsed);
+    if (!text || !text.includes('[Message]')) return '';
+    const m = /\[Message\]([^\n]*?)\bcontent=([\s\S]*)$/i.exec(text);
+    if (!m?.[2]) return '';
+    const hdr = m[1] ?? '';
+    const senderM = /\bsender=([^\s]+)/i.exec(hdr);
+    const sender = senderM?.[1] ?? '';
+    if (sender && /\/task-\d+\b|(?:^|\/)(?:schedule|cron|timer)\b/i.test(sender)) return '';
+    if (sessionState?.lastUserPrompt) {
+        if (!sessionState.subagentSenderId || !sender || sender !== sessionState.subagentSenderId) return '';
+    }
+    const cleaned = m[2].replace(/\s*<\/SYSTEM_MESSAGE>\s*$/i, '').trim();
+    if (!cleaned || /^(?:Task id "|\[plan review(?:\s+due)?\])/i.test(cleaned)) return '';
+    if (sessionState && !sessionState.subagentSenderId && sender) sessionState.subagentSenderId = sender;
+    return cleaned;
+}
+
+function resetTranscriptCompactionState(sessionState) {
+    sessionState.seenSpans = {};
+    sessionState.fileSliceCounts = {};
+    sessionState.lastFileReadEnd = {};
+    sessionState.injectedPointers = [];
+    sessionState.orientedDirs = [];
+    delete sessionState.orientedRepos;
+    sessionState.turn0Matched = false;
+    sessionState.midLoopHintEmitted = false;
+    sessionState.lastBlockedReadKey = null;
+    sessionState.isEditPrompt = false;
+    sessionState.editTargetFiles = [];
+    sessionState.preEditInvocations = 0;
+    sessionState.editedInPrompt = false;
+    sessionState.exploreGuardEmitted = false;
+    sessionState.exploreGuardStage = 0;
+}
+
 function applyTranscriptEntry(parsed, stepFallback, sessionState) {
     extractPathsFromEntry(parsed, sessionState);
     const stepType = String(parsed?.type ?? '').toUpperCase();
     const stepSrc = String(parsed?.source ?? '').toUpperCase();
-    if (stepType === 'SYSTEM_MESSAGE' || stepSrc === 'SYSTEM' || stepSrc === 'SYSTEM_SDK') return;
-    const role = parsed?.role ?? parsed?.type ?? parsed?.author ?? parsed?.message?.role;
-    if (role !== 'user' && role !== 'human' && role !== 'USER_INPUT' && !parsed?.user_input && !parsed?.userPrompt) return;
-    const raw = parsed?.content ?? parsed?.text ?? parsed?.user_input ?? parsed?.userPrompt ?? parsed?.message?.content ?? '';
-    const text = Array.isArray(raw) ? raw.map((c) => (typeof c === 'string' ? c : c?.text ?? '')).join('\n') : (typeof raw === 'string' ? raw : '');
-    const cleaned = stripUserRequestTags(text);
+    const stepIdx = parsed?.step_index ?? parsed?.step ?? parsed?.index ?? stepFallback;
+    if (stepType === 'CHECKPOINT') {
+        if (typeof sessionState.lastCheckpointStep !== 'number' || (typeof stepIdx === 'number' && stepIdx > sessionState.lastCheckpointStep)) {
+            resetTranscriptCompactionState(sessionState);
+            if (typeof stepIdx === 'number') sessionState.lastCheckpointStep = stepIdx;
+        }
+        return;
+    }
+    if (stepSrc === 'SYSTEM_SDK') return;
+    const subagentMsg = extractSubagentSystemMessage(parsed, sessionState);
+    if (stepType === 'SYSTEM_MESSAGE' || stepSrc === 'SYSTEM') {
+        if (!subagentMsg) return;
+    } else {
+        const role = parsed?.role ?? parsed?.type ?? parsed?.author ?? parsed?.message?.role;
+        if (role !== 'user' && role !== 'human' && role !== 'USER_INPUT' && !parsed?.user_input && !parsed?.userPrompt) return;
+    }
+    const text = subagentMsg || extractRawTextContent(parsed);
+    if (!subagentMsg) {
+        sessionState.hasDirectUserInput = true;
+        extractMetadataContext(text, sessionState);
+    }
+    const cleaned = subagentMsg || stripUserRequestTags(text);
     if (!cleaned) return;
     const normCleaned = normalizePromptKey(cleaned);
     const normPrev = normalizePromptKey(sessionState.lastUserPrompt);
@@ -136,8 +225,33 @@ function applyTranscriptEntry(parsed, stepFallback, sessionState) {
         && normPrev.length > normCleaned.length
         && normPrev.startsWith(normCleaned);
     if (!truncPrefix) sessionState.lastUserPrompt = cleaned;
-    sessionState.lastUserStep = parsed?.step_index ?? parsed?.step ?? parsed?.index ?? stepFallback;
+    sessionState.lastUserStep = stepIdx;
     extractPathsFromText(cleaned, sessionState);
+}
+
+function entryNeedsFullTranscriptHydration(parsed, sessionState = null) {
+    if (!parsed || parsed.step_index === undefined || !Array.isArray(parsed.truncated_fields))
+        return false;
+    if (parsed.truncated_fields.includes('tool_calls'))
+        return true;
+    if (!parsed.truncated_fields.includes('content'))
+        return false;
+    const stepType = String(parsed?.type ?? '').toUpperCase();
+    const stepSrc = String(parsed?.source ?? '').toUpperCase();
+    if (stepSrc === 'SYSTEM_SDK' || stepType === 'CHECKPOINT')
+        return false;
+    if (stepType === 'SYSTEM_MESSAGE' || stepSrc === 'SYSTEM') {
+        if (sessionState?.hasDirectUserInput) return false;
+        const raw = extractRawTextContent(parsed);
+        if (stepSrc !== 'SYSTEM' || stepType !== 'SYSTEM_MESSAGE' || !raw.includes('[Message]')) return false;
+        const hdr = /\[Message\]([^\n]*)/i.exec(raw)?.[1] ?? '';
+        const sender = /\bsender=([^\s]+)/i.exec(hdr)?.[1] ?? '';
+        if (sender && /\/task-\d+\b|(?:^|\/)(?:schedule|cron|timer)\b/i.test(sender)) return false;
+        if (sessionState?.lastUserPrompt && (!sessionState.subagentSenderId || !sender || sender !== sessionState.subagentSenderId)) return false;
+        return true;
+    }
+    const role = parsed?.role ?? parsed?.type ?? parsed?.author ?? parsed?.message?.role;
+    return role === 'user' || role === 'human' || role === 'USER_INPUT' || Boolean(parsed?.user_input || parsed?.userPrompt);
 }
 
 export function parseAgyTranscript(transcriptPath, sessionState) {
@@ -152,7 +266,7 @@ export function parseAgyTranscript(transcriptPath, sessionState) {
         for (let i = 0; i < lines.length; i++) {
             let parsed = null;
             try { parsed = JSON.parse(lines[i]); } catch { continue; }
-            if (Array.isArray(parsed?.truncated_fields) && parsed.truncated_fields.includes('content') && parsed?.step_index !== undefined) {
+            if (entryNeedsFullTranscriptHydration(parsed, sessionState)) {
                 parsed = (fullMap ??= loadFullTranscriptMap(transcriptPath))?.get(`${parsed.step_index}:${parsed.type ?? ''}`) ?? parsed;
             }
             applyTranscriptEntry(parsed, slice.offset + i, sessionState);

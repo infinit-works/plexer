@@ -7,7 +7,9 @@ import { createConnection, createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadGraphCached, invalidateGraphCaches } from '../context/graph-store.js';
+import { wiringPath } from '../context/node-file.js';
 import { ensureFreshGraph } from '../graph/refresh.js';
+import { nearestPlexerRoot } from '../graph/root.js';
 import { readCurrentVersion } from '../util/cli-meta.js';
 import { contextDirFor } from '../util/paths.js';
 import { computeCodeStamp, ensureSocketParentDir, resolveDaemonSocketPath } from './socket-path.js';
@@ -273,8 +275,6 @@ function resetDaemonIdleTimer(state) {
 }
 
 async function handleHookMessage(state, msg) {
-    if (state.repoRefreshChains.size > 0)
-        await Promise.allSettled([...state.repoRefreshChains.values()]);
     if (!state.hookDispatchCached) {
         const mod = await import('../hosts/engine/dispatcher.js');
         state.hookDispatchCached = mod.dispatchHostEvent;
@@ -287,6 +287,8 @@ async function handleHookMessage(state, msg) {
         sessionCache: state.sessionCache,
         getGraph: (repoRoot) => getHotGraphForState(state, repoRoot),
         withRepoLock: (repoRoot, fn) => runSerializedForRepo(state, repoRoot, fn),
+        scheduleRefresh: (repoRoot) => scheduleRefreshForState(state, repoRoot),
+        hasInFlightRefresh: (repoRoot) => Boolean(repoRoot && state.repoRefreshChains.has(resolve(repoRoot))),
         onFileEdited: (repoRoot) => scheduleRefreshForState(state, repoRoot),
         onGraphRefreshed: (repoRoot) => {
             state.hotGraphs.delete(repoRoot);
@@ -300,8 +302,17 @@ async function handleHookMessage(state, msg) {
 }
 
 async function handleCliMessage(state, msg) {
-    if (state.repoRefreshChains.size > 0)
-        await Promise.allSettled([...state.repoRefreshChains.values()]);
+    const baseCwd = msg.cwd && existsSync(msg.cwd) ? resolve(msg.cwd) : null;
+    const targetRoot = baseCwd ? (nearestPlexerRoot(baseCwd)?.root ?? baseCwd) : null;
+    const pending = targetRoot ? state.repoRefreshChains.get(resolve(targetRoot)) : null;
+    if (pending) {
+        if (targetRoot && existsSync(wiringPath(contextDirFor(targetRoot)))) {
+            await Promise.race([pending.catch(() => {}), new Promise((r) => setTimeout(r, 1500))]);
+        }
+        else {
+            await pending.catch(() => {});
+        }
+    }
     if (!state.runCliCached) {
         const mod = await import('../cli/cli-main.js');
         state.runCliCached = mod.runCli;
@@ -365,7 +376,7 @@ async function processDaemonMessage(state, msg) {
 function enqueueDaemonRequest(state, conn, msg) {
     resetDaemonIdleTimer(state);
     state.inFlight += 1;
-    state.serialChain = state.serialChain
+    Promise.resolve()
         .then(() => processDaemonMessage(state, msg))
         .then((res) => {
             if (!conn.destroyed)
@@ -492,7 +503,6 @@ export async function startDaemon(opts = {}) {
         activeConns: new Set(),
         runCliCached: null,
         hookDispatchCached: null,
-        serialChain: Promise.resolve(),
         idleTimer: null,
         closing: false,
         draining: false,

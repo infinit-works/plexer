@@ -3,7 +3,7 @@
  * water-fill stdout cap so chained agent shell calls never spill to disk.
  */
 
-export const BATCH_MAX_BYTES = 9000;
+export const BATCH_MAX_BYTES = 7800;
 export const BATCHABLE_SUBCOMMANDS = new Set([
     'read',
     'ask',

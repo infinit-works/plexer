@@ -1,21 +1,14 @@
 ---
 name: plexer
 description: >-
-  Offline structural code graph and call-chain indexer (`plexer`). Always activate
-  and start with `plexer` in any codebase to locate code flows, trace cross-file
-  callers/callees/blast radius, map repo architecture, or get exact symbol spans
-  and inlined `L<n>:` source in Turn 1 before reading or editing files.
+  Offline structural code graph and call-chain indexer (`plexer`). Load only when
+  `[plexer]` rules or Turn-0 context are absent in a code repo, to locate flows,
+  trace callers or blast radius, or read symbol spans without paging files.
 ---
 
 # plexer: Repo Context Graph
 
-- **Use `[plexer]` Turn-0 context first (never re-query or serialize):**
-  - **Batch without `&&` shell overflows:** Never re-run `plexer ask` on spans already inlined in Turn-0 `[plexer]` context. Pass multiple `<file:symbol|file:Lx-Ly>` or `<symbol>` arguments to **1** `plexer read`, `plexer callers`, or `plexer grep` command, or issue **parallel** tool calls in a single turn. Never `&&`-chain multiple `plexer` commands in one shell call (combined stdout over ~10 KB truncates into a spill file) and never serialize 1 query per turn.
-  - **Diagnosis & caller prompts:** When `[plexer] retrieved context` includes the needed `L<n>:` lines, helpers, constants, and `call sites`, **answer in 0 tool calls** with exact `file:Lx-Ly` citations. Otherwise fetch all missing targets in **1** `plexer read <file:symbol|file:Lx-Ly> [...]` or `plexer callers <symbols...> [--depth 2|all]` call.
-  - **Code-edit prompts & hybrid read rule:** Edit `(named in prompt)` blocks and inlined `L<n>:` spans directly without re-reading. Check `likely co-edits / tests` and `// other symbols in <file>: sym(Lx-Ly)` footers to skip repo-wide `grep`/`find`. Batch 1–6 targeted spans (`<=200` lines per file) in **1** `plexer read` call; when editing multiple regions of one file or needing `>200` lines of a single file, read that file once in parallel with your native file-read tool (`read_file`, `view_file`, `Read`) instead of slicing it across turns. Apply edits with native edit tools (`edit_file`, `replace_file_content`, `multi_replace_file_content`, `Edit`; never `python3`, `node`, or `sed` scripts), and skip unrequested `test/` reads.
-- **CLI (`plexer <cmd>`):**
-  - `plexer read <file:symbol|file:Lx-Ly> [...] [--full]`: exact `L<n>:` source for symbols or ranges in 1 call (auto-merges overlapping ranges under a ~9 KB batch pool).
-  - `plexer ask "<query>" [...] [--in <scope>/]`: rank symbols and inline `L<n>:` source, helpers, types, and `call sites`.
-  - `plexer callers <symbols...> [--depth 2|all] [--direction out]` / `plexer callees <symbols...> [--depth 2|all]`: trace callers (`[depth 2 via <sym>]`), callees, inferred cross-file `.method()`/`:Method()` callers, and unlinked lexical receiver sites in 1 call (`plexer impact <files...>` or `plexer blast` for blast radius / diff impact); prefer over `grep` for symbols.
-  - `plexer skeleton <files...> [--all-matches]`: file signatures; `plexer map`: directory hubs & hotspots; `plexer grep <pats...> [--fixed] [-i]`: literal/regex search.
-  - `plexer health [scan|next|resolve|suppress|plan|review|status|autofix|move|tree|viz|detect|prompt] [--diff]`: health scanner, 20-dimension review + scorecard (`strict` north star), and execution queue (`next` -> fix -> `resolve` -> `next`).
+- **Turn-0 first — zero wasted calls:** Never re-run `plexer ask` on spans already inlined in `[plexer]` Turn-0 context or repeat identical searches with no edits.
+- **Q&A & callers:** If inlined `L<n>:` spans and `call sites` answer the prompt, reply directly citing `file:Lx-Ly` with 0 tool calls; otherwise fetch all missing targets in **1** batched `plexer read` or `plexer callers` call.
+- **Edits & hybrid reads:** Edit `(named in prompt)` and inlined `L<n>:` spans directly without re-reading. Check `likely co-edits / tests` and `// other symbols in <file>` footers to skip repo-wide searches. Batch `1–5` `<=200`-line spans in **1** `plexer read` (never `&&`-chain or add `echo` dividers), or read a single `>200`-line multi-edit file once in parallel via native `read_file`/`view_file`/`Read`. Apply edits with native edit tools (never Python/Node/`sed`), run one narrow check if applicable, and stop once green.
+- **CLI:** `plexer read <file:sym|file:Lx-Ly ...>` (omit `--full` on multi-span) | `plexer ask "<q>" [--in dir/]` | `plexer callers|callees <syms...> [--depth 2|all]` | `plexer impact <files...> | blast` | `plexer skeleton <files|dirs...>` | `plexer grep "<pat...>" [--in dir/] [--fixed] [-i]` | `plexer map` | `plexer health [scan|next|resolve|autofix|review --diff]`.

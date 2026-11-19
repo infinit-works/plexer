@@ -2,19 +2,46 @@ export const HOOK_BUDGETS = {
     qaSingleHitBytes: 3600, qaMultiHitBytes: 3800, qaMergedBytes: 6800, qaMaxInlined: 5,
     editSingleHitBytes: 3200, editMultiHitBytes: 2200, editMergedBytes: 4000, editMaxInlined: 3,
     singleQueryInline: 3, multiQueryInline: 1, pinBytes: 5600, pinMax: 3, editTotalBytes: 4600,
+    qaMultiSubsystemMergedBytes: 4600,
 };
 
-export function mergeMultiQueryHits(results, editEnvelope) {
+export const GEMINI_HOOK_BUDGETS = {
+    qaSingleHitBytes: 4200, qaMultiHitBytes: 4200, qaMergedBytes: 7600, qaMaxInlined: 5,
+    editSingleHitBytes: 3800, editMultiHitBytes: 2800, editMergedBytes: 5800, editMaxInlined: 4,
+    singleQueryInline: 4, multiQueryInline: 3, pinBytes: 6000, pinMax: 4, editTotalBytes: 6200,
+};
+
+export function resolveHookBudgets(opts = {}) {
+    return opts?.geminiProfile ? GEMINI_HOOK_BUDGETS : HOOK_BUDGETS;
+}
+
+export function isGeminiModelProfile(input, hostKind = 'claude') {
+    if (hostKind === 'gemini') return true;
+    const m = String(input?.modelName ?? input?.model ?? input?.agentModel ?? '').trim().toLowerCase();
+    if (/claude|sonnet|opus|haiku|gpt-|o1-|o3-|o4-|codex/.test(m)) return false;
+    if (/gemini|orchestrator|neon|hydrogen|argon|carbon|flash|gemma|^pro\b|-pro\b|^auto$/.test(m)) return true;
+    return hostKind === 'agy' && !m;
+}
+
+export function isOrchestratorInput(input, agyState = null) {
+    const m = String(input?.modelName ?? input?.model ?? input?.agentModel ?? '').trim().toLowerCase();
+    if (/orchestrator/.test(m)) return true;
+    if (m && !/orchestrator/.test(m)) return false;
+    return Boolean(agyState?.isOrchestratorModel);
+}
+
+export function mergeMultiQueryHits(results, editEnvelope, opts = {}) {
     const mergedSeen = new Set();
     const mergedSymbolTitles = new Set();
     const mergedFileCounts = new Map();
     const mergedHits = [];
+    const minDistinctTarget = opts?.geminiProfile && editEnvelope ? 5 : 4;
     const pushHit = (h, rank, maxPerFile = 2) => {
         if (!h || mergedSeen.has(h.pointer)) return false;
         const fileKey = (h.pointer || '').split(':')[0];
         const titleKey = `${fileKey}:${h.title ?? ''}`;
         if (rank > 0 && h.title && mergedSymbolTitles.has(titleKey)) return false;
-        if (editEnvelope && fileKey && (mergedFileCounts.get(fileKey) ?? 0) >= maxPerFile && mergedHits.length < 4) return false;
+        if (editEnvelope && fileKey && (mergedFileCounts.get(fileKey) ?? 0) >= maxPerFile && mergedHits.length < minDistinctTarget) return false;
         mergedSeen.add(h.pointer);
         if (h.title) mergedSymbolTitles.add(titleKey);
         if (fileKey) mergedFileCounts.set(fileKey, (mergedFileCounts.get(fileKey) ?? 0) + 1);
@@ -22,10 +49,15 @@ export function mergeMultiQueryHits(results, editEnvelope) {
         return true;
     };
     for (const r of results) if (!pushHit(r?.hits?.[0], 0, 1) && editEnvelope) pushHit(r?.hits?.[1], 1, 1);
-    for (const r of results) if (r?.hits?.[0]?.code) pushHit(r.hits[0], 0, 2);
-    for (let rank = 1; rank < 3; rank++) for (const r of results) pushHit(r?.hits?.[rank], rank, 1);
-    if (mergedHits.length < 4) for (let rank = 0; rank < 3; rank++) for (const r of results) pushHit(r?.hits?.[rank], rank, 2);
-    if (mergedHits.length < 4) {
+    if (opts?.geminiProfile && editEnvelope) {
+        for (let rank = 1; rank < 3; rank++) for (const r of results) pushHit(r?.hits?.[rank], rank, 1);
+        for (const r of results) if (r?.hits?.[0]?.code) pushHit(r.hits[0], 0, 2);
+    } else {
+        for (const r of results) if (r?.hits?.[0]?.code) pushHit(r.hits[0], 0, 2);
+        for (let rank = 1; rank < 3; rank++) for (const r of results) pushHit(r?.hits?.[rank], rank, 1);
+    }
+    if (mergedHits.length < minDistinctTarget) for (let rank = 0; rank < 3; rank++) for (const r of results) pushHit(r?.hits?.[rank], rank, 2);
+    if (mergedHits.length < minDistinctTarget) {
         for (let rank = 0; rank < 3; rank++) {
             for (const r of results) {
                 const h = r?.hits?.[rank];
@@ -159,11 +191,27 @@ function tryInlineTrimmedOrReclaimedHit(mergedHits, idx, h, inlinedBytes, maxMer
     return null;
 }
 
-export function enforceMergedHitsBudget(mergedHits, intent, queryCount) {
+export function countHitSubsystemDirs(hits, limit = 5) {
+    const dirs = new Set();
+    for (const h of (hits ?? []).slice(0, limit)) {
+        const file = String(h?.pointer ?? '').split(':')[0].replace(/\\/g, '/');
+        if (!file) continue;
+        const slash = file.lastIndexOf('/');
+        dirs.add(slash > 0 ? file.slice(0, slash) : '.');
+    }
+    return dirs.size;
+}
+
+export function enforceMergedHitsBudget(mergedHits, intent, queryCount, budgets = HOOK_BUDGETS) {
+    const activeBudgets = budgets ?? HOOK_BUDGETS;
+    const isGemini = activeBudgets === GEMINI_HOOK_BUDGETS;
+    const isMultiSubsystemQa = !isGemini && !intent.editEnvelope && countHitSubsystemDirs(mergedHits) >= 3;
     const maxMergedBytes = intent.editEnvelope
-        ? (queryCount >= 3 ? Math.min(HOOK_BUDGETS.editMergedBytes, 3600) : HOOK_BUDGETS.editMergedBytes)
-        : (intent.wantsCallSites ? Math.min(HOOK_BUDGETS.qaMergedBytes, 6400) : HOOK_BUDGETS.qaMergedBytes);
-    const maxInlinedHits = intent.editEnvelope ? HOOK_BUDGETS.editMaxInlined : HOOK_BUDGETS.qaMaxInlined;
+        ? (isGemini ? activeBudgets.editMergedBytes : (queryCount >= 3 ? Math.min(activeBudgets.editMergedBytes, 3600) : activeBudgets.editMergedBytes))
+        : (isMultiSubsystemQa
+            ? Math.min(activeBudgets.qaMergedBytes, activeBudgets.qaMultiSubsystemMergedBytes ?? 4600)
+            : (intent.wantsCallSites ? Math.min(activeBudgets.qaMergedBytes, isGemini ? 6600 : 6400) : activeBudgets.qaMergedBytes));
+    const maxInlinedHits = intent.editEnvelope ? activeBudgets.editMaxInlined : activeBudgets.qaMaxInlined;
     let inlinedBytes = 0, inlinedCount = 0;
     for (let idx = 0; idx < mergedHits.length; idx++) {
         const h = mergedHits[idx];

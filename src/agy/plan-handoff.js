@@ -15,7 +15,9 @@ import { buildUniqueRepoLabels } from './multi-workspace.js';
 import { isSpanCovered, normalizeRelFile, parsePointerSpan } from './spans.js';
 
 const MAX_HANDOFF_BYTES = 1800;
+const GEMINI_HANDOFF_BYTES = 2800;
 const INLINE_SPAN_MAX_LINES = 45;
+const GEMINI_INLINE_SPAN_MAX_LINES = 70;
 
 function isFileOrSpanSeen(agyState, label, relPath, startLine = 1, endLine = 1) {
     const norm = normalizeRelFile(relPath);
@@ -149,23 +151,22 @@ function matchPlanRepoTargets(graph, fileCandidates, symbolCandidates) {
                 continue;
             if (n.name !== symName && n.name !== shortName)
                 continue;
-            if (matchedFiles.size === 0 || matchedFiles.has(n.path)) {
+            if (matchedFiles.size > 0 && matchedFiles.has(n.path)) {
                 matchedSymbols.push(n);
-                matchedFiles.add(n.path);
             }
         }
     }
     return { matchedFiles, matchedSymbols };
 }
 
-function appendMatchedSymbolBlock(sym, label, multiRoot, agyState, readLines, state) {
+function appendMatchedSymbolBlock(sym, label, multiRoot, agyState, readLines, state, inlineMaxLines = INLINE_SPAN_MAX_LINES) {
     const sp = parseNodeSpan(sym);
     const start = sp?.start ?? 1;
     const end = sp?.end ?? start;
     if (isFileOrSpanSeen(agyState, label, sym.path, start, end))
         return false;
     const ptrPrefix = multiRoot ? `${label}/` : '';
-    if (sp && (end - start + 1) <= INLINE_SPAN_MAX_LINES) {
+    if (sp && (end - start + 1) <= inlineMaxLines) {
         const lines = readLines(sym.path) || [];
         const snippet = [];
         for (let ln = start; ln <= Math.min(lines.length, end); ln++)
@@ -183,14 +184,14 @@ function appendMatchedSymbolBlock(sym, label, multiRoot, agyState, readLines, st
     return true;
 }
 
-function appendMatchedFileBlock(rel, label, multiRoot, graph, readLines, state) {
+function appendMatchedFileBlock(rel, label, multiRoot, graph, readLines, state, inlineMaxLines = INLINE_SPAN_MAX_LINES) {
     const ptrPrefix = multiRoot ? `${label}/` : '';
     const syms = (graph.nodes ?? [])
         .filter((n) => n.path === rel && n.kind !== 'file' && n.name)
         .slice(0, 4)
         .map((n) => `${n.name} (${n.span || 'L1'})`);
     const lines = readLines(rel) || [];
-    if (lines.length > 0 && lines.length <= INLINE_SPAN_MAX_LINES) {
+    if (lines.length > 0 && lines.length <= inlineMaxLines) {
         const snippet = lines.map((text, idx) => `L${idx + 1}: ${text}`).join('\n');
         state.targetBlocks.push(` • ${ptrPrefix}${rel}:L1-L${lines.length}\n\`\`\`\n${snippet}\n\`\`\``);
         state.spansToRecord.push({ key: `${ptrPrefix}${rel}`, start: 1, end: lines.length });
@@ -239,25 +240,26 @@ function collectRepoHandoffItems(dir, label, multiRoot, fileCandidates, symbolCa
     const byId = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
     const { matchedFiles, matchedSymbols } = matchPlanRepoTargets(graph, fileCandidates, symbolCandidates);
 
+    const inlineMaxLines = opts.inlineMaxLines ?? (opts.geminiProfile ? GEMINI_INLINE_SPAN_MAX_LINES : INLINE_SPAN_MAX_LINES);
     const handledFiles = new Set();
     for (const sym of matchedSymbols) {
         if (state.targetBlocks.length >= 4)
             break;
-        if (appendMatchedSymbolBlock(sym, label, multiRoot, agyState, readLines, state))
+        if (appendMatchedSymbolBlock(sym, label, multiRoot, agyState, readLines, state, inlineMaxLines))
             handledFiles.add(sym.path);
     }
     for (const rel of matchedFiles) {
         if (state.targetBlocks.length >= 4)
             break;
         if (!handledFiles.has(rel) && !isWholeFileSeen(agyState, label, rel))
-            appendMatchedFileBlock(rel, label, multiRoot, graph, readLines, state);
+            appendMatchedFileBlock(rel, label, multiRoot, graph, readLines, state, inlineMaxLines);
     }
     for (const rel of matchedFiles)
         collectCallersAndTestsForFile(rel, dir, label, multiRoot, graph, byId, testLinks, agyState, state);
 }
 
 /**
- * Build a <=1,800 B execution-model handoff for unread targets named in an approved plan.
+ * Build an execution-model handoff (`<=1,800 B` default, `<=2,800 B` for Gemini) for unread targets named in an approved plan.
  * Returns null (0 B) when every named target & test peer is already in session context.
  */
 export function buildPlanExecutionHandoff(workspaceDirs, planText, agyState, opts = {}) {
@@ -297,8 +299,9 @@ export function buildPlanExecutionHandoff(workspaceDirs, planText, agyState, opt
     if (state.testItems.length > 0)
         sections.push(`unseen tests: ${state.testItems.join(', ')}`);
 
+    const maxBytes = opts.maxBytes ?? (opts.geminiProfile ? GEMINI_HANDOFF_BYTES : MAX_HANDOFF_BYTES);
     return {
-        text: fitToBytes(sections.join('\n'), MAX_HANDOFF_BYTES),
+        text: fitToBytes(sections.join('\n'), maxBytes),
         spans: state.spansToRecord,
     };
 }

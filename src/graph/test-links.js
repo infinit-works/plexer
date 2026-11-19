@@ -127,11 +127,16 @@ function collectDirectAndCompanionTestLinks(graph, byId, testFiles, prodFilesByS
     linkStemCompanionTests(testFiles, prodFilesByStem, recordFileTest);
 }
 
-function formatTestEntries(map) {
+function formatTestEntries(map, prodPath = null) {
     if (!map || map.size === 0) return [];
+    const prodStem = prodPath ? canonicalFileStem(prodPath) : "";
+    const rankScore = (testFile, kind) => {
+        const stemBoost = prodStem && prodStem.length >= 2 && canonicalFileStem(testFile) === prodStem ? 1.5 : 0;
+        return TIER_RANK[kind] + stemBoost;
+    };
     return [...map.entries()]
         .map(([testFile, kind]) => ({ testFile, kind }))
-        .sort((a, b) => TIER_RANK[b.kind] - TIER_RANK[a.kind] || a.testFile.localeCompare(b.testFile));
+        .sort((a, b) => rankScore(b.testFile, b.kind) - rankScore(a.testFile, a.kind) || a.testFile.localeCompare(b.testFile));
 }
 
 function buildTestLinksLookupResult(symbolTests, fileTests, byId) {
@@ -145,8 +150,8 @@ function buildTestLinksLookupResult(symbolTests, fileTests, byId) {
             if (symMap) {
                 for (const [tf, kind] of symMap) merged.set(tf, kind);
             }
+            const resolvedPath = filePath ?? byId.get(symbolId)?.path ?? null;
             if (includeFileLevel) {
-                const resolvedPath = filePath ?? byId.get(symbolId)?.path ?? null;
                 const fMap = resolvedPath ? fileTests.get(resolvedPath) : null;
                 if (fMap) {
                     for (const [tf, kind] of fMap) {
@@ -157,11 +162,11 @@ function buildTestLinksLookupResult(symbolTests, fileTests, byId) {
                     }
                 }
             }
-            return formatTestEntries(merged);
+            return formatTestEntries(merged, resolvedPath);
         },
         /** All test entries covering `filePath`. */
         testsForFile(filePath) {
-            return formatTestEntries(fileTests.get(filePath));
+            return formatTestEntries(fileTests.get(filePath), filePath);
         },
     };
 }

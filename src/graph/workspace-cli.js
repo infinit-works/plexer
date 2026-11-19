@@ -9,7 +9,7 @@ import { buildGraph } from "./build.js";
 import { contextDirFor, ensureGitignored } from "../context/node-file.js";
 import { patchBuildConfig } from "../util/state.js";
 import { formatAsk } from "../ask/ask.js";
-import { formatGrepResult, zeroHitNote } from "../search/grep-cli.js";
+import { formatGrepResult, runGrepWithRegexFallback, zeroHitNote } from "../search/grep-cli.js";
 import { federateAsk, federateCallers, federateCheck, federateGrep, federateMap, splitWorkspace, } from "./workspace.js";
 export async function runWorkspaceBuild(root, opts) {
     const buildWorkspaceChild = async (childDir, childName) => {
@@ -65,13 +65,17 @@ export function runWorkspaceGrep(root, override, pattern, opts) {
     let result;
     let coverage;
     try {
-        ({ result, coverage } = federateGrep(root, override, pattern, {
-            ignoreCase: opts.ignoreCase,
-            fixed: opts.fixed,
-            context: opts.context,
-            source: opts.source,
-            in: opts.in,
-        }));
+        ({ result, coverage } = runGrepWithRegexFallback(
+            (pat, gOpts) => federateGrep(root, override, pat, {
+                ignoreCase: gOpts.ignoreCase,
+                fixed: gOpts.fixed,
+                context: gOpts.context,
+                source: gOpts.source,
+                in: gOpts.in,
+            }),
+            pattern,
+            opts,
+        ));
     }
     catch (err) {
         console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
@@ -86,7 +90,7 @@ export function runWorkspaceGrep(root, override, pattern, opts) {
         console.error(coverage ? `${zeroHitNote(result)}\n${coverage}` : zeroHitNote(result));
         return;
     }
-    process.stdout.write(formatGrepResult(result));
+    process.stdout.write(formatGrepResult(result, { explicitContext: Boolean(opts.explicitContext) }));
     if (coverage)
         console.log(coverage);
 }

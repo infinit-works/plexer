@@ -24,6 +24,10 @@ export function stripTrailingSlashes(path) {
 
 /** Normalize a user-supplied path prefix (`--in`) to posix with no leading `./` or trailing `/`. */
 export function normalizePathPrefix(p) {
+    if (Array.isArray(p)) {
+        const list = p.map((x) => normalizePathPrefix(x)).filter(Boolean);
+        return list.length === 1 ? list[0] : list;
+    }
     let out = toPosixPath(p);
     while (out.startsWith("./"))
         out = out.slice(2);
@@ -32,6 +36,9 @@ export function normalizePathPrefix(p) {
 
 /** Segment-aware "is `path` at or under `prefix`?". */
 export function pathUnderPrefix(path, prefix) {
+    if (Array.isArray(prefix)) {
+        return prefix.length === 0 || prefix.some((p) => p === "" || path === p || path.startsWith(`${p}/`));
+    }
     return prefix === "" || path === prefix || path.startsWith(`${prefix}/`);
 }
 
