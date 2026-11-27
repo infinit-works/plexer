@@ -40,6 +40,22 @@ function collectWarmBlastLanguageSets(diff, graph) {
         if (f.status === "deleted" || f.status === "renamed") deletedOrRenamed.push(rel);
     }
     const reexportTargets = new Set(changedTargets);
+    if (graph._inEdges && deletedOrRenamed.length === 0) {
+        const frontier = [...reexportTargets];
+        for (let fi = 0; fi < frontier.length; fi++) {
+            const target = frontier[fi];
+            for (const e of graph._inEdges.get(target) ?? []) {
+                if (e.relation !== "imports" && e.relation !== "reexports")
+                    continue;
+                addWarmLang(e.source);
+                if (e.relation === "reexports" && !reexportTargets.has(e.source)) {
+                    reexportTargets.add(e.source);
+                    frontier.push(e.source);
+                }
+            }
+        }
+        return { containerWarm, depthWarm, genericWarm };
+    }
     for (const e of graph.edges ?? []) {
         if (e.relation !== "imports" && e.relation !== "reexports") continue;
         if (!reexportTargets.has(e.target) && !deletedOrRenamed.some((p) => importSpecMatchesPath(e.source, e.target, p))) continue;
@@ -98,7 +114,7 @@ export async function runBlastCommand(dir, opts) {
     if (opts.owners !== false) {
         const { attachOwners, diffAuthors, localIdentity } = await import("./owners.js");
         const authors = opts.base === undefined ? localIdentity(root) : diffAuthors(root, opts.base);
-        attachOwners(root, report, { contextDir, exclude: [...authors, ...(opts.prAuthor ?? [])] });
+        attachOwners(root, report, { contextDir, headSha: report._headSha ?? null, exclude: [...authors, ...(opts.prAuthor ?? [])] });
     }
     if (opts.exportViz) await exportRadius(report, contextDir, root, opts.exportViz, opts.title);
     writeBlastOutput(format, report, root);

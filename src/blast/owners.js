@@ -181,11 +181,11 @@ function saveOwnerHistoryCache(cachePath, cache, headSha, fetchedPaths, fileComm
     }
 }
 
-function collectCommitsByFile(dir, uniquePaths, now, maxCommits, contextDir = null) {
+function collectCommitsByFile(dir, uniquePaths, now, maxCommits, contextDir = null, explicitHeadSha = null) {
     const fileCommits = new Map();
     if (uniquePaths.length === 0)
         return { fileCommits, multiChunk: false };
-    const headSha = contextDir ? git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"])?.trim() : null;
+    const headSha = explicitHeadSha ?? (contextDir ? git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"])?.trim() : null);
     const cachePath = contextDir && headSha ? join(contextDir, ".cache", "owners.json") : null;
     const cache = cachePath ? loadOwnerHistoryCache(cachePath) : null;
     const cachedBucket = cache && headSha ? cache.heads[headSha] : null;
@@ -206,6 +206,7 @@ function collectCommitsByFile(dir, uniquePaths, now, maxCommits, contextDir = nu
     if (missingPaths.length === 0)
         return { fileCommits, multiChunk: false };
     let chunks = 0;
+    const starvedPaths = new Set();
     for (let i = 0; i < missingPaths.length; i += BATCH_PATHSPEC) {
         const slice = missingPaths.slice(i, i + BATCH_PATHSPEC);
         const out = git(dir, [
@@ -221,12 +222,26 @@ function collectCommitsByFile(dir, uniquePaths, now, maxCommits, contextDir = nu
             ...slice,
         ]);
         chunks += 1;
-        if (out === null)
+        if (out === null) {
+            for (const p of slice)
+                starvedPaths.add(p);
             continue;
-        seq = parseGitOwnerLog(out, new Set(slice), now, fileCommits, seq);
+        }
+        const nextSeq = parseGitOwnerLog(out, new Set(slice), now, fileCommits, seq);
+        const batchCommits = nextSeq - seq;
+        seq = nextSeq;
+        if (batchCommits >= maxCommits) {
+            for (const p of slice) {
+                if (!(fileCommits.get(p)?.length > 0))
+                    starvedPaths.add(p);
+            }
+        }
     }
-    if (cachePath && cache && headSha)
-        saveOwnerHistoryCache(cachePath, cache, headSha, missingPaths, fileCommits);
+    const cacheablePaths = starvedPaths.size > 0
+        ? missingPaths.filter((p) => !starvedPaths.has(p))
+        : missingPaths;
+    if (cachePath && cache && headSha && cacheablePaths.length > 0)
+        saveOwnerHistoryCache(cachePath, cache, headSha, cacheablePaths, fileCommits);
     return { fileCommits, multiChunk: chunks > 1 || (cachedBucket !== null && missingPaths.length > 0) };
 }
 
@@ -299,7 +314,8 @@ export function ownersFor(root, files, opts = {}) {
     if (paths.length === 0)
         return [];
     const now = opts.now ?? Date.now();
-    const { fileCommits, multiChunk } = collectCommitsByFile(resolve(root), paths, now, MAX_COMMITS);
+    const maxCommits = Number.isFinite(opts.maxCommits) && opts.maxCommits > 0 ? Math.floor(opts.maxCommits) : MAX_COMMITS;
+    const { fileCommits, multiChunk } = collectCommitsByFile(resolve(root), paths, now, maxCommits);
     const commits = areaCommitsFromMap(paths, fileCommits, multiChunk);
     if (commits.length === 0)
         return [];
@@ -394,7 +410,8 @@ export function attachOwners(root, report, opts = {}) {
     const modPaths = report.modules.map((m) => [...m.files].sort().slice(0, MAX_PATHSPEC));
     const uniquePaths = [...new Set([...areaPaths.flat(), ...modPaths.flat()])].sort();
     const batchCap = Math.min(MAX_BATCH_COMMITS, Math.max(MAX_COMMITS, (areaPaths.length + modPaths.length) * MAX_COMMITS));
-    const { fileCommits, multiChunk } = collectCommitsByFile(absRoot, uniquePaths, now, batchCap, contextDir);
+    const headSha = opts.headSha ?? report._headSha ?? null;
+    const { fileCommits, multiChunk } = collectCommitsByFile(absRoot, uniquePaths, now, batchCap, contextDir, headSha);
 
     const ranked = new Map();
     const accumulateAreaOwners = (label, paths, weight) => {

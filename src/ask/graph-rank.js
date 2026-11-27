@@ -50,6 +50,93 @@ function isContainedSymbolEdge(nodeById, srcId, tgtId) {
         return false;
     return (su[0] <= sv[0] && su[1] >= sv[1]) || (sv[0] <= su[0] && sv[1] >= su[1]);
 }
+function finalizeCsrBuffers(nodeIds, indexOfId, inDegArr, offsets, targets, weights, rawWeights) {
+    const n = nodeIds.length;
+    const outWeightSum = new Float64Array(n);
+    for (let u = 0; u < n; u++) {
+        const rowStart = offsets[u];
+        const rowEnd = offsets[u + 1];
+        let sum = 0;
+        for (let e = rowStart; e < rowEnd; e++) {
+            const w = rawWeights[e] / Math.sqrt(1 + inDegArr[targets[e]]);
+            weights[e] = w;
+            sum += w;
+        }
+        if (sum > 0) {
+            const invSum = 1 / sum;
+            for (let e = rowStart; e < rowEnd; e++)
+                weights[e] *= invSum;
+            outWeightSum[u] = 1;
+        }
+    }
+    return {
+        nodeIds,
+        indexOfId,
+        offsets,
+        targets,
+        weights,
+        outWeightSum,
+        rankBuf: new Float64Array(n),
+        nextBuf: new Float64Array(n),
+        activeBuf: new Int32Array(n),
+        nextActiveBuf: new Int32Array(n),
+        inActive: new Uint8Array(n),
+        inNext: new Uint8Array(n),
+        edgeTotal: targets.length,
+        dirtyDense: false,
+    };
+}
+
+function buildCsrFromIndexedEdges(nodeIds, indexOfId, edges, nodeById) {
+    const n = nodeIds.length;
+    const inDegArr = new Int32Array(n);
+    const outDeg = new Int32Array(n);
+    const validSrc = [];
+    const validTgt = [];
+    const validWt = [];
+    for (let i = 0; i < edges.length; i++) {
+        const edge = edges[i];
+        const rawWeight = edgeBaseWeight(edge);
+        if (rawWeight <= 0)
+            continue;
+        const u = indexOfId.get(edge.source);
+        const v = indexOfId.get(edge.target);
+        if (u === undefined || v === undefined)
+            continue;
+        if (isContainedSymbolEdge(nodeById, edge.source, edge.target))
+            continue;
+        inDegArr[v]++;
+        outDeg[u]++;
+        outDeg[v]++;
+        validSrc.push(u);
+        validTgt.push(v);
+        validWt.push(rawWeight);
+    }
+    const offsets = new Int32Array(n + 1);
+    let edgeTotal = 0;
+    for (let u = 0; u < n; u++) {
+        offsets[u] = edgeTotal;
+        edgeTotal += outDeg[u];
+    }
+    offsets[n] = edgeTotal;
+    const cursor = new Int32Array(offsets);
+    const targets = new Int32Array(edgeTotal);
+    const weights = new Float64Array(edgeTotal);
+    const rawWeights = new Float64Array(edgeTotal);
+    for (let i = 0; i < validSrc.length; i++) {
+        const u = validSrc[i];
+        const v = validTgt[i];
+        const w = validWt[i];
+        const pu = cursor[u]++;
+        targets[pu] = v;
+        rawWeights[pu] = w;
+        const pv = cursor[v]++;
+        targets[pv] = u;
+        rawWeights[pv] = w * REVERSE_EDGE_SCALE;
+    }
+    return finalizeCsrBuffers(nodeIds, indexOfId, inDegArr, offsets, targets, weights, rawWeights);
+}
+
 function addWeightedWalkEdge(topology, edge, rawWeight) {
     topology.inDegree.set(edge.target, (topology.inDegree.get(edge.target) ?? 0) + 1);
     pushMap(topology.adjacency, edge.source, [edge.target, rawWeight]);
@@ -81,6 +168,7 @@ function attachCsr(topology) {
         const nbrs = topology.adjacency.get(nodeIds[i]);
         if (!nbrs)
             continue;
+        const rowStart = cursor;
         let sum = 0;
         for (let j = 0; j < nbrs.length; j++) {
             const nbr = nbrs[j];
@@ -94,7 +182,12 @@ function attachCsr(topology) {
             sum += w;
             cursor++;
         }
-        outWeightSum[i] = sum;
+        if (sum > 0) {
+            const invSum = 1 / sum;
+            for (let e = rowStart; e < cursor; e++)
+                weights[e] *= invSum;
+            outWeightSum[i] = 1;
+        }
     }
     const csr = {
         nodeIds,
@@ -105,6 +198,12 @@ function attachCsr(topology) {
         outWeightSum,
         rankBuf: new Float64Array(n),
         nextBuf: new Float64Array(n),
+        activeBuf: new Int32Array(n),
+        nextActiveBuf: new Int32Array(n),
+        inActive: new Uint8Array(n),
+        inNext: new Uint8Array(n),
+        edgeTotal: targets.length,
+        dirtyDense: false,
     };
     Object.defineProperty(topology, "_csr", { value: csr, enumerable: false, configurable: true });
     return csr;
@@ -115,33 +214,35 @@ function attachCsr(topology) {
 export function preparePageRankPartitions(graph, partitionOfId) {
     const nodeById = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
     const partitionById = new Map();
-    const mutable = new Map();
+    const parts = new Map();
     for (const node of graph.nodes) {
         const partition = partitionOfId(node.id);
         if (partition === undefined)
             continue;
         partitionById.set(node.id, partition);
-        const topology = mutable.get(partition);
-        if (topology)
-            topology.ids.add(node.id);
-        else {
-            const empty = emptyTopology();
-            empty.ids.add(node.id);
-            mutable.set(partition, empty);
+        let p = parts.get(partition);
+        if (!p) {
+            p = { nodeIds: [], indexOfId: new Map(), edges: [] };
+            parts.set(partition, p);
         }
+        p.indexOfId.set(node.id, p.nodeIds.length);
+        p.nodeIds.push(node.id);
     }
     for (const edge of graph.edges) {
-        const rawWeight = edgeBaseWeight(edge);
-        if (rawWeight <= 0)
-            continue;
         const partition = partitionById.get(edge.source);
         if (partition === undefined || partitionById.get(edge.target) !== partition)
             continue;
-        if (isContainedSymbolEdge(nodeById, edge.source, edge.target))
-            continue;
-        addWeightedWalkEdge(mutable.get(partition), edge, rawWeight);
+        parts.get(partition).edges.push(edge);
     }
-    return new Map(mutable);
+    const out = new Map();
+    for (const [partition, p] of parts) {
+        const ids = new Set(p.nodeIds);
+        const csr = buildCsrFromIndexedEdges(p.nodeIds, p.indexOfId, p.edges, nodeById);
+        const topology = { ids };
+        Object.defineProperty(topology, "_csr", { value: csr, enumerable: false, configurable: true });
+        out.set(partition, topology);
+    }
+    return out;
 }
 /** Prepare one optionally filtered topology. Kept public for callers/tests that
  * reuse the same graph across multiple seed sets. */
@@ -149,21 +250,22 @@ export function preparePageRankTopology(graph, nodeFilter) {
     if (!nodeFilter && graph._csrTopology)
         return graph._csrTopology;
     const nodeById = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
-    const ids = new Set(graph.nodes.map((node) => node.id).filter((id) => !nodeFilter || nodeFilter(id)));
-    if (ids.size === 0)
-        return emptyTopology();
-    const topology = { ids, adjacency: new Map(), inDegree: new Map() };
-    for (const edge of graph.edges) {
-        const rawWeight = edgeBaseWeight(edge);
-        if (rawWeight <= 0)
+    const nodeIds = [];
+    const indexOfId = new Map();
+    for (const node of graph.nodes) {
+        if (nodeFilter && !nodeFilter(node.id))
             continue;
-        if (!ids.has(edge.source) || !ids.has(edge.target))
+        if (indexOfId.has(node.id))
             continue;
-        if (isContainedSymbolEdge(nodeById, edge.source, edge.target))
-            continue;
-        addWeightedWalkEdge(topology, edge, rawWeight);
+        indexOfId.set(node.id, nodeIds.length);
+        nodeIds.push(node.id);
     }
-    attachCsr(topology);
+    if (nodeIds.length === 0)
+        return emptyTopology();
+    const ids = new Set(nodeIds);
+    const csr = buildCsrFromIndexedEdges(nodeIds, indexOfId, graph.edges, nodeById);
+    const topology = { ids };
+    Object.defineProperty(topology, "_csr", { value: csr, enumerable: false, configurable: true });
     if (!nodeFilter) {
         Object.defineProperty(graph, "_csrTopology", {
             value: topology,
@@ -233,7 +335,7 @@ function stepPprIteration(csr, rank, next, seedIdx, seedWeight, alpha) {
             dangling += mass;
             continue;
         }
-        const factor = (oneMinusAlpha * mass) / wSum;
+        const factor = oneMinusAlpha * mass;
         for (let e = start; e < end; e++)
             next[targets[e]] += factor * weights[e];
     }
@@ -248,7 +350,7 @@ function stepPprIteration(csr, rank, next, seedIdx, seedWeight, alpha) {
     return l1Delta;
 }
 
-function normalizePprRankMap(rank, nodeIds) {
+function normalizePprRankMap(rank, nodeIds, seeds = null, rescueFloor = 0) {
     let max = 0;
     for (let u = 0; u < nodeIds.length; u++) {
         if (rank[u] > max)
@@ -257,16 +359,136 @@ function normalizePprRankMap(rank, nodeIds) {
     if (max <= 0)
         return new Map();
     const out = new Map();
+    const minVal = rescueFloor > 0 ? max * rescueFloor : 0;
     for (let u = 0; u < nodeIds.length; u++) {
-        if (rank[u] > 0)
-            out.set(nodeIds[u], rank[u] / max);
+        const r = rank[u];
+        if (r <= 0)
+            continue;
+        const id = nodeIds[u];
+        if (rescueFloor > 0 && r < minVal && !(seeds && (seeds.get(id) ?? 0) > 0))
+            continue;
+        out.set(id, r / max);
     }
     return out;
 }
 
+function normalizePprRankMapSparse(rank, nodeIds, activeBuf, activeCount, seeds, rescueFloor) {
+    let max = 0;
+    for (let i = 0; i < activeCount; i++) {
+        const r = rank[activeBuf[i]];
+        if (r > max)
+            max = r;
+    }
+    if (max <= 0)
+        return new Map();
+    const out = new Map();
+    const minVal = rescueFloor > 0 ? max * rescueFloor : 0;
+    for (let i = 0; i < activeCount; i++) {
+        const u = activeBuf[i];
+        const r = rank[u];
+        if (r <= 0)
+            continue;
+        const id = nodeIds[u];
+        if (rescueFloor > 0 && r < minVal && !(seeds && (seeds.get(id) ?? 0) > 0))
+            continue;
+        out.set(id, r / max);
+    }
+    return out;
+}
+
+function stepPprIterationSparse(csr, rank, next, seedIdx, seedWeight, alpha, state, computeDelta) {
+    const { offsets, targets, weights, outWeightSum, activeBuf, nextActiveBuf, inActive, inNext } = csr;
+    const oneMinusAlpha = 1 - alpha;
+    let nextCount = 0;
+    for (let k = 0; k < seedIdx.length; k++) {
+        const v = seedIdx[k];
+        if (!inNext[v]) {
+            inNext[v] = 1;
+            nextActiveBuf[nextCount++] = v;
+        }
+        next[v] += alpha * seedWeight[k];
+    }
+    let dangling = 0;
+    const activeCount = state.activeCount;
+    for (let i = 0; i < activeCount; i++) {
+        const u = activeBuf[i];
+        const mass = rank[u];
+        if (mass === 0)
+            continue;
+        const start = offsets[u];
+        const end = offsets[u + 1];
+        const wSum = outWeightSum[u];
+        if (start === end || wSum <= 0) {
+            dangling += mass;
+            continue;
+        }
+        const factor = oneMinusAlpha * mass;
+        for (let e = start; e < end; e++) {
+            const v = targets[e];
+            if (!inNext[v]) {
+                inNext[v] = 1;
+                nextActiveBuf[nextCount++] = v;
+            }
+            next[v] += factor * weights[e];
+        }
+    }
+    if (dangling > 0) {
+        const dm = oneMinusAlpha * dangling;
+        for (let k = 0; k < seedIdx.length; k++) {
+            const v = seedIdx[k];
+            next[v] += dm * seedWeight[k];
+        }
+    }
+    let l1Delta = computeDelta ? 0 : 1;
+    if (computeDelta) {
+        for (let i = 0; i < activeCount; i++) {
+            const u = activeBuf[i];
+            l1Delta += Math.abs(next[u] - rank[u]);
+        }
+        for (let j = 0; j < nextCount; j++) {
+            const v = nextActiveBuf[j];
+            if (!inActive[v])
+                l1Delta += Math.abs(next[v]);
+        }
+    }
+    for (let i = 0; i < activeCount; i++) {
+        const u = activeBuf[i];
+        rank[u] = 0;
+        inActive[u] = 0;
+    }
+    const maxActive = state.maxActive ?? 0;
+    if (maxActive > 0 && nextCount > maxActive) {
+        const picked = new Array(nextCount);
+        for (let j = 0; j < nextCount; j++) {
+            const v = nextActiveBuf[j];
+            picked[j] = v;
+            inNext[v] = 0;
+        }
+        picked.sort((a, b) => next[b] - next[a]);
+        for (let j = 0; j < maxActive; j++) {
+            const v = picked[j];
+            activeBuf[j] = v;
+            inActive[v] = 1;
+        }
+        for (let j = maxActive; j < picked.length; j++) {
+            next[picked[j]] = 0;
+        }
+        state.activeCount = maxActive;
+        return l1Delta;
+    }
+    for (let j = 0; j < nextCount; j++) {
+        const v = nextActiveBuf[j];
+        activeBuf[j] = v;
+        inActive[v] = 1;
+        inNext[v] = 0;
+    }
+    state.activeCount = nextCount;
+    return l1Delta;
+}
+
 export function personalizedPageRankPrepared(topology, seeds, opts = {}) {
     const alpha = opts.alpha ?? 0.25;
-    const iters = opts.iters ?? 25;
+    const rescueFloor = opts.rescueFloor ?? 0;
     if (topology.ids.size === 0)
         return new Map();
     const csr = attachCsr(topology);
@@ -274,12 +496,69 @@ export function personalizedPageRankPrepared(topology, seeds, opts = {}) {
     if (!prepared)
         return new Map();
     const { seedIdx, seedWeight } = prepared;
+    const n = csr.nodeIds.length;
+    const iters = opts.iters ?? (n > 4096 ? 12 : 25);
+    const maxActive = opts.maxActive ?? (n > 4096 ? 2048 : 0);
     let rank = csr.rankBuf;
     let next = csr.nextBuf;
-    rank.fill(0);
-    for (let k = 0; k < seedIdx.length; k++)
-        rank[seedIdx[k]] = seedWeight[k];
+    if (csr.dirtyDense) {
+        rank.fill(0);
+        next.fill(0);
+        csr.dirtyDense = false;
+    }
+    const useSparseInit = (maxActive > 0 || seedIdx.length * 3 < n) && csr.activeBuf;
+    if (!useSparseInit) {
+        csr.dirtyDense = true;
+        rank.fill(0);
+        for (let k = 0; k < seedIdx.length; k++)
+            rank[seedIdx[k]] = seedWeight[k];
+        for (let iter = 0; iter < iters; iter++) {
+            const l1Delta = stepPprIteration(csr, rank, next, seedIdx, seedWeight, alpha);
+            const tmp = rank;
+            rank = next;
+            next = tmp;
+            if (l1Delta < 1e-6)
+                break;
+        }
+        return normalizePprRankMap(rank, csr.nodeIds, seeds, rescueFloor);
+    }
+    const { activeBuf, inActive } = csr;
+    let activeCount = 0;
+    for (let k = 0; k < seedIdx.length; k++) {
+        const u = seedIdx[k];
+        if (!inActive[u]) {
+            inActive[u] = 1;
+            activeBuf[activeCount++] = u;
+        }
+        rank[u] = seedWeight[k];
+    }
+    if (csr.edgeTotal === 0) {
+        const out = normalizePprRankMapSparse(rank, csr.nodeIds, activeBuf, activeCount, seeds, rescueFloor);
+        for (let i = 0; i < activeCount; i++) {
+            const u = activeBuf[i];
+            rank[u] = 0;
+            inActive[u] = 0;
+        }
+        return out;
+    }
+    const state = { activeCount, maxActive };
+    let isDense = false;
     for (let iter = 0; iter < iters; iter++) {
+        if (!isDense && (maxActive > 0 || state.activeCount * 3 < n)) {
+            const l1Delta = stepPprIterationSparse(csr, rank, next, seedIdx, seedWeight, alpha, state, iter >= 6);
+            const tmp = rank;
+            rank = next;
+            next = tmp;
+            if (l1Delta < 1e-6)
+                break;
+            continue;
+        }
+        if (!isDense) {
+            isDense = true;
+            csr.dirtyDense = true;
+            for (let i = 0; i < state.activeCount; i++)
+                inActive[activeBuf[i]] = 0;
+        }
         const l1Delta = stepPprIteration(csr, rank, next, seedIdx, seedWeight, alpha);
         const tmp = rank;
         rank = next;
@@ -287,5 +566,13 @@ export function personalizedPageRankPrepared(topology, seeds, opts = {}) {
         if (l1Delta < 1e-6)
             break;
     }
-    return normalizePprRankMap(rank, csr.nodeIds);
+    if (isDense)
+        return normalizePprRankMap(rank, csr.nodeIds, seeds, rescueFloor);
+    const out = normalizePprRankMapSparse(rank, csr.nodeIds, activeBuf, state.activeCount, seeds, rescueFloor);
+    for (let i = 0; i < state.activeCount; i++) {
+        const u = activeBuf[i];
+        rank[u] = 0;
+        inActive[u] = 0;
+    }
+    return out;
 }

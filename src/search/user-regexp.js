@@ -5,7 +5,7 @@
  * Prevents catastrophic backtracking (ReDoS) patterns such as `(a+)+` or
  * `([a-z]*)*` from freezing the CLI or the stdio MCP server.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { git } from "../blast/diff.js";
 
@@ -180,7 +180,22 @@ function unwrapBranchPrefix(raw) {
     return b;
 }
 
-function leadingFirstSet(raw) {
+function foldAsciiCaseRanges(ranges) {
+    if (!ranges || ranges.length === 0)
+        return ranges;
+    const out = [];
+    for (let i = 0; i < ranges.length; i++) {
+        const [lo, hi] = ranges[i];
+        out.push([lo, hi]);
+        if (lo <= 90 && hi >= 65)
+            out.push([Math.max(lo, 65) + 32, Math.min(hi, 90) + 32]);
+        if (lo <= 122 && hi >= 97)
+            out.push([Math.max(lo, 97) - 32, Math.min(hi, 122) - 32]);
+    }
+    return mergeRanges(out);
+}
+
+function leadingFirstSet(raw, ignoreCase = false) {
     const b = unwrapBranchPrefix(raw);
     if (!b) return ALL_RANGES;
     const ch = b[0];
@@ -204,15 +219,15 @@ function leadingFirstSet(raw) {
     if (!ranges) return ALL_RANGES;
     const rest = b.slice(nextIdx);
     if (/^(?:\?|\*|\{0(?:,|\}))/.test(rest)) return ALL_RANGES;
-    return ranges;
+    return ignoreCase ? foldAsciiCaseRanges(ranges) : ranges;
 }
 
-function hasOverlappingBranches(branches) {
+function hasOverlappingBranches(branches, ignoreCase = false) {
     if (branches.length < 2) return false;
     if (new Set(branches).size < branches.length) return true;
     let seenRanges = [];
     for (const raw of branches) {
-        const first = leadingFirstSet(raw);
+        const first = leadingFirstSet(raw, ignoreCase);
         if (rangesIntersect(seenRanges, first)) {
             return true;
         }
@@ -221,17 +236,17 @@ function hasOverlappingBranches(branches) {
     return false;
 }
 
-function checkClosedGroupBacktracking(groupStack, pattern, i) {
+function checkClosedGroupBacktracking(groupStack, pattern, i, ignoreCase = false) {
     const popped = groupStack.pop();
     const q = readQuantifierAt(pattern, i + 1);
     if (popped) {
         popped.branches[popped.branches.length - 1] = pattern.slice(popped.currentBranchStart, i);
-        if (q && q.repeated) {
+        if (q && q.unbounded) {
             if (popped.hasInnerRepeat) return { risk: true, nextIdx: 0 };
             const nonEmpty = popped.branches
-                .map((b) => b.replace(/^(?:\?:|\?!|\?=|\?<[!=]|\?<[^>]+>)/, "").trim())
+                .map((b) => b.replace(/^(?:\?:|\?!|\?=|\?<[!=]|\?<[^>]+>)/, ""))
                 .filter(Boolean);
-            if (hasOverlappingBranches(nonEmpty)) return { risk: true, nextIdx: 0 };
+            if (hasOverlappingBranches(nonEmpty, ignoreCase)) return { risk: true, nextIdx: 0 };
             if (groupStack.length > 0) groupStack[groupStack.length - 1].hasInnerRepeat = true;
         } else if (popped.hasInnerRepeat && groupStack.length > 0) {
             groupStack[groupStack.length - 1].hasInnerRepeat = true;
@@ -244,7 +259,8 @@ function checkClosedGroupBacktracking(groupStack, pattern, i) {
  * Scan `pattern` for nested repeating quantifiers (e.g. `(a+)+`, `([a-z]*)*`,
  * `(a|b+)+`) or excessive adjacent wildcards that cause exponential NFA states.
  */
-function hasCatastrophicBacktrackingRisk(pattern) {
+function hasCatastrophicBacktrackingRisk(pattern, flags = "") {
+    const ignoreCase = typeof flags === "string" && flags.includes("i");
     const groupStack = [];
     let inCharClass = false;
     let i = 0;
@@ -269,12 +285,12 @@ function hasCatastrophicBacktrackingRisk(pattern) {
             top.currentBranchStart = i + 1;
             i += 1;
         } else if (ch === ")") {
-            const closed = checkClosedGroupBacktracking(groupStack, pattern, i);
+            const closed = checkClosedGroupBacktracking(groupStack, pattern, i, ignoreCase);
             if (closed.risk) return true;
             i = closed.nextIdx;
         } else {
             const q = readQuantifierAt(pattern, i);
-            if (q && q.repeated && groupStack.length > 0) groupStack[groupStack.length - 1].hasInnerRepeat = true;
+            if (q && q.unbounded && groupStack.length > 0) groupStack[groupStack.length - 1].hasInnerRepeat = true;
             i = q ? q.nextIdx : i + 1;
         }
     }
@@ -295,7 +311,7 @@ export function compileSafeUserRegex(pattern, flags = "") {
             `regular expression pattern exceeds maximum length (${pattern.length} > ${MAX_REGEX_PATTERN_LENGTH} chars)`,
         );
     }
-    if (hasCatastrophicBacktrackingRisk(pattern)) {
+    if (hasCatastrophicBacktrackingRisk(pattern, flags)) {
         throw new SyntaxError(
             `unsafe regular expression "${pattern}" (nested repeating quantifier risks catastrophic backtracking) — simplify the pattern or use --fixed`,
         );
@@ -312,7 +328,10 @@ const IGNORED_TEXT_EXT = /\.(?:[cm]?[jt]sx?|pyi?|luau?|go|rs|java|kt|swift|c|cc|
  */
 export function findIgnoredMatchDirs(root, matcher, maxFiles = 60) {
     if (!root || typeof matcher !== "function") return [];
-    const out = git(root, ["ls-files", "-o", "-i", "--exclude-standard"]);
+    const out = git(root, [
+        "ls-files", "-o", "-i", "--exclude-standard", "--",
+        ".", ":(exclude)node_modules", ":(exclude)plexer", ":(exclude).git",
+    ], 2000);
     if (!out) return [];
     const rawFiles = out
         .split("\n")
@@ -333,8 +352,11 @@ export function findIgnoredMatchDirs(root, matcher, maxFiles = 60) {
         checkedPerDir.set(dirKey, dirCount + 1);
         totalChecked += 1;
         try {
-            const text = readFileSync(join(root, rel), "utf8");
-            if (text.length > 512_000 || text.includes("\0")) continue;
+            const absPath = join(root, rel);
+            const st = statSync(absPath);
+            if (!st.isFile() || st.size > 512_000) continue;
+            const text = readFileSync(absPath, "utf8");
+            if (text.includes("\0")) continue;
             if (matcher(text)) {
                 hitDirs.add(dirKey);
             }

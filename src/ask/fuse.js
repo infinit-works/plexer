@@ -169,8 +169,17 @@ export function fuseScopes(docs) {
  */
 export function combineComparableScopes(docs) {
     const gated = partitionAndGateScopes(docs);
-    if (gated.passthrough)
+    if (gated.passthrough) {
+        const ranked = gated.passthrough.ranked;
+        const max = ranked[0]?.score ?? 0;
+        if (max > 0) {
+            return {
+                ...gated.passthrough,
+                ranked: ranked.map((r) => ({ ...r, score: r.score / max })),
+            };
+        }
         return gated.passthrough;
+    }
     const { byScope, federated, alsoMatched } = gated;
     // An id can only belong to one scope (scope is a path prefix), but keep the
     // defensive max so a duplicate cannot double-count or flip its attribution.

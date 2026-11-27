@@ -326,7 +326,8 @@ function appendDependentSymbolsSection(out, r, symbols, evidence) {
         out.push(`**${mod.label}** — ${plural(mod.symbols.length, "symbol")} in ${plural(mod.files.length, "file")}`);
         out.push("");
         for (const s of mod.symbols) {
-            if (listed++ >= MAX_SYMBOLS_LISTED) break;
+            if (listed >= MAX_SYMBOLS_LISTED) break;
+            listed++;
             const relLabel = s.typeOnly ? `${s.relation} (type-only)` : s.relation;
             out.push(`- \`${s.path}:${s.span}\` — ${s.name} (${relLabel}, depth ${s.depth})`);
             const [line] = evidence?.(s)?.lines ?? [];
@@ -401,8 +402,15 @@ function detailSections(r, symbols, evidence) {
 function caveatLines(r) {
     const out = [];
     if (r.deleted.length > 0) {
-        out.push(`⚠️ ${plural(r.deleted.length, "deleted file")} (${r.deleted.slice(0, 5).join(", ")}) — ` +
-            "their dependents cannot be computed from a graph built at this commit, since the files are gone from it.");
+        const coveredDeleted = new Set([
+            ...(r.modules ?? []).flatMap((m) => m.from ?? []),
+            ...(r.testModules ?? []).flatMap((m) => m.from ?? []),
+        ]);
+        const unresolvedDeleted = r.deleted.filter((p) => !coveredDeleted.has(p));
+        if (unresolvedDeleted.length > 0) {
+            out.push(`⚠️ ${plural(unresolvedDeleted.length, "deleted file")} (${unresolvedDeleted.slice(0, 5).join(", ")}) — ` +
+                "no indexed or pre-image dependents were resolved for these deleted files.");
+        }
     }
     if (r.unindexed.length > 0) {
         out.push(`⚠️ ${plural(r.unindexed.length, "changed file")} not in the graph (${r.unindexed.slice(0, 5).join(", ")}) — ` +
@@ -411,19 +419,33 @@ function caveatLines(r) {
     return out;
 }
 /** Terminal report: same content, no markdown scaffolding. */
+const MAX_TEXT_REPORT_SYMBOLS = 60;
+const MAX_TEXT_REPORT_BYTES = 8192;
+
 function appendBlastModules(lines, r, symbols) {
     for (const a of r.areas) {
         lines.push(`${TEST_GLYPH[a.tests]} ${a.label} — ${plural(a.files.length, "changed file")}, ${a.reached}/${a.behavioural} reached by a test`);
     }
     if (r.areas.length > 0)
         lines.push("");
-    for (const mod of r.modules) {
+    let totalListed = 0;
+    for (let mIdx = 0; mIdx < r.modules.length; mIdx++) {
+        const mod = r.modules[mIdx];
+        const remainingCap = MAX_TEXT_REPORT_SYMBOLS - totalListed;
+        if (remainingCap <= 0) {
+            const omittedSyms = symbols - totalListed;
+            const omittedMods = r.modules.length - mIdx;
+            lines.push(`… (+${plural(omittedSyms, "more symbol")} across ${plural(omittedMods, "more area")} — use --format json)`, "");
+            break;
+        }
+        const modLimit = Math.min(25, remainingCap);
         lines.push(`${mod.label} — ${plural(mod.symbols.length, "symbol")} in ${plural(mod.files.length, "file")}`);
-        for (const s of mod.symbols.slice(0, 25)) {
+        for (const s of mod.symbols.slice(0, modLimit)) {
             const relLabel = s.typeOnly ? `${s.relation} (type-only)` : s.relation;
             lines.push(`  ${relLabel} ← ${s.name} (${s.path}:${s.span}) [depth ${s.depth}]`);
+            totalListed++;
         }
-        const hidden = mod.symbols.length - 25;
+        const hidden = mod.symbols.length - modLimit;
         if (hidden > 0)
             lines.push(`  …${plural(hidden, "more symbol")}`);
         lines.push("");
@@ -446,8 +468,6 @@ function appendBlastReviewersAndCoChanges(lines, r) {
         }
         lines.push("");
     }
-    for (const line of caveatLines(r))
-        lines.push(line.replace(/⚠️ /, "⚠ "), "");
     if (Array.isArray(r.coChanges) && r.coChanges.length > 0) {
         lines.push("Co-change warnings (untouched partners)");
         for (const c of r.coChanges.slice(0, 8)) {
@@ -486,8 +506,25 @@ export function textReport(r) {
         `  impacted: ${plural(symbols, "symbol")} in ${plural(r.modules.length, "area")}`,
         "",
     ];
+    for (const line of caveatLines(r))
+        lines.push(line.replace(/⚠️ /, "⚠ "), "");
     appendBlastModules(lines, r, symbols);
     appendBlastReviewersAndCoChanges(lines, r);
     appendBlastLayersAndHotspots(lines, r);
-    return lines.join("\n").replace(/\n+$/, "\n");
+    const out = lines.join("\n").replace(/\n+$/, "\n");
+    if (Buffer.byteLength(out, "utf8") <= MAX_TEXT_REPORT_BYTES)
+        return out;
+    const rawLines = out.trimEnd().split("\n");
+    const kept = [];
+    let bytes = 0;
+    const footer = "… (truncated to 8 KB — use --format json)";
+    const maxBody = MAX_TEXT_REPORT_BYTES - Buffer.byteLength(footer, "utf8") - 2;
+    for (const ln of rawLines) {
+        const lb = Buffer.byteLength(ln, "utf8") + 1;
+        if (kept.length > 0 && bytes + lb > maxBody)
+            break;
+        kept.push(ln);
+        bytes += lb;
+    }
+    return `${kept.join("\n")}\n${footer}\n`;
 }

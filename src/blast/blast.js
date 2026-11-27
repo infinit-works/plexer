@@ -26,7 +26,7 @@ import { GENERIC_MEMBER_NAMES } from "../util/id.js";
 import { globToRegExp, isTestPath, pushMap, toPosixPath } from "../util/paths.js";
 import { parseLayerRuleEntry } from "./layer-rules.js";
 import { readJson } from "../util/state.js";
-import { changedFiles, readPreImageFile, refExists, resolveBaseRef } from "./diff.js";
+import { changedFiles, readPreImageFile, readPreImageFilesBatch, refExists, resolveBaseRef } from "./diff.js";
 import { escapeRegExp, spanRange } from "./evidence.js";
 import { analyzeGitHistory, untouchedCoChanges } from "./history.js";
 import { dirLabel, moduleIndex, parentDir, shortLabel } from "./modules.js";
@@ -43,7 +43,10 @@ function seedsForFile(symbols, ranges) {
         return [];
     const hit = new Map();
     for (const r of ranges) {
-        const overlapping = symbols.filter((s) => s.start <= r.end && s.end >= r.start);
+        const anchor = r.rawStart ?? r.start;
+        const overlapping = r.pureDeletion
+            ? symbols.filter((s) => s.start <= anchor && anchor < s.end)
+            : symbols.filter((s) => s.start <= r.end && s.end >= r.start);
         // Drop any symbol that strictly contains another overlapping one (the class
         // around a changed method), keeping the tightest description of the edit.
         for (const s of overlapping) {
@@ -79,37 +82,166 @@ function blastRadiusFromDir(dir, rawOpts) {
     });
 }
 function indexBlastGraphNodes(graph) {
+    const cached = graph._blastIndex;
+    if (cached && cached.nodeLen === graph.nodes.length && cached.edgeLen === graph.edges.length)
+        return cached.idx;
     const byId = graph._byId ?? new Map(graph.nodes.map((n) => [n.id, n]));
-    const fileNodes = new Map();
-    const goFilesByDir = new Map();
-    const symbolsByFile = new Map();
-    const edgesBySource = new Map();
-    const importersByTarget = new Map();
-    const incomingTargets = new Set();
-    const unresolvedImports = [];
-    for (const n of graph.nodes) {
-        if (n.kind === "file") {
-            fileNodes.set(n.path, n);
-            if (n.path.endsWith(".go") && !n.path.endsWith("_test.go"))
-                pushMap(goFilesByDir, posix.dirname(toPosixPath(n.path)), n.path);
-            continue;
+    const nodesByPath = graph._nodesByPath;
+    const inEdges = graph._inEdges;
+    const outEdges = graph._outEdges;
+
+    let idx;
+    if (nodesByPath && inEdges && outEdges) {
+        const symCache = new Map();
+        const impCache = new Map();
+        const outCache = new Map();
+        let goDirs = null;
+        let unresolved = null;
+        const getGoDirs = () => {
+            if (goDirs)
+                return goDirs;
+            goDirs = new Map();
+            for (const n of graph.nodes) {
+                if (n.kind === "file" && n.path.endsWith(".go") && !n.path.endsWith("_test.go"))
+                    pushMap(goDirs, posix.dirname(toPosixPath(n.path)), n.path);
+            }
+            return goDirs;
+        };
+        idx = {
+            byId,
+            fileNodes: {
+                has(p) {
+                    const list = nodesByPath.get(p);
+                    if (!list) return false;
+                    for (let i = 0; i < list.length; i++) {
+                        if (list[i].kind === "file") return true;
+                    }
+                    return false;
+                },
+                get(p) {
+                    const list = nodesByPath.get(p);
+                    if (!list) return undefined;
+                    for (let i = 0; i < list.length; i++) {
+                        if (list[i].kind === "file") return list[i];
+                    }
+                    return undefined;
+                },
+            },
+            goFilesByDir: {
+                has: (d) => getGoDirs().has(d),
+                get: (d) => getGoDirs().get(d),
+            },
+            symbolsByFile: {
+                get(p) {
+                    let syms = symCache.get(p);
+                    if (syms !== undefined)
+                        return syms;
+                    const list = nodesByPath.get(p);
+                    if (!list) {
+                        symCache.set(p, undefined);
+                        return undefined;
+                    }
+                    syms = [];
+                    for (let i = 0; i < list.length; i++) {
+                        const n = list[i];
+                        if (n.kind === "file")
+                            continue;
+                        const b = spanRange(n.span);
+                        if (b)
+                            syms.push({ node: n, ...b });
+                    }
+                    symCache.set(p, syms);
+                    return syms;
+                },
+            },
+            edgesBySource: {
+                get(s) {
+                    let list = outCache.get(s);
+                    if (list !== undefined)
+                        return list;
+                    const raw = outEdges.get(s);
+                    list = raw ? raw.filter((e) => e.relation !== "contains") : [];
+                    outCache.set(s, list);
+                    return list;
+                },
+            },
+            importersByTarget: {
+                get(t) {
+                    let list = impCache.get(t);
+                    if (list !== undefined)
+                        return list;
+                    const raw = inEdges.get(t);
+                    list = raw ? raw.filter((e) => e.relation === "imports" || e.relation === "reexports") : [];
+                    impCache.set(t, list);
+                    return list;
+                },
+            },
+            incomingTargets: {
+                has(t) {
+                    const list = inEdges.get(t);
+                    if (!list)
+                        return false;
+                    for (let i = 0; i < list.length; i++) {
+                        if (list[i].relation !== "contains")
+                            return true;
+                    }
+                    return false;
+                },
+            },
+            get unresolvedImports() {
+                if (unresolved !== null)
+                    return unresolved;
+                unresolved = [];
+                for (const list of inEdges.values()) {
+                    for (let i = 0; i < list.length; i++) {
+                        const e = list[i];
+                        if (e.relation === "imports" && !byId.has(e.target))
+                            unresolved.push(e);
+                    }
+                }
+                return unresolved;
+            },
+        };
+    }
+    else {
+        const fileNodes = new Map();
+        const goFilesByDir = new Map();
+        const symbolsByFile = new Map();
+        const edgesBySource = new Map();
+        const importersByTarget = new Map();
+        const incomingTargets = new Set();
+        const unresolvedImports = [];
+        for (const n of graph.nodes) {
+            if (n.kind === "file") {
+                fileNodes.set(n.path, n);
+                if (n.path.endsWith(".go") && !n.path.endsWith("_test.go"))
+                    pushMap(goFilesByDir, posix.dirname(toPosixPath(n.path)), n.path);
+                continue;
+            }
+            const b = spanRange(n.span);
+            if (!b)
+                continue;
+            pushMap(symbolsByFile, n.path, { node: n, ...b });
         }
-        const b = spanRange(n.span);
-        if (!b)
-            continue;
-        pushMap(symbolsByFile, n.path, { node: n, ...b });
+        for (const e of graph.edges) {
+            if (e.relation === "contains")
+                continue;
+            pushMap(edgesBySource, e.source, e);
+            incomingTargets.add(e.target);
+            if (e.relation === "imports" || e.relation === "reexports")
+                pushMap(importersByTarget, e.target, e);
+            if (e.relation === "imports" && !byId.has(e.target))
+                unresolvedImports.push(e);
+        }
+        idx = { byId, fileNodes, goFilesByDir, symbolsByFile, edgesBySource, importersByTarget, incomingTargets, unresolvedImports };
     }
-    for (const e of graph.edges) {
-        if (e.relation === "contains")
-            continue;
-        pushMap(edgesBySource, e.source, e);
-        incomingTargets.add(e.target);
-        if (e.relation === "imports" || e.relation === "reexports")
-            pushMap(importersByTarget, e.target, e);
-        if (e.relation === "imports" && !byId.has(e.target))
-            unresolvedImports.push(e);
-    }
-    return { byId, fileNodes, goFilesByDir, symbolsByFile, edgesBySource, importersByTarget, incomingTargets, unresolvedImports };
+    Object.defineProperty(graph, "_blastIndex", {
+        value: { nodeLen: graph.nodes.length, edgeLen: graph.edges.length, idx },
+        enumerable: false,
+        configurable: true,
+        writable: true,
+    });
+    return idx;
 }
 function baseRefFromBasis(rootDir, basis, explicitBaseRef) {
     if (explicitBaseRef)
@@ -157,8 +289,9 @@ export function importSpecMatchesPath(sourceFile, spec, targetPath) {
     if (normSpec.startsWith(".")) {
         return matchRelativeImportSpec(sourceFile, normSpec, normTarget, targetNoExt);
     }
-    const dotSlash = normSpec.includes("/") ? normSpec : normSpec.replace(/\./g, "/");
-    const cleanSpec = stripImportExtAndIndex(dotSlash.replace(/^@[^/]+\//, ""));
+    const noScope = normSpec.replace(/^@[^/]+\//, "");
+    const noExt = stripImportExtAndIndex(noScope);
+    const cleanSpec = noExt.includes("/") ? noExt : noExt.replace(/\./g, "/");
     if (!cleanSpec || cleanSpec === "index")
         return false;
     return targetNoExt === cleanSpec || targetNoExt.endsWith(`/${cleanSpec}`) || (cleanSpec.includes("/") && targetNoExt.endsWith(cleanSpec));
@@ -265,8 +398,27 @@ function extractPreImageNodes(relPath, source) {
         return nodes;
     return extractFallbackPreImageNodes(relPath, source);
 }
-function collectPreImageSeeds(file, prePath, preRanges, idx, rootDir, baseRef) {
-    const preSource = rootDir && baseRef ? readPreImageFile(rootDir, baseRef, prePath) : null;
+const PRE_DECL_LIKE_RE = /(?:\b(?:export|pub|function|def|fn|func|class|interface|struct|trait|enum|type|local|module\.exports|exports)\b|=>)/;
+
+function shouldParseModifiedPreImage(file, prePath, postSyms, idx) {
+    if (!file.oldRanges?.length)
+        return false;
+    if (file.hunks?.some((h) => h.dropped > 0 || h.lines?.some((l) => l.sign === "-" && PRE_DECL_LIKE_RE.test(l.text))))
+        return true;
+    if (postSyms.length === 0)
+        return true;
+    const fileSyms = idx.symbolsByFile.get(prePath) ?? [];
+    for (const r of file.oldRanges) {
+        if (fileSyms.some((s) => Math.abs(r.start - s.start) <= 1 || Math.abs(r.end - s.end) <= 1 || (r.start <= s.end && r.end >= s.start && !postSyms.some((p) => p.id === s.node.id))))
+            return true;
+    }
+    return false;
+}
+
+function collectPreImageSeeds(file, prePath, preRanges, idx, rootDir, baseRef, preImageByPath) {
+    const preSource = preImageByPath && preImageByPath.has(prePath)
+        ? preImageByPath.get(prePath)
+        : (rootDir && baseRef ? readPreImageFile(rootDir, baseRef, prePath) : null);
     if (!preSource)
         return [];
     const preNodes = extractPreImageNodes(prePath, preSource);
@@ -279,18 +431,29 @@ function collectPreImageSeeds(file, prePath, preRanges, idx, rootDir, baseRef) {
             symEntries.push({ node: n, ...b });
     }
     const matched = preRanges === null ? symEntries.map((s) => s.node) : seedsForFile(symEntries, preRanges);
-    return matched;
+    return matched.map((n) => {
+        const gNode = idx.byId.get(n.id);
+        if (!gNode)
+            return n;
+        if (n.exported === gNode.exported && n.defaultExport === gNode.defaultExport)
+            return n;
+        return {
+            ...n,
+            ...(gNode.exported !== undefined ? { exported: gNode.exported } : {}),
+            ...(gNode.defaultExport !== undefined ? { defaultExport: gNode.defaultExport } : {}),
+        };
+    });
 }
 const BARREL_FILE_RE = /^(?:index|init(?:\.(?:client|server))?|mod|__init__)\.[a-z0-9]+$/i;
 const TS_JS_PY_EXT = /\.(?:[cm]?[jt]sx?|pyi?|vue|svelte|astro)$/i;
 const TS_TYPE_FILE_EXT = /\.(?:[cm]?tsx?|vue|svelte|astro)$/i;
 const MAX_DEP_BARREL_HOPS = 6;
 
-function resolveDeletedWalkSeeds(prePath, isIndexed, unresolvedSpecs, file, idx, rootDir, baseRef) {
+function resolveDeletedWalkSeeds(prePath, isIndexed, unresolvedSpecs, file, idx, rootDir, baseRef, preImageByPath) {
     const staleFileNode = idx.fileNodes.get(prePath);
     const staleSyms = (idx.symbolsByFile.get(prePath) ?? []).map((s) => s.node);
     const preSyms = (isIndexed || unresolvedSpecs.length > 0)
-        ? collectPreImageSeeds(file, prePath, null, idx, rootDir, baseRef)
+        ? collectPreImageSeeds(file, prePath, null, idx, rootDir, baseRef, preImageByPath)
         : [];
     if (!staleFileNode && staleSyms.length === 0 && preSyms.length === 0 && unresolvedSpecs.length === 0)
         return null;
@@ -309,15 +472,21 @@ function resolveDeletedWalkSeeds(prePath, isIndexed, unresolvedSpecs, file, idx,
         missingPreSyms: allDeletedSyms.filter((s) => !idx.byId.has(s.id)),
     };
 }
-function collectPreImageSeedsForFile(file, prePath, unresolvedSpecs, idx, rootDir, baseRef) {
-    const preRanges = file.oldRanges?.length ? file.oldRanges : (file.ranges?.length ? file.ranges : []);
-    if ((file.status === "modified" || file.status === "renamed") && preRanges.length > 0)
-        return collectPreImageSeeds(file, prePath, preRanges, idx, rootDir, baseRef);
-    if (file.status === "renamed" && unresolvedSpecs.length > 0)
-        return collectPreImageSeeds(file, prePath, null, idx, rootDir, baseRef);
+function collectPreImageSeedsForFile(file, prePath, unresolvedSpecs, postSyms, idx, rootDir, baseRef, preImageByPath) {
+    if (file.status === "modified") {
+        if (!shouldParseModifiedPreImage(file, prePath, postSyms, idx))
+            return [];
+        return collectPreImageSeeds(file, prePath, file.oldRanges, idx, rootDir, baseRef, preImageByPath);
+    }
+    if (file.status === "renamed") {
+        if (file.oldRanges?.length)
+            return collectPreImageSeeds(file, prePath, file.oldRanges, idx, rootDir, baseRef, preImageByPath);
+        if (unresolvedSpecs.length > 0)
+            return collectPreImageSeeds(file, prePath, null, idx, rootDir, baseRef, preImageByPath);
+    }
     return [];
 }
-function resolveFileWalkSeeds(file, idx, rootDir, baseRef) {
+function resolveFileWalkSeeds(file, idx, rootDir, baseRef, preImageByPath) {
     const prePath = file.status === "renamed" ? (file.oldPath ?? file.path) : file.path;
     const hasSamePkgSiblings = prePath.endsWith(".go") && idx.goFilesByDir.has(posix.dirname(toPosixPath(prePath)));
     const isIndexed = idx.fileNodes.has(file.path) || idx.fileNodes.has(prePath) || idx.incomingTargets.has(prePath) || hasSamePkgSiblings;
@@ -325,19 +494,30 @@ function resolveFileWalkSeeds(file, idx, rootDir, baseRef) {
         ? unresolvedImportTargetsForPath(idx.unresolvedImports, prePath)
         : [];
     if (file.status === "deleted")
-        return resolveDeletedWalkSeeds(prePath, isIndexed, unresolvedSpecs, file, idx, rootDir, baseRef);
+        return resolveDeletedWalkSeeds(prePath, isIndexed, unresolvedSpecs, file, idx, rootDir, baseRef, preImageByPath);
     const fileNode = idx.fileNodes.get(file.path) ?? idx.fileNodes.get(prePath);
     if (!fileNode && unresolvedSpecs.length === 0)
         return "unindexed";
     const postSyms = fileNode && file.ranges.length > 0 ? seedsForFile(idx.symbolsByFile.get(fileNode.path), file.ranges) : [];
     const postIds = new Set(postSyms.map((s) => s.id));
-    const preSyms = collectPreImageSeedsForFile(file, prePath, unresolvedSpecs, idx, rootDir, baseRef);
-    const extraPreSyms = preSyms.filter((p) => !postIds.has(p.id) && (idx.byId.has(p.id) || idx.incomingTargets.has(p.id) || file.ranges.length > 0 || (file.oldRanges?.length ?? 0) > 0));
+    const preSyms = collectPreImageSeedsForFile(file, prePath, unresolvedSpecs, postSyms, idx, rootDir, baseRef, preImageByPath);
+    const extraPreSyms = preSyms.filter((p) => !postIds.has(p.id) && (idx.byId.has(p.id) || idx.incomingTargets.has(p.id) || (file.oldRanges?.length ?? 0) > 0));
     const allSyms = [...postSyms, ...extraPreSyms];
     const displaySeeds = allSyms.length > 0 ? allSyms : (fileNode ? [{ ...fileNode, wholeFile: true }] : unresolvedSpecs);
     const walkMap = new Map();
     for (const s of allSyms) walkMap.set(s.id, s);
-    if (fileNode) walkMap.set(fileNode.id, fileNode);
+    const shouldSeedFileNode = Boolean(
+        fileNode && (
+            allSyms.length === 0 ||
+            file.status === "renamed" ||
+            allSyms.some((s) => {
+                const gn = idx.byId.get(s.id);
+                return s.exported || s.defaultExport || gn?.exported || gn?.defaultExport ||
+                    s.kind === "class" || s.kind === "interface" || s.kind === "struct" || s.kind === "type" || s.kind === "enum";
+            })
+        ),
+    );
+    if (shouldSeedFileNode) walkMap.set(fileNode.id, fileNode);
     if (prePath !== fileNode?.path && idx.incomingTargets.has(prePath))
         walkMap.set(prePath, { id: prePath, name: basename(prePath), kind: "file", path: prePath, span: "L1-L1" });
     for (const u of unresolvedSpecs) if (!walkMap.has(u.id)) walkMap.set(u.id, u);
@@ -430,6 +610,7 @@ function buildMissingSymbolMeta(missingPreSyms) {
     const missingNames = new Set();
     const missingQuals = new Set();
     const missingMethodOwners = new Map();
+    const ownerWordReByName = new Map();
     const missingTypeNames = new Set();
     let hasDefaultMissing = false;
     for (const p of missingPreSyms) {
@@ -444,9 +625,11 @@ function buildMissingSymbolMeta(missingPreSyms) {
         if (owner) {
             missingQuals.add(`${owner}.${p.name}`);
             pushMap(missingMethodOwners, p.name, owner);
+            if (!ownerWordReByName.has(owner))
+                ownerWordReByName.set(owner, new RegExp(`\\b${escapeRegExp(owner)}\\b`));
         }
     }
-    return { missingNames, missingQuals, missingMethodOwners, missingTypeNames, hasDefaultMissing };
+    return { missingNames, missingQuals, missingMethodOwners, ownerWordReByName, missingTypeNames, hasDefaultMissing };
 }
 function matchesMissingRawEdge(e, depFile, depSource, depLocalNames, meta, targetPaths, barrelFiles, isSameGoPkg) {
     const leafName = e.name ? e.name.split(/[.:]/).pop() : "";
@@ -476,7 +659,7 @@ function matchesMissingRawEdge(e, depFile, depSource, depLocalNames, meta, targe
         const owners = meta.missingMethodOwners.get(leafName) ?? [];
         const ownerMatched = e.recvType
             ? owners.includes(e.recvType)
-            : owners.some((own) => e.receiver === own || new RegExp(`\\b${escapeRegExp(own)}\\b`).test(depSource));
+            : owners.some((own) => e.receiver === own || meta.ownerWordReByName.get(own)?.test(depSource));
         if (!ownerMatched)
             return false;
     }
@@ -521,7 +704,9 @@ function scanDepLinesForMissing(depFile, depSource, names, idx, targetPaths, bar
     const nameList = [...terms].filter((n) => !GENERIC_MEMBER_NAMES.has(n.toLowerCase()));
     if (nameList.length === 0)
         return [];
-    const wordMatcher = new RegExp(`\\b(?:${nameList.map(escapeRegExp).join("|")})\\b`);
+    const joinedNames = nameList.map(escapeRegExp).join("|");
+    const wordMatcher = new RegExp(`\\b(?:${joinedNames})\\b`);
+    const callMatcher = new RegExp(`\\b(?:${joinedNames})\\s*\\(`);
     const lines = depSource.split("\n");
     const symEntries = idx.symbolsByFile.get(depFile) ?? [];
     const fileNode = idx.fileNodes.get(depFile) ?? null;
@@ -537,7 +722,7 @@ function scanDepLinesForMissing(depFile, depSource, names, idx, targetPaths, bar
             continue;
         const hitNode = enclosingSymbolAtLine(symEntries, fileNode, i + 1);
         if (hitNode && !out.has(hitNode.id)) {
-            const callHit = new RegExp(`\\b(?:${nameList.map(escapeRegExp).join("|")})\\s*\\(`).test(line);
+            const callHit = callMatcher.test(line);
             out.set(hitNode.id, { node: hitNode, relation: callHit ? "calls" : relation, typeOnly: false });
         }
     }
@@ -591,14 +776,28 @@ function mergeBlastHit(merged, hit, filePath) {
     if (!prev.hit.typeOnly)
         delete prev.hit.typeOnly;
 }
-function propagateRecoveredMatchTransitive(graph, idx, match, depth, filePath, merged) {
-    const subHits = impactOfMany(graph, [match.node], depth - 1, "in");
-    const subSeeds = new Set([match.node.id]);
-    const subTypeOnly = new Map();
+function propagateRecoveredMatchesTransitiveBatch(graph, idx, matches, depth, filePath, merged) {
+    if (depth <= 1 || matches.length === 0)
+        return;
+    const seedNodes = [];
+    const seedTypeOnly = new Map();
+    for (const m of matches) {
+        const prev = seedTypeOnly.get(m.node.id);
+        if (prev === undefined) {
+            seedNodes.push(m.node);
+            seedTypeOnly.set(m.node.id, Boolean(m.typeOnly));
+        }
+        else if (prev && !m.typeOnly) {
+            seedTypeOnly.set(m.node.id, false);
+        }
+    }
+    const subHits = impactOfMany(graph, seedNodes, depth - 1, "in");
+    const subSeeds = new Set(seedTypeOnly.keys());
+    const subTypeOnly = new Map(seedTypeOnly);
     for (const sh of subHits) {
-        if (!hasNode(sh) || sh.node.id === match.node.id)
+        if (!hasNode(sh) || subSeeds.has(sh.node.id))
             continue;
-        const tOnly = Boolean(match.typeOnly || isHitTypeOnly(sh, subSeeds, idx.edgesBySource, subTypeOnly));
+        const tOnly = isHitTypeOnly(sh, subSeeds, idx.edgesBySource, subTypeOnly);
         subTypeOnly.set(sh.node.id, tOnly);
         mergeBlastHit(merged, toImpacted({ ...sh, depth: sh.depth + 1 }, tOnly), filePath);
     }
@@ -612,20 +811,30 @@ function mergeRecoveredPreImageHits(graph, idx, file, resolved, depth, rootDir, 
         return;
     const targetPaths = [...new Set([resolved.prePath, file.path].filter(Boolean))];
     const preDir = posix.dirname(toPosixPath(resolved.prePath));
+    const allMatches = [];
     for (const depFile of depFiles) {
         const isSameGoPkg = resolved.prePath.endsWith(".go") && depFile.endsWith(".go") && posix.dirname(toPosixPath(depFile)) === preDir;
         const hits = findRecoveredDepMatches(depFile, rootDir, depCache, resolved.missingPreSyms, targetPaths, barrelFiles, idx, isSameGoPkg);
         for (const match of hits) {
             mergeBlastHit(merged, toImpacted({ node: match.node, relation: match.relation, depth: 1, typeOnly: match.typeOnly }, match.typeOnly), file.path);
-            if (depth > 1)
-                propagateRecoveredMatchTransitive(graph, idx, match, depth, file.path, merged);
+            allMatches.push(match);
         }
     }
+    if (depth > 1 && allMatches.length > 0)
+        propagateRecoveredMatchesTransitiveBatch(graph, idx, allMatches, depth, file.path, merged);
 }
 function isHitTypeOnly(h, seedIds, edgesBySource, typeOnlyByNodeId) {
+    const srcEdges = edgesBySource.get(h.node.id) ?? [];
+    for (const e of srcEdges) {
+        if (e.typeOnly)
+            continue;
+        if (seedIds.has(e.target) && typeOnlyByNodeId.get(e.target) !== true)
+            return false;
+        if (h.depth > 1 && typeOnlyByNodeId.get(e.target) === false)
+            return false;
+    }
     if (h.typeOnly === true)
         return true;
-    const srcEdges = edgesBySource.get(h.node.id) ?? [];
     const targetMatches = srcEdges.filter((e) =>
         h.depth === 1 ? seedIds.has(e.target) || (h.via && e.target === h.via.id) : h.via ? e.target === h.via.id : seedIds.has(e.target),
     );
@@ -635,10 +844,37 @@ function isHitTypeOnly(h, seedIds, edgesBySource, typeOnlyByNodeId) {
         return true;
     return false;
 }
+function collectNeededPreImagePaths(changed, idx) {
+    const paths = [];
+    for (const file of changed) {
+        const prePath = file.status === "renamed" ? (file.oldPath ?? file.path) : file.path;
+        if (!prePath)
+            continue;
+        if (file.status === "deleted") {
+            const hasSamePkgSiblings = prePath.endsWith(".go") && idx.goFilesByDir.has(posix.dirname(toPosixPath(prePath)));
+            const isIndexed = idx.fileNodes.has(file.path) || idx.fileNodes.has(prePath) || idx.incomingTargets.has(prePath) || hasSamePkgSiblings;
+            if (isIndexed || unresolvedImportTargetsForPath(idx.unresolvedImports, prePath).length > 0)
+                paths.push(prePath);
+        }
+        else if (file.status === "renamed") {
+            if (file.oldRanges?.length || unresolvedImportTargetsForPath(idx.unresolvedImports, prePath).length > 0)
+                paths.push(prePath);
+        }
+        else if (file.status === "modified" && file.oldRanges?.length) {
+            const fileNode = idx.fileNodes.get(file.path) ?? idx.fileNodes.get(prePath);
+            const postSyms = fileNode && file.ranges.length > 0 ? seedsForFile(idx.symbolsByFile.get(fileNode.path), file.ranges) : [];
+            if (shouldParseModifiedPreImage(file, prePath, postSyms, idx))
+                paths.push(prePath);
+        }
+    }
+    return paths;
+}
 function collectBlastSeedsAndImpacts(graph, changed, depth, opts = {}, basis = "") {
     const idx = indexBlastGraphNodes(graph);
     const rootDir = opts.rootDir ?? null;
     const baseRef = baseRefFromBasis(rootDir, basis, opts.baseRef);
+    const prePaths = rootDir && baseRef ? collectNeededPreImagePaths(changed, idx) : [];
+    const preImageByPath = prePaths.length > 0 ? readPreImageFilesBatch(rootDir, baseRef, prePaths) : null;
     const seeds = [];
     const unindexed = [];
     const deleted = [];
@@ -651,7 +887,7 @@ function collectBlastSeedsAndImpacts(graph, changed, depth, opts = {}, basis = "
     for (const file of changed) {
         if (file.status === "deleted")
             deleted.push(file.path);
-        const resolved = resolveFileWalkSeeds(file, idx, rootDir, baseRef);
+        const resolved = resolveFileWalkSeeds(file, idx, rootDir, baseRef, preImageByPath);
         if (resolved === "unindexed") {
             unindexed.push(file.path);
             continue;
@@ -724,14 +960,30 @@ function collectBlastTestIncoming(graph) {
     const inDegree = new Map();
     /** Incoming edge sources per node id, resolved to the source's file path. */
     const incoming = new Map();
-    for (const e of graph.edges) {
-        inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1);
-        const path = nodeById.get(e.source)?.path;
-        if (!path || !isTestPath(path))
-            continue;
-        const at = incoming.get(e.target) ?? new Set();
-        at.add(path);
-        incoming.set(e.target, at);
+    if (graph._inEdges) {
+        for (const [target, list] of graph._inEdges) {
+            inDegree.set(target, list.length);
+            for (const e of list) {
+                const path = nodeById.get(e.source)?.path;
+                if (!path || !isTestPath(path))
+                    continue;
+                let at = incoming.get(target);
+                if (!at)
+                    incoming.set(target, (at = new Set()));
+                at.add(path);
+            }
+        }
+    }
+    else {
+        for (const e of graph.edges) {
+            inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1);
+            const path = nodeById.get(e.source)?.path;
+            if (!path || !isTestPath(path))
+                continue;
+            const at = incoming.get(e.target) ?? new Set();
+            at.add(path);
+            incoming.set(e.target, at);
+        }
     }
     const testLinks = linkTestsForGraph(graph);
     return { inDegree, incoming, testLinks };
@@ -976,6 +1228,8 @@ export function blastRadiusIn(graph, contextDir, changed, basisOrOpts, depthArg,
                 ? analyzeGitHistory(rootDir, contextDir, opts.since ? { since: opts.since } : undefined)
                 : null));
     if (history) {
+        if (history.head)
+            Object.defineProperty(res, "_headSha", { value: history.head, enumerable: false, configurable: true });
         const coChanges = untouchedCoChanges(history, changed.map((c) => c.path), graph);
         if (coChanges.length > 0) {
             res.coChanges = coChanges;

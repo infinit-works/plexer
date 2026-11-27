@@ -9,9 +9,9 @@
  * human text and wires the CLI command; `mcp/tools.js` renders the same
  * shape for the `plexer_find_all` tool.
  */
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { escapeRegExp, resolveSafeRepoFile, spanRange } from "../util/span.js";
+import { MAX_SOURCE_READ_BYTES, escapeRegExp, resolveSafeRepoFile, spanRange } from "../util/span.js";
 import { assertPrefixIndexed } from "../context/scopes.js";
 import { computeInDegree } from "../context/symbol-query.js";
 import { isTestPath, normalizePathPrefix, pathUnderPrefix, pushMap } from "../util/paths.js";
@@ -81,6 +81,17 @@ function getOrInitGrepTextCache(graph, repoRoot) {
     Object.defineProperty(graph, "_grepFileTextLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
     return textCache;
 }
+function getOrInitGrepSafePathCache(graph, absRoot, realRoot) {
+    if (graph._grepSafePathCache && graph._grepSafePathRoot === absRoot && graph._grepSafePathRealRoot === realRoot && graph._grepSafePathLen === graph.nodes.length) {
+        return graph._grepSafePathCache;
+    }
+    const pathCache = new Map();
+    Object.defineProperty(graph, "_grepSafePathCache", { value: pathCache, enumerable: false, configurable: true, writable: true });
+    Object.defineProperty(graph, "_grepSafePathRoot", { value: absRoot, enumerable: false, configurable: true, writable: true });
+    Object.defineProperty(graph, "_grepSafePathRealRoot", { value: realRoot, enumerable: false, configurable: true, writable: true });
+    Object.defineProperty(graph, "_grepSafePathLen", { value: graph.nodes.length, enumerable: false, configurable: true, writable: true });
+    return pathCache;
+}
 function readCachedGrepFileText(filePath, safe, textCache) {
     const st = safe.stat;
     const cached = textCache.get(filePath);
@@ -101,7 +112,8 @@ function readCachedGrepFileText(filePath, safe, textCache) {
     return text;
 }
 
-function recordMatchedFileLines(filePath, lines, ctx) {
+function recordMatchedFileLines(file, lines, ctx) {
+    const filePath = file.path;
     let symbols;
     let totalMatchedLines = 0;
     let fileHasHit = false;
@@ -119,7 +131,7 @@ function recordMatchedFileLines(filePath, lines, ctx) {
             group = {
                 symbol: sym ? toSymbolRef(sym) : null,
                 path: filePath,
-                inDegree: sym ? (ctx.inDegree.get(sym.id) ?? 0) : 0,
+                inDegree: sym ? (ctx.inDegree.get(sym.id) ?? 0) : (ctx.inDegree.get(file.id) ?? ctx.inDegree.get(filePath) ?? 0),
                 hits: [],
                 omittedHits: 0,
             };
@@ -135,9 +147,18 @@ function recordMatchedFileLines(filePath, lines, ctx) {
     return { totalMatchedLines, fileHasHit };
 }
 
-function collectGrepFileMatches(fileNodes, repoRoot, textCache, isSimpleFixed, pattern, regex, symbolsByPath, inDegree, maxHitsPerSymbol, linesByPath) {
-    const groups = new Map();
-    let totalMatchedLines = 0;
+function collectGrepFileMatchesBatch(fileNodes, repoRoot, textCache, safePathCache, specs, symbolsByPath, inDegree, maxHitsPerSymbol, needLinesByPath) {
+    const states = specs.map((s) => ({
+        isSimpleFixed: s.isSimpleFixed,
+        pattern: s.pattern,
+        regex: s.regex,
+        symbolsByPath,
+        inDegree,
+        maxHitsPerSymbol,
+        groups: new Map(),
+        totalMatchedLines: 0,
+        linesByPath: needLinesByPath ? new Map() : null,
+    }));
     let truncatedFiles = 0;
     const absRoot = resolve(repoRoot);
     let realRoot = absRoot;
@@ -146,22 +167,54 @@ function collectGrepFileMatches(fileNodes, repoRoot, textCache, isSimpleFixed, p
     } catch {
         /* keep absRoot fallback */
     }
-    const ctx = { isSimpleFixed, pattern, regex, symbolsByPath, inDegree, maxHitsPerSymbol, groups };
     for (const file of fileNodes) {
-        const safe = resolveSafeRepoFile(absRoot, realRoot, file.path);
+        let safe = null;
+        const cachedPath = safePathCache?.get(file.path);
+        if (cachedPath) {
+            try {
+                const st = statSync(cachedPath.realFile);
+                if (st.isFile() && st.size <= MAX_SOURCE_READ_BYTES) {
+                    safe = { ...cachedPath, stat: st };
+                } else {
+                    safePathCache.delete(file.path);
+                }
+            } catch {
+                safePathCache.delete(file.path);
+                textCache.delete(file.path);
+            }
+        }
+        if (!safe) {
+            safe = resolveSafeRepoFile(absRoot, realRoot, file.path);
+            if (safe && safePathCache) {
+                safePathCache.set(file.path, {
+                    absFile: safe.absFile,
+                    realFile: safe.realFile,
+                    rel: safe.rel,
+                    realRel: safe.realRel,
+                });
+            }
+        }
         if (!safe) continue;
         const text = readCachedGrepFileText(file.path, safe, textCache);
         if (text === null) {
             truncatedFiles++;
             continue;
         }
-        if (isSimpleFixed ? !text.includes(pattern) : !regex.test(text)) continue;
-        const lines = text.split("\n");
-        const matched = recordMatchedFileLines(file.path, lines, ctx);
-        totalMatchedLines += matched.totalMatchedLines;
-        if (matched.fileHasHit && linesByPath) linesByPath.set(file.path, lines);
+        let lines = null;
+        for (let si = 0; si < states.length; si++) {
+            const st = states[si];
+            if (st.isSimpleFixed ? !text.includes(st.pattern) : !st.regex.test(text)) continue;
+            if (lines === null) {
+                lines = text.split(/\r?\n/);
+                if (lines.length > 1 && lines[lines.length - 1] === "")
+                    lines.pop();
+            }
+            const matched = recordMatchedFileLines(file, lines, st);
+            st.totalMatchedLines += matched.totalMatchedLines;
+            if (matched.fileHasHit && st.linesByPath) st.linesByPath.set(file.path, lines);
+        }
     }
-    return { groups, totalMatchedLines, truncatedFiles };
+    return { states, truncatedFiles };
 }
 function rankGrepSymbolNameMatch(group, candTerms) {
     if (!group.symbol?.name || candTerms.length === 0)
@@ -228,33 +281,23 @@ function normalizeInFilter(rawIn) {
     return unique.length === 1 ? unique[0] : unique;
 }
 
-export function grepGraph(graph, repoRoot, pattern, opts = {}) {
-    const maxHits = opts.maxHits ?? DEFAULT_MAX_HITS;
-    const maxHitsPerSymbol = opts.maxHitsPerSymbol ?? DEFAULT_MAX_HITS_PER_SYMBOL;
-    const explicitContext = opts.context !== undefined && opts.context !== null;
-    const baseContextLines = Math.max(0, Number(opts.context ?? (opts.source ? 2 : 0)) || 0);
-    const source = opts.fixed
-        ? pattern.includes("\\|") || /^[A-Za-z0-9_.:#\s-]+(?:\|[A-Za-z0-9_.:#\s-]+)+$/.test(pattern)
-            ? pattern.split(/\\?\||\|/).map(escapeRegExp).join("|")
-            : escapeRegExp(pattern)
-        : pattern;
-    const regex = compileSafeUserRegex(source, opts.ignoreCase ? "i" : "");
-    const inDegree = computeInDegree(graph);
-    const inPrefix = normalizeInFilter(opts.in);
-    if (inPrefix)
-        assertPrefixIndexed(graph, inPrefix);
-    const { fileNodes, symbolsByPath } = getOrBuildGrepSymbolIndex(graph, inPrefix);
-    const textCache = getOrInitGrepTextCache(graph, repoRoot);
-    const isSimpleFixed = Boolean(opts.fixed && !opts.ignoreCase && !pattern.includes("|") && !pattern.includes("\\|"));
-    const linesByPath = (baseContextLines > 0 || opts.source) ? new Map() : null;
-    const { groups, totalMatchedLines, truncatedFiles } = collectGrepFileMatches(
-        fileNodes, repoRoot, textCache, isSimpleFixed, pattern, regex, symbolsByPath, inDegree, maxHitsPerSymbol, linesByPath,
-    );
-    const candTerms = pattern
-        .split(/\\?\||\|/)
+function compileGrepPatternSpec(entry, opts) {
+    const isObj = entry && typeof entry === "object";
+    const pattern = isObj ? String(entry.pattern ?? "") : String(entry ?? "");
+    const fixed = isObj && entry.fixed !== undefined ? Boolean(entry.fixed) : Boolean(opts.fixed);
+    const ignoreCase = isObj && entry.ignoreCase !== undefined ? Boolean(entry.ignoreCase) : Boolean(opts.ignoreCase);
+    const source = fixed ? escapeRegExp(pattern) : pattern;
+    const regex = compileSafeUserRegex(source, ignoreCase ? "im" : "m");
+    const isSimpleFixed = Boolean(fixed && !ignoreCase);
+    const regexFallbackNote = isObj ? entry.regexFallbackNote : undefined;
+    return { pattern, fixed, ignoreCase, regex, isSimpleFixed, regexFallbackNote };
+}
+
+function finalizeSingleGrepResult(spec, st, fileNodes, repoRoot, truncatedFiles, maxHits, explicitContext, baseContextLines, sourceOpt, skipIgnoredScan = false) {
+    const candTerms = (spec.fixed ? [spec.pattern] : spec.pattern.split(/\\?\||\|/))
         .map((t) => t.replace(/^(?:\\b|\\\.|[.:#^$\s])+|(?:\\b|\\\.|[.:#$()\s])+$/g, "").toLowerCase())
         .filter((t) => t.length >= 2);
-    const allSortedGroups = [...groups.values()].sort(
+    const allSortedGroups = [...st.groups.values()].sort(
         (a, b) =>
             Number(isTestPath(a.path)) - Number(isTestPath(b.path)) ||
             rankGrepSymbolNameMatch(a, candTerms) - rankGrepSymbolNameMatch(b, candTerms) ||
@@ -264,7 +307,7 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
     const nonTestGroupCount = allSortedGroups.filter((g) => !isTestPath(g.path)).length || allSortedGroups.length;
     const contextLines = explicitContext
         ? baseContextLines
-        : !opts.source && baseContextLines === 0
+        : !sourceOpt && baseContextLines === 0
             ? 0
             : nonTestGroupCount <= 4
                 ? 2
@@ -287,24 +330,59 @@ export function grepGraph(graph, repoRoot, pattern, opts = {}) {
             truncatedHits += droppedInGroup;
         }
         collected += g.hits.length;
-        if (linesByPath && g.hits.length > 0) {
-            const fileLines = linesByPath.get(g.path);
+        if (st.linesByPath && g.hits.length > 0) {
+            const fileLines = st.linesByPath.get(g.path);
             if (fileLines)
                 g.contextBlocks = buildGrepContextBlocks(g, fileLines, contextLines, candTerms);
         }
         keptGroups.push(g);
     }
     const ignoredDirs =
-        totalMatchedLines === 0 && repoRoot
-            ? findIgnoredMatchDirs(repoRoot, (text) => (isSimpleFixed ? text.includes(pattern) : regex.test(text)))
+        st.totalMatchedLines === 0 && repoRoot && !skipIgnoredScan
+            ? findIgnoredMatchDirs(repoRoot, (text) => (spec.isSimpleFixed ? text.includes(spec.pattern) : spec.regex.test(text)))
             : [];
     return {
-        pattern,
+        pattern: spec.pattern,
         filesSearched: fileNodes.length,
-        totalHits: totalMatchedLines,
+        totalHits: st.totalMatchedLines,
         groups: keptGroups,
         truncated: { files: truncatedFiles, hits: truncatedHits },
         ...(ignoredDirs.length > 0 ? { ignoredDirs } : {}),
+        ...(spec.regexFallbackNote ? { regexFallbackNote: spec.regexFallbackNote } : {}),
     };
+}
+
+export function grepGraphMany(graph, repoRoot, patterns, opts = {}) {
+    const compiledSpecs = (Array.isArray(patterns) ? patterns : [patterns]).map((p) => compileGrepPatternSpec(p, opts));
+    const maxHits = opts.maxHits ?? DEFAULT_MAX_HITS;
+    const maxHitsPerSymbol = opts.maxHitsPerSymbol ?? DEFAULT_MAX_HITS_PER_SYMBOL;
+    const explicitContext = opts.context !== undefined && opts.context !== null;
+    const baseContextLines = Math.max(0, Number(opts.context ?? (opts.source ? 2 : 0)) || 0);
+    const inDegree = computeInDegree(graph);
+    const inPrefix = normalizeInFilter(opts.in);
+    if (inPrefix)
+        assertPrefixIndexed(graph, inPrefix);
+    const { fileNodes, symbolsByPath } = getOrBuildGrepSymbolIndex(graph, inPrefix);
+    const textCache = getOrInitGrepTextCache(graph, repoRoot);
+    const absRoot = resolve(repoRoot);
+    let realRoot = absRoot;
+    try { realRoot = realpathSync(absRoot); } catch { /* fallback */ }
+    const safePathCache = getOrInitGrepSafePathCache(graph, absRoot, realRoot);
+    const needLinesByPath = baseContextLines > 0 || opts.source;
+    const { states, truncatedFiles } = collectGrepFileMatchesBatch(
+        fileNodes, repoRoot, textCache, safePathCache, compiledSpecs, symbolsByPath, inDegree, maxHitsPerSymbol, needLinesByPath,
+    );
+    const anyPatternMatched = states.some((s) => s.totalMatchedLines > 0);
+    const skipIgnoredScan = Boolean(
+        opts.skipIgnoredScan
+        || (compiledSpecs.length >= 2 && !opts.includeIgnoredDirsOnMultiHit && anyPatternMatched),
+    );
+    return compiledSpecs.map((spec, idx) =>
+        finalizeSingleGrepResult(spec, states[idx], fileNodes, repoRoot, truncatedFiles, maxHits, explicitContext, baseContextLines, opts.source, skipIgnoredScan),
+    );
+}
+
+export function grepGraph(graph, repoRoot, pattern, opts = {}) {
+    return grepGraphMany(graph, repoRoot, [pattern], opts)[0];
 }
 

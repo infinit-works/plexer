@@ -32,8 +32,15 @@ function coverage(candidate, queryWeights) {
     }
     return clamp01(share);
 }
+const TIE_EPSILON = 1e-9;
+
 function baselineOrder(a, b) {
     const scoreOrder = b.baselineScore - a.baselineScore;
+    if (Math.abs(scoreOrder) > TIE_EPSILON)
+        return scoreOrder;
+    const depOrder = Number(Boolean(a.dependency)) - Number(Boolean(b.dependency));
+    if (depOrder !== 0)
+        return depOrder;
     if (scoreOrder !== 0)
         return scoreOrder;
     if (a.baselineTieKey !== undefined && b.baselineTieKey !== undefined)
@@ -191,8 +198,14 @@ export function rankFilesBounded(candidates, queryWeights) {
     for (const [file, members] of groups) {
         ranked.push(scoreBoundedFileGroup(file, members, queryWeights));
     }
-    ranked.sort((a, b) => b.score - a.score ||
-        baselineOrder(a.representative, b.representative) ||
-        a.file.localeCompare(b.file));
+    ranked.sort((a, b) => {
+        const diff = b.score - a.score;
+        if (Math.abs(diff) > TIE_EPSILON)
+            return diff;
+        const depOrder = Number(Boolean(a.representative?.dependency)) - Number(Boolean(b.representative?.dependency));
+        if (depOrder !== 0)
+            return depOrder;
+        return diff || baselineOrder(a.representative, b.representative) || a.file.localeCompare(b.file);
+    });
     return ranked;
 }
