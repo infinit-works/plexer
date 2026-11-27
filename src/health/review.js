@@ -25,6 +25,7 @@ import {
     normalizeDimensionKey,
 } from "./constants.js";
 import { buildDimensionPromptsForLangs, buildReviewSystemPrompt } from "./dimensions.js";
+import { isTriageStale } from "./queue.js";
 import { emptyLivingPlan, healthDir, loadLivingPlan, mintIssueId } from "./state.js";
 import { SCORED_ZONES } from "./zones.js";
 
@@ -244,7 +245,6 @@ function buildRetrospectiveContext(state, plan) {
     const policies = Array.isArray(plan?.policies) ? [...plan.policies] : [];
 
     return {
-        issues: sanitizedIssues,
         recent_issues: sanitizedIssues,
         chronic_issues: chronicIssues,
         policies,
@@ -375,19 +375,70 @@ export function prepareReview(contextDir, arg2, arg3, arg4 = null, arg5 = null, 
     };
 }
 
+function tryParseJsonObject(text) {
+    if (!text || typeof text !== "string") return null;
+    try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+        // Not a standalone JSON object
+    }
+    return null;
+}
+
+function extractBalancedJsonObjects(text) {
+    const out = [];
+    let inString = false;
+    let escaped = false;
+    let depth = 0;
+    let start = -1;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (ch === "\\") escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            continue;
+        }
+        if (ch === "{") {
+            if (depth === 0) start = i;
+            depth += 1;
+        } else if (ch === "}" && depth > 0) {
+            depth -= 1;
+            if (depth === 0 && start >= 0) {
+                out.push(text.slice(start, i + 1));
+                start = -1;
+            }
+        }
+    }
+    return out;
+}
+
 /**
  * Parse a JSON object out of a `.raw.txt` or `.json` file (stripping optional markdown code fences).
  */
 export function parseReviewRawText(rawText) {
     const trimmed = String(rawText || "").trim();
-    const fenceMatch = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed);
-    const candidate = fenceMatch ? fenceMatch[1].trim() : trimmed;
-    const firstBrace = candidate.indexOf("{");
-    const lastBrace = candidate.lastIndexOf("}");
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-        return JSON.parse(candidate.slice(firstBrace, lastBrace + 1));
+    if (!trimmed) throw new Error("Empty review output; expected a JSON object");
+
+    const direct = tryParseJsonObject(trimmed);
+    if (direct) return direct;
+
+    for (const m of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+        const obj = tryParseJsonObject(m[1].trim());
+        if (obj) return obj;
     }
-    return JSON.parse(candidate);
+
+    for (const candidate of extractBalancedJsonObjects(trimmed)) {
+        const obj = tryParseJsonObject(candidate);
+        if (obj) return obj;
+    }
+
+    throw new Error("Review output did not contain a valid JSON object");
 }
 
 function tokenizeText(str) {
@@ -823,11 +874,23 @@ function validateReviewPayload(rawAssessments, rawFindings, dimensionJudgment, o
 function storeImportedReviewFindings(state, validFindings, importedDimSet, nowIso) {
     const newFindingIds = new Set();
     let importedFindings = 0;
+    const scanNum = state.scan_count || 1;
+    const preservedTriagedStatuses = new Set(["false_positive", "wontfix", "deferred", "triaged_out"]);
+
     for (const f of validFindings) {
         const primaryFile = f.related_files[0] || "repo";
         const id = mintIssueId("review", primaryFile, `${f.dimension}_${f.identifier}`);
         newFindingIds.add(id);
+        const prev = state.issues[id];
+        const keepTriaged = Boolean(
+            prev && (preservedTriagedStatuses.has(prev.status) || prev.suppressed),
+        );
+        const wasResolved = Boolean(
+            prev && (prev.status === "fixed" || prev.status === "auto_resolved"),
+        );
+
         state.issues[id] = {
+            ...(prev || {}),
             id,
             detector: "review",
             category: "review",
@@ -844,10 +907,12 @@ function storeImportedReviewFindings(state, validFindings, importedDimSet, nowIs
             suggestion: f.suggestion,
             evidence: f.evidence,
             related_files: f.related_files,
-            status: "open",
-            verified: false,
-            first_seen_scan: state.scan_count || 1,
-            last_seen_scan: state.scan_count || 1,
+            status: keepTriaged ? prev.status : "open",
+            suppressed: keepTriaged ? Boolean(prev.suppressed) : false,
+            verified: keepTriaged ? Boolean(prev.verified) : false,
+            first_seen_scan: prev?.first_seen_scan || scanNum,
+            last_seen_scan: scanNum,
+            ...(wasResolved ? { reopen_count: (prev.reopen_count || 0) + 1, reopened_at_scan: scanNum } : {}),
         };
         importedFindings += 1;
     }
@@ -1548,6 +1613,7 @@ export async function runTriageStages(rootDir, contextDir, state, plan, opts = {
     writeFileSync(promptPath, promptText, "utf8");
 
     let parsed = null;
+    let runnerError = null;
     try {
         const rawOut = await invokeRunnerSubprocess(
             rootDir,
@@ -1557,10 +1623,33 @@ export async function runTriageStages(rootDir, contextDir, state, plan, opts = {
             promptText,
         );
         parsed = parseReviewRawText(rawOut);
-    } catch {
-        // Fallback deterministic synthesis if runner fails or returns non-JSON
+    } catch (err) {
+        runnerError = err?.message || String(err || "Triage runner failed");
     }
 
+    const nowIso = new Date().toISOString();
+    if (!plan.triage) plan.triage = emptyLivingPlan().triage;
+    if (!plan.triage.stages) plan.triage.stages = {};
+
+    if (runnerError || !parsed) {
+        plan.triage.last_error = {
+            message: runnerError || "Triage runner returned empty output",
+            runner: runnerCmd || runner,
+            at: nowIso,
+        };
+        return {
+            ok: false,
+            action: "plan_triage_run_stages",
+            status: "error",
+            error: plan.triage.last_error.message,
+            runner: runnerCmd || runner,
+            stage: "error",
+            triage: plan.triage,
+            stale: state ? isTriageStale(plan, state) : false,
+        };
+    }
+
+    delete plan.triage.last_error;
     const byDet = new Map();
     for (const iss of openIssues) {
         byDet.set(iss.detector, (byDet.get(iss.detector) || 0) + 1);
@@ -1571,17 +1660,14 @@ export async function runTriageStages(rootDir, contextDir, state, plan, opts = {
         .join(", ");
 
     const observeReport =
-        parsed?.observe || `Observed ${openIssues.length} open findings across: ${topDets || "none"}.`;
+        parsed.observe || `Observed ${openIssues.length} open findings across: ${topDets || "none"}.`;
     const reflectReport =
-        parsed?.reflect || "Reviewed root causes and cross-module dependencies across open findings.";
+        parsed.reflect || "Reviewed root causes and cross-module dependencies across open findings.";
     const organizeReport =
-        parsed?.organize || "Prioritized high-tier architectural and boundary issues before local cleanup.";
+        parsed.organize || "Prioritized high-tier architectural and boundary issues before local cleanup.";
     const strategyReport =
-        parsed?.strategy || "Execute top-ranked clusters in order, verifying callers and tests after each batch.";
+        parsed.strategy || "Execute top-ranked clusters in order, verifying callers and tests after each batch.";
 
-    const nowIso = new Date().toISOString();
-    if (!plan.triage) plan.triage = emptyLivingPlan().triage;
-    if (!plan.triage.stages) plan.triage.stages = {};
     plan.triage.stages.observe = { report: observeReport, updated_at: nowIso };
     plan.triage.stages.reflect = { report: reflectReport, updated_at: nowIso };
     plan.triage.stages.organize = { report: organizeReport, updated_at: nowIso };

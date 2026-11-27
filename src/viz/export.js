@@ -37,7 +37,8 @@ export function exportViz(opts) {
     const defaultTab = wantContext && (opts.contextGraph || context.nodes.length > 0 || codeNodes === 0) ? "context" : "code";
     const health = buildVizHealthPayload(opts.contextDir);
     const repoRoot = opts.rootDir ?? dirname(opts.contextDir);
-    const treemapHtml = health ? renderHealthTreemapHtml(repoRoot, opts.contextDir) : null;
+    const wantTreemap = !opts.tabs || tabs.includes("treemap");
+    const treemapHtml = wantTreemap && health ? renderHealthTreemapHtml(repoRoot, opts.contextDir) : null;
     const effectiveTabs = treemapHtml && !tabs.includes("treemap") ? [...tabs, "treemap"] : tabs.filter((t) => t !== "treemap" || Boolean(treemapHtml));
     const contextGraph = {
         ...context,

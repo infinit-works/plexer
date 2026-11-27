@@ -338,7 +338,7 @@ export function buildExecutionQueue(state, plan, opts = {}) {
         focusCluster,
     );
 
-    const scores = computeScoreSnapshot(state);
+    const scores = opts.scores || computeScoreSnapshot(state);
     const impactEstimator = createFastScoreImpactEstimator(state, scores);
     const items = [];
     for (const iss of openIssues) {
@@ -832,20 +832,15 @@ function parseStepsMarkdownText(rawText) {
     return steps;
 }
 
+function normalizeOneBasedIndex(rawIdx, length) {
+    const n = Number(rawIdx);
+    if (!Number.isInteger(n) || n < 1 || n > length) return -1;
+    return n - 1;
+}
+
 function resolveClusterStepIndex(cluster, rawIdx) {
     const steps = Array.isArray(cluster.steps) ? cluster.steps : [];
-    const n = Number(rawIdx);
-    if (!Number.isFinite(n)) return -1;
-    if (n === 0) {
-        return steps.length > 0 ? 0 : -1;
-    }
-    if (n >= 1 && n <= steps.length) {
-        return n - 1;
-    }
-    if (n >= 0 && n < steps.length) {
-        return n;
-    }
-    return -1;
+    return normalizeOneBasedIndex(rawIdx, steps.length);
 }
 
 function appendClusterStepsFromFile(cluster, stepsFile, rootDir) {
@@ -1007,6 +1002,18 @@ function parseClusterImportPayload(rawInput, rootDir = null) {
         }
     }
 
+    const decodeYamlScalar = (rawVal) => {
+        const s = String(rawVal || "").trim();
+        if (s.startsWith('"')) {
+            try {
+                return String(JSON.parse(s));
+            } catch {
+                return s.replace(/^"|"$/g, "").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+            }
+        }
+        return s.replace(/^'|'$/g, "");
+    };
+
     const steps = [];
     const yamlStepBlocks = trimmed.split(/\n\s*-\s+index:\s*/);
     if (yamlStepBlocks.length > 1) {
@@ -1015,15 +1022,24 @@ function parseClusterImportPayload(rawInput, rootDir = null) {
             const tMatch = /title:\s*(.+)/m.exec(blk);
             const dMatch = /detail:\s*(.+)/m.exec(blk);
             const eMatch = /effort:\s*(.+)/m.exec(blk);
+            const refsMatch = /issue_refs:\s*(\[[^\n]*\])/m.exec(blk);
             const doneMatch = /done:\s*(true|false)/m.exec(blk);
-            const unq = (v) => String(v || "").trim().replace(/^["']|["']$/g, "");
+            let issueRefs = [];
+            if (refsMatch) {
+                try {
+                    const parsedRefs = JSON.parse(refsMatch[1]);
+                    if (Array.isArray(parsedRefs)) issueRefs = parsedRefs;
+                } catch {
+                    issueRefs = [];
+                }
+            }
             const isDone = doneMatch ? doneMatch[1] === "true" : false;
             steps.push({
                 index: i,
-                title: unq(tMatch?.[1] || `Step ${i}`),
-                detail: unq(dMatch?.[1] || ""),
-                effort: unq(eMatch?.[1] || "medium"),
-                issue_refs: [],
+                title: decodeYamlScalar(tMatch?.[1] || `Step ${i}`),
+                detail: decodeYamlScalar(dMatch?.[1] || ""),
+                effort: decodeYamlScalar(eMatch?.[1] || "medium"),
+                issue_refs: issueRefs,
                 done: isDone,
                 status: isDone ? "done" : "pending",
             });
@@ -1485,14 +1501,30 @@ export function managePlanPolicy(plan, subAction = "list", ruleOrIdx = null, con
         }
     } else if (sub === "remove" && ruleOrIdx !== null && ruleOrIdx !== undefined) {
         const raw = String(ruleOrIdx).trim();
+        const removedPolicies = [];
         if (/^\d+$/.test(raw)) {
-            const n = Number(raw);
-            const idx = n >= 0 && n < plan.policies.length ? n : n - 1;
-            if (idx >= 0 && idx < plan.policies.length) {
-                plan.policies.splice(idx, 1);
+            const idx = normalizeOneBasedIndex(Number(raw), plan.policies.length);
+            if (idx >= 0) {
+                removedPolicies.push(...plan.policies.splice(idx, 1));
             }
         } else {
-            plan.policies = plan.policies.filter((p) => p !== raw);
+            plan.policies = plan.policies.filter((p) => {
+                if (p === raw) {
+                    removedPolicies.push(p);
+                    return false;
+                }
+                return true;
+            });
+        }
+        if (config && Array.isArray(config.layer_rules) && removedPolicies.length > 0) {
+            const removedSpecs = removedPolicies.map(parsePolicyLayerRule).filter(Boolean);
+            const directRule = parsePolicyLayerRule(raw);
+            if (directRule) removedSpecs.push(directRule);
+            if (removedSpecs.length > 0) {
+                config.layer_rules = config.layer_rules.filter(
+                    (r) => !removedSpecs.some((rm) => rm.from === r.from && rm.to === r.to),
+                );
+            }
         }
     }
 
@@ -1846,20 +1878,55 @@ function excludedFileMatchesPattern(filePath, pat, wildcardRe) {
 
 function purgeIdsFromPlan(plan, rmSet) {
     let purgedPlanCount = 0;
-    if (Array.isArray(plan.queue_order)) {
-        const before = plan.queue_order.length;
-        plan.queue_order = plan.queue_order.filter((id) => !rmSet.has(id));
-        purgedPlanCount += before - plan.queue_order.length;
-    }
+    const filterList = (list) => {
+        if (!Array.isArray(list)) return list;
+        const before = list.length;
+        const filtered = list.filter((id) => !rmSet.has(id));
+        purgedPlanCount += before - filtered.length;
+        return filtered;
+    };
+    plan.queue_order = filterList(plan.queue_order);
+    plan.deferred_ids = filterList(plan.deferred_ids);
+    plan.promoted_ids = filterList(plan.promoted_ids);
     if (Array.isArray(plan.uncommitted_resolved)) {
         plan.uncommitted_resolved = plan.uncommitted_resolved.filter((id) => !rmSet.has(id));
     }
+    if (Array.isArray(plan.skipped)) {
+        const before = plan.skipped.length;
+        plan.skipped = plan.skipped.filter((entry) => {
+            const id = typeof entry === "string" ? entry : entry?.id;
+            return !id || !rmSet.has(id);
+        });
+        purgedPlanCount += before - plan.skipped.length;
+    } else if (plan.skipped && typeof plan.skipped === "object") {
+        for (const id of rmSet) {
+            if (Object.prototype.hasOwnProperty.call(plan.skipped, id)) {
+                delete plan.skipped[id];
+                purgedPlanCount += 1;
+            }
+        }
+    }
+    if (plan.annotations && typeof plan.annotations === "object") {
+        for (const id of rmSet) {
+            if (Object.prototype.hasOwnProperty.call(plan.annotations, id)) {
+                delete plan.annotations[id];
+                purgedPlanCount += 1;
+            }
+        }
+    }
+    if (plan.triage && Array.isArray(plan.triage.triaged_review_ids)) {
+        plan.triage.triaged_review_ids = plan.triage.triaged_review_ids.filter((id) => !rmSet.has(id));
+    }
     if (plan.clusters && typeof plan.clusters === "object") {
         for (const c of Object.values(plan.clusters)) {
-            if (!Array.isArray(c?.issue_ids)) continue;
-            const b = c.issue_ids.length;
-            c.issue_ids = c.issue_ids.filter((id) => !rmSet.has(id));
-            purgedPlanCount += b - c.issue_ids.length;
+            if (Array.isArray(c?.issue_ids)) {
+                c.issue_ids = filterList(c.issue_ids);
+            }
+            for (const s of c?.steps || []) {
+                if (s && Array.isArray(s.issue_refs)) {
+                    s.issue_refs = s.issue_refs.filter((id) => !rmSet.has(id));
+                }
+            }
         }
     }
     return purgedPlanCount;

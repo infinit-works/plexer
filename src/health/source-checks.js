@@ -9,11 +9,83 @@ import { DETECTOR_CATEGORY } from "./constants.js";
 import { mintIssueId } from "./state.js";
 import {
     SCORED_ZONES,
+    createCodeStripState,
     hasInlineSuppression,
     hasWordToken,
     stepLuauBlockDepth,
+    stripCodeLineWithState,
+    stripCodeLines,
     stripCodeStringsAndComments,
 } from "./zones.js";
+
+function fnv1aHex8(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h = Math.imul(h ^ str.charCodeAt(i), 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+function createEnclosingSymbolFinder(fileSymbols) {
+    const spans = [];
+    for (const sym of fileSymbols || []) {
+        if (sym.aliasOf) continue;
+        if (sym.kind !== "function" && sym.kind !== "method" && sym.kind !== "class") continue;
+        const r = spanRange(sym.span);
+        if (!r) continue;
+        spans.push({ name: sym.name || "module", start: r.start, end: r.end, len: r.end - r.start });
+    }
+    spans.sort((a, b) => a.start - b.start || a.len - b.len);
+    return (lineNum) => {
+        let best = null;
+        for (const s of spans) {
+            if (s.start > lineNum) break;
+            if (lineNum <= s.end && (!best || s.len < best.len)) {
+                best = s;
+            }
+        }
+        return best ? best.name : "module";
+    };
+}
+
+function mintAnchoredSourceId(detector, relPath, enclosingSymbol, contentKey, tracker) {
+    const symPart = String(enclosingSymbol || "module")
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_.-]/g, "")
+        .slice(0, 24) || "module";
+    const keyPart = String(contentKey || "").trim();
+    let suffix;
+    if (/^[a-zA-Z0-9_.-]{1,48}$/.test(keyPart)) {
+        suffix = keyPart;
+    } else {
+        const tagMatch = /^([a-z][a-z0-9_]{1,22})_/.exec(keyPart);
+        const tag = tagMatch ? `${tagMatch[1]}_` : "";
+        suffix = `${tag}${fnv1aHex8(keyPart || `${detector}:${symPart}`)}`;
+    }
+    const baseKey = `${detector}::${relPath}::${symPart}::${suffix}`;
+    const count = (tracker.idCounts.get(baseKey) || 0) + 1;
+    tracker.idCounts.set(baseKey, count);
+    const uniqueSuffix = count > 1 ? `${suffix}_${count}` : suffix;
+    return mintIssueId(detector, relPath, `${symPart}::${uniqueSuffix}`);
+}
+
+function makeSourceTracker(relPath, fileSymbols, lines, strippedLines) {
+    return {
+        relPath,
+        enclosingOf: createEnclosingSymbolFinder(fileSymbols),
+        idCounts: new Map(),
+        strippedLines,
+        booleanStateCount: 0,
+        firstBooleanStateLine: 1,
+        shadowedLuauSchedulers: new Set(),
+        luauBlockStack: [],
+        luauLongState: { longClose: null },
+        luauFnDepthBeforeLine: 0,
+        luauLineCode: "",
+        goStack: [],
+        goAtLine: new Array(lines.length).fill(false),
+    };
+}
 
 const AI_PROSE_RE =
     /^\s*(?:\/\/|#|--)\s*(?:Here we|This function simply|Now we will|Note that we|As requested|TODO:\s*implement later|Step \d+:\s+(?:Initialize|Return|Check|Validate)|Helper function to|Function that)\b/i;
@@ -98,11 +170,12 @@ function checkStaleDeprecationsInFile(relPath, lines, fileSymbols, incomingByTar
     }
 }
 
-function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags, issues) {
+function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags, tracker, issues) {
+    const symName = tracker.enclosingOf(lineNum);
     if (flags.allowSlop) {
         if (AI_PROSE_RE.test(trimmed) && !hasInlineSuppression(lines, lineNum, "ai_slop")) {
             issues.push({
-                id: mintIssueId("ai_slop", relPath, `L${lineNum}`),
+                id: mintAnchoredSourceId("ai_slop", relPath, symName, trimmed, tracker),
                 detector: "ai_slop",
                 category: "slop",
                 dimension: "code_quality",
@@ -110,6 +183,7 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
                 confidence: "medium",
                 severity: "low",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -123,7 +197,7 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
             !hasInlineSuppression(lines, lineNum, "debug_logs")
         ) {
             issues.push({
-                id: mintIssueId("debug_logs", relPath, `L${lineNum}`),
+                id: mintAnchoredSourceId("debug_logs", relPath, symName, trimmed, tracker),
                 detector: "debug_logs",
                 category: "slop",
                 dimension: "code_quality",
@@ -131,6 +205,7 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
                 confidence: "high",
                 severity: "low",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -143,14 +218,13 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
     }
 
     if (flags.allowTypes && (flags.isTs || flags.isLuau || flags.isPy)) {
-        const raw = lines[lineNum - 1] || trimmed;
-        const codeOnly = stripCodeStringsAndComments(raw, flags.isLuau, flags.isPy);
+        const codeOnly = tracker.strippedLines[lineNum - 1] ?? stripCodeStringsAndComments(lines[lineNum - 1] || trimmed, flags.isLuau, flags.isPy, relPath);
         const isTsBypass = flags.isTs && (/\bas\s+any\b|:\s*any\b/.test(codeOnly) || /@ts-ignore\b/.test(trimmed));
         const isLuauBypass = flags.isLuau && (/::\s*any\b/.test(codeOnly) || /^--!nocheck\b/.test(trimmed));
         const isPyBypass = flags.isPy && /#\s*type:\s*ignore\s*$/.test(trimmed);
         if ((isTsBypass || isLuauBypass || isPyBypass) && !hasInlineSuppression(lines, lineNum, "type_bypasses")) {
             issues.push({
-                id: mintIssueId("type_bypasses", relPath, `L${lineNum}`),
+                id: mintAnchoredSourceId("type_bypasses", relPath, symName, trimmed, tracker),
                 detector: "type_bypasses",
                 category: "types",
                 dimension: "code_quality",
@@ -158,6 +232,7 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
                 confidence: "high",
                 severity: "low",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -169,19 +244,69 @@ function checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags,
     }
 }
 
-function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues) {
+function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, tracker, issues) {
+    const rawLine = lines[i] || "";
+    const catchMatch = /\bcatch\s*(?:\([^)]*\))?\s*\{/.exec(rawLine);
+    if (!catchMatch) return;
+
+    const afterOpen = rawLine.slice(catchMatch.index + catchMatch[0].length);
+    const sameLineCloseIdx = afterOpen.indexOf("}");
     const blockLines = [];
-    for (let k = i + 1; k < Math.min(lines.length, i + 6); k++) {
-        const bl = lines[k].trim();
-        if (bl.startsWith("}")) break;
-        if (bl && !bl.startsWith("//") && !bl.startsWith("/*") && !bl.startsWith("*")) {
-            blockLines.push(bl);
+    let endLine = lineNum + 2;
+    let isInlineEmpty = false;
+
+    if (sameLineCloseIdx >= 0) {
+        const inner = afterOpen.slice(0, sameLineCloseIdx).trim();
+        endLine = lineNum;
+        if (!inner) {
+            isInlineEmpty = true;
+        } else {
+            blockLines.push(inner);
+        }
+    } else {
+        for (let k = i + 1; k < Math.min(lines.length, i + 6); k++) {
+            const bl = lines[k].trim();
+            if (bl.startsWith("}")) {
+                endLine = k + 1;
+                break;
+            }
+            if (bl && !bl.startsWith("//") && !bl.startsWith("/*") && !bl.startsWith("*")) {
+                blockLines.push(bl);
+            }
         }
     }
-    if (blockLines.length !== 1 || hasInlineSuppression(lines, lineNum, "silent_catches")) return;
+
+    if (hasInlineSuppression(lines, lineNum, "silent_catches")) return;
+    const symName = tracker.enclosingOf(lineNum);
+
+    if (isInlineEmpty || blockLines.length === 0) {
+        // Also catch single-line `catch (e) {}` or multi-line empty `catch (e) {\n}`
+        if (isInlineEmpty || (sameLineCloseIdx < 0 && i + 1 < lines.length && lines[i + 1].trim().startsWith("}"))) {
+            issues.push({
+                id: mintAnchoredSourceId("silent_catches", relPath, symName, `empty_catch_${rawLine.trim()}`, tracker),
+                detector: "silent_catches",
+                category: "catches",
+                dimension: "code_quality",
+                tier: "T3",
+                confidence: "medium",
+                severity: "medium",
+                file: relPath,
+                symbol: symName,
+                line: lineNum,
+                end_line: sameLineCloseIdx >= 0 ? lineNum : lineNum + 1,
+                span: `L${lineNum}-L${sameLineCloseIdx >= 0 ? lineNum : lineNum + 1}`,
+                identifier: `empty_catch_L${lineNum}`,
+                summary: `Empty \`catch\` block at L${lineNum} silently swallows exceptions.`,
+                suggestion: `Handle, log with context, or rethrow the caught error instead of leaving \`catch\` empty.`,
+            });
+        }
+        return;
+    }
+
+    if (blockLines.length !== 1) return;
     if (/^console\.(?:error|warn|log)\(/.test(blockLines[0])) {
         issues.push({
-            id: mintIssueId("silent_catches", relPath, `log_only_L${lineNum}`),
+            id: mintAnchoredSourceId("silent_catches", relPath, symName, `log_only_${blockLines[0]}`, tracker),
             detector: "silent_catches",
             category: "catches",
             dimension: "code_quality",
@@ -189,16 +314,17 @@ function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues) {
             confidence: "medium",
             severity: "medium",
             file: relPath,
+            symbol: symName,
             line: lineNum,
-            end_line: lineNum + 2,
-            span: `L${lineNum}-L${lineNum + 2}`,
+            end_line: endLine,
+            span: `L${lineNum}-L${endLine}`,
             identifier: `log_only_catch_L${lineNum}`,
             summary: `Log-only \`catch\` block at L${lineNum} logs the error and continues execution without rethrowing or returning a fallback.`,
             suggestion: `Propagate the error, return an explicit error result, or document why continuing after failure is safe.`,
         });
     } else if (/^return\s+undefined\s*;?$/.test(blockLines[0])) {
         issues.push({
-            id: mintIssueId("silent_catches", relPath, `empty_return_L${lineNum}`),
+            id: mintAnchoredSourceId("silent_catches", relPath, symName, `empty_return_${blockLines[0]}`, tracker),
             detector: "silent_catches",
             category: "catches",
             dimension: "code_quality",
@@ -206,9 +332,10 @@ function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues) {
             confidence: "medium",
             severity: "medium",
             file: relPath,
+            symbol: symName,
             line: lineNum,
-            end_line: lineNum + 2,
-            span: `L${lineNum}-L${lineNum + 2}`,
+            end_line: endLine,
+            span: `L${lineNum}-L${endLine}`,
             identifier: `catch_return_empty_L${lineNum}`,
             summary: `Broad \`catch\` block at L${lineNum} masks exceptions as \`${blockLines[0]}\`.`,
             suggestion: `Narrow the caught error type or surface the failure explicitly to callers.`,
@@ -216,14 +343,15 @@ function checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues) {
     }
 }
 
-function checkPySilentExceptOnLine(relPath, lines, i, lineNum, trimmed, issues) {
+function checkPySilentExceptOnLine(relPath, lines, i, lineNum, trimmed, tracker, issues) {
     const nextLine = (lines[i + 1] || "").trim();
     const afterNext = (lines[i + 2] || "").trim();
     const isSwallowedNext = nextLine === "pass" || /^return\s+(?:\[\]|\{\}|None)$/.test(nextLine) || /^(?:logger|logging|print)\b/.test(nextLine);
     if (!isSwallowedNext || /^(?:raise|return)\b/.test(afterNext) || hasInlineSuppression(lines, lineNum, "silent_catches"))
         return;
+    const symName = tracker.enclosingOf(lineNum);
     issues.push({
-        id: mintIssueId("silent_catches", relPath, `py_except_L${lineNum}`),
+        id: mintAnchoredSourceId("silent_catches", relPath, symName, `py_except_${trimmed}_${nextLine}`, tracker),
         detector: "silent_catches",
         category: "catches",
         dimension: "code_quality",
@@ -231,6 +359,7 @@ function checkPySilentExceptOnLine(relPath, lines, i, lineNum, trimmed, issues) 
         confidence: "high",
         severity: "medium",
         file: relPath,
+        symbol: symName,
         line: lineNum,
         end_line: lineNum + 1,
         span: `L${lineNum}-L${lineNum + 1}`,
@@ -258,7 +387,7 @@ function extractPcallWindowText(lines, startIdx) {
     }
     return callLines.join("\n");
 }
-function checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, issues) {
+function checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, tracker, issues) {
     if (!/^\s*(?:local\s+_(?:\s*,\s*_)*\s*=\s*)?pcall\s*\(/.test(raw) || isLuauContinuationLine(lines, i))
         return;
     if (hasInlineSuppression(lines, lineNum, "silent_catches"))
@@ -267,8 +396,9 @@ function checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, issues) {
     const isBestEffortCleanup = /(?::|\.)(?:Destroy|Disconnect|ClearAllChildren|SetCore|SetCoreGuiEnabled)\b|\btask\.cancel\b|\bcancel\s*\(/.test(pcallWindow);
     if (isBestEffortCleanup)
         return;
+    const symName = tracker.enclosingOf(lineNum);
     issues.push({
-        id: mintIssueId("silent_catches", relPath, `luau_pcall_L${lineNum}`),
+        id: mintAnchoredSourceId("silent_catches", relPath, symName, `luau_pcall_${raw.trim()}`, tracker),
         detector: "silent_catches",
         category: "catches",
         dimension: "code_quality",
@@ -276,6 +406,7 @@ function checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, issues) {
         confidence: "high",
         severity: "medium",
         file: relPath,
+        symbol: symName,
         line: lineNum,
         end_line: lineNum,
         span: `L${lineNum}-L${lineNum}`,
@@ -284,14 +415,14 @@ function checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, issues) {
         suggestion: `Capture \`local ok, err = pcall(...)\` and handle or warn on \`not ok\`.`,
     });
 }
-function checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flags, issues) {
+function checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flags, tracker, issues) {
     if (!flags.allowCatches) return;
     if (flags.isJsTs && /\bcatch\s*(?:\([^)]*\))?\s*\{/.test(trimmed))
-        checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, issues);
+        checkJsTsSilentCatchOnLine(relPath, lines, i, lineNum, tracker, issues);
     else if (flags.isPy && /^except(?:\s+Exception|\s*:)/.test(trimmed))
-        checkPySilentExceptOnLine(relPath, lines, i, lineNum, trimmed, issues);
+        checkPySilentExceptOnLine(relPath, lines, i, lineNum, trimmed, tracker, issues);
     else if (flags.isLuau)
-        checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, issues);
+        checkLuauSilentPcallOnLine(relPath, lines, i, lineNum, raw, tracker, issues);
 }
 
 const CLIENT_SERVER_SERVICE_ACCESS_RE =
@@ -309,7 +440,8 @@ function isLuauContinuationLine(lines, idx) {
     return false;
 }
 
-function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
+function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, tracker, issues) {
+    const symName = tracker.enclosingOf(lineNum);
     if (
         isClientRobloxPath(relPath) &&
         !trimmed.startsWith("--") &&
@@ -328,7 +460,7 @@ function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
                       "",
                   );
             issues.push({
-                id: mintIssueId("roblox_security", relPath, `client_server_L${lineNum}`),
+                id: mintAnchoredSourceId("roblox_security", relPath, symName, `client_server_${targetLabel}`, tracker),
                 detector: "roblox_security",
                 category: "security",
                 dimension: "security",
@@ -336,6 +468,7 @@ function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
                 confidence: "high",
                 severity: "high",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -365,7 +498,7 @@ function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
             !/\b(?:typeof|type|tonumber|tostring|assert|validate|check|schema|sanitize)\b|\bt\.[A-Za-z_]/i.test(bodyWindow)
         ) {
             issues.push({
-                id: mintIssueId("roblox_security", relPath, `unvalidated_remote_L${lineNum}`),
+                id: mintAnchoredSourceId("roblox_security", relPath, symName, `unvalidated_remote_${trimmed}`, tracker),
                 detector: "roblox_security",
                 category: "security",
                 dimension: "security",
@@ -373,6 +506,7 @@ function checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues) {
                 confidence: "high",
                 severity: "high",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: Math.min(lines.length, lineNum + 5),
                 span: `L${lineNum}-L${Math.min(lines.length, lineNum + 5)}`,
@@ -498,10 +632,11 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
     if (!codeOnly) return;
 
     if (flags.allowSecurity) {
-        checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, issues);
+        checkLuauSecurityOnLine(relPath, lines, i, lineNum, trimmed, stateTracker, issues);
     }
 
     if (flags.allowTraps && !trimmed.startsWith("--")) {
+        const symName = stateTracker.enclosingOf(lineNum);
         const schedMatch = /(?:^|[^.\w:])(wait|spawn|delay)\s*\(/.exec(codeOnly);
         if (schedMatch && !hasInlineSuppression(lines, lineNum, "luau_quality")) {
             const fnName = schedMatch[1];
@@ -510,7 +645,7 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
                 new RegExp(`\\bfunction\\s+(?:[A-Za-z0-9_.]+[.:])?${fnName}\\s*\\(`).test(codeOnly);
             if (!isShadowed) {
                 issues.push({
-                    id: mintIssueId("luau_quality", relPath, `legacy_${fnName}_L${lineNum}`),
+                    id: mintAnchoredSourceId("luau_quality", relPath, symName, `legacy_${fnName}_${codeOnly}`, stateTracker),
                     detector: "luau_quality",
                     category: "traps",
                     dimension: "code_quality",
@@ -518,6 +653,7 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
                     confidence: "high",
                     severity: "medium",
                     file: relPath,
+                    symbol: symName,
                     line: lineNum,
                     end_line: lineNum,
                     span: `L${lineNum}-L${lineNum}`,
@@ -533,7 +669,7 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
             !hasInlineSuppression(lines, lineNum, "luau_quality")
         ) {
             issues.push({
-                id: mintIssueId("luau_quality", relPath, `instance_new_parent_L${lineNum}`),
+                id: mintAnchoredSourceId("luau_quality", relPath, symName, `instance_new_parent_${trimmed}`, stateTracker),
                 detector: "luau_quality",
                 category: "traps",
                 dimension: "code_quality",
@@ -541,6 +677,7 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
                 confidence: "high",
                 severity: "medium",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -557,7 +694,7 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
             !hasInlineSuppression(lines, lineNum, "luau_quality")
         ) {
             issues.push({
-                id: mintIssueId("luau_quality", relPath, `untracked_connect_L${lineNum}`),
+                id: mintAnchoredSourceId("luau_quality", relPath, symName, `untracked_connect_${codeOnly}`, stateTracker),
                 detector: "luau_quality",
                 category: "traps",
                 dimension: "code_quality",
@@ -565,6 +702,7 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
                 confidence: "medium",
                 severity: "medium",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -578,10 +716,11 @@ function checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, fl
 
 function checkJsTsTrapsOnLine(relPath, lines, lineNum, trimmed, flags, stateTracker, issues) {
     if (!flags.isJsTs || trimmed.startsWith("//")) return;
-    const codeLine = trimmed.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '""');
+    const symName = stateTracker.enclosingOf(lineNum);
+    const codeLine = stateTracker.strippedLines[lineNum - 1] ?? trimmed.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '""');
     if (/\.forEach\s*\(\s*async\b/.test(codeLine) && !hasInlineSuppression(lines, lineNum, "language_traps")) {
         issues.push({
-            id: mintIssueId("language_traps", relPath, `foreach_async_L${lineNum}`),
+            id: mintAnchoredSourceId("language_traps", relPath, symName, `foreach_async_${trimmed}`, stateTracker),
             detector: "language_traps",
             category: "traps",
             dimension: "code_quality",
@@ -589,6 +728,7 @@ function checkJsTsTrapsOnLine(relPath, lines, lineNum, trimmed, flags, stateTrac
             confidence: "high",
             severity: "high",
             file: relPath,
+            symbol: symName,
             line: lineNum,
             end_line: lineNum,
             span: `L${lineNum}-L${lineNum}`,
@@ -609,7 +749,7 @@ function checkJsTsTrapsOnLine(relPath, lines, lineNum, trimmed, flags, stateTrac
         !hasInlineSuppression(lines, lineNum, "language_traps")
     ) {
         issues.push({
-            id: mintIssueId("language_traps", relPath, `sort_no_comparator_L${lineNum}`),
+            id: mintAnchoredSourceId("language_traps", relPath, symName, `sort_no_comparator_${trimmed}`, stateTracker),
             detector: "language_traps",
             category: "traps",
             dimension: "code_quality",
@@ -617,6 +757,7 @@ function checkJsTsTrapsOnLine(relPath, lines, lineNum, trimmed, flags, stateTrac
             confidence: "high",
             severity: "medium",
             file: relPath,
+            symbol: symName,
             line: lineNum,
             end_line: lineNum,
             span: `L${lineNum}-L${lineNum}`,
@@ -627,14 +768,44 @@ function checkJsTsTrapsOnLine(relPath, lines, lineNum, trimmed, flags, stateTrac
     }
 }
 
+function stepGoLoopBlockStack(goStack, codeLine) {
+    let inForHeader = /\bfor\b/.test(codeLine);
+    let inFuncHeader = /\bfunc\b/.test(codeLine);
+    for (let k = 0; k < codeLine.length; k++) {
+        const ch = codeLine[k];
+        if (ch === "{") {
+            if (inFuncHeader) {
+                goStack.push("func");
+                inFuncHeader = false;
+            } else if (inForHeader) {
+                goStack.push("for");
+                inForHeader = false;
+            } else {
+                goStack.push("block");
+            }
+        } else if (ch === "}" && goStack.length > 0) {
+            goStack.pop();
+        }
+    }
+}
+
+function isInsideGoLoopNotInnerFunc(goStack) {
+    for (let k = goStack.length - 1; k >= 0; k--) {
+        if (goStack[k] === "func") return false;
+        if (goStack[k] === "for") return true;
+    }
+    return false;
+}
+
 function checkLanguageTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, stateTracker, issues) {
+    const symName = stateTracker.enclosingOf(lineNum);
     if (flags.isPy && !trimmed.startsWith("#")) {
         if (
             /\bdef\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*=\s*(?:\[\]|\{\}|set\(\))/.test(trimmed) &&
             !hasInlineSuppression(lines, lineNum, "language_traps")
         ) {
             issues.push({
-                id: mintIssueId("language_traps", relPath, `py_mutable_default_L${lineNum}`),
+                id: mintAnchoredSourceId("language_traps", relPath, symName, `py_mutable_default_${trimmed}`, stateTracker),
                 detector: "language_traps",
                 category: "traps",
                 dimension: "code_quality",
@@ -642,6 +813,7 @@ function checkLanguageTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, st
                 confidence: "high",
                 severity: "high",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -650,77 +822,58 @@ function checkLanguageTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, st
                 suggestion: `Default the parameter to \`None\` and initialize a fresh container inside the function body.`,
             });
         }
-        if (flags.wantSecurity && /\bsubprocess\.(?:run|call|check_call|check_output)\s*\(/.test(trimmed)) {
-            const callWindow = lines.slice(i, Math.min(lines.length, i + 6)).join(" ");
-            if (!/\btimeout\s*=/.test(callWindow) && !hasInlineSuppression(lines, lineNum, "security_traps")) {
-                issues.push({
-                    id: mintIssueId("security_traps", relPath, `subprocess_timeout_L${lineNum}`),
-                    detector: "security_traps",
-                    category: "security",
-                    dimension: "security",
-                    tier: "T2",
-                    confidence: "high",
-                    severity: "medium",
-                    file: relPath,
-                    line: lineNum,
-                    end_line: lineNum,
-                    span: `L${lineNum}-L${lineNum}`,
-                    identifier: `subprocess_L${lineNum}`,
-                    summary: `\`subprocess\` call at L${lineNum} has no \`timeout=\` guard and can hang indefinitely.`,
-                    suggestion: `Pass an explicit \`timeout=<seconds>\` argument to the \`subprocess\` call.`,
-                });
-            }
-        }
     }
 
     checkJsTsTrapsOnLine(relPath, lines, lineNum, trimmed, flags, stateTracker, issues);
 
-    if (flags.isRust && flags.wantSecurity && /\bunsafe\s*\{/.test(trimmed)) {
-        const prevWindow = lines.slice(Math.max(0, i - 3), i + 1).join("\n");
-        if (!/\/\/\s*SAFETY:/i.test(prevWindow) && !hasInlineSuppression(lines, lineNum, "security_traps")) {
-            issues.push({
-                id: mintIssueId("security_traps", relPath, `rust_unsafe_L${lineNum}`),
-                detector: "security_traps",
-                category: "security",
-                dimension: "security",
-                tier: "T2",
-                confidence: "high",
-                severity: "medium",
-                file: relPath,
-                line: lineNum,
-                end_line: lineNum,
-                span: `L${lineNum}-L${lineNum}`,
-                identifier: `unsafe_L${lineNum}`,
-                summary: `Rust \`unsafe\` block at L${lineNum} lacks a preceding \`// SAFETY:\` invariant comment.`,
-                suggestion: `Document the safety invariants above L${lineNum} with a \`// SAFETY:\` comment.`,
-            });
-        }
-    }
-
-    if (flags.isGo && /\bdefer\s+/.test(trimmed)) {
-        const prevWindow = lines.slice(Math.max(0, i - 6), i).join("\n");
-        if (/\bfor\s+[^{]+\{/.test(prevWindow) && !hasInlineSuppression(lines, lineNum, "language_traps")) {
-            issues.push({
-                id: mintIssueId("language_traps", relPath, `go_defer_loop_L${lineNum}`),
-                detector: "language_traps",
-                category: "traps",
-                dimension: "code_quality",
-                tier: "T2",
-                confidence: "medium",
-                severity: "medium",
-                file: relPath,
-                line: lineNum,
-                end_line: lineNum,
-                span: `L${lineNum}-L${lineNum}`,
-                identifier: `defer_loop_L${lineNum}`,
-                summary: `Go \`defer\` inside a \`for\` loop at L${lineNum} delays cleanup until the enclosing function exits.`,
-                suggestion: `Extract the loop body into a helper function or close the resource explicitly at the end of each iteration.`,
-            });
+    if (flags.isGo) {
+        const codeLine = stateTracker.strippedLines[i] || "";
+        const deferMatch = /\bdefer\s+/.exec(codeLine);
+        if (deferMatch) {
+            stepGoLoopBlockStack(stateTracker.goStack, codeLine.slice(0, deferMatch.index));
+            if (isInsideGoLoopNotInnerFunc(stateTracker.goStack) && !hasInlineSuppression(lines, lineNum, "language_traps")) {
+                issues.push({
+                    id: mintAnchoredSourceId("language_traps", relPath, symName, `go_defer_loop_${trimmed}`, stateTracker),
+                    detector: "language_traps",
+                    category: "traps",
+                    dimension: "code_quality",
+                    tier: "T2",
+                    confidence: "medium",
+                    severity: "medium",
+                    file: relPath,
+                    symbol: symName,
+                    line: lineNum,
+                    end_line: lineNum,
+                    span: `L${lineNum}-L${lineNum}`,
+                    identifier: `defer_loop_L${lineNum}`,
+                    summary: `Go \`defer\` inside a \`for\` loop at L${lineNum} delays cleanup until the enclosing function exits.`,
+                    suggestion: `Extract the loop body into a helper function or close the resource explicitly at the end of each iteration.`,
+                });
+            }
+            stepGoLoopBlockStack(stateTracker.goStack, codeLine.slice(deferMatch.index));
+        } else {
+            stepGoLoopBlockStack(stateTracker.goStack, codeLine);
         }
     }
 }
 
-function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
+const UI_SECRET_VAR_SUFFIX_RE =
+    /(?:label|title|text|msg|message|error|err|warn|warning|hint|help|prompt|placeholder|description|desc|tooltip|header|column|col|field|name|path|url|route|pattern|regex|schema|type|kind|env|var)$/i;
+
+function looksLikeHumanUiString(val) {
+    const s = String(val || "").trim();
+    if (!s) return true;
+    if (/\s/.test(s)) {
+        // Multi-word UI labels/prompts/messages contain spaces (real API tokens/passwords rarely have multiple words)
+        const words = s.split(/\s+/).filter(Boolean);
+        if (words.length >= 2) return true;
+    }
+    if (/^[a-z0-9_]+(?:\.[a-z0-9_]+){2,}$/i.test(s)) return true;
+    return false;
+}
+
+function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, tracker, issues) {
+    const symName = tracker.enclosingOf(lineNum);
     for (const pat of SECRET_TOKEN_PATTERNS) {
         if (
             pat.re.test(trimmed) &&
@@ -729,7 +882,7 @@ function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
             !hasInlineSuppression(lines, lineNum, "security_traps")
         ) {
             issues.push({
-                id: mintIssueId("security_traps", relPath, `hardcoded_secret_L${lineNum}`),
+                id: mintAnchoredSourceId("security_traps", relPath, symName, `hardcoded_secret_${pat.label}`, tracker),
                 detector: "security_traps",
                 category: "security",
                 dimension: "security",
@@ -737,6 +890,7 @@ function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
                 confidence: "high",
                 severity: "high",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -754,12 +908,14 @@ function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
         );
     if (
         secretVarMatch &&
+        !UI_SECRET_VAR_SUFFIX_RE.test(secretVarMatch[1]) &&
         !/\b(?:os\.environ|os\.getenv|process\.env|env\.|GetSecret)/i.test(trimmed) &&
         !PLACEHOLDER_SECRET_RE.test(secretVarMatch[2].trim()) &&
+        !looksLikeHumanUiString(secretVarMatch[2]) &&
         !hasInlineSuppression(lines, lineNum, "security_traps")
     ) {
         issues.push({
-            id: mintIssueId("security_traps", relPath, `secret_var_${secretVarMatch[1]}_L${lineNum}`),
+            id: mintAnchoredSourceId("security_traps", relPath, symName, `secret_var_${secretVarMatch[1]}`, tracker),
             detector: "security_traps",
             category: "security",
             dimension: "security",
@@ -767,6 +923,7 @@ function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
             confidence: "high",
             severity: "high",
             file: relPath,
+            symbol: symName,
             line: lineNum,
             end_line: lineNum,
             span: `L${lineNum}-L${lineNum}`,
@@ -777,7 +934,7 @@ function checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues) {
     }
 }
 
-function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, flags, issues) {
+function checkUniversalSecurityRulesOnLine(relPath, lines, i, lineNum, trimmed, flags, tracker, issues) {
     if (
         !flags.allowSecurity ||
         trimmed.startsWith("//") ||
@@ -787,10 +944,56 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
         return;
     }
 
-    const raw = lines[lineNum - 1] || trimmed;
-    const codeOnly = stripCodeStringsAndComments(raw, flags.isLuau, flags.isPy);
+    const symName = tracker.enclosingOf(lineNum);
+    const codeOnly = tracker.strippedLines[i] ?? stripCodeStringsAndComments(lines[i] || trimmed, flags.isLuau, flags.isPy, relPath);
 
-    checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, issues);
+    if (flags.isPy && /\bsubprocess\.(?:run|call|check_call|check_output)\s*\(/.test(trimmed)) {
+        const callWindow = lines.slice(i, Math.min(lines.length, i + 6)).join(" ");
+        if (!/\btimeout\s*=/.test(callWindow) && !hasInlineSuppression(lines, lineNum, "security_traps")) {
+            issues.push({
+                id: mintAnchoredSourceId("security_traps", relPath, symName, `subprocess_timeout_${trimmed}`, tracker),
+                detector: "security_traps",
+                category: "security",
+                dimension: "security",
+                tier: "T2",
+                confidence: "high",
+                severity: "medium",
+                file: relPath,
+                symbol: symName,
+                line: lineNum,
+                end_line: lineNum,
+                span: `L${lineNum}-L${lineNum}`,
+                identifier: `subprocess_L${lineNum}`,
+                summary: `\`subprocess\` call at L${lineNum} has no \`timeout=\` guard and can hang indefinitely.`,
+                suggestion: `Pass an explicit \`timeout=<seconds>\` argument to the \`subprocess\` call.`,
+            });
+        }
+    }
+
+    if (flags.isRust && /\bunsafe\s*\{/.test(trimmed)) {
+        const prevWindow = lines.slice(Math.max(0, i - 3), i + 1).join("\n");
+        if (!/\/\/\s*SAFETY:/i.test(prevWindow) && !hasInlineSuppression(lines, lineNum, "security_traps")) {
+            issues.push({
+                id: mintAnchoredSourceId("security_traps", relPath, symName, `rust_unsafe_${trimmed}`, tracker),
+                detector: "security_traps",
+                category: "security",
+                dimension: "security",
+                tier: "T2",
+                confidence: "high",
+                severity: "medium",
+                file: relPath,
+                symbol: symName,
+                line: lineNum,
+                end_line: lineNum,
+                span: `L${lineNum}-L${lineNum}`,
+                identifier: `unsafe_L${lineNum}`,
+                summary: `Rust \`unsafe\` block at L${lineNum} lacks a preceding \`// SAFETY:\` invariant comment.`,
+                suggestion: `Document the safety invariants above L${lineNum} with a \`// SAFETY:\` comment.`,
+            });
+        }
+    }
+
+    checkHardcodedSecretsOnLine(relPath, lines, lineNum, trimmed, tracker, issues);
 
     if (
         /\b(?:Math\.random|random\.random|random\.randint|math\.random)\s*\(/.test(codeOnly) &&
@@ -800,7 +1003,7 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
         !hasInlineSuppression(lines, lineNum, "security_traps")
     ) {
         issues.push({
-            id: mintIssueId("security_traps", relPath, `insecure_random_L${lineNum}`),
+            id: mintAnchoredSourceId("security_traps", relPath, symName, `insecure_random_${codeOnly}`, tracker),
             detector: "security_traps",
             category: "security",
             dimension: "security",
@@ -808,6 +1011,7 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
             confidence: "medium",
             severity: "medium",
             file: relPath,
+            symbol: symName,
             line: lineNum,
             end_line: lineNum,
             span: `L${lineNum}-L${lineNum}`,
@@ -823,7 +1027,7 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
         !hasInlineSuppression(lines, lineNum, "security_traps")
     ) {
         issues.push({
-            id: mintIssueId("security_traps", relPath, `weak_crypto_L${lineNum}`),
+            id: mintAnchoredSourceId("security_traps", relPath, symName, `weak_crypto_${trimmed}`, tracker),
             detector: "security_traps",
             category: "security",
             dimension: "security",
@@ -831,6 +1035,7 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
             confidence: "medium",
             severity: "medium",
             file: relPath,
+            symbol: symName,
             line: lineNum,
             end_line: lineNum,
             span: `L${lineNum}-L${lineNum}`,
@@ -852,7 +1057,7 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
         !hasInlineSuppression(lines, lineNum, "security_traps")
     ) {
         issues.push({
-            id: mintIssueId("security_traps", relPath, `sensitive_log_L${lineNum}`),
+            id: mintAnchoredSourceId("security_traps", relPath, symName, `sensitive_log_${codeOnly}`, tracker),
             detector: "security_traps",
             category: "security",
             dimension: "security",
@@ -860,6 +1065,7 @@ function checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, fla
             confidence: "medium",
             severity: "medium",
             file: relPath,
+            symbol: symName,
             line: lineNum,
             end_line: lineNum,
             span: `L${lineNum}-L${lineNum}`,
@@ -913,7 +1119,7 @@ function checkPyMutableLruCacheTraps(relPath, lines, fileSymbols, issues) {
     }
 }
 
-function checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines, issues) {
+function checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines, tracker, issues) {
     if (sym.aliasOf || (sym.kind !== "function" && sym.kind !== "method"))
         return;
     const range = spanRange(sym.span);
@@ -925,7 +1131,7 @@ function checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines
     for (let ln = range.start; ln <= range.end && ln <= lines.length; ln++) {
         if (seenGetServiceLines.has(ln))
             continue;
-        const codeText = stripCodeStringsAndComments(lines[ln - 1] || "", true, false);
+        const codeText = tracker.strippedLines[ln - 1] ?? stripCodeStringsAndComments(lines[ln - 1] || "", true, false);
         if (!/\bgame:GetService\s*\(/.test(codeText) || hasInlineSuppression(lines, ln, "luau_quality"))
             continue;
         const guardWindow = lines
@@ -936,7 +1142,7 @@ function checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines
             continue;
         seenGetServiceLines.add(ln);
         issues.push({
-            id: mintIssueId("luau_quality", relPath, `service_in_fn_${sym.name}_L${ln}`),
+            id: mintAnchoredSourceId("luau_quality", relPath, sym.name, `service_in_fn_${codeText.trim()}`, tracker),
             detector: "luau_quality",
             category: "traps",
             dimension: "code_quality",
@@ -944,6 +1150,7 @@ function checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines
             confidence: "high",
             severity: "low",
             file: relPath,
+            symbol: sym.name,
             line: ln,
             end_line: ln,
             span: `L${ln}-L${ln}`,
@@ -957,7 +1164,7 @@ function checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTrac
     if (flags.isLuau && flags.allowTraps) {
         const seenGetServiceLines = new Set();
         for (const sym of fileSymbols)
-            checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines, issues);
+            checkLuauSymbolGetServiceTraps(relPath, lines, sym, seenGetServiceLines, stateTracker, issues);
     }
     if (flags.isPy && flags.allowTraps)
         checkPyMutableLruCacheTraps(relPath, lines, fileSymbols, issues);
@@ -1020,7 +1227,7 @@ function findNextNonContinuationLineIdx(fnLines, startIdx, initTrim) {
     }
     return nextIdx;
 }
-function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues) {
+function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, isJsTs, tracker, issues) {
     for (let idx = 1; idx < fnLines.length - 1; idx++) {
         const rawLine = fnLines[idx];
         const tLine = rawLine.trim();
@@ -1036,11 +1243,12 @@ function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues)
         const nextTrim = nextRaw.trim();
         const nextIndent = nextRaw.match(/^\s*/)[0].length;
         const closesBlock = /^(?:[})\]]|end\b|else\b|elseif\b|elif\b|except\b|catch\b|finally\b|case\b|default\b|when\b|#\[|@)/.test(nextTrim);
-        if (nextIndent === termIndent && termIndent > 0 && !closesBlock) {
+        const isHoistedJsFunction = isJsTs && /^(?:async\s+)?function\b/.test(nextTrim);
+        if (nextIndent === termIndent && termIndent > 0 && !closesBlock && !isHoistedJsFunction) {
             const absLine = range.start + nextIdx;
             if (!hasInlineSuppression(lines, absLine, "language_traps")) {
                 issues.push({
-                    id: mintIssueId("language_traps", relPath, `unreachable_${sym.name}_L${absLine}`),
+                    id: mintAnchoredSourceId("language_traps", relPath, sym.name, `unreachable_${nextTrim}`, tracker),
                     detector: "language_traps",
                     category: "traps",
                     dimension: "code_quality",
@@ -1048,6 +1256,7 @@ function checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues)
                     confidence: "high",
                     severity: "medium",
                     file: relPath,
+                    symbol: sym.name,
                     line: absLine,
                     end_line: absLine,
                     span: `L${absLine}-L${absLine}`,
@@ -1109,7 +1318,7 @@ function collectTrackedDictKeys(range, fnLines) {
     return tracked;
 }
 
-function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, issues) {
+function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, tracker, issues) {
     for (const [rKey, rLine] of td.reads.entries()) {
         if (td.writes.has(rKey))
             continue;
@@ -1118,7 +1327,7 @@ function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, is
         );
         if (nearMatch && !hasInlineSuppression(lines, rLine, "dict_keys")) {
             issues.push({
-                id: mintIssueId("dict_keys", relPath, `drift_${varName}_${rKey}_L${rLine}`),
+                id: mintAnchoredSourceId("dict_keys", relPath, sym.name, `drift_${varName}_${rKey}`, tracker),
                 detector: "dict_keys",
                 category: "types",
                 dimension: "code_quality",
@@ -1126,6 +1335,7 @@ function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, is
                 confidence: "high",
                 severity: "high",
                 file: relPath,
+                symbol: sym.name,
                 line: rLine,
                 end_line: rLine,
                 span: `L${rLine}-L${rLine}`,
@@ -1140,7 +1350,7 @@ function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, is
     for (const [wKey, wLine] of td.writes.entries()) {
         if (!td.reads.has(wKey) && !hasInlineSuppression(lines, wLine, "dict_keys")) {
             issues.push({
-                id: mintIssueId("dict_keys", relPath, `dead_write_${varName}_${wKey}_L${wLine}`),
+                id: mintAnchoredSourceId("dict_keys", relPath, sym.name, `dead_write_${varName}_${wKey}`, tracker),
                 detector: "dict_keys",
                 category: "types",
                 dimension: "code_quality",
@@ -1148,6 +1358,7 @@ function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, is
                 confidence: "medium",
                 severity: "medium",
                 file: relPath,
+                symbol: sym.name,
                 line: wLine,
                 end_line: wLine,
                 span: `L${wLine}-L${wLine}`,
@@ -1158,17 +1369,44 @@ function reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapes, is
         }
     }
 }
-function checkDictKeysInFunction(relPath, lines, sym, range, fnLines, potentials, issues) {
+
+function doesDictVarEscape(strippedFnText, varName) {
+    const esc = varName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const directEscapeRe = new RegExp(
+        `(?:\\breturn\\b[^;\\n]*\\b${esc}\\b(?!\\s*[\\[.])|\\.\\.\\.${esc}\\b|\\bfor\\b[^\\n]*\\b${esc}\\b|[=:,\\[]\\s*\\b${esc}\\b(?!\\s*[\\[.])|[{,]\\s*\\b${esc}\\b\\s*[,}])`,
+    );
+    if (directEscapeRe.test(strippedFnText)) return true;
+
+    // Check any call argument usage including nested calls like `send(format(x), cfg)` or `send(wrap(cfg))`
+    const identRe = new RegExp(`(?<![A-Za-z0-9_$.])\\b${esc}\\b(?!\\s*[\\[.])`, "g");
+    let m;
+    while ((m = identRe.exec(strippedFnText)) !== null) {
+        let parenDepth = 0;
+        for (let k = m.index - 1; k >= 0; k--) {
+            const ch = strippedFnText[k];
+            if (ch === ")") parenDepth += 1;
+            else if (ch === "(") {
+                if (parenDepth === 0) {
+                    // Inside a parenthesized expression/call: check if preceded by identifier/member (call) or `return`
+                    const beforeParen = strippedFnText.slice(Math.max(0, k - 40), k);
+                    if (/[A-Za-z0-9_.\]]\s*$/.test(beforeParen)) return true;
+                    break;
+                }
+                parenDepth -= 1;
+            }
+        }
+    }
+    return false;
+}
+
+function checkDictKeysInFunction(relPath, lines, sym, range, fnLines, strippedFnLines, potentials, tracker, issues) {
     potentials.dict_keys += 1;
     const tracked = collectTrackedDictKeys(range, fnLines);
-    const fullFnText = fnLines.join("\n");
+    const fullFnText = strippedFnLines.join("\n");
     for (const [varName, td] of tracked.entries()) {
         if (!td.initLocal || td.writes.size < 2 || td.reads.size < 1)
             continue;
-        const escapedRe = new RegExp(
-            `(?:\\breturn\\b[^;\\n]*\\b${varName}\\b(?!\\s*[\\[.])|\\breturn\\s*\\([^()]{0,400}?\\b${varName}\\b(?!\\s*[\\[.])|[A-Za-z0-9_.:]+\\s*\\([^()]{0,400}?\\b${varName}\\b(?!\\s*[\\[.])|\\.\\.\\.${varName}\\b|\\bfor\\b[^\\n]*\\b${varName}\\b|[=:,\\[]\\s*\\b${varName}\\b(?!\\s*[\\[.])|[{,]\\s*\\b${varName}\\b\\s*[,}])`,
-        );
-        reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, escapedRe.test(fullFnText), issues);
+        reportDictKeyIssuesForVar(relPath, lines, sym, varName, td, doesDictVarEscape(fullFnText, varName), tracker, issues);
     }
 }
 
@@ -1199,7 +1437,7 @@ function checkAsyncFunctionMissingAwait(relPath, lines, sym, range, fnLines, iss
         suggestion: `Remove the \`async\` keyword from \`${sym.name}\` or \`await\` the intended asynchronous operation.`,
     });
 }
-function checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags, potentials, issues) {
+function checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags, potentials, tracker, issues) {
     if (!flags.allowTraps && !flags.allowTypes)
         return;
     for (const sym of fileSymbols) {
@@ -1209,16 +1447,17 @@ function checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags,
         if (!range || range.end <= range.start)
             continue;
         const fnLines = lines.slice(range.start - 1, range.end);
+        const strippedFnLines = tracker.strippedLines.slice(range.start - 1, range.end);
         if (flags.allowTraps && flags.isJsTs)
             checkAsyncFunctionMissingAwait(relPath, lines, sym, range, fnLines, issues);
         if (flags.allowTraps)
-            checkUnreachableInFunction(relPath, lines, sym, range, fnLines, issues);
+            checkUnreachableInFunction(relPath, lines, sym, range, fnLines, flags.isJsTs, tracker, issues);
         if (flags.allowTypes && (flags.isPy || flags.isJsTs || flags.isLuau))
-            checkDictKeysInFunction(relPath, lines, sym, range, fnLines, potentials, issues);
+            checkDictKeysInFunction(relPath, lines, sym, range, fnLines, strippedFnLines, potentials, tracker, issues);
     }
 }
 
-function checkLuauReactiveSmells(relPath, lines, issues) {
+function checkLuauReactiveSmells(relPath, lines, tracker, issues) {
     let inComputedStart = 0;
     let depth = 0;
     for (let i = 0; i < lines.length; i++) {
@@ -1235,8 +1474,9 @@ function checkLuauReactiveSmells(relPath, lines, issues) {
             continue;
         depth = stepLuauBlockDepth(depth, trimmed);
         if (/\b(?::set\s*\(|Instance\.new\s*\(|:Connect\s*\()/.test(trimmed) && !hasInlineSuppression(lines, lineNum, "reactive_smells")) {
+            const symName = tracker.enclosingOf(lineNum);
             issues.push({
-                id: mintIssueId("reactive_smells", relPath, `computed_side_effect_L${lineNum}`),
+                id: mintAnchoredSourceId("reactive_smells", relPath, symName, `computed_side_effect_${trimmed}`, tracker),
                 detector: "reactive_smells",
                 category: "traps",
                 dimension: "code_quality",
@@ -1244,6 +1484,7 @@ function checkLuauReactiveSmells(relPath, lines, issues) {
                 confidence: "high",
                 severity: "high",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -1258,7 +1499,7 @@ function checkLuauReactiveSmells(relPath, lines, issues) {
         }
     }
 }
-function checkReactHookSmells(relPath, lines, issues) {
+function checkReactHookSmells(relPath, lines, tracker, issues) {
     for (let i = 0; i < lines.length; i++) {
         const lineNum = i + 1;
         const trimmed = lines[i].trim();
@@ -1266,8 +1507,9 @@ function checkReactHookSmells(relPath, lines, issues) {
             continue;
         if (/^(?:if|for|while)\s*\([^)]*\)\s*\{?[^\n]*\buse(?:State|Effect|Memo|Callback|Ref|Context)\s*\(/.test(trimmed) &&
             !hasInlineSuppression(lines, lineNum, "reactive_smells")) {
+            const symName = tracker.enclosingOf(lineNum);
             issues.push({
-                id: mintIssueId("reactive_smells", relPath, `conditional_hook_L${lineNum}`),
+                id: mintAnchoredSourceId("reactive_smells", relPath, symName, `conditional_hook_${trimmed}`, tracker),
                 detector: "reactive_smells",
                 category: "traps",
                 dimension: "code_quality",
@@ -1275,6 +1517,7 @@ function checkReactHookSmells(relPath, lines, issues) {
                 confidence: "high",
                 severity: "high",
                 file: relPath,
+                symbol: symName,
                 line: lineNum,
                 end_line: lineNum,
                 span: `L${lineNum}-L${lineNum}`,
@@ -1285,35 +1528,60 @@ function checkReactHookSmells(relPath, lines, issues) {
         }
     }
 }
-function checkReactiveSmellsInFile(relPath, lines, flags, potentials, issues) {
+function checkReactiveSmellsInFile(relPath, lines, flags, potentials, tracker, issues) {
     if (!flags.allowTraps || (!flags.isLuau && !flags.isJsTs))
         return;
     potentials.reactive_smells += 1;
     if (flags.isLuau)
-        checkLuauReactiveSmells(relPath, lines, issues);
+        checkLuauReactiveSmells(relPath, lines, tracker, issues);
     if (flags.isJsTs)
-        checkReactHookSmells(relPath, lines, issues);
+        checkReactHookSmells(relPath, lines, tracker, issues);
+}
+
+function buildStrippedTokenLineIndex(strippedLines) {
+    const tokenLines = new Map();
+    const re = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+    for (let i = 0; i < strippedLines.length; i++) {
+        const s = strippedLines[i];
+        if (!s) continue;
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(s)) !== null) {
+            const tok = m[0];
+            let lineSet = tokenLines.get(tok);
+            if (!lineSet) {
+                lineSet = new Set();
+                tokenLines.set(tok, lineSet);
+            }
+            lineSet.add(i);
+        }
+    }
+    return tokenLines;
+}
+
+function isIdentUsedOutsideSpan(tokenLines, ident, startIdx, endIdx) {
+    const set = tokenLines.get(ident);
+    if (!set) return false;
+    for (const lnIdx of set) {
+        if (lnIdx < startIdx || lnIdx > endIdx) return true;
+    }
+    return false;
 }
 
 /**
  * Count non-comment token references to `ident` in `lines` excluding `lineIdx`.
  * Shared between `unused_imports` detection and `autofix unused-imports`.
  */
-export function countIdentifierUsesOutsideLine(lines, lineIdx, ident, isPy = false, isLuau = false) {
-    const escaped = ident.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const wordRe = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
-    let count = 0;
-    for (let i = 0; i < lines.length; i++) {
-        if (i === lineIdx) continue;
-        const l = lines[i].trim();
-        if (l.startsWith("//") || l.startsWith("--") || (isPy && l.startsWith("#"))) continue;
-        const stripped = stripCodeStringsAndComments(lines[i], isLuau, isPy);
-        if (wordRe.test(stripped)) count += 1;
+export function countIdentifierUsesOutsideLine(lines, lineIdx, ident, isPy = false, isLuau = false, tokenLines = null) {
+    if (tokenLines) {
+        return isIdentUsedOutsideSpan(tokenLines, ident, lineIdx, lineIdx) ? 1 : 0;
     }
-    return count;
+    const stripped = stripCodeLines(lines, { isPy, isLuau });
+    const idxMap = buildStrippedTokenLineIndex(stripped);
+    return isIdentUsedOutsideSpan(idxMap, ident, lineIdx, lineIdx) ? 1 : 0;
 }
 
-function pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, isPy = false, isLuau = false) {
+function pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, isPy = false, isLuau = false, tokenLines = null) {
     if (/;.*\S/.test(trimmed)) return null;
     const namedMatch = /^(\s*import\s*)\{([^}]+)\}(\s*from\s*["'][^"']+["']\s*;?\s*)$/.exec(line);
     if (!namedMatch) return null;
@@ -1334,7 +1602,7 @@ function pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, isPy = false,
             continue;
         }
         const localIdent = aliasMatch[2] || aliasMatch[1];
-        if (countIdentifierUsesOutsideLine(lines, lineIdx, localIdent, isPy, isLuau) === 0) {
+        if (countIdentifierUsesOutsideLine(lines, lineIdx, localIdent, isPy, isLuau, tokenLines) === 0) {
             removedNames.push(localIdent);
         } else {
             kept.push(spec);
@@ -1364,7 +1632,7 @@ function pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, isPy = false,
  * Determine whether `line` at `lineIdx` imports unused identifiers.
  * Returns a shared edit descriptor consumed by both `unused_imports` scanning and `autofix`.
  */
-export function findUnusedImportEditOnLine(line, trimmed, lines, lineIdx, isPy = false, isLuau = false) {
+export function findUnusedImportEditOnLine(line, trimmed, lines, lineIdx, isPy = false, isLuau = false, tokenLines = null) {
     if (/;.*\S/.test(trimmed)) return null;
     const luauReq = /^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*require\([^)]+\)\s*$/.exec(trimmed);
     const jsImp = /^import\s+(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["'][^"']+["'];?\s*$/.exec(trimmed);
@@ -1384,7 +1652,7 @@ export function findUnusedImportEditOnLine(line, trimmed, lines, lineIdx, isPy =
     if (
         ident &&
         !usesClassicJsxReact &&
-        countIdentifierUsesOutsideLine(lines, lineIdx, ident, effectiveIsPy, effectiveIsLuau) === 0
+        countIdentifierUsesOutsideLine(lines, lineIdx, ident, effectiveIsPy, effectiveIsLuau, tokenLines) === 0
     ) {
         return {
             action: "remove",
@@ -1394,53 +1662,204 @@ export function findUnusedImportEditOnLine(line, trimmed, lines, lineIdx, isPy =
             identifier: ident,
         };
     }
-    return pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, effectiveIsPy, effectiveIsLuau);
+    return pruneNamedImportSpecifiers(line, trimmed, lines, lineIdx, effectiveIsPy, effectiveIsLuau, tokenLines);
 }
 
-function advanceLuauLongClose(raw, luauLongClose) {
-    if (luauLongClose)
-        return raw.includes(luauLongClose) ? null : luauLongClose;
-    const lb = /(?:--)?\[(=*)\[/.exec(raw);
-    if (lb && !raw.slice(lb.index + lb[0].length).includes(`]${lb[1]}]`))
-        return `]${lb[1]}]`;
+function collectUnusedFromSpecList(rawSpecText, tokenLines, startIdx, endIdx, isJsTs) {
+    const specs = rawSpecText.split(",").map((s) => s.trim()).filter(Boolean);
+    const removedNames = [];
+    let keptCount = 0;
+    for (const spec of specs) {
+        if (isJsTs && /^type\s+/.test(spec)) { keptCount += 1; continue; }
+        const m = /^([A-Za-z_$][A-Za-z0-9_$]*)(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?$/.exec(spec);
+        if (!m) { keptCount += 1; continue; }
+        const localIdent = m[2] || m[1];
+        if (!isIdentUsedOutsideSpan(tokenLines, localIdent, startIdx, endIdx)) {
+            removedNames.push(localIdent);
+        } else {
+            keptCount += 1;
+        }
+    }
+    return { removedNames, action: keptCount === 0 ? "remove" : "replace" };
+}
+
+function findMultilineOrLangUnusedImport(lines, strippedLines, tokenLines, i, flags) {
+    const trimmed = strippedLines[i]?.trim() || "";
+    if (!trimmed) return null;
+
+    // Multi-line JS/TS `import { ... } from "..."`
+    if (flags.isJsTs && /^import\s*\{[^}]*$/.test(trimmed)) {
+        let endIdx = -1;
+        const limit = Math.min(lines.length, i + 40);
+        for (let k = i + 1; k < limit; k++) {
+            if (/\}\s*from\s+["'][^"']+["']/.test(lines[k])) { endIdx = k; break; }
+            if (/;/.test(strippedLines[k] || "")) break;
+        }
+        if (endIdx > i) {
+            const joined = lines.slice(i, endIdx + 1).join(" ");
+            const m = /^import\s*\{([^}]+)\}\s*from\s+["'][^"']+["']/.exec(joined.trim());
+            if (m) {
+                const { removedNames, action } = collectUnusedFromSpecList(m[1], tokenLines, i, endIdx, true);
+                if (removedNames.length > 0) {
+                    return { startIdx: i, endIdx, removedNames, identifier: removedNames[0], action };
+                }
+            }
+            return { startIdx: i, endIdx, removedNames: [] };
+        }
+    }
+
+    // Multi-line or multi-specifier Python `from pkg import (a, b)` or `from pkg import a, b`
+    if (flags.isPy && /^from\s+[A-Za-z0-9_.]+\s+import\s+/.test(trimmed)) {
+        let endIdx = i;
+        if (trimmed.includes("(") && !trimmed.includes(")")) {
+            const limit = Math.min(lines.length, i + 40);
+            for (let k = i + 1; k < limit; k++) {
+                endIdx = k;
+                if ((strippedLines[k] || "").includes(")")) break;
+            }
+        }
+        const joined = strippedLines.slice(i, endIdx + 1).join(" ").replace(/#.*$/, "");
+        const m = /^from\s+[A-Za-z0-9_.]+\s+import\s+\(?([^)]+)\)?/.exec(joined.trim());
+        if (m && (endIdx > i || m[1].includes(","))) {
+            const { removedNames, action } = collectUnusedFromSpecList(m[1], tokenLines, i, endIdx, false);
+            if (removedNames.length > 0) {
+                return { startIdx: i, endIdx, removedNames, identifier: removedNames[0], action };
+            }
+            return { startIdx: i, endIdx, removedNames: [] };
+        }
+    }
+
+    // Go imports (`import "pkg"`, `import alias "pkg"`, or `import ( ... )` blocks)
+    if (flags.isGo) {
+        const singleGo = /^import\s+(?:([A-Za-z_][A-Za-z0-9_]*|\.|_)\s+)?["']([^"']+)["']/.exec(lines[i].trim());
+        if (singleGo) {
+            const alias = singleGo[1];
+            if (alias === "_" || alias === ".") return null;
+            const ident = alias || singleGo[2].split("/").pop();
+            if (ident && !isIdentUsedOutsideSpan(tokenLines, ident, i, i)) {
+                return { startIdx: i, endIdx: i, removedNames: [ident], identifier: ident, action: "remove" };
+            }
+            return null;
+        }
+        if (/^import\s*\(\s*$/.test(trimmed)) {
+            let endIdx = i;
+            const limit = Math.min(lines.length, i + 80);
+            const items = [];
+            for (let k = i + 1; k < limit; k++) {
+                const gl = lines[k].trim();
+                endIdx = k;
+                if (gl === ")") break;
+                const gm = /^(?:([A-Za-z_][A-Za-z0-9_]*|\.|_)\s+)?["']([^"']+)["']/.exec(gl);
+                if (gm && gm[1] !== "_" && gm[1] !== ".") {
+                    items.push({ lineIdx: k, ident: gm[1] || gm[2].split("/").pop() });
+                }
+            }
+            const unusedItems = items.filter((it) => it.ident && !isIdentUsedOutsideSpan(tokenLines, it.ident, i, endIdx));
+            if (unusedItems.length > 0) {
+                return {
+                    startIdx: unusedItems[0].lineIdx,
+                    endIdx: unusedItems[0].lineIdx,
+                    jumpToIdx: endIdx,
+                    multiItems: unusedItems,
+                };
+            }
+            return { startIdx: i, endIdx, removedNames: [] };
+        }
+    }
+
+    // Rust `use` statements (skip `pub use` re-exports)
+    if (flags.isRust && /^use\s+/.test(trimmed)) {
+        let endIdx = i;
+        while (endIdx + 1 < lines.length && !(strippedLines[endIdx] || "").includes(";") && endIdx - i < 20) {
+            endIdx += 1;
+        }
+        const joined = lines.slice(i, endIdx + 1).join(" ").trim();
+        const useMatch = /^use\s+[^;]*::(?:\{([^}]+)\}|([A-Za-z_][A-Za-z0-9_]*(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?))\s*;/.exec(joined);
+        if (useMatch) {
+            const rawList = useMatch[1] || useMatch[2];
+            const specs = rawList.split(",").map((s) => s.trim()).filter((s) => s && s !== "*" && s !== "self");
+            const removedNames = [];
+            let keptCount = 0;
+            for (const spec of specs) {
+                const m = /^([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$/.exec(spec);
+                if (!m) { keptCount += 1; continue; }
+                const localIdent = m[2] || m[1];
+                if (!isIdentUsedOutsideSpan(tokenLines, localIdent, i, endIdx)) {
+                    removedNames.push(localIdent);
+                } else {
+                    keptCount += 1;
+                }
+            }
+            if (removedNames.length > 0) {
+                return { startIdx: i, endIdx, removedNames, identifier: removedNames[0], action: keptCount === 0 ? "remove" : "replace" };
+            }
+        }
+        if (endIdx > i) return { startIdx: i, endIdx, removedNames: [] };
+    }
+
     return null;
 }
-function checkUnusedImportsInFile(relPath, lines, flags, potentials, issues) {
+
+function pushUnusedImportIssue(relPath, lines, startLine, endLine, removedNames, identifier, action, tracker, issues) {
+    if (hasInlineSuppression(lines, startLine, "unused_imports")) return;
+    const label = removedNames.join(", ");
+    const plural = removedNames.length > 1 ? "s" : "";
+    issues.push({
+        id: mintAnchoredSourceId("unused_imports", relPath, "module", `import_${identifier}`, tracker),
+        detector: "unused_imports",
+        category: "dead",
+        dimension: "code_quality",
+        tier: "T3",
+        confidence: "high",
+        severity: "low",
+        file: relPath,
+        symbol: "module",
+        line: startLine,
+        end_line: endLine,
+        span: `L${startLine}-L${endLine}`,
+        identifier,
+        detail: { removed_names: removedNames, action },
+        summary: `Unused import binding${plural} \`${label}\` at ${relPath}:L${startLine}.`,
+        suggestion: `Remove unused import${plural} \`${label}\` or run \`plexer health autofix unused-imports\`.`,
+    });
+}
+
+function checkUnusedImportsInFile(relPath, lines, flags, potentials, tracker, issues) {
     potentials.unused_imports += 1;
-    let luauLongClose = null;
+    const strippedLines = tracker.strippedLines;
+    const tokenLines = buildStrippedTokenLineIndex(strippedLines);
+    const luauState = createCodeStripState();
+
     for (let i = 0; i < lines.length; i++) {
         const raw = lines[i];
         const trimmed = raw.trim();
         const lineNum = i + 1;
-        const wasInLongBracket = Boolean(luauLongClose);
-        if (flags.isLuau)
-            luauLongClose = advanceLuauLongClose(raw, luauLongClose);
-        if (wasInLongBracket || !trimmed)
+        const wasInLuauLong = Boolean(luauState.longStringClose || luauState.blockCommentClose);
+        if (flags.isLuau) {
+            stripCodeLineWithState(raw, luauState, { relPath, isLuau: true });
+        }
+        if (wasInLuauLong || !trimmed) continue;
+        if (trimmed.startsWith("//") || trimmed.startsWith("--") || (flags.isPy && trimmed.startsWith("#"))) continue;
+
+        const multi = findMultilineOrLangUnusedImport(lines, strippedLines, tokenLines, i, flags);
+        if (multi) {
+            if (multi.multiItems) {
+                for (const it of multi.multiItems) {
+                    pushUnusedImportIssue(relPath, lines, it.lineIdx + 1, it.lineIdx + 1, [it.ident], it.ident, "remove", tracker, issues);
+                }
+                i = multi.jumpToIdx;
+                continue;
+            }
+            if (multi.removedNames.length > 0) {
+                pushUnusedImportIssue(relPath, lines, multi.startIdx + 1, multi.endIdx + 1, multi.removedNames, multi.identifier, multi.action, tracker, issues);
+            }
+            i = multi.endIdx;
             continue;
-        if (trimmed.startsWith("//") || trimmed.startsWith("--") || (flags.isPy && trimmed.startsWith("#")))
-            continue;
-        const res = findUnusedImportEditOnLine(raw, trimmed, lines, i, flags.isPy, flags.isLuau);
-        if (!res || hasInlineSuppression(lines, lineNum, "unused_imports"))
-            continue;
-        const label = res.removedNames.join(", ");
-        const plural = res.removedNames.length > 1 ? "s" : "";
-        issues.push({
-            id: mintIssueId("unused_imports", relPath, `${res.identifier}_L${lineNum}`),
-            detector: "unused_imports",
-            category: "dead",
-            dimension: "code_quality",
-            tier: "T3",
-            confidence: "high",
-            severity: "low",
-            file: relPath,
-            line: lineNum,
-            end_line: lineNum,
-            span: `L${lineNum}-L${lineNum}`,
-            identifier: res.identifier,
-            detail: { removed_names: res.removedNames, action: res.action },
-            summary: `Unused import binding${plural} \`${label}\` at ${relPath}:L${lineNum}.`,
-            suggestion: `Remove unused import${plural} \`${label}\` or run \`plexer health autofix unused-imports\`.`,
-        });
+        }
+
+        const res = findUnusedImportEditOnLine(raw, trimmed, lines, i, flags.isPy, flags.isLuau, tokenLines);
+        if (!res) continue;
+        pushUnusedImportIssue(relPath, lines, lineNum, lineNum, res.removedNames, res.identifier, res.action, tracker, issues);
     }
 }
 
@@ -1484,25 +1903,24 @@ function recordSourceCheckPotentials(relPath, flags, ignoreRules, potentials) {
     }
     if (flags.allowTraps)
         potentials.language_traps += 1;
-    if (flags.allowSecurity && !ignoreRules.isIgnored(relPath, "traps"))
+    if (flags.allowSecurity && !ignoreRules.isIgnored(relPath, "security_traps"))
         potentials.security_traps += 1;
 }
 function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarget, ignoreRules, enabled, potentials, issues) {
     const flags = buildSourceCheckFlags(relPath, ignoreRules, enabled);
+    const strippedLines = stripCodeLines(lines, { relPath });
+    const stateTracker = makeSourceTracker(relPath, fileSymbols, lines, strippedLines);
+    if (flags.isLuau) {
+        stateTracker.shadowedLuauSchedulers = collectShadowedLuauSchedulerNames(lines);
+    }
+
     if (flags.allowDead && !ignoreRules.isIgnored(relPath, "unused_imports"))
-        checkUnusedImportsInFile(relPath, lines, flags, potentials, issues);
+        checkUnusedImportsInFile(relPath, lines, flags, potentials, stateTracker, issues);
     if (flags.allowSlop && !ignoreRules.isIgnored(relPath, "stale_deprecations"))
         checkStaleDeprecationsInFile(relPath, lines, fileSymbols, incomingByTarget, potentials, issues);
     recordSourceCheckPotentials(relPath, flags, ignoreRules, potentials);
-    const stateTracker = {
-        booleanStateCount: 0,
-        firstBooleanStateLine: 1,
-        shadowedLuauSchedulers: flags.isLuau ? collectShadowedLuauSchedulerNames(lines) : new Set(),
-        luauBlockStack: [],
-        luauLongState: { longClose: null },
-        luauFnDepthBeforeLine: 0,
-        luauLineCode: "",
-    };
+
+    const allowUniversalSecurity = flags.allowSecurity && !ignoreRules.isIgnored(relPath, "security_traps");
     for (let i = 0; i < lines.length; i++) {
         const lineNum = i + 1;
         const raw = lines[i];
@@ -1514,17 +1932,19 @@ function scanSingleFileSourceChecks(relPath, lines, fileSymbols, incomingByTarge
             stateTracker.luauFnDepthBeforeLine = stateTracker.luauBlockStack.filter((b) => b === "fn").length;
             stepLuauFnBlockStack(stateTracker.luauBlockStack, stateTracker.luauLineCode);
         }
-        checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags, issues);
-        checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flags, issues);
+        checkSlopAndTypeBypassesOnLine(relPath, lines, lineNum, trimmed, flags, stateTracker, issues);
+        checkSilentCatchesOnLine(relPath, lines, i, lineNum, raw, trimmed, flags, stateTracker, issues);
         checkLuauSecurityAndTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, stateTracker, issues);
-        if ((flags.wantTraps || flags.wantSecurity) && !ignoreRules.isIgnored(relPath, "traps")) {
+        if (flags.allowTraps) {
             checkLanguageTrapsOnLine(relPath, lines, i, lineNum, trimmed, flags, stateTracker, issues);
-            checkUniversalSecurityRulesOnLine(relPath, lines, lineNum, trimmed, flags, issues);
+        }
+        if (allowUniversalSecurity) {
+            checkUniversalSecurityRulesOnLine(relPath, lines, i, lineNum, trimmed, flags, stateTracker, issues);
         }
     }
     checkLuauAndPySymbolTraps(relPath, lines, fileSymbols, flags, stateTracker, issues);
-    checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags, potentials, issues);
-    checkReactiveSmellsInFile(relPath, lines, flags, potentials, issues);
+    checkFunctionScopedTrapsAndDictKeys(relPath, lines, fileSymbols, flags, potentials, stateTracker, issues);
+    checkReactiveSmellsInFile(relPath, lines, flags, potentials, stateTracker, issues);
 }
 
 // Universal language/runtime type tags and HTTP methods rather than project-specific values.
@@ -1719,7 +2139,7 @@ function fillZeroSourcePotentials(potentials, enabledCategories, scoredFileCount
 /**
  * Run all source & AST checks (`catches`, `types`, `traps`, `slop`, `security`).
  */
-export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, fileFilter = null) {
+export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, fileFilter = null, detectorFilter = null) {
     const issues = [];
     const potentials = {
         unused_imports: 0,
@@ -1764,7 +2184,8 @@ export function runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledC
             luauFileCount += 1;
         scanSingleFileSourceChecks(relPath, lines, symbolsByFile.get(relPath) || [], incomingByTarget, ignoreRules, enabled, potentials, issues);
     }
-    if (enabled.wantTypes && scoredFiles.length > 0)
+    const wantEnumBypasses = enabled.wantTypes && (!detectorFilter || detectorFilter.has("enum_bypasses") || detectorFilter.has("types"));
+    if (wantEnumBypasses && scoredFiles.length > 0)
         checkEnumBypassIssues(scoredFiles, readLines, ignoreRules, potentials, issues);
     fillZeroSourcePotentials(potentials, enabledCategories, Math.max(1, scoredFiles.length), luauFileCount);
     return { issues, potentials };

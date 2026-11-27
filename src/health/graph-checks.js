@@ -2,7 +2,7 @@
  * Structural, coupling, dead-code, wrapper, cohesion, and test-topology detectors
  * operating directly on `plexer`'s `wiring.json` graph + source lines.
  */
-import { basename, dirname, extname } from "node:path";
+import { basename, dirname, extname, posix } from "node:path";
 import { analyzeGitHistory } from "../blast/history.js";
 import { parseLayerRuleEntry } from "../blast/layer-rules.js";
 import { WALK_RELATIONS } from "../context/symbol-query.js";
@@ -18,6 +18,7 @@ import {
     hasWordToken,
     isSupportOrBenchFile,
     loadPackageEntrypoints,
+    stripCodeLines,
     stripCodeStringsAndComments,
 } from "./zones.js";
 
@@ -352,9 +353,14 @@ function flattenGraphFileNodes(files) {
 function normalizeGraphShape(graph) {
     if (!graph)
         return { nodes: [], edges: [] };
+    if (graph._normalizedForHealth && Array.isArray(graph.nodes) && Array.isArray(graph.edges)) {
+        return graph;
+    }
     const edges = (graph.edges || []).map(normalizeGraphEdge);
     const nodes = Array.isArray(graph.nodes) ? graph.nodes : flattenGraphFileNodes(graph.files);
-    return { ...graph, nodes, edges };
+    const out = { ...graph, nodes, edges };
+    Object.defineProperty(out, "_normalizedForHealth", { value: true, enumerable: false });
+    return out;
 }
 
 function addTopologySetEntry(map, k, v) {
@@ -452,15 +458,28 @@ export function buildUndirectedFileAdjacency(rawGraph, zoneMap = null) {
 const PURE_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const IDENT_TOKEN_SCAN_RE = /(?<![A-Za-z0-9_$])[A-Za-z_$][A-Za-z0-9_$]*/g;
 
-function buildRepoIdentifierIndex(allFileNodes, readLines) {
+function getStrippedLinesForFile(filePath, readLines, repoState = null) {
+    if (repoState?.strippedByFile?.has(filePath)) {
+        return repoState.strippedByFile.get(filePath);
+    }
+    const raw = readLines(filePath) || [];
+    const stripped = stripCodeLines(raw, { relPath: filePath });
+    if (repoState) {
+        if (!repoState.strippedByFile) repoState.strippedByFile = new Map();
+        repoState.strippedByFile.set(filePath, stripped);
+    }
+    return stripped;
+}
+
+function buildRepoIdentifierIndex(allFileNodes, readLines, repoState = null) {
     const index = new Map();
     for (const fNode of allFileNodes || []) {
         if (!fNode.path) continue;
-        const fLines = readLines(fNode.path) || [];
+        const fLines = getStrippedLinesForFile(fNode.path, readLines, repoState);
         const fileTokens = new Set();
-        for (const rawLine of fLines) {
-            if (!rawLine) continue;
-            const matches = rawLine.match(IDENT_TOKEN_SCAN_RE);
+        for (const strippedLine of fLines) {
+            if (!strippedLine) continue;
+            const matches = strippedLine.match(IDENT_TOKEN_SCAN_RE);
             if (!matches) continue;
             for (let i = 0; i < matches.length; i++) {
                 fileTokens.add(matches[i]);
@@ -478,28 +497,57 @@ function buildRepoIdentifierIndex(allFileNodes, readLines) {
     return index;
 }
 
-function hasImporterReferenceOrStarReexport(shortName, importers, readLines) {
+function stripExtForModuleMatch(p) {
+    return String(p || "").replace(/\\/g, "/").replace(/\.(?:js|mjs|cjs|jsx|ts|mts|cts|tsx|luau|lua|py|pyi)$/i, "");
+}
+
+function specifierMatchesTargetFile(impPath, spec, selfPath) {
+    if (!selfPath || !spec) return true;
+    const normSelf = stripExtForModuleMatch(selfPath);
+    if (spec.startsWith(".")) {
+        const resolved = stripExtForModuleMatch(posix.normalize(posix.join(posix.dirname(impPath.replace(/\\/g, "/")), spec)));
+        return (
+            resolved === normSelf ||
+            `${resolved}/index` === normSelf ||
+            `${resolved}/init` === normSelf ||
+            `${resolved}/__init__` === normSelf
+        );
+    }
+    return normSelf === stripExtForModuleMatch(spec);
+}
+
+function hasImporterReferenceOrStarReexport(shortName, importers, readLines, selfPath = null, repoState = null) {
     if (!importers || importers.size === 0) return false;
     for (const impPath of importers) {
-        const impLines = readLines(impPath) || [];
-        const ext = extname(impPath).toLowerCase();
-        const isLuau = ext === ".luau" || ext === ".lua";
-        const isPy = ext === ".py";
-        for (const rawLine of impLines) {
-            if (rawLine.includes(shortName) && hasWordToken(rawLine, shortName)) return true;
+        const rawLines = readLines(impPath) || [];
+        const strippedLines = getStrippedLinesForFile(impPath, readLines, repoState);
+        for (let i = 0; i < strippedLines.length; i++) {
+            const stripped = strippedLines[i];
+            if (!stripped) continue;
+            if (stripped.includes(shortName) && hasWordToken(stripped, shortName)) return true;
+            const rawLine = rawLines[i] || "";
             if (rawLine.includes("*")) {
-                const stripped = stripCodeStringsAndComments(rawLine, isLuau, isPy);
-                if (stripped && /\b(?:import\s*\*\s*as|export\s*\*\s*from)\b/.test(stripped)) return true;
+                const reexportMatch = /\bexport\s+\*\s+from\s+["']([^"']+)["']/.exec(rawLine);
+                if (reexportMatch && specifierMatchesTargetFile(impPath, reexportMatch[1], selfPath)) {
+                    return true;
+                }
+                const nsMatch = /\bimport\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["']([^"']+)["']/.exec(rawLine);
+                if (nsMatch && specifierMatchesTargetFile(impPath, nsMatch[2], selfPath)) {
+                    const nsIdent = nsMatch[1];
+                    if (strippedLines.some((l, idx) => idx !== i && l && hasWordToken(l, nsIdent))) {
+                        return true;
+                    }
+                }
             }
         }
     }
     return false;
 }
 
-function fileContainsWordToken(filePath, shortName, readLines) {
-    const fLines = readLines(filePath) || [];
-    for (const rawLine of fLines) {
-        if (rawLine.includes(shortName) && hasWordToken(rawLine, shortName)) return true;
+function fileContainsWordToken(filePath, shortName, readLines, repoState = null) {
+    const fLines = getStrippedLinesForFile(filePath, readLines, repoState);
+    for (const strippedLine of fLines) {
+        if (strippedLine && strippedLine.includes(shortName) && hasWordToken(strippedLine, shortName)) return true;
     }
     return false;
 }
@@ -507,22 +555,22 @@ function fileContainsWordToken(filePath, shortName, readLines) {
 export function isSymbolReferencedAcrossRepo(shortName, importers, repoState, selfPath) {
     const { allFileNodes, readLines } = repoState;
     if (!readLines || !shortName) return false;
-    if (hasImporterReferenceOrStarReexport(shortName, importers, readLines)) return true;
+    if (hasImporterReferenceOrStarReexport(shortName, importers, readLines, selfPath, repoState)) return true;
     if (PURE_IDENT_RE.test(shortName)) {
         if (!repoState.tokenIndex) {
-            repoState.tokenIndex = buildRepoIdentifierIndex(allFileNodes, readLines);
+            repoState.tokenIndex = buildRepoIdentifierIndex(allFileNodes, readLines, repoState);
         }
         const candidatePaths = repoState.tokenIndex.get(shortName);
         if (!candidatePaths || candidatePaths.size === 0) return false;
         for (const filePath of candidatePaths) {
-            if (filePath !== selfPath && !(importers && importers.has(filePath)) && fileContainsWordToken(filePath, shortName, readLines)) {
+            if (filePath !== selfPath && !(importers && importers.has(filePath)) && fileContainsWordToken(filePath, shortName, readLines, repoState)) {
                 return true;
             }
         }
         return false;
     }
     for (const fNode of allFileNodes || []) {
-        if (fNode.path && fNode.path !== selfPath && !(importers && importers.has(fNode.path)) && fileContainsWordToken(fNode.path, shortName, readLines)) {
+        if (fNode.path && fNode.path !== selfPath && !(importers && importers.has(fNode.path)) && fileContainsWordToken(fNode.path, shortName, readLines, repoState)) {
             return true;
         }
     }
@@ -563,6 +611,35 @@ function splitTopLevelArgs(raw) {
     return out;
 }
 
+function hasDefaultParamAssignment(paramStr) {
+    let angle = 0;
+    let paren = 0;
+    let bracket = 0;
+    let brace = 0;
+    let quote = null;
+    for (let i = 0; i < paramStr.length; i++) {
+        const ch = paramStr[i];
+        if (quote) {
+            if (ch === "\\") { i += 1; continue; }
+            if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") { quote = ch; continue; }
+        if (ch === "<") angle += 1;
+        else if (ch === ">" && angle > 0) angle -= 1;
+        else if (ch === "(") paren += 1;
+        else if (ch === ")" && paren > 0) paren -= 1;
+        else if (ch === "[") bracket += 1;
+        else if (ch === "]" && bracket > 0) bracket -= 1;
+        else if (ch === "{") brace += 1;
+        else if (ch === "}" && brace > 0) brace -= 1;
+        else if (ch === "=" && angle === 0 && paren === 0 && bracket === 0 && brace === 0 && paramStr[i + 1] !== ">") {
+            return true;
+        }
+    }
+    return false;
+}
+
 function extractSimpleWrapperParams(lines, startLine, signature) {
     const rawParams = extractBalancedSignatureParams(lines, startLine, signature);
     if (rawParams === null) return null;
@@ -570,10 +647,9 @@ function extractSimpleWrapperParams(lines, startLine, signature) {
     if (!trimmed) return [];
     const params = [];
     for (const part of splitTopLevelArgs(trimmed)) {
-        if (!part || part.startsWith("{") || part.startsWith("[")) return null;
+        if (!part || part.startsWith("{") || part.startsWith("[") || hasDefaultParamAssignment(part)) return null;
         const clean = part
             .replace(/^\.\.\./, "")
-            .replace(/\s*=.*$/, "")
             .replace(/\s*:\s*.*$/, "")
             .replace(/\?$/, "")
             .trim();
@@ -588,7 +664,7 @@ function argsStrictlyForwardParams(params, rawArgsText) {
     if (!params) return false;
     const argsText = String(rawArgsText || "").trim();
     const args = argsText ? splitTopLevelArgs(argsText) : [];
-    if (args.length > params.length) return false;
+    if (args.length !== params.length) return false;
     for (let i = 0; i < args.length; i++) {
         const argClean = args[i].replace(/^\.\.\./, "").trim();
         if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(argClean)) return false;
@@ -601,6 +677,7 @@ function checkPassthroughWrapperInFile(fNode, lines, sym, range, externalCallers
     potentials.passthrough_wrappers += 1;
     const loc = range.end - range.start + 1;
     if (loc < 2 || loc > 5 || externalCallers.length > 1 || sym.exported) return;
+    if (hasInlineSuppression(lines, range.start, "passthrough_wrappers")) return;
     const bodySlice = lines
         .slice(range.start - 1, range.end)
         .map((l) => l.trim())
@@ -807,9 +884,16 @@ function checkFacadeModuleInFile(fNode, lines, fileSymbols, issues, packageEntry
         nonEmpty.push(cur);
     }
 
-    const reexportCount = nonEmpty.filter((l) =>
-        /^(export\s+\*|export\s+(?:type\s+)?\{.*\}\s+from|from\s+\S+\s+import|__all__\s*=)/.test(l),
-    ).length;
+    const isPyFile = /\.pyi?$/i.test(fNode.path || "");
+    const hasPyAll = isPyFile && nonEmpty.some((l) => /^__all__\s*=/.test(l));
+    const reexportCount = nonEmpty.filter((l) => {
+        if (/^(?:export\s+\*|export\s+(?:type\s+)?\{.*\}\s+from)/.test(l)) return true;
+        if (!isPyFile) return false;
+        if (/^__all__\s*=/.test(l)) return true;
+        if (/^from\s+\S+\s+import\s+\*/.test(l)) return true;
+        if (/^from\s+\S+\s+import\s+.*\bas\b/.test(l)) return true;
+        return hasPyAll && /^from\s+\./.test(l);
+    }).length;
     if (
         nonEmpty.length >= 1 &&
         reexportCount / nonEmpty.length >= 0.7 &&
@@ -983,35 +1067,43 @@ export function detectCircularDeps(graphOrAdj, zoneMap = null, fileFilter = null
 }
 
 /**
- * Detect reciprocal directory cycles (`directory_cycles`), skipping `e.typeOnly === true` edges.
+ * Detect circular directory cycles (`directory_cycles`) including 3+ node cycles via Tarjan SCC,
+ * skipping `e.typeOnly === true` edges.
  */
 export function detectDirectoryCycles(graphOrAdj, zoneMap = null, fileFilter = null) {
     const adj =
         graphOrAdj instanceof Map
             ? graphOrAdj
             : buildRuntimeScoredFileAdj(graphOrAdj, zoneMap, fileFilter);
-    const dirEdges = new Map();
+    const dirAdj = new Map();
+    const dirEdgeCounts = new Map();
     for (const [srcFile, targets] of adj.entries()) {
         const srcDir = dirname(srcFile);
         if (srcDir === ".") continue;
+        if (!dirAdj.has(srcDir)) dirAdj.set(srcDir, new Set());
         for (const tgtFile of targets) {
             const tgtDir = dirname(tgtFile);
             if (tgtDir === "." || tgtDir === srcDir) continue;
+            dirAdj.get(srcDir).add(tgtDir);
+            if (!dirAdj.has(tgtDir)) dirAdj.set(tgtDir, new Set());
             const key = `${srcDir} -> ${tgtDir}`;
-            dirEdges.set(key, (dirEdges.get(key) || 0) + 1);
+            dirEdgeCounts.set(key, (dirEdgeCounts.get(key) || 0) + 1);
         }
     }
+
+    const dirAdjArr = new Map();
+    for (const [d, set] of dirAdj.entries()) {
+        dirAdjArr.set(d, [...set].sort());
+    }
+    const sccs = findStronglyConnectedComponents(dirAdjArr);
     const out = [];
-    const seenDirPairs = new Set();
-    for (const [key, abCount] of dirEdges.entries()) {
-        const [dirA, dirB] = key.split(" -> ");
-        const pairKey = [dirA, dirB].sort().join("<->");
-        if (seenDirPairs.has(pairKey)) continue;
-        const baCount = dirEdges.get(`${dirB} -> ${dirA}`) || 0;
-        if (baCount > 0) {
-            seenDirPairs.add(pairKey);
+    for (const comp of sccs) {
+        if (comp.length === 2) {
+            const [dirA, dirB] = comp;
+            const abCount = dirEdgeCounts.get(`${dirA} -> ${dirB}`) || 0;
+            const baCount = dirEdgeCounts.get(`${dirB} -> ${dirA}`) || 0;
             out.push({
-                id: mintIssueId("directory_cycles", dirA, basename(dirB)),
+                id: mintIssueId("directory_cycles", dirA, dirB),
                 detector: "directory_cycles",
                 category: "coupling",
                 dimension: "security",
@@ -1023,8 +1115,29 @@ export function detectDirectoryCycles(graphOrAdj, zoneMap = null, fileFilter = n
                 end_line: 1,
                 span: "L1-L1",
                 identifier: `${dirA} <-> ${dirB}`,
+                cycle: comp,
                 summary: `Reciprocal directory coupling between \`${dirA}\` (${abCount} edges) and \`${dirB}\` (${baCount} edges).`,
                 suggestion: `Establish a one-way layering direction between \`${dirA}\` and \`${dirB}\` or move shared contracts into a common lower-level directory.`,
+            });
+        } else if (comp.length >= 3) {
+            const dirA = comp[0];
+            const cycleChain = [...comp, dirA].join(" → ");
+            out.push({
+                id: mintIssueId("directory_cycles", dirA, comp.slice(1).join("->")),
+                detector: "directory_cycles",
+                category: "coupling",
+                dimension: "security",
+                tier: "T4",
+                confidence: "high",
+                severity: "high",
+                file: dirA,
+                line: 1,
+                end_line: 1,
+                span: "L1-L1",
+                identifier: `${comp.length}-dir cycle`,
+                cycle: comp,
+                summary: `Circular directory dependency cycle (${comp.length} directories): ${cycleChain}.`,
+                suggestion: `Establish a DAG layering order across ${comp.join(", ")} by extracting shared contracts into a lower-level directory.`,
             });
         }
     }
@@ -1062,7 +1175,7 @@ function checkImportAffinityIssues(scoredFileAdj, fileImportIn, zoneMap, potenti
             const ratio = count / allPeers.length;
             if (ratio >= 0.7 && count >= 4) {
                 issues.push({
-                    id: mintIssueId("import_affinity_outliers", filePath, basename(peerDir)),
+                    id: mintIssueId("import_affinity_outliers", filePath, peerDir),
                     detector: "import_affinity_outliers",
                     category: "coupling",
                     dimension: "code_quality",
@@ -1230,7 +1343,7 @@ function collectPrivateAccessIssuesForSymbol(fNode, targetDir, sym, ctx, zoneMap
         seenPrivatePairs.add(pairKey);
         const callerRange = spanRange(callerNode.span) || { start: 1, end: 1 };
         issues.push({
-            id: mintIssueId("private_imports", callerNode.path, `${name}_from_${basename(fNode.path)}`),
+            id: mintIssueId("private_imports", callerNode.path, `${name}_from_${fNode.path}`),
             detector: "private_imports",
             category: "coupling",
             dimension: "code_quality",
@@ -1984,7 +2097,7 @@ function evaluateEdgeLayerViolations(srcFile, tgtFile, srcCustom, srcRoblox, src
         const tgtCustom = matchConfiguredLayerIndex(tgtFile, configuredLayers);
         if (tgtCustom && srcCustom.index < tgtCustom.index) {
             issues.push({
-                id: mintIssueId("layer_violation", srcFile, `${srcCustom.prefix}_to_${tgtCustom.prefix}_${basename(tgtFile)}`),
+                id: mintIssueId("layer_violation", srcFile, `${srcCustom.prefix}_to_${tgtCustom.prefix}_${tgtFile}`),
                 detector: "layer_violation",
                 category: "coupling",
                 dimension: "security",
@@ -2009,7 +2122,7 @@ function evaluateEdgeLayerViolations(srcFile, tgtFile, srcCustom, srcRoblox, src
             (srcRoblox === "server" && tgtRoblox === "client");
         if (illegalRoblox) {
             issues.push({
-                id: mintIssueId("layer_violation", srcFile, `roblox_${srcRoblox}_to_${tgtRoblox}_${basename(tgtFile)}`),
+                id: mintIssueId("layer_violation", srcFile, `roblox_${srcRoblox}_to_${tgtRoblox}_${tgtFile}`),
                 detector: "layer_violation",
                 category: "coupling",
                 dimension: "security",
@@ -2030,7 +2143,7 @@ function evaluateEdgeLayerViolations(srcFile, tgtFile, srcCustom, srcRoblox, src
     const tgtConv = classifyConventionalLayer(tgtFile);
     if (srcConv && tgtConv && srcConv.rank < tgtConv.rank) {
         issues.push({
-            id: mintIssueId("layer_violation", srcFile, `leaf_to_top_${basename(tgtFile)}`),
+            id: mintIssueId("layer_violation", srcFile, `leaf_to_top_${tgtFile}`),
             detector: "layer_violation",
             category: "coupling",
             dimension: "security",
@@ -2098,7 +2211,7 @@ function recordMatchingLayerRuleIssues(edge, sNode, srcPath, tgtPath, compiledRu
         const range = spanRange(sNode?.span) || { start: edge.line || 1, end: edge.line || 1 };
         const ln = edge.line || range.start || 1;
         out.push({
-            id: mintIssueId("layer_violation", srcPath, `${rule.from}_to_${rule.to}_${basename(tgtPath)}`),
+            id: mintIssueId("layer_violation", srcPath, `${rule.from}_to_${rule.to}_${tgtPath}`),
             detector: "layer_violation",
             category: "coupling",
             dimension: "security",
@@ -2121,11 +2234,11 @@ function recordMatchingLayerRuleIssues(edge, sNode, srcPath, tgtPath, compiledRu
  * Evaluate explicit glob `config.layer_rules` (`{ from, to, allowTypeOnly, reason }`)
  * and inline `forbid: <from> -> <to>` entries in `plan?.policies` across `graph.edges`.
  */
-export function detectLayerViolations(rawGraph, zoneMap = null, config = null, fileFilter = null, plan = null) {
+export function detectLayerViolations(rawGraph, zoneMap = null, config = null, fileFilter = null, plan = null, sharedNodeById = null) {
     const graph = normalizeGraphShape(rawGraph);
     const compiledRules = compileLayerRuleSpecs(config, plan);
     if (compiledRules.length === 0) return [];
-    const nodeById = new Map((graph?.nodes || []).map((n) => [n.id, n]));
+    const nodeById = sharedNodeById || new Map((graph?.nodes || []).map((n) => [n.id, n]));
     const out = [];
     const seenViolations = new Set();
     for (const edge of graph?.edges || []) {
@@ -2141,8 +2254,8 @@ export function detectLayerViolations(rawGraph, zoneMap = null, config = null, f
     return out;
 }
 
-function buildProdAndStaticPairIndex(graph, zoneMap) {
-    const byId = new Map((graph?.nodes || []).map((n) => [n.id, n]));
+function buildProdAndStaticPairIndex(graph, zoneMap, sharedNodeById = null) {
+    const byId = sharedNodeById || new Map((graph?.nodes || []).map((n) => [n.id, n]));
     const prodFiles = new Set();
     for (const n of graph?.nodes || []) {
         if (n.kind === "file" && SCORED_ZONES.has(resolveZone(zoneMap, n.path))) {
@@ -2174,7 +2287,7 @@ function recordPartnerTemporalCoupling(srcFile, partners, prodFiles, staticPairs
         seenPairs.add(pairKey);
         if (!matchesFileFilter(fileFilter, fileA) && !matchesFileFilter(fileFilter, fileB)) continue;
         out.push({
-            id: mintIssueId("temporal_coupling", fileA, basename(fileB)),
+            id: mintIssueId("temporal_coupling", fileA, fileB),
             detector: "temporal_coupling",
             category: "coupling",
             dimension: "code_quality",
@@ -2206,12 +2319,13 @@ export function detectTemporalCoupling(
     zoneMap = null,
     config = null,
     fileFilter = null,
+    opts = null,
 ) {
     if (!rootDir) return [];
     const graph = normalizeGraphShape(rawGraph);
-    const history = config?.gitHistory || analyzeGitHistory(rootDir, contextDir);
+    const history = opts?.gitHistory || config?.gitHistory || analyzeGitHistory(rootDir, contextDir);
     if (!history || !history.coChanges) return [];
-    const { prodFiles, staticPairs } = buildProdAndStaticPairIndex(graph, zoneMap);
+    const { prodFiles, staticPairs } = buildProdAndStaticPairIndex(graph, zoneMap, opts?.nodeById || null);
     const out = [];
     const seenPairs = new Set();
     for (const [rawSrc, partners] of Object.entries(history.coChanges)) {
@@ -2226,8 +2340,9 @@ export function detectTemporalCoupling(
 function computeTransitiveReach(startFile, runtimeAdj) {
     const visited = new Set([startFile]);
     const queue = [startFile];
-    while (queue.length > 0) {
-        const cur = queue.shift();
+    let head = 0;
+    while (head < queue.length) {
+        const cur = queue[head++];
         for (const nxt of runtimeAdj.get(cur) || []) {
             if (!visited.has(nxt)) {
                 visited.add(nxt);
@@ -2348,7 +2463,7 @@ function evaluateDirZoneOfPain(dir, dirFiles, ctx, scoredFileAdj, readLines, zon
     if (m.ca + m.ce === 0) return;
     if (m.ca >= 5 && m.instability <= 0.25 && m.abstractness <= 0.1 && m.distance >= 0.78 && m.internalEdges === 0) {
         issues.push({
-            id: mintIssueId("package_census", repFile, `zone_of_pain_${basename(dir)}`),
+            id: mintIssueId("package_census", repFile, `zone_of_pain_${dir}`),
             detector: "package_census",
             category: "coupling",
             dimension: "file_health",
@@ -2437,10 +2552,9 @@ function buildHotspotIssueForFile(fNode, fileStats, totalRepoCommits, ctx, readL
  */
 function checkHotspotIssues(graph, ctx, readLines, zoneMap, ignoreRules, config, opts, potentials, issues) {
     const history =
+        opts?.gitHistory ||
         config?.gitHistory ||
         (opts?.rootDir ? analyzeGitHistory(opts.rootDir, opts.contextDir || null) : null);
-    if (config && history && !config.gitHistory)
-        config.gitHistory = history;
     const fileStats = history?.files;
     if (!fileStats || typeof fileStats !== "object")
         return;
@@ -2589,6 +2703,7 @@ function runCouplingAndLayerGraphChecks(
         config,
         opts.fileFilter || null,
         opts.plan || null,
+        ctx.nodeById,
     ).filter((iss) => !ignoreRules.isIgnored(iss.file, "layer_violation"));
     const existingIds = new Set(issues.map((i) => i.id));
     for (const lv of explicitLayerViolations) {
@@ -2600,7 +2715,11 @@ function runCouplingAndLayerGraphChecks(
 
     if (wantCoupling) {
         potentials.temporal_coupling = Math.max(1, scoredFileAdj.size);
-        if (opts.rootDir) {
+        const wantTemporal =
+            !opts.detectorFilter ||
+            opts.detectorFilter.has("temporal_coupling") ||
+            opts.detectorFilter.has("coupling");
+        if (opts.rootDir && wantTemporal) {
             const tempIssues = detectTemporalCoupling(
                 graph,
                 opts.rootDir,
@@ -2608,6 +2727,7 @@ function runCouplingAndLayerGraphChecks(
                 zoneMap,
                 config,
                 opts.fileFilter || null,
+                { gitHistory: opts.gitHistory || null, nodeById: ctx.nodeById },
             ).filter((iss) => !ignoreRules.isIgnored(iss.file, "coupling"));
             issues.push(...tempIssues);
         }
@@ -2669,13 +2789,16 @@ export function runGraphChecks(
         hollow_tests: 0,
     };
 
-    const ctx = buildGraphCheckTopology(graph);
+    const normGraph = normalizeGraphShape(graph);
+    const ctx = buildGraphCheckTopology(normGraph);
     const wantDead = enabledCategories.has("dead");
     const wantCoupling = enabledCategories.has("coupling");
     const wantCohesion = enabledCategories.has("cohesion");
     const wantTests = enabledCategories.has("tests");
     const wantSecurity = enabledCategories.has("security");
     const wantTraps = enabledCategories.has("traps");
+    const detFilter = opts.detectorFilter || null;
+    const wantsDet = (name, cat) => !detFilter || detFilter.size === 0 || detFilter.has(name) || detFilter.has(cat);
 
     if (wantDead) {
         checkDeadAndWrapperIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues, opts.rootDir || null);
@@ -2683,7 +2806,7 @@ export function runGraphChecks(
 
     if (wantCoupling || wantSecurity) {
         runCouplingAndLayerGraphChecks(
-            graph,
+            normGraph,
             ctx,
             readLines,
             zoneMap,
@@ -2697,17 +2820,29 @@ export function runGraphChecks(
     }
 
     if (wantCohesion) {
-        checkMonsterAndClassCohesionIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
-        checkSignatureVarianceIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
-        checkHotspotIssues(graph, ctx, readLines, zoneMap, ignoreRules, config, opts, potentials, issues);
+        if (
+            wantsDet("low_cohesion_files", "cohesion") ||
+            wantsDet("god_classes", "cohesion") ||
+            wantsDet("delegation_heavy_classes", "cohesion") ||
+            wantsDet("monster_functions", "cohesion") ||
+            wantsDet("hotspots", "cohesion")
+        ) {
+            checkMonsterAndClassCohesionIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
+        }
+        if (wantsDet("signature_variance", "cohesion")) {
+            checkSignatureVarianceIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
+        }
+        if (wantsDet("hotspots", "cohesion")) {
+            checkHotspotIssues(normGraph, ctx, readLines, zoneMap, ignoreRules, config, opts, potentials, issues);
+        }
     }
 
-    if (wantTraps) {
+    if (wantTraps && wantsDet("deceptive_queries", "traps")) {
         checkDeceptiveQueryIssues(ctx, readLines, zoneMap, ignoreRules, potentials, issues);
     }
 
-    if (wantTests) {
-        checkTestHealthIssues(graph, ctx, readLines, zoneMap, ignoreRules, config, potentials, issues);
+    if (wantTests && (wantsDet("untested_hubs", "tests") || wantsDet("hollow_tests", "tests"))) {
+        checkTestHealthIssues(normGraph, ctx, readLines, zoneMap, ignoreRules, config, potentials, issues);
     }
 
     return { issues, potentials };

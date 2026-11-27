@@ -6,12 +6,13 @@ import { changedFiles } from "../blast/diff.js";
 import { analyzeGitHistory } from "../blast/history.js";
 import { contextDirFor } from "../context/node-file.js";
 import { loadGraphCached } from "../context/graph-store.js";
-import { fileReader } from "../util/span.js";
+import { fileReader, fmtLine } from "../util/span.js";
 import { moveFileOrDir, runAutofix, warmAutofixGrammars } from "./autofix.js";
 import { generateConcerns } from "./concerns.js";
 import {
     ALL_CATEGORIES,
     AVAILABLE_DIRECTIVE_PHASES,
+    DETECTOR_CATEGORY,
     MECHANICAL_DIMENSIONS,
     SUBJECTIVE_DIMENSIONS,
     buildAgentLoopPrompt,
@@ -79,6 +80,7 @@ import {
     VALID_ZONES,
     classifyZone,
     createSuppressionLedger,
+    createZoneClassifier,
     loadIgnoreRules,
 } from "./zones.js";
 
@@ -124,10 +126,24 @@ function parseCategorySet(onlyOpt, skipOpt) {
 
 export function buildZoneMap(graph, config, rootDir = null) {
     const map = new Map();
-    const overrides = config?.zones || {};
+    const zoneOverrides = config?.zones || {};
+    const classify = createZoneClassifier(zoneOverrides, rootDir);
     for (const node of graph.nodes) {
         if (node.kind === "file") {
-            map.set(node.path, classifyZone(node.path, overrides, rootDir));
+            let zone = classify(node.path);
+            if (zone === "production" && node.dependency === true) {
+                const norm = String(node.path || "").replace(/\\/g, "/").replace(/^\.\//, "");
+                const hasExplicitOverride = Boolean(
+                    zoneOverrides[norm] ||
+                    Object.keys(zoneOverrides).some((p) => {
+                        const clean = p.replace(/\\/g, "/").replace(/\/+$/, "");
+                        return norm === clean || norm.startsWith(`${clean}/`);
+                    }),
+                );
+                if (!hasExplicitOverride)
+                    zone = "vendor";
+            }
+            map.set(node.path, zone);
         }
     }
     return map;
@@ -217,25 +233,80 @@ function issueMatchesMechanicalScope(iss, { detectorFilter, inPrefixes, diffFile
     return true;
 }
 
+const GIT_HISTORY_DETECTORS = new Set(["duplicates", "temporal_coupling", "hotspots"]);
+
+function narrowCategoriesForDetectorFilter(enabledCategories, detectorFilter, hasExplicitOnly) {
+    if (hasExplicitOnly || !detectorFilter || detectorFilter.size === 0) return enabledCategories;
+    const narrowed = new Set();
+    for (const raw of detectorFilter) {
+        const norm = raw.replace(/-/g, "_");
+        if (DETECTOR_CATEGORY[norm]) narrowed.add(DETECTOR_CATEGORY[norm]);
+        else if (enabledCategories.has(norm)) narrowed.add(norm);
+    }
+    if (narrowed.size === 0) return enabledCategories;
+    for (const cat of [...enabledCategories]) {
+        if (!narrowed.has(cat)) enabledCategories.delete(cat);
+    }
+    return enabledCategories;
+}
+
+function shouldComputeGitHistory(enabledCategories, detectorFilter) {
+    if (detectorFilter && detectorFilter.size > 0) {
+        for (const raw of detectorFilter) {
+            const norm = raw.replace(/-/g, "_");
+            if (GIT_HISTORY_DETECTORS.has(norm) || norm === "coupling" || norm === "cohesion" || norm === "duplicates") {
+                return true;
+            }
+        }
+        return false;
+    }
+    return (
+        enabledCategories.has("duplicates") ||
+        enabledCategories.has("coupling") ||
+        enabledCategories.has("cohesion")
+    );
+}
+
 export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
-    const enabledCategories = parseCategorySet(opts.only, opts.skip);
-    const zoneMap = buildZoneMap(graph, config, rootDir);
+    const scope = buildMechanicalScopeFilter(rootDir, opts);
+    const enabledCategories = narrowCategoriesForDetectorFilter(
+        parseCategorySet(opts.only, opts.skip),
+        scope.detectorFilter,
+        Boolean(opts.only),
+    );
+    const zoneMap = opts.zoneMap || buildZoneMap(graph, config, rootDir);
     const suppressionLedger = opts.suppressionLedger || createSuppressionLedger();
     const ignoreRules = loadIgnoreRules(rootDir, config?.excludes || [], suppressionLedger);
     const readLines = createTrackedLineReader(rootDir, suppressionLedger);
-    const gitHistory =
-        config?.gitHistory ||
-        (rootDir ? analyzeGitHistory(rootDir, opts.contextDir || null) : null);
-    if (config && gitHistory && !config.gitHistory) {
-        config.gitHistory = gitHistory;
+
+    if (scope.diffFileSet && scope.diffFileSet.size === 0) {
+        return {
+            issues: [],
+            potentials: {},
+            zoneMap,
+            ignoreRules,
+            readLines,
+            suppressionLedger,
+            scannedCategories: enabledCategories,
+            scannedDetectors: scope.detectorFilter,
+            fileFilter: scope.fileFilter,
+        };
     }
 
-    const scope = buildMechanicalScopeFilter(rootDir, opts);
+    const gitHistory =
+        opts.gitHistory ||
+        (rootDir && shouldComputeGitHistory(enabledCategories, scope.detectorFilter)
+            ? analyzeGitHistory(rootDir, opts.contextDir || null)
+            : null);
+
     const allIssues = [];
     const potentials = {};
 
-    if (enabledCategories.has("duplicates")) {
-        const dupRes = detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHistory);
+    const wantDuplicates =
+        enabledCategories.has("duplicates") &&
+        (!scope.detectorFilter || scope.detectorFilter.has("duplicates"));
+    if (wantDuplicates) {
+        const dupRes = detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHistory, scope.fileFilter);
         allIssues.push(...dupRes.issues);
         potentials.duplicates = dupRes.potential;
     }
@@ -245,13 +316,23 @@ export function runMechanicalDetectors(graph, rootDir, config, opts = {}) {
         contextDir: opts.contextDir || null,
         plan: opts.plan || null,
         fileFilter: scope.fileFilter,
+        detectorFilter: scope.detectorFilter,
+        gitHistory,
     });
     allIssues.push(...graphRes.issues);
     Object.assign(potentials, graphRes.potentials);
 
     if (scope.fileFilter) scaleScopedPotentials(graph, zoneMap, scope.fileFilter, potentials);
 
-    const srcRes = runSourceChecks(graph, readLines, zoneMap, ignoreRules, enabledCategories, scope.fileFilter);
+    const srcRes = runSourceChecks(
+        graph,
+        readLines,
+        zoneMap,
+        ignoreRules,
+        enabledCategories,
+        scope.fileFilter,
+        scope.detectorFilter,
+    );
     allIssues.push(...srcRes.issues);
     Object.assign(potentials, srcRes.potentials);
 
@@ -589,8 +670,9 @@ function handleHealthPlanAction(root, contextDir, state, plan, config, totalProd
     if (sub === "commit-log") {
         return handlePlanCommitLogSubAction(root, contextDir, state, plan, config, opts);
     }
-    const queue = buildExecutionQueue(state, plan, { count: opts.count || 15, totalProdFiles });
-    return { action: "plan", plan, queue, scores: computeScoreSnapshot(state) };
+    const scores = computeScoreSnapshot(state);
+    const queue = buildExecutionQueue(state, plan, { count: opts.count || 15, totalProdFiles, scores });
+    return { action: "plan", plan, queue, scores };
 }
 
 function buildShowDimensionResponse(state, firstPat, lowerPat, opts) {
@@ -651,7 +733,7 @@ function enrichShowItemsWithCode(items, readLines) {
         const sLine = Math.max(1, (iss.line || 1) - 1);
         const eLine = Math.min(fLines.length, (iss.end_line || iss.line || 1) + 2);
         const excerpt = [];
-        for (let ln = sLine; ln <= eLine; ln++) excerpt.push(`L${ln}: ${fLines[ln - 1]}`);
+        for (let ln = sLine; ln <= eLine; ln++) excerpt.push(fmtLine(ln, fLines[ln - 1]));
         return { ...iss, code_excerpt: excerpt.join("\n") };
     });
 }
@@ -899,6 +981,7 @@ function runHealthScanAction(root, contextDir, graph, config, state, plan, total
         explain: opts.explain,
         includeSkipped: opts.includeSkipped,
         totalProdFiles,
+        scores,
     });
     const headline = computeHeadline(activeState, scores, plan, config);
     const reminders = computeReminders(activeState, scores, plan, config, "scan", totalProdFiles, {
@@ -931,7 +1014,7 @@ function runHealthScanAction(root, contextDir, graph, config, state, plan, total
     return scanResult;
 }
 
-function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config, state, plan, totalProdFiles, opts) {
+function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config, state, plan, totalProdFiles, opts, zoneMap = null) {
     ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, true);
     const isBacklog = action === "backlog";
     const scores = computeScoreSnapshot(state);
@@ -943,18 +1026,29 @@ function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config
         explain: opts.explain,
         includeSkipped: opts.includeSkipped,
         totalProdFiles,
+        scores,
     });
-    const zoneMap = buildZoneMap(graph, config, root);
-    const fileAdj = buildUndirectedFileAdjacency(graph, zoneMap);
-    const lanes = computeWorkLanes(queue.all_items || [], fileAdj, opts);
-    queue.fixer_leverage = lanes.fixer_leverage || computeFixerLeverage(queue.all_items || []);
-    if (opts.lanes) {
-        queue.lanes = lanes;
+
+    let lanes = null;
+    const needReminderLanes =
+        action === "next" &&
+        (queue.all_items || []).length >= 2 &&
+        Number(state.reminder_history?.parallel_lanes_available || 0) < 3;
+    if (opts.lanes || needReminderLanes) {
+        const resolvedZoneMap = zoneMap || buildZoneMap(graph, config, root);
+        const fileAdj = buildUndirectedFileAdjacency(graph, resolvedZoneMap);
+        lanes = computeWorkLanes(queue.all_items || [], fileAdj, opts);
+        queue.fixer_leverage = lanes.fixer_leverage || computeFixerLeverage(queue.all_items || []);
+        if (opts.lanes) {
+            queue.lanes = lanes;
+        }
+    } else {
+        queue.fixer_leverage = computeFixerLeverage(queue.all_items || []);
     }
 
     const shouldPersistReminders = action === "next" && !opts.readOnly;
     const reminders = computeReminders(state, scores, plan, config, action, totalProdFiles, {
-        laneCount: lanes.lane_count,
+        laneCount: lanes ? lanes.lane_count : 0,
         persistReminders: shouldPersistReminders,
     });
     if (shouldPersistReminders) {
@@ -967,7 +1061,7 @@ function handleHealthQueueOrStatusAction(action, graph, root, contextDir, config
         scores,
         headline: computeHeadline(state, scores, plan, config),
         queue,
-        ...(opts.lanes || action === "status" ? { lanes, work_lanes: lanes } : {}),
+        ...(opts.lanes && lanes ? { work_lanes: lanes } : {}),
         reminders,
     };
     if (action === "status") {
@@ -1073,6 +1167,7 @@ function handleHealthToolAction(
             ...opts,
             contextDir,
             plan,
+            zoneMap,
             detector: detName === "all" ? null : detName,
         });
         return {
@@ -1084,11 +1179,11 @@ function handleHealthToolAction(
         };
     }
     if (action === "tree") {
-        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, false);
+        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, { ...opts, zoneMap }, false);
         return { action: "tree", tree_text: generateHealthTreeText(graph, state, zoneMap, readLines, opts) };
     }
     if (action === "viz") {
-        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, opts, false);
+        ensureInitialHealthScan(graph, root, contextDir, config, state, plan, { ...opts, zoneMap }, false);
         return {
             action: "viz",
             ...generateHealthTreemapHtml(contextDir, graph, state, zoneMap, readLines, { ...opts, rootDir: root }),
@@ -1157,15 +1252,10 @@ export function health(dir, opts = {}) {
     if (action === "plan") return handleHealthPlanAction(root, contextDir, state, plan, config, totalProdFiles, opts);
     if (action === "show") return handleHealthShowAction(graph, state, config, zoneMap, readLines, opts);
     if (action === "next" || action === "backlog" || action === "status") {
-        return handleHealthQueueOrStatusAction(action, graph, root, contextDir, config, state, plan, totalProdFiles, opts);
+        return handleHealthQueueOrStatusAction(action, graph, root, contextDir, config, state, plan, totalProdFiles, opts, zoneMap);
     }
 
-    if (action === "scan" || !opts.action) {
-        const filePaths = graph.nodes.filter((n) => n.kind === "file" && n.path).map((n) => n.path);
-        void warmAutofixGrammars(filePaths).catch(() => null);
-    }
-
-    return runHealthScanAction(root, contextDir, graph, config, state, plan, totalProdFiles, opts);
+    return runHealthScanAction(root, contextDir, graph, config, state, plan, totalProdFiles, { ...opts, zoneMap });
 }
 
 export async function healthAsync(dir, opts = {}) {

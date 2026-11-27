@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { basename, delimiter, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { computeStats, readStats, readWiring } from '../../src/util/state.js';
@@ -7,6 +7,8 @@ import { isWithinRoot, tryRealpath } from '../../src/util/fs.js';
 import { contextDirFor, fileUriToPath } from '../../src/util/paths.js';
 import {
     buildVizHealthPayload,
+    getCachedCodeGraphPayload,
+    getCachedTreemapPayload,
     readJailedSourceExcerpt,
     renderHealthTreemapHtml,
 } from '../../src/viz/serve.js';
@@ -18,17 +20,39 @@ import { buildAgyContextGraph, computeSidecarRev } from '../../src/agy/context-g
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const VIEWER_DIR = resolve(PACKAGE_ROOT, 'src', 'viewer');
 
-function parseEnvWorkspacePaths(env = {}) {
+export function parseEnvWorkspacePaths(env = {}) {
     const out = [];
+    const seen = new Set();
+    const pushUnique = (rawPath) => {
+        const trimmed = String(rawPath ?? '').trim();
+        if (!trimmed || seen.has(trimmed)) return;
+        seen.add(trimmed);
+        out.push(trimmed);
+    };
     const rawMulti = env?.ANTIGRAVITY_WORKSPACE_PATHS;
-    if (rawMulti) {
-        for (const part of rawMulti.split(delimiter).concat(rawMulti.split(','))) {
-            const trimmed = part.trim();
-            if (trimmed) out.push(trimmed);
+    if (typeof rawMulti === 'string' && rawMulti.trim()) {
+        const trimmed = rawMulti.trim();
+        let parsedJson = false;
+        if (trimmed.startsWith('[')) {
+            try {
+                const arr = JSON.parse(trimmed);
+                if (Array.isArray(arr)) {
+                    for (const item of arr) {
+                        if (typeof item === 'string') pushUnique(item);
+                    }
+                    parsedJson = true;
+                }
+            } catch { /* fall back to delimiter split */ }
+        }
+        if (!parsedJson) {
+            const splitRe = delimiter === ':' ? /[,\n]|(?<!\bfile):(?!\/\/)/ : /[,\n;]/;
+            for (const part of trimmed.split(splitRe)) {
+                pushUnique(part);
+            }
         }
     }
     if (env?.ANTIGRAVITY_PROJECT_DIR)
-        out.push(env.ANTIGRAVITY_PROJECT_DIR);
+        pushUnique(env.ANTIGRAVITY_PROJECT_DIR);
     return out;
 }
 
@@ -124,28 +148,52 @@ function injectPreloadScript(html) {
     return `<script src="/preload.js"></script>\n${html}`;
 }
 
+function resolveScopedRepoRoot(realReq, matchingRoot) {
+    let start = realReq;
+    try {
+        if (existsSync(realReq) && !statSync(realReq).isDirectory()) {
+            start = dirname(realReq);
+        }
+    } catch { /* ignore */ }
+    let cur = start;
+    while (isWithinRoot(cur, matchingRoot)) {
+        if (hasPlexerIndex(cur)) return cur;
+        if (cur === matchingRoot) break;
+        const up = dirname(cur);
+        if (up === cur) break;
+        cur = up;
+    }
+    const nearest = tryRealpath(nearestPlexerRoot(start).root);
+    if (isWithinRoot(nearest, matchingRoot)) return nearest;
+    return matchingRoot;
+}
+
 function authorizeSidecarRepo(data, { allowedRoots, strictWs, hostEnv, envSid, sid }) {
     const hasExplicitScope = strictWs || Array.isArray(allowedRoots);
-    const roots = Array.isArray(allowedRoots)
-        ? allowedRoots.map(fileUriToPath).filter(Boolean).map(tryRealpath)
+    const rawRoots = Array.isArray(allowedRoots)
+        ? allowedRoots.map(fileUriToPath).filter(Boolean)
         : collectActiveWorkspaceRoots({ sessionId: sid, env: hostEnv });
+    const roots = [...new Set(rawRoots.map((r) => tryRealpath(resolve(r))))];
     if (strictWs && !Array.isArray(allowedRoots) && roots.length === 0) {
         const startup = resolveSidecarRepo(null, envSid, null);
-        if (startup) roots.push(startup);
+        if (startup) roots.push(tryRealpath(resolve(startup)));
     }
     if (data?.ws && (hasExplicitScope || roots.length > 0)) {
         const requested = fileUriToPath(data.ws);
         if (!requested) return { ok: false };
-        const resolvedReq = nearestPlexerRoot(resolve(requested)).root;
-        return roots.some((root) => isWithinRoot(resolvedReq, root)) ? { ok: true, repo: resolvedReq } : { ok: false };
+        const realReq = tryRealpath(resolve(requested));
+        const matchingRoot = roots.find((root) => isWithinRoot(realReq, root));
+        if (!matchingRoot) return { ok: false };
+        return { ok: true, repo: resolveScopedRepoRoot(realReq, matchingRoot) };
     }
     if (hasExplicitScope) {
         if (roots.length === 0) return { ok: false };
-        const candidate = resolveSidecarRepo(null, envSid, null);
-        return { ok: true, repo: roots.some((root) => isWithinRoot(candidate, root)) ? candidate : roots[0] };
+        const candidate = tryRealpath(resolveSidecarRepo(null, envSid, null));
+        const matchingRoot = roots.find((root) => isWithinRoot(candidate, root));
+        return { ok: true, repo: matchingRoot ? resolveScopedRepoRoot(candidate, matchingRoot) : roots[0] };
     }
     const fallback = resolveSidecarRepo(data?.ws, sid, data?.fallback_ws);
-    if (roots.length > 0 && !roots.some((root) => isWithinRoot(fallback, root))) {
+    if (roots.length > 0 && !roots.some((root) => isWithinRoot(tryRealpath(fallback), root))) {
         return { ok: true, repo: roots[0] };
     }
     return { ok: true, repo: fallback };
@@ -212,7 +260,19 @@ export function createSidecarHandlers({
             '/api/code-graph': (data) => {
                 const auth = authorizeRepoOf(data);
                 if (!auth.ok) return forbiddenResponse();
-                return loadGraphCached(contextDirFor(auth.repo)) ?? { nodes: [], edges: [] };
+                const cached = getCachedCodeGraphPayload(contextDirFor(auth.repo));
+                if (!cached) {
+                    return makeResponse(ResponseClass, JSON.stringify({ nodes: [], edges: [] }), {
+                        contentType: 'application/json; charset=utf-8',
+                        status: 200,
+                        headers: { 'cache-control': 'no-cache' },
+                    });
+                }
+                return makeResponse(ResponseClass, cached.json, {
+                    contentType: 'application/json; charset=utf-8',
+                    status: 200,
+                    headers: { etag: cached.etag, 'cache-control': 'no-cache' },
+                });
             },
             '/api/context-graph': (data) => {
                 const auth = authorizeRepoOf(data);
@@ -241,18 +301,20 @@ export function createSidecarHandlers({
             '/api/treemap': (data) => {
                 const auth = authorizeRepoOf(data);
                 if (!auth.ok) return forbiddenResponse();
-                const html = hasPlexerIndex(auth.repo) ? renderHealthTreemapHtml(auth.repo, contextDirFor(auth.repo)) : null;
-                if (!html) {
+                const cached = hasPlexerIndex(auth.repo) ? getCachedTreemapPayload(auth.repo, contextDirFor(auth.repo)) : null;
+                if (!cached?.html) {
                     return makeResponse(
                         ResponseClass,
                         'treemap unavailable — build index first',
                         { contentType: 'text/plain; charset=utf-8', status: 404 },
                     );
                 }
-                return makeResponse(ResponseClass, html, {
+                return makeResponse(ResponseClass, cached.html, {
                     contentType: 'text/html; charset=utf-8',
                     status: 200,
                     headers: {
+                        etag: cached.etag,
+                        'cache-control': 'no-cache',
                         'x-frame-options': 'SAMEORIGIN',
                         'content-security-policy':
                             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'self'",
@@ -263,37 +325,70 @@ export function createSidecarHandlers({
     };
 }
 
+export function attachDaemonShutdownHooks(daemon, proc = process) {
+    if (!daemon || daemon.alreadyRunning) return async () => {};
+    let closedAsync = false;
+    const cleanupSync = () => {
+        if (daemon.socketPath && process.platform !== 'win32' && !daemon.socketPath.startsWith('\\\\.\\pipe\\')) {
+            try { rmSync(daemon.socketPath, { force: true }); } catch { /* ignore */ }
+        }
+    };
+    const cleanupAsync = async () => {
+        if (!closedAsync) {
+            closedAsync = true;
+            try { await daemon.close?.(); } catch { /* ignore */ }
+        }
+        cleanupSync();
+    };
+    const onSignal = (sig) => {
+        void cleanupAsync().finally(() => {
+            proc.exit?.(sig === 'SIGINT' ? 130 : 143);
+        });
+    };
+    proc.once('SIGINT', onSignal);
+    proc.once('SIGTERM', onSignal);
+    proc.once('exit', cleanupSync);
+    return cleanupAsync;
+}
+
 async function runMain() {
     const { startDaemon } = await import('../../src/daemon/plexerd.js');
     if (process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
-        await startDaemon({ persistent: true });
-        const { SidecarApp, Response } = await import('sidecar_sdk');
-        const app = new SidecarApp();
-        const startupRoots = collectActiveWorkspaceRoots({
-            sessionId: process.env.ANTIGRAVITY_CONVERSATION_ID || '',
-            env: process.env,
-        });
-        if (startupRoots.length === 0) {
-            const fallbackRepo = resolveSidecarRepo(null, process.env.ANTIGRAVITY_CONVERSATION_ID || '');
-            if (fallbackRepo) startupRoots.push(fallbackRepo);
+        const daemon = await startDaemon({ persistent: true, argv: ['--persistent'] });
+        const cleanupDaemon = attachDaemonShutdownHooks(daemon);
+        try {
+            const { SidecarApp, Response } = await import('sidecar_sdk');
+            const app = new SidecarApp();
+            const startupRoots = collectActiveWorkspaceRoots({
+                sessionId: process.env.ANTIGRAVITY_CONVERSATION_ID || '',
+                env: process.env,
+            });
+            if (startupRoots.length === 0) {
+                const fallbackRepo = resolveSidecarRepo(null, process.env.ANTIGRAVITY_CONVERSATION_ID || '');
+                if (fallbackRepo) startupRoots.push(fallbackRepo);
+            }
+            const handlers = createSidecarHandlers({
+                ResponseClass: Response,
+                allowedRoots: startupRoots,
+                strictWs: true,
+                env: process.env,
+            });
+            for (const [route, fn] of Object.entries(handlers.pages)) {
+                app.page(route, fn);
+            }
+            for (const [route, fn] of Object.entries(handlers.apis)) {
+                app.api(route, fn, 'GET');
+            }
+            await app.run();
+        } finally {
+            await cleanupDaemon();
         }
-        const handlers = createSidecarHandlers({
-            ResponseClass: Response,
-            allowedRoots: startupRoots,
-            strictWs: true,
-            env: process.env,
-        });
-        for (const [route, fn] of Object.entries(handlers.pages)) {
-            app.page(route, fn);
-        }
-        for (const [route, fn] of Object.entries(handlers.apis)) {
-            app.api(route, fn, 'GET');
-        }
-        await app.run();
         return;
     }
     if (process.argv.includes('--daemon')) {
-        await startDaemon({ persistent: true });
+        const persistent = process.argv.includes('--persistent') || true;
+        const daemon = await startDaemon({ persistent, argv: ['--persistent'] });
+        attachDaemonShutdownHooks(daemon);
     }
 }
 

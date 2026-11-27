@@ -3,7 +3,7 @@
  * 1. `plexer health tree` — Annotated LLM-readable directory/file tree with LOC, fan-in/fan-out, and open issues.
  * 2. `plexer health viz` — Self-contained interactive HTML treemap (`plexer/.health/treemap.html`).
  */
-import { statSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 const gitHistoryCache = new Map();
@@ -158,8 +158,10 @@ export function buildHealthTreeData(graph, state, zoneMap, readLines, opts = {})
         if (node.kind !== "file") continue;
         const zone = zoneMap?.get ? zoneMap.get(node.path) || "production" : zoneMap?.[node.path] || "production";
         if (!SCORED_ZONES.has(zone) && zone !== "test") continue;
-        const lines = typeof readLines === "function" ? readLines(node.path) || [] : [];
-        const loc = Math.max(1, lines.length || Number(node.lineCount) || 1);
+        const loc = Math.max(
+            1,
+            Number(node.lineCount) || (typeof readLines === "function" ? (readLines(node.path) || []).length : 0) || 1,
+        );
         const { churn, churnScore } = readNodeChurnMetrics(gitHistory, node.path);
         insertFileIntoHealthTree(
             root, node, zone, loc,
@@ -292,15 +294,8 @@ const TREEMAP_CLIENT_SCRIPT = `
     let selectedZone = "all";
     let focusedPath = "";
 
-    function worstAspectRatio(row, sideLength) {
-      if (row.length === 0 || sideLength <= 0) return Infinity;
-      let sum = 0, maxA = 0, minA = Infinity;
-      for (const item of row) {
-        sum += item.area;
-        if (item.area > maxA) maxA = item.area;
-        if (item.area < minA) minA = item.area;
-      }
-      if (sum <= 0 || minA <= 0) return Infinity;
+    function worstRatioFromStats(sum, maxA, minA, sideLength) {
+      if (sum <= 0 || minA <= 0 || sideLength <= 0) return Infinity;
       const s2 = sum * sum;
       const w2 = sideLength * sideLength;
       return Math.max((w2 * maxA) / s2, s2 / (w2 * minA));
@@ -317,12 +312,14 @@ const TREEMAP_CLIENT_SCRIPT = `
       const scaled = valid.map((it) => ({ ...it, area: (it.value / totalValue) * totalArea }));
 
       let row = [];
-      let remaining = scaled.slice();
+      let rowSum = 0;
+      let rowMax = 0;
+      let rowMin = Infinity;
+      let idx = 0;
 
-      function layoutRow(r) {
-        const rowArea = r.reduce((a, b) => a + b.area, 0);
+      function layoutRow(r, rArea) {
         if (w >= h) {
-          const rowW = rowArea / Math.max(1, h);
+          const rowW = rArea / Math.max(1, h);
           let curY = y;
           for (const it of r) {
             const itemH = it.area / Math.max(1, rowW);
@@ -332,7 +329,7 @@ const TREEMAP_CLIENT_SCRIPT = `
           x += rowW;
           w = Math.max(0, w - rowW);
         } else {
-          const rowH = rowArea / Math.max(1, w);
+          const rowH = rArea / Math.max(1, w);
           let curX = x;
           for (const it of r) {
             const itemW = it.area / Math.max(1, rowH);
@@ -344,18 +341,30 @@ const TREEMAP_CLIENT_SCRIPT = `
         }
       }
 
-      while (remaining.length > 0) {
-        const next = remaining[0];
+      while (idx < scaled.length) {
+        const next = scaled[idx];
         const shortSide = Math.max(1, Math.min(w, h));
-        if (row.length === 0 || worstAspectRatio(row.concat([next]), shortSide) <= worstAspectRatio(row, shortSide)) {
+        const nextSum = rowSum + next.area;
+        const nextMax = Math.max(rowMax, next.area);
+        const nextMin = Math.min(rowMin, next.area);
+        if (
+          row.length === 0 ||
+          worstRatioFromStats(nextSum, nextMax, nextMin, shortSide) <= worstRatioFromStats(rowSum, rowMax, rowMin, shortSide)
+        ) {
           row.push(next);
-          remaining.shift();
+          rowSum = nextSum;
+          rowMax = nextMax;
+          rowMin = nextMin;
+          idx += 1;
         } else {
-          layoutRow(row);
+          layoutRow(row, rowSum);
           row = [];
+          rowSum = 0;
+          rowMax = 0;
+          rowMin = Infinity;
         }
       }
-      if (row.length > 0) layoutRow(row);
+      if (row.length > 0) layoutRow(row, rowSum);
       return results;
     }
 
@@ -501,7 +510,9 @@ const TREEMAP_CLIENT_SCRIPT = `
           if (n.kind === "dir" && (n.children || []).length > 0) {
             zoomTo(n);
           } else if (n.path && window.parent && window.parent !== window) {
-            window.parent.postMessage({ type: "plexer-treemap-select", path: n.path }, "*");
+            const targetOrigin =
+              window.location.origin && window.location.origin !== "null" ? window.location.origin : "*";
+            window.parent.postMessage({ type: "plexer-treemap-select", path: n.path }, targetOrigin);
           }
         };
         div.onmousemove = (e) => showTooltip(e, n);
@@ -614,6 +625,7 @@ function buildTreemapHtmlDocument(tree, scores) {
       <select id="zone-filter" title="Filter by zone">
         <option value="all">All zones</option>
         <option value="production">production</option>
+        <option value="script">script</option>
         <option value="test">test</option>
       </select>
       <input id="search-filter" type="search" placeholder="Search path or issue..." />
@@ -664,7 +676,7 @@ export function generateHealthTreemapHtml(arg1, arg2, arg3, arg4, arg5, opts = {
             }
         }
         tree = buildHealthTreeData(graph, state, zoneMap, readLines, { ...opts, gitHistory });
-        scores = computeScoreSnapshot(state);
+        scores = opts.scores || computeScoreSnapshot(state);
         outPath = opts.output
             ? resolve(opts.output)
             : join(healthDir(contextDir), "treemap.html");
@@ -673,6 +685,7 @@ export function generateHealthTreemapHtml(arg1, arg2, arg3, arg4, arg5, opts = {
     const html = buildTreemapHtmlDocument(tree, scores);
 
     if (outPath && opts.write !== false) {
+        mkdirSync(dirname(outPath), { recursive: true });
         writeFileSync(outPath, html, "utf8");
     }
     if (isDirectTreeCall) {

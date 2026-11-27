@@ -10,10 +10,12 @@
  *   GET /api/health        health snapshot + per-file findings from plexer/.health/state.json
  *   GET /events            SSE; fs.watch on the context dir, debounced 300ms
  */
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { readFileSync, existsSync, statSync, watch } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { loadGraphCached } from "../context/graph-store.js";
+import { sqliteHasGraph, sqliteWalRevision } from "../storage/sqlite-store.js";
 import { computeScoreSnapshot } from "../health/scoring.js";
 import { loadHealthConfig, loadHealthState, stateFilePath } from "../health/state.js";
 import { buildZoneMap } from "../health/health.js";
@@ -209,6 +211,85 @@ export function readJailedSourceExcerpt(repoRoot, realRepoRoot, contextDir, opts
     }
 }
 
+const MAX_VIZ_PAYLOAD_CACHE = 8;
+const codeGraphPayloadCache = new Map();
+const treemapPayloadCache = new Map();
+
+function statStamp(filePath) {
+    try {
+        const st = statSync(filePath);
+        return `${st.dev}:${st.ino}:${st.size}:${Math.round(st.mtimeMs)}`;
+    }
+    catch {
+        return "missing";
+    }
+}
+
+function makeVizEtag(prefix, revKey) {
+    return `"${prefix}-${createHash("sha1").update(revKey).digest("hex").slice(0, 16)}"`;
+}
+
+function lruSetViz(cache, key, value) {
+    if (cache.has(key)) cache.delete(key);
+    else if (cache.size >= MAX_VIZ_PAYLOAD_CACHE) {
+        const oldest = cache.keys().next().value;
+        if (oldest !== undefined) cache.delete(oldest);
+    }
+    cache.set(key, value);
+}
+
+function graphRevStamp(absDir) {
+    if (sqliteHasGraph(absDir)) {
+        const r = sqliteWalRevision(absDir);
+        if (r)
+            return `sql:${r.ino}:${r.size}:${Math.round(r.mtimeMs)}:${r.walSize}:${Math.round(r.walMtimeMs)}`;
+    }
+    return statStamp(join(absDir, ".graph", "wiring.json"));
+}
+
+/** Return cached serialized `/api/code-graph` JSON and ETag keyed by SQLite WAL or `wiring.json` stat. */
+export function getCachedCodeGraphPayload(contextDir) {
+    if (!contextDir) return null;
+    const absDir = resolve(contextDir);
+    const rev = graphRevStamp(absDir);
+    const hit = codeGraphPayloadCache.get(absDir);
+    if (hit && hit.rev === rev) {
+        codeGraphPayloadCache.delete(absDir);
+        codeGraphPayloadCache.set(absDir, hit);
+        return hit.value;
+    }
+    const parsed = loadGraphCached(absDir);
+    const value = parsed ? { rev, json: JSON.stringify(parsed), etag: makeVizEtag("cg", rev) } : null;
+    lruSetViz(codeGraphPayloadCache, absDir, { rev, value });
+    return value;
+}
+
+/** Return cached `/api/treemap` HTML and ETag keyed by graph + health state/config stats. */
+export function getCachedTreemapPayload(repoRoot, contextDir) {
+    if (!repoRoot || !contextDir) return null;
+    const absRoot = resolve(repoRoot);
+    const absCtx = resolve(contextDir);
+    const key = `${absRoot}|${absCtx}`;
+    const rev = `${graphRevStamp(absCtx)}|${statStamp(join(absCtx, ".health", "state.json"))}|${statStamp(join(absCtx, ".health", "config.json"))}`;
+    const hit = treemapPayloadCache.get(key);
+    if (hit && hit.rev === rev) {
+        treemapPayloadCache.delete(key);
+        treemapPayloadCache.set(key, hit);
+        return hit.value;
+    }
+    const html = renderHealthTreemapHtml(absRoot, absCtx);
+    const value = html ? { rev, html, etag: makeVizEtag("tm", rev) } : null;
+    lruSetViz(treemapPayloadCache, key, { rev, value });
+    return value;
+}
+
+function etagMatches(req, etag) {
+    const raw = String(req?.headers?.["if-none-match"] ?? "").trim();
+    if (!raw) return false;
+    if (raw === "*") return true;
+    return raw.split(",").some((part) => part.trim().replace(/^W\//, "") === etag);
+}
+
 export function renderHealthTreemapHtml(repoRoot, contextDir) {
     if (!repoRoot || !contextDir)
         return null;
@@ -266,7 +347,7 @@ function handleVizEventsRequest(req, res, method, sseClients) {
 function acceptVizHttpRequest(req, res, boundPort) {
     const hostHeader = String(req.headers?.host ?? "").trim();
     const hostMatch = LOOPBACK_HOST_RE.exec(hostHeader);
-    if (!hostMatch || (boundPort && hostMatch[1] && Number(hostMatch[1]) !== boundPort)) {
+    if (!hostMatch || (boundPort && Number(hostMatch[1] || 80) !== boundPort)) {
         sendJson(res, 403, { error: "forbidden Host header" });
         return null;
     }
@@ -317,12 +398,23 @@ function dispatchVizApiRoute(parsedUrl, method, req, res, opts, repoRoot, realRe
         return;
     }
     if (path === "/api/code-graph") {
-        const parsed = loadGraphCached(opts.contextDir);
-        if (!parsed) {
+        const cached = getCachedCodeGraphPayload(opts.contextDir);
+        if (!cached) {
             sendJson(res, 404, { error: "no wiring graph in this context dir — run `plexer build` first" });
             return;
         }
-        sendJson(res, 200, parsed);
+        if (etagMatches(req, cached.etag)) {
+            res.writeHead(304, { etag: cached.etag, "cache-control": "no-cache", ...SECURITY_HEADERS });
+            res.end();
+            return;
+        }
+        res.writeHead(200, {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-cache",
+            etag: cached.etag,
+            ...SECURITY_HEADERS,
+        });
+        res.end(method === "HEAD" ? undefined : cached.json);
         return;
     }
     if (path === "/api/source") {
@@ -334,12 +426,24 @@ function dispatchVizApiRoute(parsedUrl, method, req, res, opts, repoRoot, realRe
         return;
     }
     if (path === "/api/treemap") {
-        const html = renderHealthTreemapHtml(repoRoot, opts.contextDir);
-        const status = html ? 200 : 404;
-        const body = html ? html : "treemap unavailable — build index first";
-        const ctype = html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8";
-        res.writeHead(status, { "content-type": ctype, ...TREEMAP_FRAME_HEADERS });
-        res.end(method === "HEAD" ? undefined : body);
+        const cached = getCachedTreemapPayload(repoRoot, opts.contextDir);
+        if (!cached?.html) {
+            res.writeHead(404, { "content-type": "text/plain; charset=utf-8", ...TREEMAP_FRAME_HEADERS });
+            res.end(method === "HEAD" ? undefined : "treemap unavailable — build index first");
+            return;
+        }
+        if (etagMatches(req, cached.etag)) {
+            res.writeHead(304, { ...TREEMAP_FRAME_HEADERS, "cache-control": "no-cache", etag: cached.etag });
+            res.end();
+            return;
+        }
+        res.writeHead(200, {
+            "content-type": "text/html; charset=utf-8",
+            ...TREEMAP_FRAME_HEADERS,
+            "cache-control": "no-cache",
+            etag: cached.etag,
+        });
+        res.end(method === "HEAD" ? undefined : cached.html);
         return;
     }
     if (path === "/events") {

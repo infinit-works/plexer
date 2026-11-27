@@ -276,83 +276,27 @@ export const AVAILABLE_DIRECTIVE_PHASES = [
  * Build the scan workflow guide.
  */
 export function buildWorkflowGuide(attestExample = ATTEST_RESOLVE_EXAMPLE) {
-    return `## INSTRUCTIONS FOR AGENTS — Workflow Guide
+    return `## Workflow Guide
 
-Work the two loops: **outer** (\`scan\` → \`score\` → at target? → \`rescan\`) and
-**inner** (\`plan\` → \`next\` → fix → \`resolve\` → repeat until queue clear).
+1. \`plexer health next\` — execution queue (use \`backlog\` for broader open work).
+2. Fix with \`plexer callers\` / \`plexer read\`, then \`plexer health resolve "<id>" --note "<what you did>" --confirm\` (or \`--attest "${attestExample}"\`).
+3. \`plexer health autofix <fixer> --dry-run\` · \`plexer health move <src> <dst> --dry-run\`.
+4. \`plexer health plan\` / \`plan cluster create\` · \`plexer health review --prepare\` → \`--import <file>\` · \`plexer health scan\` to verify.
 
-1. **Follow \`next\`**: \`plexer health next\` — the single source of truth for what to work on now.
-   It is the execution queue from the living plan, surfaces auto-clustered batches,
-   and tells you the exact file, lines, and resolve command to run.
-   Use \`plexer health backlog\` only to inspect broader open work outside execution.
-2. **Fix & resolve**: Fix the issue in code (using \`plexer callers\` / \`plexer read\`), then:
-   \`plexer health resolve "<id>" --note "<what you did>" --confirm\`
-   Or with explicit attestation: \`--attest "${attestExample}"\`
-3. **Plan strategically**: \`plexer health plan\` / \`plexer health plan cluster list\` — reorder,
-   cluster related issues (\`plan cluster create\`), and inspect the execution queue.
-4. **Run auto-fixers**: \`plexer health autofix <fixer> --dry-run\` to preview, then apply.
-   Use \`plexer health move <src> <dst> --dry-run\` to move files/dirs and auto-rewrite imports/requires.
-5. **Explore topology**: \`plexer health tree\` (annotated directory/file health tree),
-   \`plexer health viz\` (HTML treemap), or \`plexer health detect <detector>\` (fast single-detector run).
-6. **Rescan**: \`plexer health scan\` — verify improvements and catch cascading effects.
-7. **Subjective review**: \`plexer health review --prepare\` → run blind subagent reviews against
-   \`plexer/.health/review_packet_blind.json\` (20 dimensions + holistic context & concerns) →
-   \`plexer health review --import <file>\`.
-8. **Triage**: \`plexer health plan triage --stage observe|reflect|organize --report "..."\`
-   then \`plexer health plan triage --complete --strategy "..."\`.
-9. **Check progress**: \`plexer health status\` — dimension scores dashboard.
-
-### Understanding Scores & False Positives
-- **Overall**: 25% mechanical + 75% subjective. Lenient — wontfix doesn't count against you.
-- **Objective**: Mechanical detectors only (no subjective review component).
-- **Strict**: Same as overall, but \`wontfix\` items and open review defects count against you. **THIS IS YOUR NORTH STAR.**
-- **Verified**: Like strict, but only credits fixes the scanner has confirmed on rescan.
-- Wontfix is not free — every \`wontfix\` (\`plan skip --permanent\` or \`suppress\`) requires \`--attest\` and widens the overall↔strict gap.
-- Genuine detector mistakes belong in \`false_positive\`, NOT risky refactors:
-  \`plexer health suppress "<id>" --false-positive --reason "<15+ chars explaining why detector is wrong>"\`
-  or \`plexer health plan skip "<id>" --false-positive --reason "<explanation>"\` (exempt from strict/verified penalties when reasoned/attested).
-
-### Do-No-Harm Guardrails
-- **Never delete \`@generated\` headers, generated files, or CI scripts** just to clear an orphaned/single-importer finding; classify them as \`plexer health zone set <path> generated\` or \`exclude\` instead.
-- **Never collapse intentional data tables, registries, or config modules** into callers to chase fewer files.
-- **Never remove public package entrypoints, dynamic loader modules, or documented API exports** without verifying external/runtime callers.
-- **Never strip outgoing payload keys** referenced by serialized/wire consumers, and **never add dummy \`local _ = ...\` bindings** to silence leak detectors — store handles and clean up on teardown or dismiss proven false positives with \`--false-positive --reason\`.`;
+Scores: **strict** (north star; counts \`wontfix\` & open review) · **overall** (25% mech / 75% subj) · **objective** (mech only) · **verified** (rescan-confirmed).
+Dismiss false positives cleanly via \`plexer health suppress "<id>" --false-positive --reason "<15+ chars>"\`.
+Guardrails: never delete \`@generated\`/CI files (use \`zone set <path> generated\` or \`exclude\`), collapse data tables, strip public/dynamic entrypoints or wire keys, or add dummy \`local _ = ...\` bindings.`;
 }
 
 /**
  * Ready-to-paste Agent Loop Prompt (powered natively by plexer).
  */
 export function buildAgentLoopPrompt(targetPath = ".") {
-    return `I want you to systematically improve the quality of this codebase using \`plexer health\`.
-Run ALL of the following:
+    return `Improve codebase quality systematically with \`plexer health\`:
 
-Before scanning, check for directories/files that should be excluded or marked \`generated\` (vendor, build output,
-generated code, packages, worktrees, CI generators, etc.) and exclude obvious ones with \`plexer health exclude <path>\`
-or \`plexer health zone set <path> generated\`. Share any questionable candidates with me before excluding.
-
-plexer health scan ${targetPath}
-plexer health next
-
-Your goal is to get the **strict score** as high as possible (target >= 98). The scoring
-resists gaming — real defects require real code fixes, while genuine detector false positives should be
-dismissed transparently via \`plexer health suppress <id> --false-positive --reason "<why>"\` or
-\`plexer health plan skip <id> --false-positive --reason "<why>"\` rather than destructive refactors.
-
-THE LOOP: run \`plexer health next\`. It is the execution queue from the living plan, not the
-whole backlog. It tells you what to fix now, which file and lines, and the exact
-\`plexer health resolve\` command to run when done.
-Fix real defects, dismiss proven false positives cleanly, resolve it, and run \`plexer health next\` again. Over and over.
-
-Use \`plexer health backlog\` only when you need to inspect broader open work that is not
-currently driving execution.
-
-Do no harm: NEVER delete generated/CI files, inline cohesive data/config tables solely to reduce file count,
-strip public/dynamic entrypoints or wire payload keys, or silence warnings with dummy \`local _ = ...\` bindings.
-Fix things properly, not minimally. Use \`plexer callers\`, \`plexer blast\`, and \`plexer health move\` to verify
-blast radius and update all callers cleanly.
-
-Use \`plexer health plan\` / \`plexer health plan cluster create <name>\` to reorder priorities or
-group related issues. When subjective review is surfaced by \`next\`, run \`plexer health review --prepare\`,
-evaluate the 20 dimensions blindly against \`plexer/.health/review_packet_blind.json\`, and import with
-\`plexer health review --import\`. Rescan periodically with \`plexer health scan\`.`;
+1. Exclude vendor/build/generated paths first (\`plexer health exclude <path>\` or \`plexer health zone set <path> generated\`).
+2. Run \`plexer health scan ${targetPath}\` then \`plexer health next\`.
+3. Target **strict >= 98**. THE LOOP: run \`plexer health next\`, fix real defects (verify blast radius with \`plexer callers\` / \`plexer blast\` / \`plexer health move\`), dismiss genuine detector mistakes with \`plexer health suppress <id> --false-positive --reason "<why>"\`, \`plexer health resolve\`, and repeat.
+4. Use \`plexer health backlog\` for non-queue items, \`plexer health plan\` / \`plan cluster create\` to group work, \`plexer health review --prepare\` → \`--import\` for subjective review, and \`plexer health scan\` periodically to verify.
+5. Do no harm: never delete generated/CI files, inline cohesive data tables, strip public/dynamic entrypoints or wire payload keys, or silence warnings with dummy \`local _ = ...\` bindings.`;
 }

@@ -20,17 +20,22 @@ function appendQueueLines(lines, queue) {
     if (queue.items.length === 0 && (queue.workflow_steps || []).length === 0) {
         lines.push("  ✓ Execution queue is empty!");
     } else {
+        let hasResolveCmd = false;
         for (let i = 0; i < queue.items.length; i++) {
             const it = queue.items[i];
             const impactVal = Number(it.score_impact ?? it.score_impact_detail?.deltaStrict ?? 0);
             const impactTag = impactVal > 0 ? ` (+${impactVal.toFixed(1)} pts)` : "";
             const descText = it.custom_description || it.summary;
+            const idTag = it.id ? ` [${it.id}]` : "";
             lines.push(
-                `  ${i + 1}. [${it.tier} · ${it.severity} · ${it.detector}] ${it.file}:${it.span} — ${descText}${impactTag}`,
+                `  ${i + 1}. [${it.tier} · ${it.severity} · ${it.detector}] ${it.file}:${it.span} — ${descText}${impactTag}${idTag}`,
             );
             if (it.explanation) lines.push(`     Why: ${it.explanation}`);
             if (it.suggestion) lines.push(`     Fix: ${it.suggestion}`);
-            if (it.resolve_command) lines.push(`     Resolve: \`${it.resolve_command}\``);
+            if (it.resolve_command) hasResolveCmd = true;
+        }
+        if (hasResolveCmd) {
+            lines.push('  Resolve: `plexer health resolve "<id>" --note "<fix summary>" --confirm`');
         }
     }
 
@@ -128,10 +133,8 @@ export function formatHealthText(result) {
 
     if (headline) {
         lines.push(`plexer health — ${headline}`);
-    } else if (scores) {
-        lines.push(
-            `plexer health — strict ${scores.strict}% (north star) · overall ${scores.overall}% · objective ${scores.objective}% · verified ${scores.verified}%`,
-        );
+    } else if (!scores) {
+        lines.push("plexer health");
     }
 
     if (scores) {
@@ -229,15 +232,20 @@ export function formatHealthMarkdown(result) {
 
     if (queue && queue.items.length > 0) {
         lines.push("", "### Prioritized Execution Queue (`plexer health next`)");
+        let hasResolveCmd = false;
         for (const it of queue.items) {
             const impactVal = Number(it.score_impact ?? it.score_impact_detail?.deltaStrict ?? 0);
             const impactTag = impactVal > 0 ? ` (+${impactVal.toFixed(1)} pts)` : "";
+            const idTag = it.id ? ` (\`${it.id}\`)` : "";
             lines.push(
-                `- **\`[${it.tier} · ${it.severity} · ${it.detector}]\` \`${it.file}:${it.span}\`** — ${it.custom_description || it.summary}${impactTag}`,
+                `- **\`[${it.tier} · ${it.severity} · ${it.detector}]\` \`${it.file}:${it.span}\`** — ${it.custom_description || it.summary}${impactTag}${idTag}`,
             );
             if (it.explanation) lines.push(`  - *Why:* ${it.explanation}`);
             if (it.suggestion) lines.push(`  - *Fix:* ${it.suggestion}`);
-            if (it.resolve_command) lines.push(`  - *Resolve:* \`${it.resolve_command}\``);
+            if (it.resolve_command) hasResolveCmd = true;
+        }
+        if (hasResolveCmd) {
+            lines.push('- *Resolve:* `plexer health resolve "<id>" --note "<fix summary>" --confirm`');
         }
     }
 

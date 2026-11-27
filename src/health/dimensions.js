@@ -602,23 +602,20 @@ export const DIMENSION_BATCHES = [
 export const LANGUAGE_REVIEW_OVERRIDES = {
     luau: {
         system_prompt_append:
-            "Luau / Roblox review anchors: enforce `--!strict` typing without `:: any` escapes; verify every `RemoteEvent.OnServerEvent` and `RemoteFunction.OnServerInvoke` validates client argument `typeof(...)`, `math.isnan` (`x == x`), ownership, and cooldowns on the server; check that `RBXScriptConnection` handles and Flux reactive scopes (`Flux.scope`) are cleaned up on teardown/Destroy; prefer `task.wait`/`task.spawn`/`task.delay` over legacy globals; hoist `game:GetService(...)` to module top; never pass the 2nd parent argument to `Instance.new(class, parent)`.",
+            "Luau / Roblox review anchors: enforce `--!strict` without `:: any` escapes; validate `RemoteEvent.OnServerEvent`/`RemoteFunction.OnServerInvoke` args (`typeof`, `x == x`, ownership, cooldowns); disconnect `RBXScriptConnection`s and destroy `Flux.scope` on teardown; prefer `task.wait`/`task.spawn`/`task.delay`, hoist `game:GetService(...)` to module top, and avoid 2-arg `Instance.new(class, parent)`.",
         dimension_prompts: {
             authorization_consistency: {
                 look_for_append: [
-                    "Roblox `OnServerEvent` / `OnServerInvoke` callbacks trusting client-supplied damage, currency, CFrame, or asset IDs without `typeof()` + NaN (`x == x`) + server-authoritative state checks",
                     "Client modules (`*.client.luau` / `StarterPlayerScripts`) requiring `ServerStorage` or `ServerScriptService` modules",
                 ],
             },
             contract_coherence: {
                 look_for_append: [
-                    "Event connections (`:Connect(...)`), threads (`task.spawn`/`task.delay`), or Flux scopes created in component/class lifecycle methods without a matching `:Disconnect()` / `scope:destroy()` on teardown",
-                    "Yielding functions (`task.wait`, `:WaitForChild`, `DataStore:GetAsync`) called inside non-yielding contracts or Flux computed/effect blocks without `Flux.async`",
+                    "Yielding calls (`task.wait`, `:WaitForChild`, `DataStore:GetAsync`) inside non-yielding contracts or Flux computed/effect blocks without `Flux.async`",
                 ],
             },
             type_safety: {
                 look_for_append: [
-                    "Luau modules missing `--!strict` header or using `:: any` to silence type mismatches",
                     "Using raw string literals instead of `Enum.<EnumType>.<Item>`",
                 ],
             },
@@ -641,6 +638,18 @@ export const LANGUAGE_REVIEW_OVERRIDES = {
             "Go review anchors: watch for ignored `err` returns (`_ = ...`), unbuffered channel goroutine leaks without `context.Context` cancellation, and premature single-implementation interfaces.",
     },
 };
+
+function normalizeReviewLangs(detectedLangs = []) {
+    const out = new Set();
+    for (const lang of detectedLangs) {
+        const k = String(lang || "").toLowerCase();
+        if (!k) continue;
+        if (k === "lua" || k === "roblox") out.add("luau");
+        else if (k === "javascript") out.add("typescript");
+        else out.add(k);
+    }
+    return out;
+}
 
 /**
  * Build the Two-Phase (`PHASE 1 — OBSERVE` -> `PHASE 2 — JUDGE`) system prompt for blind reviews.
@@ -670,9 +679,7 @@ export function buildReviewSystemPrompt(detectedLangs = []) {
         "- Any dimension scored < 85 MUST include at least one concrete defect in `findings[]` for that dimension (or explicit rationale in `dimension_judgment`).",
     ];
 
-    for (const lang of detectedLangs) {
-        const key = String(lang).toLowerCase();
-        const normKey = key === "lua" || key === "roblox" ? "luau" : key === "javascript" ? "typescript" : key;
+    for (const normKey of normalizeReviewLangs(detectedLangs)) {
         const override = LANGUAGE_REVIEW_OVERRIDES[normKey];
         if (override?.system_prompt_append) {
             base.push("", override.system_prompt_append);
@@ -685,15 +692,8 @@ export function buildReviewSystemPrompt(detectedLangs = []) {
 /**
  * Build the enriched prompt dictionary for all 20 dimensions with language overrides applied.
  */
-export function buildDimensionPromptsForLangs(detectedLangs = [], seedFiles = []) {
-    const normLangs = new Set(
-        detectedLangs.map((l) => {
-            const k = String(l).toLowerCase();
-            if (k === "lua" || k === "roblox") return "luau";
-            if (k === "javascript") return "typescript";
-            return k;
-        }),
-    );
+export function buildDimensionPromptsForLangs(detectedLangs = []) {
+    const normLangs = normalizeReviewLangs(detectedLangs);
 
     const out = {};
     for (const [id, def] of Object.entries(SUBJECTIVE_DIMENSIONS)) {
@@ -713,7 +713,6 @@ export function buildDimensionPromptsForLangs(detectedLangs = [], seedFiles = []
             look_for: lookFor,
             skip,
             anchors: def.anchors,
-            seed_files: seedFiles.slice(0, 10),
         };
     }
     return out;

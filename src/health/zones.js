@@ -170,9 +170,9 @@ function lookupZoneOverride(norm, zoneOverrides) {
     return null;
 }
 
-function classifyByDirectoryAndConfig(parts, lowerParts, base, rootDir, norm) {
+function classifyByDirectoryAndConfig(parts, lowerParts, base, rootDir, norm, repoHints = null) {
     const isLuauPath = base.endsWith(".luau") || base.endsWith(".lua");
-    const isRobloxRepo = hasRobloxManifest(rootDir);
+    const isRobloxRepo = repoHints ? repoHints.isRobloxRepo : hasRobloxManifest(rootDir);
     for (let i = 0; i < lowerParts.length - 1; i++) {
         const seg = lowerParts[i];
         if (VENDOR_SEGMENTS.has(seg)) return "vendor";
@@ -180,7 +180,8 @@ function classifyByDirectoryAndConfig(parts, lowerParts, base, rootDir, norm) {
         if (GENERATED_SEGMENTS.has(seg)) return "generated";
     }
     if (GENERATED_SUFFIX_RE.test(base)) return "generated";
-    if (rootDir && typeof rootDir === "string" && (workflowOutputMatchers(rootDir).some((rx) => rx.test(norm)) || hasGeneratedHeader(rootDir, norm))) {
+    const wfMatchers = repoHints ? repoHints.wfMatchers : rootDir && typeof rootDir === "string" ? workflowOutputMatchers(rootDir) : [];
+    if (rootDir && typeof rootDir === "string" && (wfMatchers.some((rx) => rx.test(norm)) || hasGeneratedHeader(rootDir, norm))) {
         return "generated";
     }
     if (CONFIG_BASENAMES.has(base) || /\.(?:config\.(?:js|ts|mjs|cjs)|project\.json|d\.(?:ts|luau))$/.test(base)) {
@@ -189,14 +190,22 @@ function classifyByDirectoryAndConfig(parts, lowerParts, base, rootDir, norm) {
     return null;
 }
 
-export function classifyZone(relPath, zoneOverrides = {}, rootDir = null) {
+export function createZoneClassifier(zoneOverrides = {}, rootDir = null) {
+    const repoHints = {
+        isRobloxRepo: hasRobloxManifest(rootDir),
+        wfMatchers: rootDir && typeof rootDir === "string" ? workflowOutputMatchers(rootDir) : [],
+    };
+    return (relPath) => classifyZone(relPath, zoneOverrides, rootDir, repoHints);
+}
+
+export function classifyZone(relPath, zoneOverrides = {}, rootDir = null, repoHints = null) {
     const norm = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
     const override = lookupZoneOverride(norm, zoneOverrides);
     if (override) return override;
     const parts = norm.split("/");
     const lowerParts = parts.map((p) => p.toLowerCase());
     const base = lowerParts[lowerParts.length - 1] || "";
-    const earlyZone = classifyByDirectoryAndConfig(parts, lowerParts, base, rootDir, norm);
+    const earlyZone = classifyByDirectoryAndConfig(parts, lowerParts, base, rootDir, norm, repoHints);
     if (earlyZone) return earlyZone;
     for (const seg of lowerParts.slice(0, -1)) {
         if (TEST_SEGMENTS.has(seg)) return "test";
@@ -215,16 +224,35 @@ registerGraphCacheClearer(() => {
     packageEntrypointsCache.clear();
 });
 
+function registerWildcardEntrypoint(out, cand) {
+    if (!out._wildcards) {
+        const wildcards = [];
+        out._wildcards = wildcards;
+        const baseHas = Set.prototype.has.bind(out);
+        out.has = (val) => baseHas(val) || wildcards.some((rx) => rx.test(val));
+    }
+    const globPat = cand.replace(/\*+/g, "**");
+    out._wildcards.push(globToRegExp(globPat));
+    if (!/\.[a-z0-9*]+$/i.test(cand)) {
+        out._wildcards.push(globToRegExp(`${globPat}.*`));
+        out._wildcards.push(globToRegExp(`${globPat}/index.*`));
+    }
+}
+
 function addPackageEntrypointCandidate(out, raw, baseSubdir = "") {
     if (!raw || typeof raw !== "string") return;
     const trimmed = raw.trim();
     if (!trimmed || /^[a-z]+:\/\//i.test(trimmed) || trimmed.includes("${")) return;
     const clean = trimmed.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-    if (!clean || clean.includes("*") || clean.startsWith("..") || clean.startsWith("-")) return;
+    if (!clean || clean.startsWith("..") || clean.startsWith("-")) return;
     const candidates = baseSubdir && !clean.startsWith(`${baseSubdir}/`)
         ? [clean, `${baseSubdir}/${clean}`]
         : [clean];
     for (const cand of candidates) {
+        if (cand.includes("*")) {
+            registerWildcardEntrypoint(out, cand);
+            continue;
+        }
         out.add(cand);
         if (!/\.[a-z0-9]+$/i.test(cand)) {
             out.add(`${cand}/init.luau`);
@@ -603,7 +631,43 @@ export function loadIgnoreRules(rootDir, configExcludes = [], ledger = null) {
     };
 }
 
-const INLINE_SUPPRESS_RE = /(?:\/\/|--|#|\/\*)\s*(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore|selene:\s*allow)/i;
+const INLINE_SUPPRESS_DIRECTIVE_RE = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore|selene:\s*allow)/i;
+const DETECTOR_ALIASES = {
+    unused: "unused_imports",
+    dup: "duplicates",
+    dups: "duplicates",
+    duplicate: "duplicates",
+    catches: "silent_catches",
+    smells: "reactive_smells",
+    cycles: "file_cycles",
+    dir_cycles: "directory_cycles",
+    dead_code: "dead_symbols",
+    dead_exports: "unreferenced_exports",
+};
+
+function extractCommentPortionForSuppression(line, isPreceding) {
+    if (typeof line !== "string" || !line) return null;
+    if (isPreceding) {
+        return /^\s*(?:\/\/|--|#|\/\*)/.test(line) ? line : null;
+    }
+    let inQuote = null;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (inQuote) {
+            if (ch === "\\") { i += 1; continue; }
+            if (ch === inQuote) inQuote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+            inQuote = ch;
+            continue;
+        }
+        if ((ch === "/" && (line[i + 1] === "/" || line[i + 1] === "*")) || (ch === "-" && line[i + 1] === "-") || ch === "#") {
+            return line.slice(i);
+        }
+    }
+    return null;
+}
 
 function buildSuppressionCandidates(lines, lineNum) {
     const candidates = [
@@ -620,20 +684,37 @@ function buildSuppressionCandidates(lines, lineNum) {
 }
 
 function lineMatchesInlineSuppression(line, isPreceding, detNorm, detLower, detCat) {
-    if (isPreceding && !/^\s*(?:\/\/|--|#|\/\*)/.test(line)) return false;
-    if (!INLINE_SUPPRESS_RE.test(line)) return false;
-    const isSeleneOnly = /--\s*selene:\s*allow/i.test(line) && !/(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)/i.test(line);
+    const commentText = extractCommentPortionForSuppression(line, isPreceding);
+    if (!commentText || !INLINE_SUPPRESS_DIRECTIVE_RE.test(commentText)) return false;
+
+    const isSeleneOnly = /--\s*selene:\s*allow/i.test(commentText) && !/(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)/i.test(commentText);
     if (isSeleneOnly && detNorm && detNorm !== "luau_quality" && detNorm !== "language_traps") return false;
-    const bracketMatch = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)(?:-file)?\s*\[([^\]]+)\]/i.exec(line);
+
+    const bracketMatch = /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)(?:-file)?\s*\[([^\]]+)\]/i.exec(commentText);
     const colonMatch = !bracketMatch
-        ? /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)(?:-file)?\s*:\s*([A-Za-z0-9_,\s*-]+)/i.exec(line)
+        ? /(?:plexer-ignore|plexer:\s*ignore|review:\s*ignore)(?:-file)?\s*:\s*([^\n*]+)/i.exec(commentText)
         : null;
-    const rawSpec = bracketMatch ? bracketMatch[1] : colonMatch ? colonMatch[1] : null;
+
+    let rawSpec = null;
+    if (bracketMatch) {
+        rawSpec = bracketMatch[1];
+    } else if (colonMatch) {
+        // Support `: reason` or `-- reason` suffixes after the detector list (e.g. `plexer-ignore: dead_symbols: intentional`)
+        rawSpec = colonMatch[1].split(/\s*(?::|--|\/\/|#|\*\/|\s-\s)\s*/)[0];
+    }
     if (rawSpec === null || !detNorm) return true;
-    const tokens = rawSpec.replace(/(?:--|\/\/|#).*$/, "").trim().split(/[\s,]+/).map((s) => s.trim().toLowerCase().replace(/-/g, "_")).filter(Boolean);
+
+    const tokens = rawSpec
+        .trim()
+        .split(/[\s,]+/)
+        .map((s) => s.trim().toLowerCase().replace(/-/g, "_"))
+        .filter(Boolean);
     if (tokens.length === 0) return true;
-    const detParts = detNorm.split("_");
-    return tokens.some((t) => t === "all" || t === "*" || t === detNorm || t === detLower || (detCat && t === detCat) || detParts.includes(t));
+
+    return tokens.some((rawTok) => {
+        const tok = DETECTOR_ALIASES[rawTok] || rawTok;
+        return tok === "all" || tok === "*" || tok === detNorm || tok === detLower || (detCat && tok === detCat);
+    });
 }
 
 /**
@@ -668,72 +749,6 @@ function readLongBracketPrefix(s, start) {
     return { openLen: j - start + 1, close: `]${"=".repeat(eqCount)}]` };
 }
 
-function stepLuauBacktickBody(rawLine, st) {
-    const ch = rawLine[st.i];
-    if (ch === "\\") { st.i += 2; return; }
-    if (ch === "`") { st.inBacktick = false; st.out += '"'; st.i += 1; return; }
-    if (ch === "{") { st.interpStack.push(0); st.out += " "; st.i += 1; return; }
-    st.i += 1;
-}
-
-function stepLuauBacktickInterp(ch, st) {
-    const topIdx = st.interpStack.length - 1;
-    if (ch === "{") {
-        st.interpStack[topIdx] += 1;
-        st.out += "{";
-    } else if (st.interpStack[topIdx] === 0) {
-        st.interpStack.pop();
-        st.inBacktick = true;
-        st.out += " ";
-    } else {
-        st.interpStack[topIdx] -= 1;
-        st.out += "}";
-    }
-    st.i += 1;
-}
-
-function advanceLuauQuotedLiteral(rawLine, i, len, q) {
-    let idx = i + 1;
-    while (idx < len) {
-        if (rawLine[idx] === "\\") { idx += 2; continue; }
-        if (rawLine[idx] === q) return idx + 1;
-        idx += 1;
-    }
-    return idx;
-}
-
-function stripLuauLine(rawLine) {
-    const len = rawLine.length;
-    const st = { out: "", interpStack: [], inBacktick: false, i: 0 };
-    while (st.i < len) {
-        if (st.inBacktick) { stepLuauBacktickBody(rawLine, st); continue; }
-        const ch = rawLine[st.i];
-        if (st.interpStack.length > 0 && (ch === "{" || ch === "}")) { stepLuauBacktickInterp(ch, st); continue; }
-        if (ch === "-" && rawLine[st.i + 1] === "-") {
-            const lb = readLongBracketPrefix(rawLine, st.i + 2);
-            const closeIdx = lb ? rawLine.indexOf(lb.close, st.i + 2 + lb.openLen) : -1;
-            st.out += " ";
-            if (closeIdx >= 0) { st.i = closeIdx + lb.close.length; continue; }
-            break;
-        }
-        if (ch === "[") {
-            const lb = readLongBracketPrefix(rawLine, st.i);
-            if (lb) {
-                const closeIdx = rawLine.indexOf(lb.close, st.i + lb.openLen);
-                st.out += '""';
-                if (closeIdx < 0) break;
-                st.i = closeIdx + lb.close.length;
-                continue;
-            }
-        }
-        if (ch === '"' || ch === "'") { st.i = advanceLuauQuotedLiteral(rawLine, st.i, len, ch); st.out += '""'; continue; }
-        if (ch === "`") { st.inBacktick = true; st.out += '"'; st.i += 1; continue; }
-        st.out += ch;
-        st.i += 1;
-    }
-    return st.out;
-}
-
 function matchPythonStringPrefix(rawLine, idx) {
     if (idx > 0 && /[A-Za-z0-9_]/.test(rawLine[idx - 1])) return null;
     for (const pLen of [2, 1, 0]) {
@@ -746,19 +761,6 @@ function matchPythonStringPrefix(rawLine, idx) {
         return { prefixLen: pLen, quote: triple, isFString: /[fF]/.test(pref) };
     }
     return null;
-}
-
-function consumePythonQuotedLiteral(rawLine, startIdx, len, quote) {
-    let i = startIdx;
-    while (i < len) {
-        if (rawLine.startsWith(quote, i)) return i + quote.length;
-        if (rawLine[i] === "\\") {
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    return i;
 }
 
 function consumePythonFStringLiteral(rawLine, st, quote) {
@@ -810,52 +812,467 @@ function stepPythonFStringBrace(ch, st) {
     return false;
 }
 
-function stripPythonLine(rawLine) {
-    const st = { out: "", len: rawLine.length, fStringStack: [], activeFQuote: null, i: 0 };
-    while (st.i < st.len) {
-        if (st.activeFQuote) {
-            st.activeFQuote = consumePythonFStringLiteral(rawLine, st, st.activeFQuote);
+const REGEX_PREFIX_KEYWORDS = new Set([
+    "return", "throw", "case", "in", "of", "instanceof", "typeof", "void",
+    "delete", "await", "yield", "else", "do", "new",
+]);
+
+function createStripConfig(relPathOrOpts = "") {
+    if (relPathOrOpts && typeof relPathOrOpts === "object") {
+        const rel = String(relPathOrOpts.relPath || "");
+        const extMatch = /\.([a-z0-9]+)$/i.exec(rel);
+        const ext = extMatch ? `.${extMatch[1].toLowerCase()}` : "";
+        const isLuau = Boolean(relPathOrOpts.isLuau) || ext === ".luau" || ext === ".lua" || ext === ".sql";
+        const isPy = Boolean(relPathOrOpts.isPy) || ext === ".py" || ext === ".pyi";
+        const isHashComment = isPy || /\.(?:sh|bash|zsh|rb|pl|r|ya?ml|toml)$/i.test(rel);
+        const isRust = Boolean(relPathOrOpts.isRust) || ext === ".rs";
+        const isGo = Boolean(relPathOrOpts.isGo) || ext === ".go";
+        const isJsTs = Boolean(relPathOrOpts.isJsTs) || /\.(?:js|jsx|mjs|cjs|ts|tsx|mts|cts)$/i.test(rel);
+        return {
+            isLuau,
+            isPy,
+            isHashComment,
+            isRust,
+            isGo,
+            isJsTs,
+            isSlashComment: !isLuau && !isHashComment,
+            preserveStrings: Boolean(relPathOrOpts.preserveStrings),
+        };
+    }
+    const rel = String(relPathOrOpts || "");
+    return createStripConfig({ relPath: rel });
+}
+
+export function createCodeStripState() {
+    return {
+        blockCommentClose: null,
+        longStringClose: null,
+        pyTripleQuote: null,
+        pyFStringStack: [],
+        tplStack: [],
+        inJsTemplateText: false,
+        luauBacktick: false,
+        luauInterpStack: [],
+    };
+}
+
+function consumeQuotedOnLine(rawLine, startIdx, quoteCh) {
+    let i = startIdx + 1;
+    while (i < rawLine.length) {
+        if (rawLine[i] === "\\") { i += 2; continue; }
+        if (rawLine[i] === quoteCh) return i + 1;
+        i += 1;
+    }
+    return i;
+}
+
+function tryConsumeJsRegexLiteral(rawLine, startIdx) {
+    let j = startIdx + 1;
+    let inClass = false;
+    while (j < rawLine.length) {
+        const ch = rawLine[j];
+        if (ch === "\\") {
+            if (j + 1 >= rawLine.length) return -1;
+            j += 2;
             continue;
         }
-        const ch = rawLine[st.i];
-        if (st.fStringStack.length > 0 && stepPythonFStringBrace(ch, st)) continue;
-        if (ch === "#") break;
-        const spec = matchPythonStringPrefix(rawLine, st.i);
-        if (spec) {
-            st.i += spec.prefixLen + spec.quote.length;
-            if (spec.isFString) {
-                st.out += '"';
-                st.activeFQuote = consumePythonFStringLiteral(rawLine, st, spec.quote);
+        if (ch === "[") { inClass = true; j += 1; continue; }
+        if (ch === "]" && inClass) { inClass = false; j += 1; continue; }
+        if (ch === "/" && !inClass) {
+            let k = j + 1;
+            while (k < rawLine.length && /[dgimsuvy]/.test(rawLine[k])) k += 1;
+            return k;
+        }
+        j += 1;
+    }
+    return -1;
+}
+
+function tryConsumeRustCharOrLifetime(rawLine, startIdx) {
+    const len = rawLine.length;
+    if (startIdx + 1 >= len) return -1;
+    if (rawLine[startIdx + 1] === "\\") {
+        let j = startIdx + 3;
+        while (j < len && j <= startIdx + 16) {
+            if (rawLine[j] === "'") return j + 1;
+            j += 1;
+        }
+        return -1;
+    }
+    if (startIdx + 2 < len && rawLine[startIdx + 1] !== "'" && rawLine[startIdx + 2] === "'") {
+        return startIdx + 3;
+    }
+    return -1;
+}
+
+function stepPyTripleQuoteState(rawLine, st, state, preserveStrings) {
+    const { quote, isFString } = state.pyTripleQuote;
+    while (st.i < rawLine.length) {
+        if (rawLine.startsWith(quote, st.i)) {
+            if (preserveStrings) st.out += quote;
+            else st.out += isFString ? '"' : '""';
+            st.i += quote.length;
+            state.pyTripleQuote = null;
+            st.lastTokenType = "string";
+            return true;
+        }
+        if (rawLine[st.i] === "\\") {
+            if (preserveStrings) st.out += rawLine.slice(st.i, st.i + 2);
+            st.i += 2;
+            continue;
+        }
+        if (isFString && rawLine[st.i] === "{") {
+            if (rawLine[st.i + 1] === "{") {
+                if (preserveStrings) st.out += "{{";
+                st.i += 2;
                 continue;
             }
-            st.i = consumePythonQuotedLiteral(rawLine, st.i, st.len, spec.quote);
-            st.out += '""';
+            state.pyFStringStack.push({ braceDepth: 0, quote });
+            state.pyTripleQuote = null;
+            st.out += preserveStrings ? "{" : " ${";
+            st.i += 1;
+            st.lastTokenType = "op";
+            return true;
+        }
+        if (preserveStrings) st.out += rawLine[st.i];
+        st.i += 1;
+    }
+    return false;
+}
+
+function stepJsTemplateTextState(rawLine, st, state, preserveStrings) {
+    while (st.i < rawLine.length) {
+        const ch = rawLine[st.i];
+        if (ch === "\\") {
+            if (preserveStrings) st.out += rawLine.slice(st.i, st.i + 2);
+            st.i += 2;
             continue;
         }
+        if (ch === "`") {
+            st.out += preserveStrings ? "`" : '"';
+            st.i += 1;
+            state.inJsTemplateText = false;
+            st.lastTokenType = "string";
+            return true;
+        }
+        if (ch === "$" && rawLine[st.i + 1] === "{") {
+            state.tplStack.push({ braceDepth: 0 });
+            state.inJsTemplateText = false;
+            st.out += preserveStrings ? "${" : " ${";
+            st.i += 2;
+            st.lastTokenType = "op";
+            return true;
+        }
+        if (preserveStrings) st.out += ch;
+        st.i += 1;
+    }
+    return false;
+}
+
+function stepLuauBacktickTextState(rawLine, st, state, preserveStrings) {
+    while (st.i < rawLine.length) {
+        const ch = rawLine[st.i];
+        if (ch === "\\") {
+            if (preserveStrings) st.out += rawLine.slice(st.i, st.i + 2);
+            st.i += 2;
+            continue;
+        }
+        if (ch === "`") {
+            st.out += preserveStrings ? "`" : '"';
+            st.i += 1;
+            state.luauBacktick = false;
+            st.lastTokenType = "string";
+            return true;
+        }
+        if (ch === "{") {
+            state.luauInterpStack.push(0);
+            state.luauBacktick = false;
+            st.out += preserveStrings ? "{" : " ";
+            st.i += 1;
+            st.lastTokenType = "op";
+            return true;
+        }
+        if (preserveStrings) st.out += ch;
+        st.i += 1;
+    }
+    return false;
+}
+
+function stepActiveMultilineStripState(rawLine, st, state, cfg) {
+    if (state.blockCommentClose) {
+        const closeIdx = rawLine.indexOf(state.blockCommentClose, st.i);
+        if (closeIdx < 0) { st.i = rawLine.length; return true; }
+        st.out += " ";
+        st.i = closeIdx + state.blockCommentClose.length;
+        state.blockCommentClose = null;
+        return true;
+    }
+    if (state.longStringClose) {
+        const closeIdx = rawLine.indexOf(state.longStringClose, st.i);
+        if (closeIdx < 0) {
+            if (cfg.preserveStrings) st.out += rawLine.slice(st.i);
+            st.i = rawLine.length;
+            return true;
+        }
+        st.out += cfg.preserveStrings ? rawLine.slice(st.i, closeIdx + state.longStringClose.length) : '""';
+        st.i = closeIdx + state.longStringClose.length;
+        state.longStringClose = null;
+        st.lastTokenType = "string";
+        return true;
+    }
+    if (state.pyTripleQuote) {
+        stepPyTripleQuoteState(rawLine, st, state, cfg.preserveStrings);
+        return true;
+    }
+    if (state.inJsTemplateText) {
+        stepJsTemplateTextState(rawLine, st, state, cfg.preserveStrings);
+        return true;
+    }
+    if (state.luauBacktick) {
+        stepLuauBacktickTextState(rawLine, st, state, cfg.preserveStrings);
+        return true;
+    }
+    return false;
+}
+
+function stepInterpCloseOrOpen(ch, st, state, cfg) {
+    if (state.tplStack.length > 0 && (ch === "{" || ch === "}")) {
+        const top = state.tplStack[state.tplStack.length - 1];
+        if (ch === "{") {
+            top.braceDepth += 1;
+            st.out += "{";
+            st.lastTokenType = "op";
+        } else if (top.braceDepth > 0) {
+            top.braceDepth -= 1;
+            st.out += "}";
+            st.lastTokenType = "close";
+        } else {
+            state.tplStack.pop();
+            state.inJsTemplateText = true;
+            st.out += cfg.preserveStrings ? "}" : "} ";
+            st.lastTokenType = "close";
+        }
+        st.i += 1;
+        return true;
+    }
+    if (state.pyFStringStack.length > 0 && (ch === "{" || ch === "}")) {
+        const top = state.pyFStringStack[state.pyFStringStack.length - 1];
+        if (ch === "{") {
+            top.braceDepth += 1;
+            st.out += "{";
+            st.lastTokenType = "op";
+        } else if (top.braceDepth > 0) {
+            top.braceDepth -= 1;
+            st.out += "}";
+            st.lastTokenType = "close";
+        } else {
+            state.pyFStringStack.pop();
+            if (top.quote.length === 3) {
+                state.pyTripleQuote = { quote: top.quote, isFString: true };
+            }
+            st.out += cfg.preserveStrings ? "}" : "} ";
+            st.lastTokenType = "close";
+        }
+        st.i += 1;
+        return true;
+    }
+    if (state.luauInterpStack.length > 0 && (ch === "{" || ch === "}")) {
+        const topIdx = state.luauInterpStack.length - 1;
+        if (ch === "{") {
+            state.luauInterpStack[topIdx] += 1;
+            st.out += "{";
+        } else if (state.luauInterpStack[topIdx] === 0) {
+            state.luauInterpStack.pop();
+            state.luauBacktick = true;
+            st.out += cfg.preserveStrings ? "}" : " ";
+        } else {
+            state.luauInterpStack[topIdx] -= 1;
+            st.out += "}";
+        }
+        st.i += 1;
+        return true;
+    }
+    return false;
+}
+
+export function stripCodeLineWithState(rawLine, state, relPathOrOpts = "") {
+    if (typeof rawLine !== "string" || !rawLine) return "";
+    const cfg = typeof relPathOrOpts === "object" && relPathOrOpts !== null && "isSlashComment" in relPathOrOpts
+        ? relPathOrOpts
+        : createStripConfig(relPathOrOpts);
+    const len = rawLine.length;
+    const st = { out: "", i: 0, lastTokenType: "start" };
+
+    while (st.i < len) {
+        if (stepActiveMultilineStripState(rawLine, st, state, cfg)) continue;
+        const ch = rawLine[st.i];
+        if (stepInterpCloseOrOpen(ch, st, state, cfg)) continue;
+
+        if (cfg.isSlashComment && ch === "/" && rawLine[st.i + 1] === "/") break;
+        if (cfg.isSlashComment && ch === "/" && rawLine[st.i + 1] === "*") {
+            state.blockCommentClose = "*/";
+            st.out += " ";
+            st.i += 2;
+            continue;
+        }
+        if (cfg.isLuau && ch === "-" && rawLine[st.i + 1] === "-") {
+            const lb = readLongBracketPrefix(rawLine, st.i + 2);
+            if (lb) {
+                state.blockCommentClose = lb.close;
+                st.out += " ";
+                st.i += 2 + lb.openLen;
+                continue;
+            }
+            break;
+        }
+        if (cfg.isLuau && ch === "[") {
+            const lb = readLongBracketPrefix(rawLine, st.i);
+            if (lb) {
+                state.longStringClose = lb.close;
+                if (cfg.preserveStrings) st.out += rawLine.slice(st.i, st.i + lb.openLen);
+                st.i += lb.openLen;
+                continue;
+            }
+        }
+        if (cfg.isHashComment && ch === "#") break;
+
+        if (cfg.isJsTs && ch === "/" && rawLine[st.i + 1] !== "/" && rawLine[st.i + 1] !== "*") {
+            if (st.lastTokenType === "start" || st.lastTokenType === "op") {
+                const regexEnd = tryConsumeJsRegexLiteral(rawLine, st.i);
+                if (regexEnd > st.i) {
+                    st.out += cfg.preserveStrings ? rawLine.slice(st.i, regexEnd) : '""';
+                    st.i = regexEnd;
+                    st.lastTokenType = "string";
+                    continue;
+                }
+            }
+        }
+
+        if (cfg.isPy) {
+            const spec = matchPythonStringPrefix(rawLine, st.i);
+            if (spec) {
+                if (spec.quote.length === 3) {
+                    if (cfg.preserveStrings) st.out += rawLine.slice(st.i, st.i + spec.prefixLen + 3);
+                    else if (spec.isFString) st.out += '"';
+                    state.pyTripleQuote = { quote: spec.quote, isFString: spec.isFString };
+                    st.i += spec.prefixLen + 3;
+                    continue;
+                }
+                const strStart = st.i;
+                st.i += spec.prefixLen + spec.quote.length;
+                if (spec.isFString) {
+                    const lineF = { out: "", len, fStringStack: [], activeFQuote: spec.quote, i: st.i };
+                    lineF.activeFQuote = consumePythonFStringLiteral(rawLine, lineF, spec.quote);
+                    while (lineF.i < len && (lineF.activeFQuote || lineF.fStringStack.length > 0)) {
+                        if (lineF.activeFQuote) lineF.activeFQuote = consumePythonFStringLiteral(rawLine, lineF, lineF.activeFQuote);
+                        else if (!stepPythonFStringBrace(rawLine[lineF.i], lineF)) {
+                            lineF.out += rawLine[lineF.i];
+                            lineF.i += 1;
+                        }
+                    }
+                    st.out += cfg.preserveStrings ? rawLine.slice(strStart, lineF.i) : `"${lineF.out}`;
+                    st.i = lineF.i;
+                    st.lastTokenType = "string";
+                    continue;
+                }
+                const endIdx = consumeQuotedOnLine(rawLine, st.i - 1, spec.quote);
+                st.out += cfg.preserveStrings ? rawLine.slice(strStart, endIdx) : '""';
+                st.i = endIdx;
+                st.lastTokenType = "string";
+                continue;
+            }
+        }
+
+        if (cfg.isRust && ch === "'") {
+            const charEnd = tryConsumeRustCharOrLifetime(rawLine, st.i);
+            if (charEnd > st.i) {
+                st.out += cfg.preserveStrings ? rawLine.slice(st.i, charEnd) : '""';
+                st.i = charEnd;
+                st.lastTokenType = "string";
+                continue;
+            }
+            st.out += "'";
+            st.i += 1;
+            st.lastTokenType = "ident";
+            continue;
+        }
+
+        if (ch === "`") {
+            if (cfg.isJsTs || (!cfg.isLuau && !cfg.isPy && !cfg.isGo && !cfg.isRust)) {
+                state.inJsTemplateText = true;
+                st.out += cfg.preserveStrings ? "`" : '"';
+                st.i += 1;
+                continue;
+            }
+            if (cfg.isLuau) {
+                state.luauBacktick = true;
+                st.out += cfg.preserveStrings ? "`" : '"';
+                st.i += 1;
+                continue;
+            }
+            if (cfg.isGo) {
+                state.longStringClose = "`";
+                if (cfg.preserveStrings) st.out += "`";
+                st.i += 1;
+                continue;
+            }
+        }
+
+        if (ch === '"' || ch === "'") {
+            const endIdx = consumeQuotedOnLine(rawLine, st.i, ch);
+            st.out += cfg.preserveStrings ? rawLine.slice(st.i, endIdx) : '""';
+            st.i = endIdx;
+            st.lastTokenType = "string";
+            continue;
+        }
+
+        if (/[A-Za-z_$]/.test(ch)) {
+            let j = st.i + 1;
+            while (j < len && /[A-Za-z0-9_$]/.test(rawLine[j])) j += 1;
+            const word = rawLine.slice(st.i, j);
+            st.out += word;
+            st.lastTokenType = REGEX_PREFIX_KEYWORDS.has(word) ? "op" : "ident";
+            st.i = j;
+            continue;
+        }
+        if (/[0-9]/.test(ch)) {
+            let j = st.i + 1;
+            while (j < len && /[0-9a-fA-FxXoObB_.]/.test(rawLine[j])) j += 1;
+            st.out += rawLine.slice(st.i, j);
+            st.lastTokenType = "num";
+            st.i = j;
+            continue;
+        }
+
         st.out += ch;
+        if (!/\s/.test(ch)) {
+            if (ch === ")" || ch === "]" || ch === "}") st.lastTokenType = "close";
+            else st.lastTokenType = "op";
+        }
         st.i += 1;
     }
     return st.out;
 }
 
-export function stripCodeStringsAndComments(rawLine, isLuauOrLua = false, isPython = false) {
-    if (typeof rawLine !== "string" || !rawLine) return "";
-    if (isLuauOrLua) return stripLuauLine(rawLine);
-    if (isPython) return stripPythonLine(rawLine);
-    let s = rawLine;
-    if (s.includes("`")) {
-        // Strip non-interpolated template text segments first while keeping ${...} expressions intact
-        s = s
-            .replace(/`(?:\\.|[^`$\\]|\$(?!\{))*`/g, "``")
-            .replace(/`(?:\\.|[^`$\\]|\$(?!\{))*\$\{/g, "${")
-            .replace(/\}(?:\\.|[^`$\\]|\$(?!\{))*\$\{/g, "} ${")
-            .replace(/\}(?:\\.|[^`$\\]|\$(?!\{))*`/g, "}");
+export function stripCodeLines(lines, relPathOrOpts = "") {
+    if (!Array.isArray(lines)) return [];
+    const cfg = createStripConfig(relPathOrOpts);
+    const state = createCodeStripState();
+    const out = new Array(lines.length);
+    for (let i = 0; i < lines.length; i++) {
+        out[i] = stripCodeLineWithState(lines[i] || "", state, cfg);
     }
-    return s
-        .replace(/\/\*[\s\S]*?\*\//g, " ")
-        .replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""')
-        .replace(/\/\/.*$/, "")
-        .replace(/(?<=[=(,:!&|?[{;]\s*|^)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\r\n*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\r\n])*\/[dgimsuvy]*/g, '""');
+    return out;
+}
+
+export function stripCodeStringsAndComments(rawLine, isLuauOrLua = false, isPython = false, relPath = "") {
+    if (typeof rawLine !== "string" || !rawLine) return "";
+    const cfg = createStripConfig(
+        relPath
+            ? { relPath, isLuau: isLuauOrLua, isPy: isPython }
+            : { isLuau: isLuauOrLua, isPy: isPython, isJsTs: !isLuauOrLua && !isPython },
+    );
+    return stripCodeLineWithState(rawLine, createCodeStripState(), cfg);
 }
 
 const WORD_TOKEN_RE_CACHE = new Map();

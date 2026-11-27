@@ -75,33 +75,35 @@ export function loadHealthConfig(contextDir) {
         backupCorruptHealthFile(p, "config.json");
         return emptyHealthConfig();
     }
+    const { gitHistory: _legacyGitHistory, ...cleanRaw } = raw;
     return {
         ...emptyHealthConfig(),
-        ...raw,
+        ...cleanRaw,
         issue_noise_budget:
-            typeof raw.issue_noise_budget === "number" ? raw.issue_noise_budget : 10,
+            typeof cleanRaw.issue_noise_budget === "number" ? cleanRaw.issue_noise_budget : 10,
         issue_noise_global_budget:
-            typeof raw.issue_noise_global_budget === "number" ? raw.issue_noise_global_budget : 0,
-        layers: Array.isArray(raw.layers)
-            ? raw.layers
-            : typeof raw.layers === "string"
-              ? raw.layers
+            typeof cleanRaw.issue_noise_global_budget === "number" ? cleanRaw.issue_noise_global_budget : 0,
+        layers: Array.isArray(cleanRaw.layers)
+            ? cleanRaw.layers
+            : typeof cleanRaw.layers === "string"
+              ? cleanRaw.layers
                     .split(",")
                     .map((s) => s.trim())
                     .filter(Boolean)
               : [],
-        layer_rules: Array.isArray(raw.layer_rules) ? raw.layer_rules : [],
-        excludes: Array.isArray(raw.excludes) ? raw.excludes : [],
+        layer_rules: Array.isArray(cleanRaw.layer_rules) ? cleanRaw.layer_rules : [],
+        excludes: Array.isArray(cleanRaw.excludes) ? cleanRaw.excludes : [],
         suppressions:
-            raw.suppressions && typeof raw.suppressions === "object" ? raw.suppressions : {},
-        zones: raw.zones && typeof raw.zones === "object" ? raw.zones : {},
-        directives: raw.directives && typeof raw.directives === "object" ? raw.directives : {},
+            cleanRaw.suppressions && typeof cleanRaw.suppressions === "object" ? cleanRaw.suppressions : {},
+        zones: cleanRaw.zones && typeof cleanRaw.zones === "object" ? cleanRaw.zones : {},
+        directives: cleanRaw.directives && typeof cleanRaw.directives === "object" ? cleanRaw.directives : {},
     };
 }
 
 export function saveHealthConfig(contextDir, config) {
-    writeJsonAtomic(configFilePath(contextDir), config, true);
-    return config;
+    const { gitHistory: _transientGitHistory, ...persistable } = config || {};
+    writeJsonAtomic(configFilePath(contextDir), persistable, true);
+    return persistable;
 }
 
 export function emptyHealthState() {
@@ -537,6 +539,149 @@ function resolveMissingSeenIssueTransition(id, prev, scanNum, suspectDetectors, 
     out.autoResolvedIds.push(id);
 }
 
+function remapPlanIdsInPlace(plan, idMap) {
+    if (!plan || typeof plan !== "object" || !idMap || idMap.size === 0) return;
+    const remapArr = (arr) => (Array.isArray(arr) ? [...new Set(arr.map((id) => idMap.get(id) || id))] : arr);
+    plan.queue_order = remapArr(plan.queue_order);
+    plan.promoted_ids = remapArr(plan.promoted_ids);
+    plan.uncommitted_resolved = remapArr(plan.uncommitted_resolved);
+    plan.deferred_ids = remapArr(plan.deferred_ids);
+    if (plan.triage && Array.isArray(plan.triage.triaged_review_ids)) {
+        plan.triage.triaged_review_ids = remapArr(plan.triage.triaged_review_ids);
+    }
+    for (const c of Object.values(plan.clusters || {})) {
+        if (Array.isArray(c?.issue_ids)) c.issue_ids = remapArr(c.issue_ids);
+        for (const s of c?.steps || []) {
+            if (s && Array.isArray(s.issue_refs)) s.issue_refs = remapArr(s.issue_refs);
+        }
+    }
+    if (Array.isArray(plan.skipped)) {
+        plan.skipped = plan.skipped.map((entry) => {
+            if (typeof entry === "string") return idMap.get(entry) || entry;
+            if (entry && typeof entry === "object" && entry.id && idMap.has(entry.id)) {
+                return { ...entry, id: idMap.get(entry.id) };
+            }
+            return entry;
+        });
+    } else if (plan.skipped && typeof plan.skipped === "object") {
+        for (const [oldId, newId] of idMap.entries()) {
+            if (plan.skipped[oldId]) {
+                plan.skipped[newId] = { ...plan.skipped[oldId], id: newId };
+                delete plan.skipped[oldId];
+            }
+        }
+    }
+    if (plan.annotations && typeof plan.annotations === "object") {
+        for (const [oldId, newId] of idMap.entries()) {
+            if (plan.annotations[oldId]) {
+                plan.annotations[newId] = plan.annotations[oldId];
+                delete plan.annotations[oldId];
+            }
+        }
+    }
+}
+
+function isIssueReferencedInPlan(plan, id) {
+    if (!plan || typeof plan !== "object" || !id) return false;
+    if (plan.annotations?.[id]) return true;
+    if (Array.isArray(plan.skipped)) {
+        if (plan.skipped.some((e) => e === id || e?.id === id)) return true;
+    } else if (plan.skipped?.[id]) {
+        return true;
+    }
+    if ((plan.queue_order || []).includes(id) || (plan.promoted_ids || []).includes(id) || (plan.deferred_ids || []).includes(id)) {
+        return true;
+    }
+    for (const c of Object.values(plan.clusters || {})) {
+        if ((c?.issue_ids || []).includes(id)) return true;
+        if ((c?.steps || []).some((s) => (s?.issue_refs || []).includes(id))) return true;
+    }
+    return false;
+}
+
+function normalizeCarryOverSymbol(raw) {
+    if (!raw || typeof raw !== "string") return "";
+    const s = raw.trim().replace(/_?L\d+(?:-L?\d+)?$/i, "");
+    if (!s || s === "module" || s === "item" || /^L\d+$/i.test(s)) return "";
+    return s;
+}
+
+function isCarryOverEligiblePrev(prev, oldId, catSet, detSet, fileFilter, plan) {
+    if (!prev || prev.detector === "review") return false;
+    if (!isIssueInScanScope(prev, catSet, detSet, fileFilter)) return false;
+    const activeCarryStatuses = new Set(["open", "wontfix", "false_positive", "deferred", "triaged_out"]);
+    return (
+        activeCarryStatuses.has(prev.status) ||
+        Boolean(prev.suppressed) ||
+        Boolean(prev.note) ||
+        Boolean(prev.attestation) ||
+        Boolean(prev.custom_description) ||
+        isIssueReferencedInPlan(plan, oldId)
+    );
+}
+
+function matchCarryOverMigrations(detectedItems, prevIssues, directMatchedIds, catSet, detSet, fileFilter, plan) {
+    const unmatchedNew = [];
+    for (let i = 0; i < detectedItems.length; i++) {
+        const entry = detectedItems[i];
+        if (!prevIssues[entry.id]) unmatchedNew.push({ idx: i, ...entry });
+    }
+    if (unmatchedNew.length === 0) return { migratedByNewId: new Map(), migratedOldIds: new Set(), idMigrationMap: new Map() };
+
+    const eligibleByKey = new Map();
+    for (const [oldId, prev] of Object.entries(prevIssues)) {
+        if (directMatchedIds.has(oldId)) continue;
+        if (!isCarryOverEligiblePrev(prev, oldId, catSet, detSet, fileFilter, plan)) continue;
+        const normFile = String(prev.file || "").replace(/\\/g, "/");
+        const key = `${prev.detector}::${normFile}`;
+        let list = eligibleByKey.get(key);
+        if (!list) {
+            list = [];
+            eligibleByKey.set(key, list);
+        }
+        list.push({
+            oldId,
+            prev,
+            sym: normalizeCarryOverSymbol(prev.symbol || prev.identifier),
+            line: Number(prev.line || 1),
+        });
+    }
+    if (eligibleByKey.size === 0) return { migratedByNewId: new Map(), migratedOldIds: new Set(), idMigrationMap: new Map() };
+
+    const candidates = [];
+    for (const nw of unmatchedNew) {
+        const normFile = String(nw.item.file || "").replace(/\\/g, "/");
+        const list = eligibleByKey.get(`${nw.item.detector}::${normFile}`);
+        if (!list) continue;
+        const newSym = normalizeCarryOverSymbol(nw.item.symbol || nw.item.identifier);
+        const newLine = Number(nw.item.line || 1);
+        for (const oldEntry of list) {
+            const symMatch = Boolean(newSym && oldEntry.sym && newSym === oldEntry.sym);
+            const lineDist = Math.abs(newLine - oldEntry.line);
+            if (!symMatch && lineDist > 15) continue;
+            candidates.push({
+                newId: nw.id,
+                oldId: oldEntry.oldId,
+                prev: oldEntry.prev,
+                symRank: symMatch ? 0 : 1,
+                lineDist,
+            });
+        }
+    }
+
+    candidates.sort((a, b) => a.symRank - b.symRank || a.lineDist - b.lineDist || (a.oldId < b.oldId ? -1 : a.oldId > b.oldId ? 1 : 0));
+    const migratedByNewId = new Map();
+    const migratedOldIds = new Set();
+    const idMigrationMap = new Map();
+    for (const c of candidates) {
+        if (migratedByNewId.has(c.newId) || migratedOldIds.has(c.oldId)) continue;
+        migratedByNewId.set(c.newId, c.prev);
+        migratedOldIds.add(c.oldId);
+        idMigrationMap.set(c.oldId, c.newId);
+    }
+    return { migratedByNewId, migratedOldIds, idMigrationMap };
+}
+
 function reconcileUnseenScanIssues(
     prevIssues,
     seenIds,
@@ -553,13 +698,14 @@ function reconcileUnseenScanIssues(
     suppressedIds = [],
     scannedDetectors = null,
     fileFilter = null,
+    migratedOldIds = null,
 ) {
     const catSet = toScopeSet(scannedCategories);
     const detSet = toScopeSet(scannedDetectors);
     const out = { nextIssues, verifiedFixedIds, autoResolvedIds, suspectHeldIds, resurfacedIds, reopenedIds, suppressedIds };
 
     for (const [id, prev] of Object.entries(prevIssues)) {
-        if (seenIds.has(id)) continue;
+        if (seenIds.has(id) || migratedOldIds?.has(id)) continue;
         if (prev.detector === "review" || !isIssueInScanScope(prev, catSet, detSet, fileFilter)) {
             nextIssues[id] = prev;
             continue;
@@ -624,6 +770,9 @@ function buildReopenedScanIssue(item, id, prev, scanNum) {
         reopen_count: (prev.reopen_count || 0) + 1,
         last_seen_scan: scanNum,
         reopened_at_scan: scanNum,
+        note: item.note ?? prev.note ?? null,
+        attestation: item.attestation ?? prev.attestation ?? null,
+        ...(item.custom_description ?? prev.custom_description ? { custom_description: item.custom_description ?? prev.custom_description } : {}),
     };
 }
 
@@ -643,6 +792,9 @@ function upsertDetectedScanIssue(item, id, prev, scanNum, nextIssues, newIds, re
             suspect_hold: false,
             suppressed: true,
             last_seen_scan: scanNum,
+            note: item.note ?? prev.note ?? null,
+            attestation: item.attestation ?? prev.attestation ?? null,
+            ...(item.custom_description ?? prev.custom_description ? { custom_description: item.custom_description ?? prev.custom_description } : {}),
             ...(matchedEntry.reason && !prev.reason ? { reason: matchedEntry.reason } : {}),
         };
         return;
@@ -670,6 +822,9 @@ function upsertDetectedScanIssue(item, id, prev, scanNum, nextIssues, newIds, re
         suspect_hold: false,
         suppressed: isSupp,
         last_seen_scan: scanNum,
+        note: item.note ?? prev.note ?? null,
+        attestation: item.attestation ?? prev.attestation ?? null,
+        ...(item.custom_description ?? prev.custom_description ? { custom_description: item.custom_description ?? prev.custom_description } : {}),
     };
 }
 
@@ -705,14 +860,37 @@ export function reconcileIssues(state, detectedIssues = [], scannedCategories = 
     const activeCategories = scannedCategories || opts.scannedCategories || null;
     const activeDetectors = opts.scannedDetectors || null;
     const fileFilter = opts.fileFilter || null;
+    const catSet = toScopeSet(activeCategories);
+    const detSet = toScopeSet(activeDetectors);
 
-    for (const item of detectedIssues || []) {
-        const id = item.id || mintIssueId(item.detector, item.file, item.identifier || item.line);
+    const detectedWithIds = (detectedIssues || []).map((item) => ({
+        item,
+        id: item.id || mintIssueId(item.detector, item.file, item.identifier || item.line),
+    }));
+    const directMatchedIds = new Set();
+    for (const { id } of detectedWithIds) {
+        if (prevIssues[id]) directMatchedIds.add(id);
+    }
+
+    const { migratedByNewId, migratedOldIds, idMigrationMap } = matchCarryOverMigrations(
+        detectedWithIds,
+        prevIssues,
+        directMatchedIds,
+        catSet,
+        detSet,
+        fileFilter,
+        opts.plan || null,
+    );
+    if (opts.plan && idMigrationMap.size > 0) {
+        remapPlanIdsInPlace(opts.plan, idMigrationMap);
+    }
+
+    for (const { item, id } of detectedWithIds) {
         seenIds.add(id);
         upsertDetectedScanIssue(
             item,
             id,
-            prevIssues[id],
+            prevIssues[id] || migratedByNewId.get(id),
             scanNum,
             nextIssues,
             newIds,
@@ -727,8 +905,8 @@ export function reconcileIssues(state, detectedIssues = [], scannedCategories = 
         detectedIssues,
         Boolean(opts.forceResolve),
         Boolean(opts.isScopedScan || fileFilter),
-        toScopeSet(activeCategories),
-        toScopeSet(activeDetectors),
+        catSet,
+        detSet,
         fileFilter,
     );
     reconcileUnseenScanIssues(
@@ -747,6 +925,7 @@ export function reconcileIssues(state, detectedIssues = [], scannedCategories = 
         suppressedIds,
         activeDetectors,
         fileFilter,
+        migratedOldIds,
     );
 
     state.issues = nextIssues;
@@ -767,13 +946,15 @@ export function reconcileIssues(state, detectedIssues = [], scannedCategories = 
         resurfacedCount: resurfacedIds.length,
         suppressedIds,
         suppressedCount: suppressedIds.length,
+        migratedIds: [...idMigrationMap.values()],
+        idMigrationMap: Object.fromEntries(idMigrationMap),
     };
 }
 
 function mergeScanPotentials(prevPotentials = {}, newPotentials = {}, opts = {}) {
     const base = { ...(prevPotentials || {}) };
     const incoming = newPotentials || {};
-    if (opts.isEphemeral || opts.isScopedScan) {
+    if (opts.isEphemeral) {
         return { ...base, ...incoming };
     }
     const catSet = toScopeSet(opts.scannedCategories);
@@ -883,6 +1064,7 @@ export function mergeScanIntoState(state, detectedIssues, potentials, plan, opts
 
     const rec = reconcileIssues({ ...state, scan_count: scanNum }, detectedIssues, opts.scannedCategories || null, {
         ...opts,
+        plan,
         scanNum,
     });
     const nextIssues = rec.issues;
@@ -893,7 +1075,8 @@ export function mergeScanIntoState(state, detectedIssues, potentials, plan, opts
         rec.verifiedFixedIds.length +
         rec.suspectHeldIds.length +
         rec.resurfacedIds.length +
-        rec.suppressedIds.length;
+        rec.suppressedIds.length +
+        (rec.migratedIds?.length || 0);
     const hasPendingDeferredResurface = Object.values(state.issues || {}).some(
         (i) => i.status === "deferred" && i.resurface_after_scan !== undefined && i.resurface_after_scan !== null,
     );

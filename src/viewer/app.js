@@ -31,6 +31,7 @@ const sidecarState = {
   lastRev: "",
   treemapLoadedKey: "",
   revTimer: 0,
+  revInFlight: false,
   treemapReqSeq: 0,
 };
 
@@ -138,18 +139,39 @@ const state = {
 };
 
 const FLOW_DURATION_MS = 4000;
+const MAX_LAYOUT_CACHE = 24;
+const MAX_SOURCE_CACHE = 128;
+const MAX_LABEL_WIDTH_CACHE = 2048;
 const labelWidthCache = new Map();
+
+function getLruMap(map, key) {
+  if (!map.has(key)) return undefined;
+  const val = map.get(key);
+  map.delete(key);
+  map.set(key, val);
+  return val;
+}
+
+function setLruMap(map, key, value, maxEntries) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxEntries) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
 
 function getCachedLabelWidth(text, fontSize, weight = 600) {
   if (!text) return 0;
   const key = `${weight}:${text}`;
-  let baseW = labelWidthCache.get(key);
+  let baseW = getLruMap(labelWidthCache, key);
   if (baseW === undefined) {
     ctx.save();
     ctx.font = `${weight} 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
     baseW = ctx.measureText(text).width;
     ctx.restore();
-    labelWidthCache.set(key, baseW);
+    setLruMap(labelWidthCache, key, baseW, MAX_LABEL_WIDTH_CACHE);
   }
   return baseW * (fontSize / 11);
 }
@@ -1048,8 +1070,40 @@ function applyEdgeSpringForces(edges, kSpring, alpha) {
   }
 }
 
+const clusterGrid = new Map();
+const clusterBucketPool = [];
+
+function applyClusterPairSeparation(cA, cB, i, j, clusterGap, alpha) {
+  let dx = cB.cx - cA.cx;
+  let dy = cB.cy - cA.cy;
+  const d2 = dx * dx + dy * dy;
+  const minD = cA.radius + cB.radius + clusterGap;
+  if (d2 >= minD * minD) return;
+  let dist = Math.sqrt(d2);
+  if (dist < 0.1) {
+    dx = i % 2 === 0 ? 1 : -1;
+    dy = j % 2 === 0 ? 1 : -1;
+    dist = Math.SQRT2;
+  }
+  const push = ((minD - dist) / dist) * 0.36 * alpha;
+  const px = dx * push;
+  const py = dy * push;
+  cA.pushX -= px;
+  cA.pushY -= py;
+  cB.pushX += px;
+  cB.pushY += py;
+}
+
 function applyClusterSeparationForces(clusters, isSymbols, alpha) {
   const C = clusters.length;
+  if (C <= 1) {
+    if (C === 1) {
+      clusters[0].pushX = 0;
+      clusters[0].pushY = 0;
+    }
+    return;
+  }
+  let maxRadius = 0;
   for (let i = 0; i < C; i++) {
     const c = clusters[i];
     const members = c.members;
@@ -1064,31 +1118,51 @@ function applyClusterSeparationForces(clusters, isSymbols, alpha) {
     c.cy = sy / mLen;
     c.pushX = 0;
     c.pushY = 0;
+    if (c.radius > maxRadius) maxRadius = c.radius;
   }
 
   const clusterGap = isSymbols ? 26 : 34;
+  if (C <= 32) {
+    for (let i = 0; i < C; i++) {
+      const cA = clusters[i];
+      for (let j = i + 1; j < C; j++) {
+        applyClusterPairSeparation(cA, clusters[j], i, j, clusterGap, alpha);
+      }
+    }
+    return;
+  }
+
+  const cellSize = Math.max(80, maxRadius * 2 + clusterGap);
+  for (const bucket of clusterGrid.values()) {
+    bucket.length = 0;
+    clusterBucketPool.push(bucket);
+  }
+  clusterGrid.clear();
+  for (let i = 0; i < C; i++) {
+    const c = clusters[i];
+    const gx = Math.floor(c.cx / cellSize);
+    const gy = Math.floor(c.cy / cellSize);
+    const key = ((gx & 0xffff) << 16) | (gy & 0xffff);
+    let bucket = clusterGrid.get(key);
+    if (!bucket) {
+      bucket = clusterBucketPool.pop() ?? [];
+      clusterGrid.set(key, bucket);
+    }
+    bucket.push(i);
+  }
   for (let i = 0; i < C; i++) {
     const cA = clusters[i];
-    for (let j = i + 1; j < C; j++) {
-      const cB = clusters[j];
-      let dx = cB.cx - cA.cx;
-      let dy = cB.cy - cA.cy;
-      const d2 = dx * dx + dy * dy;
-      const minD = cA.radius + cB.radius + clusterGap;
-      if (d2 < minD * minD) {
-        let dist = Math.sqrt(d2);
-        if (dist < 0.1) {
-          dx = i % 2 === 0 ? 1 : -1;
-          dy = j % 2 === 0 ? 1 : -1;
-          dist = Math.SQRT2;
+    const gx = Math.floor(cA.cx / cellSize);
+    const gy = Math.floor(cA.cy / cellSize);
+    for (let dxCell = -1; dxCell <= 1; dxCell++) {
+      const nx = (gx + dxCell) & 0xffff;
+      for (let dyCell = -1; dyCell <= 1; dyCell++) {
+        const bucket = clusterGrid.get((nx << 16) | ((gy + dyCell) & 0xffff));
+        if (!bucket) continue;
+        for (let bi = 0; bi < bucket.length; bi++) {
+          const j = bucket[bi];
+          if (j > i) applyClusterPairSeparation(cA, clusters[j], i, j, clusterGap, alpha);
         }
-        const push = ((minD - dist) / dist) * 0.36 * alpha;
-        const px = dx * push;
-        const py = dy * push;
-        cA.pushX -= px;
-        cA.pushY -= py;
-        cB.pushX += px;
-        cB.pushY += py;
       }
     }
   }
@@ -1145,9 +1219,7 @@ function stepPhysics() {
   const cellSize = SPATIAL_CELL_SIZE;
   const maxDist2 = cellSize * cellSize;
 
-  if (spatialGrid.size === 0) {
-    populateSpatialGrid();
-  }
+  populateSpatialGrid();
 
   applySpatialRepulsionForces(nodes, cellSize, maxDist2, kRepel, alpha);
   applyEdgeSpringForces(edges, kSpring, alpha);
@@ -1430,47 +1502,64 @@ function computeGraphCycles() {
   const lowlink = new Map();
   const onStack = new Set();
   const stack = [];
+  const callStack = [];
   const sccByNode = new Map();
   let sccCount = 0;
 
-  function strongConnect(vId) {
-    indices.set(vId, index);
-    lowlink.set(vId, index);
+  for (let i = 0; i < nodes.length; i++) {
+    const startId = nodes[i].id;
+    if (indices.has(startId)) continue;
+    indices.set(startId, index);
+    lowlink.set(startId, index);
     index++;
-    stack.push(vId);
-    onStack.add(vId);
+    stack.push(startId);
+    onStack.add(startId);
+    callStack.push({ id: startId, neighbors: state.adjOut.get(startId) ?? [], edgeIdx: 0 });
 
-    for (const wId of state.adjOut.get(vId) ?? []) {
-      if (!indices.has(wId)) {
-        strongConnect(wId);
-        lowlink.set(vId, Math.min(lowlink.get(vId), lowlink.get(wId)));
-      } else if (onStack.has(wId)) {
-        lowlink.set(vId, Math.min(lowlink.get(vId), indices.get(wId)));
-      }
-    }
-
-    if (lowlink.get(vId) === indices.get(vId)) {
-      const memberIds = [];
-      while (stack.length > 0) {
-        const wId = stack.pop();
-        onStack.delete(wId);
-        memberIds.push(wId);
-        if (wId === vId) break;
-      }
-      if (memberIds.length > 1) {
-        const cid = ++sccCount;
-        for (const mId of memberIds) {
-          state.cycleNodeIds.add(mId);
-          sccByNode.set(mId, cid);
+    while (callStack.length > 0) {
+      const frame = callStack[callStack.length - 1];
+      const vId = frame.id;
+      if (frame.edgeIdx < frame.neighbors.length) {
+        const wId = frame.neighbors[frame.edgeIdx++];
+        if (!indices.has(wId)) {
+          indices.set(wId, index);
+          lowlink.set(wId, index);
+          index++;
+          stack.push(wId);
+          onStack.add(wId);
+          callStack.push({ id: wId, neighbors: state.adjOut.get(wId) ?? [], edgeIdx: 0 });
+        } else if (onStack.has(wId)) {
+          const wIndex = indices.get(wId);
+          if (wIndex < lowlink.get(vId)) {
+            lowlink.set(vId, wIndex);
+          }
+        }
+      } else {
+        callStack.pop();
+        if (callStack.length > 0) {
+          const parentId = callStack[callStack.length - 1].id;
+          const vLow = lowlink.get(vId);
+          if (vLow < lowlink.get(parentId)) {
+            lowlink.set(parentId, vLow);
+          }
+        }
+        if (lowlink.get(vId) === indices.get(vId)) {
+          const memberIds = [];
+          while (stack.length > 0) {
+            const wId = stack.pop();
+            onStack.delete(wId);
+            memberIds.push(wId);
+            if (wId === vId) break;
+          }
+          if (memberIds.length > 1) {
+            const cid = ++sccCount;
+            for (const mId of memberIds) {
+              state.cycleNodeIds.add(mId);
+              sccByNode.set(mId, cid);
+            }
+          }
         }
       }
-    }
-  }
-
-  for (let i = 0; i < nodes.length; i++) {
-    const id = nodes[i].id;
-    if (!indices.has(id)) {
-      strongConnect(id);
     }
   }
 
@@ -3086,25 +3175,26 @@ function toggleOutlineSidebar(forceOpen) {
   requestDraw();
 }
 
-function buildOutlineDirHtml(dir, entries, hasSearch) {
+function buildOutlineFileSymbolsHtml(syms) {
+  if (!syms?.length) return "";
   const html = [];
-  const dirCollapsed = !hasSearch && state.collapsedDirs.has(dir);
-  const dirColor = colorForDir(dir);
-  html.push(`<div class="outline-dir${dirCollapsed ? " collapsed" : ""}" data-dir-group="${escapeHtml(dir)}">`);
-  html.push(
-    `<div class="outline-dir-header" data-toggle-dir="${escapeHtml(dir)}">` +
-      `<div class="outline-dir-left">` +
-        `<span class="outline-chevron">▾</span>` +
-        `<span class="outline-dir-dot" style="background:${dirColor}"></span>` +
-        `<span class="outline-dir-name">${escapeHtml(dir)}/</span>` +
-      `</div>` +
-      `<div class="outline-dir-meta">` +
-        `<button type="button" class="outline-focus-cluster-btn" data-focus-cluster="${escapeHtml(dir)}" title="Zoom to directory cluster">Focus</button>` +
-        `<span>${entries.length}</span>` +
-      `</div>` +
-    `</div>`
-  );
-  html.push(`<div class="outline-dir-body">`);
+  for (const s of syms) {
+    const sIn = (state.wiringIn.get(s.id) ?? []).length;
+    const sOut = (state.wiringOut.get(s.id) ?? []).length;
+    const symSel = state.selectedId === s.id ? " selected" : "";
+    html.push(
+      `<div class="outline-sym-row${symSel}" data-node-id="${escapeHtml(s.id)}" title="${escapeHtml(s.signature || s.name)}">` +
+        `<span class="outline-sym-badge" style="color:${KIND_COLORS[s.kind] ?? "#93a8ff"}">${escapeHtml(s.kind.slice(0, 4))}</span>` +
+        `<span class="outline-sym-name">${escapeHtml(s.name)}</span>` +
+        `<span class="outline-sym-meta">←${sIn} →${sOut}</span>` +
+      `</div>`
+    );
+  }
+  return html.join("");
+}
+
+function buildOutlineDirBodyHtml(dir, entries, hasSearch) {
+  const html = [];
   for (const { file, syms } of entries) {
     const fIn = (state.wiringIn.get(file.id) ?? []).length;
     const fOut = (state.wiringOut.get(file.id) ?? []).length;
@@ -3125,21 +3215,37 @@ function buildOutlineDirHtml(dir, entries, hasSearch) {
     );
     if (syms.length > 0) {
       html.push(`<div class="outline-symbols">`);
-      for (const s of syms) {
-        const sIn = (state.wiringIn.get(s.id) ?? []).length;
-        const sOut = (state.wiringOut.get(s.id) ?? []).length;
-        const symSel = state.selectedId === s.id ? " selected" : "";
-        html.push(
-          `<div class="outline-sym-row${symSel}" data-node-id="${escapeHtml(s.id)}" title="${escapeHtml(s.signature || s.name)}">` +
-            `<span class="outline-sym-badge" style="color:${KIND_COLORS[s.kind] ?? "#93a8ff"}">${escapeHtml(s.kind.slice(0, 4))}</span>` +
-            `<span class="outline-sym-name">${escapeHtml(s.name)}</span>` +
-            `<span class="outline-sym-meta">←${sIn} →${sOut}</span>` +
-          `</div>`
-        );
+      if (!fileCollapsed) {
+        html.push(buildOutlineFileSymbolsHtml(syms));
       }
       html.push(`</div>`);
     }
     html.push(`</div>`);
+  }
+  return html.join("");
+}
+
+function buildOutlineDirHtml(dir, entries, hasSearch) {
+  const html = [];
+  const dirCollapsed = !hasSearch && state.collapsedDirs.has(dir);
+  const dirColor = colorForDir(dir);
+  html.push(`<div class="outline-dir${dirCollapsed ? " collapsed" : ""}" data-dir-group="${escapeHtml(dir)}">`);
+  html.push(
+    `<div class="outline-dir-header" data-toggle-dir="${escapeHtml(dir)}">` +
+      `<div class="outline-dir-left">` +
+        `<span class="outline-chevron">▾</span>` +
+        `<span class="outline-dir-dot" style="background:${dirColor}"></span>` +
+        `<span class="outline-dir-name">${escapeHtml(dir)}/</span>` +
+      `</div>` +
+      `<div class="outline-dir-meta">` +
+        `<button type="button" class="outline-focus-cluster-btn" data-focus-cluster="${escapeHtml(dir)}" title="Zoom to directory cluster">Focus</button>` +
+        `<span>${entries.length}</span>` +
+      `</div>` +
+    `</div>`
+  );
+  html.push(`<div class="outline-dir-body">`);
+  if (!dirCollapsed) {
+    html.push(buildOutlineDirBodyHtml(dir, entries, hasSearch));
   }
   html.push(`</div></div>`);
   return html.join("");
@@ -3151,14 +3257,20 @@ function renderOutlineView(preserveScroll = true) {
   const cg = state.codeGraph;
   state.lastOutlineKey = `${cg?.nodes?.length ?? 0}::${state.scopeFilter}::${state.search}`;
   if (!cg?.nodes?.length) {
+    state.outlineByDir = new Map();
+    state.outlineSymsByFile = new Map();
     if (el.outlineCount) el.outlineCount.textContent = "0";
     el.outlineList.innerHTML = `<div class="empty-state">No wiring graph found — run <code>plexer build</code> first.</div>`;
     return;
   }
 
-  const files = cg.nodes
-    .filter((n) => n.kind === "file")
-    .sort((a, b) => a.path.localeCompare(b.path));
+  if (state.outlineCachedGraph !== cg) {
+    state.outlineCachedGraph = cg;
+    state.outlineSortedFiles = cg.nodes
+      .filter((n) => n.kind === "file")
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  }
+  const files = state.outlineSortedFiles;
 
   if (!state.filesCollapseInitialized && files.length > 8) {
     state.filesCollapseInitialized = true;
@@ -3168,21 +3280,25 @@ function renderOutlineView(preserveScroll = true) {
   }
 
   const byDir = new Map();
+  const symsByFile = new Map();
   let matchedSymbols = 0;
   let matchedFiles = 0;
 
   for (const f of files) {
     const allSyms = state.fileSymbols.get(f.path) ?? [];
-    const syms = allSyms.filter((s) => matchesFilter(s.path, s.name));
+    const syms = state.search ? allSyms.filter((s) => matchesFilter(s.path, s.name)) : allSyms;
     const fileHit = matchesFilter(f.path, f.name);
-    if (!fileHit && syms.length === 0) continue;
+    if (!fileHit && (!state.search || syms.length === 0)) continue;
     matchedFiles++;
-    matchedSymbols += state.search ? syms.length : allSyms.length;
+    matchedSymbols += syms.length;
     const dir = dirGroupOf(f.path);
     const list = byDir.get(dir) ?? [];
-    list.push({ file: f, syms: state.search ? syms : allSyms });
+    list.push({ file: f, syms });
     byDir.set(dir, list);
+    symsByFile.set(f.id, syms);
   }
+  state.outlineByDir = byDir;
+  state.outlineSymsByFile = symsByFile;
 
   if (el.outlineCount) {
     el.outlineCount.textContent = `${matchedFiles}f · ${matchedSymbols}s`;
@@ -3204,6 +3320,24 @@ function renderOutlineView(preserveScroll = true) {
   }
 }
 
+function hydrateOutlineDirEl(dirEl, dir) {
+  if (!dirEl) return;
+  const dirBody = dirEl.querySelector(".outline-dir-body");
+  if (dirBody && dirBody.childElementCount === 0) {
+    const entries = state.outlineByDir?.get(dir);
+    if (entries) dirBody.innerHTML = buildOutlineDirBodyHtml(dir, entries, Boolean(state.search));
+  }
+}
+
+function hydrateOutlineFileEl(fileEl, fileId) {
+  if (!fileEl) return;
+  const symWrap = fileEl.querySelector(".outline-symbols");
+  if (symWrap && symWrap.childElementCount === 0) {
+    const syms = state.outlineSymsByFile?.get(fileId) ?? state.fileSymbols.get(fileId);
+    if (syms?.length) symWrap.innerHTML = buildOutlineFileSymbolsHtml(syms);
+  }
+}
+
 function syncOutlineSelection(selectedId, scrollIntoView = true) {
   if (!el.outlineList) return;
   if (selectedId) {
@@ -3212,11 +3346,17 @@ function syncOutlineSelection(selectedId, scrollIntoView = true) {
       const dir = dirGroupOf(wNode.path);
       state.collapsedDirs.delete(dir);
       const dirEl = el.outlineList.querySelector(`[data-dir-group="${CSS.escape(dir)}"]`);
-      dirEl?.classList.remove("collapsed");
+      if (dirEl) {
+        dirEl.classList.remove("collapsed");
+        hydrateOutlineDirEl(dirEl, dir);
+      }
       if (wNode.kind !== "file") {
         state.collapsedFiles.delete(wNode.path);
         const fileEl = el.outlineList.querySelector(`[data-file-id="${CSS.escape(wNode.path)}"]`);
-        fileEl?.classList.remove("collapsed");
+        if (fileEl) {
+          fileEl.classList.remove("collapsed");
+          hydrateOutlineFileEl(fileEl, wNode.path);
+        }
       }
     }
   }
@@ -3307,7 +3447,7 @@ function snapshotLayoutToCache() {
       dirRadius: n.dirRadius,
     });
   }
-  state.layoutCache.set(key, snap);
+  setLruMap(state.layoutCache, key, snap, MAX_LAYOUT_CACHE);
 }
 
 function runWarmLayout() {
@@ -3347,7 +3487,7 @@ function snapshotPreviousNodePositions() {
 
 function restoreOrComputeLayout(forceRelayout) {
   const cacheKey = getLayoutCacheKey();
-  const cachedLayout = !forceRelayout ? state.layoutCache.get(cacheKey) : null;
+  const cachedLayout = !forceRelayout ? getLruMap(state.layoutCache, cacheKey) : null;
   if (cachedLayout && cachedLayout.size === state.nodes.length) {
     for (let i = 0; i < state.nodes.length; i++) {
       const n = state.nodes[i];
@@ -3755,8 +3895,9 @@ async function fetchAndRenderSource(wNode, overrideSpan = null) {
   const spanQuery = overrideSpan ?? wNode.span ?? "";
   const wantFull = state.sourceExpanded.has(nodeId);
   const cacheKey = `${wNode.path}:${spanQuery}:${wantFull ? "full" : "default"}`;
-  if (state.sourceCache.has(cacheKey)) {
-    renderSourceBox(nodeId, state.sourceCache.get(cacheKey));
+  const cachedSource = getLruMap(state.sourceCache, cacheKey);
+  if (cachedSource !== undefined) {
+    renderSourceBox(nodeId, cachedSource);
     return;
   }
 
@@ -3769,7 +3910,7 @@ async function fetchAndRenderSource(wNode, overrideSpan = null) {
       return;
     }
     const data = await res.json();
-    state.sourceCache.set(cacheKey, data);
+    setLruMap(state.sourceCache, cacheKey, data, MAX_SOURCE_CACHE);
     if (reqId === state.sourceReqSeq && state.selectedId === nodeId) {
       renderSourceBox(nodeId, data);
     }
@@ -4627,14 +4768,18 @@ function wireInspectorSourceAndOutlineEvents() {
       ev.stopPropagation();
       const fid = fileChevron.dataset.toggleFile;
       const collapsed = toggleSet(state.collapsedFiles, fid);
-      fileChevron.closest(".outline-file")?.classList.toggle("collapsed", collapsed);
+      const fileWrap = fileChevron.closest(".outline-file");
+      fileWrap?.classList.toggle("collapsed", collapsed);
+      if (!collapsed) hydrateOutlineFileEl(fileWrap, fid);
       return;
     }
     const dirHeader = ev.target.closest("[data-toggle-dir]");
     if (dirHeader) {
       const dir = dirHeader.dataset.toggleDir;
       const collapsed = toggleSet(state.collapsedDirs, dir);
-      dirHeader.closest(".outline-dir")?.classList.toggle("collapsed", collapsed);
+      const dirWrap = dirHeader.closest(".outline-dir");
+      dirWrap?.classList.toggle("collapsed", collapsed);
+      if (!collapsed) hydrateOutlineDirEl(dirWrap, dir);
       return;
     }
     const row = ev.target.closest("[data-node-id]");
@@ -4643,7 +4788,9 @@ function wireInspectorSourceAndOutlineEvents() {
     if (row.classList.contains("outline-file-row")) {
       const fileWrap = row.closest(".outline-file");
       if (fileWrap && (state.fileSymbols.get(row.dataset.filePath) ?? []).length > 0) {
-        fileWrap.classList.toggle("collapsed", toggleSet(state.collapsedFiles, nodeId));
+        const collapsed = toggleSet(state.collapsedFiles, nodeId);
+        fileWrap.classList.toggle("collapsed", collapsed);
+        if (!collapsed) hydrateOutlineFileEl(fileWrap, nodeId);
       }
     }
     jumpToNodeId(nodeId, false);
@@ -5010,7 +5157,8 @@ function renderWorkspaceSelectOptions(uris) {
 }
 
 async function pollSidecarRev() {
-  if (!sidecarState.active || document.hidden) return;
+  if (!sidecarState.active || document.hidden || sidecarState.revInFlight) return;
+  sidecarState.revInFlight = true;
   try {
     const res = await apiFetch("/api/rev");
     if (!res?.ok) return;
@@ -5026,6 +5174,8 @@ async function pollSidecarRev() {
     }
   } catch {
     // Sidecar polling is best-effort.
+  } finally {
+    sidecarState.revInFlight = false;
   }
 }
 
@@ -5060,6 +5210,14 @@ async function initSidecarIntegration() {
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) pollSidecarRev();
   });
+  const stopRevTimer = () => {
+    if (sidecarState.revTimer) {
+      clearInterval(sidecarState.revTimer);
+      sidecarState.revTimer = 0;
+    }
+  };
+  window.addEventListener("beforeunload", stopRevTimer);
+  window.addEventListener("pagehide", stopRevTimer);
 }
 
 async function fetchOrReadEmbeddedGraphs() {
@@ -5150,5 +5308,10 @@ if (sidecarState.active) {
 if (!window.__PLEXER_DATA__ && !sidecarState.active && typeof EventSource !== "undefined") {
   const es = new EventSource("/events");
   es.addEventListener("message", () => loadGraphs(true));
+  const closeEs = () => {
+    try { es.close(); } catch { /* ignore */ }
+  };
+  window.addEventListener("beforeunload", closeEs);
+  window.addEventListener("pagehide", closeEs);
 }
 

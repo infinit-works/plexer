@@ -2,10 +2,9 @@
  * $O(N \log N)$ LOC-windowed exact (SHA-256) and near-duplicate (token 4-gram Jaccard >= 0.82)
  * function/method detector powered by `wiring.json` symbol spans.
  */
-import { createHash } from "node:crypto";
 import { spanRange } from "../util/span.js";
 import { mintIssueId } from "./state.js";
-import { SCORED_ZONES, UnionFind, hasInlineSuppression } from "./zones.js";
+import { SCORED_ZONES, UnionFind, hasInlineSuppression, stripCodeLines } from "./zones.js";
 
 const MIN_DUP_LINES = 8;
 const MIN_DUP_TOKENS = 24;
@@ -66,57 +65,10 @@ const STOP_KEYWORDS = new Set([
     "this",
 ]);
 
-function advanceQuotedString(raw, startIdx) {
-    const q = raw[startIdx];
-    let i = startIdx + 1;
-    while (i < raw.length) {
-        if (raw[i] === "\\") {
-            i += 2;
-            continue;
-        }
-        i += 1;
-        if (raw[i - 1] === q) break;
-    }
-    return i;
-}
-
-function stripLineCommentsPreserveStrings(raw, { isDashComment, isHashComment, isSlashComment }) {
-    let out = "";
-    let i = 0;
-    while (i < raw.length) {
-        const ch = raw[i];
-        if (isSlashComment && ch === "/" && raw[i + 1] === "/") break;
-        if (isSlashComment && ch === "/" && raw[i + 1] === "*") {
-            const close = raw.indexOf("*/", i + 2);
-            if (close < 0) break;
-            out += " ";
-            i = close + 2;
-            continue;
-        }
-        if (isDashComment && ch === "-" && raw[i + 1] === "-") break;
-        if (isHashComment && ch === "#") break;
-        if (ch === '"' || ch === "'" || ch === "`") {
-            const nextIdx = advanceQuotedString(raw, i);
-            out += raw.slice(i, nextIdx);
-            i = nextIdx;
-            continue;
-        }
-        out += ch;
-        i += 1;
-    }
-    return out.trim();
-}
-
 function stripCommentsPreserveStrings(lines, relPath = "") {
-    const isDashComment = /\.(?:luau|lua|sql)$/i.test(relPath);
-    const isHashComment = /\.(?:py|pyi|sh|bash|zsh|rb|pl|r|ya?ml|toml)$/i.test(relPath);
-    const mode = { isDashComment, isHashComment, isSlashComment: !isDashComment && !isHashComment };
-    const cleaned = [];
-    for (const raw of lines) {
-        const trimmed = stripLineCommentsPreserveStrings(raw, mode);
-        if (trimmed) cleaned.push(trimmed);
-    }
-    return cleaned;
+    return stripCodeLines(lines, { relPath, preserveStrings: true })
+        .map((l) => l.trim())
+        .filter(Boolean);
 }
 
 function collectParamNamesFromHeader(headerLines, locals) {
@@ -253,16 +205,37 @@ function externalVocabOverlap(setA, setB) {
     return union > 0 ? inter / union : 0;
 }
 
+function fnv1a53(str) {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x9e3779b9;
+    for (let i = 0; i < str.length; i++) {
+        const c = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ c, 0x01000193);
+        h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b);
+    }
+    return ((h1 >>> 0) & 0x1fffff) * 0x100000000 + (h2 >>> 0);
+}
+
+function fnv1aHex16(str) {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x9e3779b9;
+    for (let i = 0; i < str.length; i++) {
+        const c = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ c, 0x01000193);
+        h2 = Math.imul(h2 ^ (c + 31), 0x85ebca6b);
+    }
+    return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+}
+
 function buildShingles(tokens, k = 4) {
     const set = new Set();
     if (tokens.length < k) {
-        set.add(tokens.join(" "));
+        set.add(fnv1a53(tokens.join(" ")));
         return set;
     }
     for (let i = 0; i <= tokens.length - k; i++) {
-        const gram = `${tokens[i]} ${tokens[i + 1]} ${tokens[i + 2]} ${tokens[i + 3]}`;
-        const h = createHash("md5").update(gram).digest("hex").slice(0, 8);
-        set.add(h);
+        const gram = `${tokens[i]}\x00${tokens[i + 1]}\x00${tokens[i + 2]}\x00${tokens[i + 3]}`;
+        set.add(fnv1a53(gram));
     }
     return set;
 }
@@ -344,7 +317,8 @@ function collectDuplicateCandidates(graph, readLines, zoneMap, ignoreRules) {
         );
         if (structuralTokens.length < MIN_DUP_TOKENS) continue;
 
-        const exactHash = createHash("sha256").update(exactTokens.join(" ")).digest("hex").slice(0, 16);
+        const exactHash = fnv1aHex16(exactTokens.join(" "));
+        const structHash = fnv1aHex16(structuralTokens.join(" ")).slice(0, 8);
         const shingles = buildShingles(structuralTokens, 4);
 
         candidates.push({
@@ -356,6 +330,7 @@ function collectDuplicateCandidates(graph, readLines, zoneMap, ignoreRules) {
             end: range.end,
             loc,
             exactHash,
+            structHash,
             shingles,
             externalVocab,
         });
@@ -406,20 +381,65 @@ function findCloneDrift(members, gitHistory) {
 }
 
 function unionNearDuplicatePairs(remaining, uf, maxSimByIdx, maxVocabOverlapByIdx) {
+    const shingleIndex = new Map();
+    for (let i = 0; i < remaining.length; i++) {
+        for (const sh of remaining[i].c.shingles) {
+            let list = shingleIndex.get(sh);
+            if (!list) {
+                list = [];
+                shingleIndex.set(sh, list);
+            }
+            list.push(i);
+        }
+    }
+
+    const repIdxByRoot = new Map();
+    for (let i = 0; i < remaining.length; i++) repIdxByRoot.set(i, i);
+
     for (let i = 0; i < remaining.length; i++) {
         const base = remaining[i].c;
         const maxLoc = Math.ceil(base.loc / 0.7);
-        for (let j = i + 1; j < remaining.length; j++) {
+        const minShared = Math.max(1, Math.ceil(JACCARD_THRESHOLD * base.shingles.size));
+        const hitCounts = new Map();
+        for (const sh of base.shingles) {
+            const postings = shingleIndex.get(sh);
+            if (!postings) continue;
+            for (const j of postings) {
+                if (j <= i) continue;
+                hitCounts.set(j, (hitCounts.get(j) || 0) + 1);
+            }
+        }
+        const candJs = [];
+        for (const [j, hits] of hitCounts.entries()) {
+            if (hits >= minShared) candJs.push(j);
+        }
+        candJs.sort((a, b) => a - b);
+
+        for (const j of candJs) {
             const other = remaining[j].c;
             if (other.loc > maxLoc) break;
             if (other.path === base.path && other.name === base.name && other.start === base.start) continue;
             const sim = jaccard(base.shingles, other.shingles);
             if (sim < JACCARD_THRESHOLD) continue;
             const vocabOverlap = externalVocabOverlap(base.externalVocab, other.externalVocab);
-            // Require pairwise external-vocab overlap on every unioned pair so
-            // unrelated >=14-LOC functions never bridge transitively.
             if (vocabOverlap < 0.5) continue;
-            uf.union(i, j);
+
+            const rootA = uf.find(i);
+            const rootB = uf.find(j);
+            if (rootA !== rootB) {
+                const repA = remaining[repIdxByRoot.get(rootA) ?? rootA].c;
+                const repB = remaining[repIdxByRoot.get(rootB) ?? rootB].c;
+                const repSim = jaccard(repA.shingles, repB.shingles);
+                const repVocab = externalVocabOverlap(repA.externalVocab, repB.externalVocab);
+                const minRepLoc = Math.min(repA.loc, repB.loc);
+                const maxRepLoc = Math.max(repA.loc, repB.loc);
+                if (repSim < JACCARD_THRESHOLD || repVocab < 0.5 || maxRepLoc > Math.ceil(minRepLoc / 0.7)) {
+                    continue;
+                }
+                const chosenRep = repIdxByRoot.get(rootA) ?? rootA;
+                uf.union(i, j);
+                repIdxByRoot.set(uf.find(i), chosenRep);
+            }
             maxSimByIdx.set(i, Math.max(maxSimByIdx.get(i) || 0, sim));
             maxSimByIdx.set(j, Math.max(maxSimByIdx.get(j) || 0, sim));
             maxVocabOverlapByIdx.set(i, Math.max(maxVocabOverlapByIdx.get(i) || 0, vocabOverlap));
@@ -428,7 +448,7 @@ function unionNearDuplicatePairs(remaining, uf, maxSimByIdx, maxVocabOverlapById
     }
 }
 
-function buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOverlapByIdx, gitHistory) {
+function buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOverlapByIdx, gitHistory, usedIds) {
     const cluster = sortCloneMembers(compIndices.map((idx) => remaining[idx].c));
     let bestVocabOverlap = 0;
     let bestSim = JACCARD_THRESHOLD;
@@ -446,8 +466,16 @@ function buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOv
         ? ` [clone_drift: ${cloneDrift.file_a} <-> ${cloneDrift.file_b} co-changed in ${cloneDrift.co_commits} commits]`
         : "";
 
+    let issueId = mintIssueId("duplicates", primary.path, `${primary.name}::near_${primary.structHash}`);
+    let ord = 2;
+    while (usedIds?.has(issueId)) {
+        issueId = mintIssueId("duplicates", primary.path, `${primary.name}::near_${primary.structHash}_${ord}`);
+        ord += 1;
+    }
+    usedIds?.add(issueId);
+
     return {
-        id: mintIssueId("duplicates", primary.path, `near_${primary.name}_L${primary.start}`),
+        id: issueId,
         detector: "duplicates",
         category: "duplicates",
         dimension: "duplication",
@@ -455,6 +483,7 @@ function buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOv
         confidence: bestSim >= 0.9 && bestVocabOverlap >= 0.5 ? "high" : "medium",
         severity: cloneDrift || cluster.length >= 3 || primary.loc >= 30 ? "high" : "medium",
         file: primary.path,
+        symbol: primary.name,
         line: primary.start,
         end_line: primary.end,
         span: primary.span,
@@ -477,7 +506,7 @@ function buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOv
     };
 }
 
-function collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHistory = null) {
+function collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHistory = null, fileFilter = null) {
     const remaining = candidates
         .map((c, idx) => ({ c, idx }))
         .filter((x) => !clusteredIndices.has(x.idx))
@@ -488,9 +517,11 @@ function collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHis
     const maxVocabOverlapByIdx = new Map();
     unionNearDuplicatePairs(remaining, uf, maxSimByIdx, maxVocabOverlapByIdx);
 
+    const usedIds = new Set(issues.map((i) => i.id));
     for (const compIndices of uf.components()) {
         if (compIndices.length < 2) continue;
-        const issue = buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOverlapByIdx, gitHistory);
+        if (fileFilter && !compIndices.some((idx) => fileFilter(remaining[idx].c.path))) continue;
+        const issue = buildNearDuplicateIssue(compIndices, remaining, maxSimByIdx, maxVocabOverlapByIdx, gitHistory, usedIds);
         if (issue) issues.push(issue);
     }
 }
@@ -498,7 +529,7 @@ function collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHis
 /**
  * Detect exact and near-duplicate functions/methods across scored files in `graph`.
  */
-export function detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHistory = null) {
+export function detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHistory = null, fileFilter = null) {
     const candidates = collectDuplicateCandidates(graph, readLines, zoneMap, ignoreRules);
     const issues = [];
     const clusteredIndices = new Set();
@@ -517,6 +548,7 @@ export function detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHist
         if (indices.length < 2) continue;
         for (const i of indices) clusteredIndices.add(i);
         const members = sortCloneMembers(indices.map((i) => candidates[i]));
+        if (fileFilter && !members.some((m) => fileFilter(m.path))) continue;
         const primary = members[0];
         const peerList = members
             .slice(1)
@@ -536,6 +568,7 @@ export function detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHist
             confidence: "high",
             severity: cloneDrift || members.length >= 3 || primary.loc >= 25 ? "high" : "medium",
             file: primary.path,
+            symbol: primary.name,
             line: primary.start,
             end_line: primary.end,
             span: primary.span,
@@ -558,7 +591,7 @@ export function detectDuplicates(graph, readLines, zoneMap, ignoreRules, gitHist
         });
     }
 
-    collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHistory);
+    collectNearDuplicateIssues(candidates, clusteredIndices, issues, gitHistory, fileFilter);
 
     return {
         issues,
