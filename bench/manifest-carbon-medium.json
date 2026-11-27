@@ -37,10 +37,6 @@
     "cold": {
       "conversationId": "/tmp/plexer-agy-logs/carbon-medium/T4-cold.jsonl",
       "cloneDir": "/tmp/plexer-ab-carbon-medium-cold/z"
-    },
-    "trail": {
-      "conversationId": "/tmp/plexer-agy-logs/carbon-medium/T4-trail.jsonl",
-      "cloneDir": "/tmp/plexer-ab-carbon-medium-trail/z"
     }
   },
   "T5": {
@@ -51,10 +47,6 @@
     "plexer": {
       "conversationId": "/tmp/plexer-agy-logs/carbon-medium/T5-plexer.jsonl",
       "cloneDir": "/tmp/plexer-ab-carbon-medium-plexer/plexer"
-    },
-    "trail": {
-      "conversationId": "/tmp/plexer-agy-logs/carbon-medium/T5-trail.jsonl",
-      "cloneDir": "/tmp/plexer-ab-carbon-medium-trail/plexer"
     }
   },
   "T6": {
@@ -95,10 +87,6 @@
     "plexer": {
       "conversationId": "/tmp/plexer-agy-logs/carbon-medium/T9-plexer.jsonl",
       "cloneDir": "/tmp/plexer-ab-carbon-medium-plexer/plexer"
-    },
-    "trail": {
-      "conversationId": "/tmp/plexer-agy-logs/carbon-medium/T9-trail.jsonl",
-      "cloneDir": "/tmp/plexer-ab-carbon-medium-trail/plexer"
     }
   },
   "T10": {

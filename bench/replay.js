@@ -22,8 +22,9 @@
  * a particular plexer hook version failed to deliver. Test files are excluded: the hook
  * deliberately doesn't inline tests.
  */
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 const argv = process.argv.slice(2);
 const argVal = (name, dflt) => {
@@ -36,6 +37,7 @@ const OUT = resolve(argVal("--out", DEFAULT_SPANS));
 
 export const LOG_ROOTS = [
     { dir: "/tmp/plexer-claude-logs", suite: "T" },
+    { dir: "/tmp/plexer-agy-logs", suite: "T" },
     { dir: "/tmp/plexer-swebench-logs", suite: "S" },
     { dir: "/tmp/plexer-large-logs", suite: "L" },
 ];
@@ -115,14 +117,43 @@ export function readsFromBash(cmd, cwd) {
             for (const f of files) out.push({ file: f, a: null, b: null });
         } else if (prog === "head" || prog === "tail") {
             let n = 10;
+            let plusStart = null;
             for (let i = 0; i < rest.length; i++) {
-                const m = /^-(?:n)?(\d+)$/.exec(rest[i]);
+                const w = rest[i];
+                const plus = /^(?:-n)?\+(\d+)$/.exec(w);
+                if (plus) {
+                    plusStart = Number(plus[1]);
+                    continue;
+                }
+                const m = /^-(?:n)?(\d+)$/.exec(w);
                 if (m) n = Number(m[1]);
-                else if (rest[i] === "-n" && /^\d+$/.test(rest[i + 1] || "")) n = Number(rest[i + 1]);
+                else if (w === "-n") {
+                    const nxt = rest[i + 1] || "";
+                    const pNext = /^\+(\d+)$/.exec(nxt);
+                    if (pNext) plusStart = Number(pNext[1]);
+                    else if (/^\d+$/.test(nxt)) n = Number(nxt);
+                }
             }
-            const fs = rest.filter((w, i) => !w.startsWith("-") && !(rest[i - 1] === "-n")).map((w) => normPath(w, cwd)).filter(Boolean);
-            // tail's absolute range is unknown without the file length; record head only.
-            if (prog === "head") for (const f of fs) out.push({ file: f, a: 1, b: n });
+            const fs = rest
+                .filter((w, i) => !w.startsWith("-") && !/^\+\d+$/.test(w) && rest[i - 1] !== "-n")
+                .map((w) => normPath(w, cwd))
+                .filter(Boolean);
+            if (prog === "head") {
+                for (const f of fs) out.push({ file: f, a: 1, b: n });
+            } else if (plusStart !== null) {
+                let headLimit = 200;
+                if (stages.length > 1 && stages[1][0] === "head") {
+                    const hr = stages[1].slice(1);
+                    for (let i = 0; i < hr.length; i++) {
+                        const hm = /^-(?:n)?(\d+)$/.exec(hr[i]);
+                        if (hm) headLimit = Number(hm[1]);
+                        else if (hr[i] === "-n" && /^\d+$/.test(hr[i + 1] || "")) headLimit = Number(hr[i + 1]);
+                    }
+                }
+                for (const f of fs) out.push({ file: f, a: plusStart, b: plusStart + headLimit - 1 });
+            } else {
+                for (const f of fs) out.push({ file: f, a: null, b: null });
+            }
         } else if (prog === "awk") {
             const expr = rest.find((w) => /NR\s*>=?\s*\d+/.test(w));
             const m = expr && /NR\s*>=?\s*(\d+)\s*&&\s*NR\s*<=?\s*(\d+)/.exec(expr);
@@ -160,14 +191,45 @@ function singleGrepFile(cmd, cwd) {
     return null;
 }
 
-/** Extract one run's needs from a stream-json transcript. */
+function resolveAgyTranscriptPath(path) {
+    let rawLines;
+    try {
+        rawLines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim().length > 0);
+    } catch {
+        return path;
+    }
+    const firstLine = rawLines[0];
+    if (!firstLine) return path;
+    try {
+        const firstObj = JSON.parse(firstLine);
+        if (firstObj?.event === "init" && firstObj.conversation_id) {
+            const roots = [
+                join(homedir(), ".gemini", "antigravity-cli", "brain"),
+                join(homedir(), ".gemini", "antigravity", "brain"),
+            ];
+            for (const brainRoot of roots) {
+                for (const fname of ["transcript_full.jsonl", "transcript.jsonl"]) {
+                    const candidate = join(brainRoot, firstObj.conversation_id, ".system_generated", "logs", fname);
+                    if (existsSync(candidate)) return candidate;
+                }
+            }
+        }
+    } catch {
+        // Not an init stream wrapper; parse path directly.
+    }
+    return path;
+}
+
+/** Extract one run's needs from a Claude stream-json or AGY transcript. */
 export function needsFromTranscript(path) {
     const reads = [];
     const whole = new Set();
     const hits = [];
     let cwd = null;
-    const pending = new Map(); // tool_use_id -> singleFile hint
-    for (const line of readFileSync(path, "utf8").split("\n")) {
+    const pending = new Map(); // tool_use_id -> singleFile hint (Claude)
+    const pendingAgy = []; // FIFO singleFile hint for AGY GENERIC results
+    const resolvedPath = resolveAgyTranscriptPath(path);
+    for (const line of readFileSync(resolvedPath, "utf8").split("\n")) {
         if (!line) continue;
         let j;
         try {
@@ -199,6 +261,37 @@ export function needsFromTranscript(path) {
                 if (c.type !== "tool_result" || !pending.has(c.tool_use_id)) continue;
                 const t = typeof c.content === "string" ? c.content : (c.content || []).map((x) => x.text || "").join("\n");
                 hits.push(...hitsFromResult(t, cwd, pending.get(c.tool_use_id)));
+            }
+        } else if (j.type === "PLANNER_RESPONSE" && Array.isArray(j.tool_calls)) {
+            for (const call of j.tool_calls) {
+                const args = call?.args || {};
+                if (call.name === "run_command" || call.name === "bash") {
+                    const cmd = String(args.CommandLine ?? args.command ?? "");
+                    if (cmd) {
+                        for (const r of readsFromBash(cmd, cwd)) (r.a == null ? whole.add(r.file) : reads.push(r));
+                        pendingAgy.push(singleGrepFile(cmd, cwd));
+                    }
+                } else if (call.name === "read_file" || call.name === "view_file") {
+                    const target = args.Path ?? args.TargetFile ?? args.AbsolutePath ?? args.file_path ?? args.target_file;
+                    const f = normPath(target, cwd);
+                    if (!f) continue;
+                    if (args.StartLine || args.EndLine) {
+                        const a = Number(args.StartLine || 1);
+                        const b = Number(args.EndLine || a + 799);
+                        reads.push({ file: f, a, b });
+                    } else {
+                        whole.add(f);
+                    }
+                } else if (call.name === "grep_search") {
+                    const sp = args.SearchPath ?? args.path;
+                    pendingAgy.push(sp ? normPath(sp, cwd) : null);
+                }
+            }
+        } else if (j.type === "GENERIC" && typeof j.content === "string") {
+            const body = j.content.replace(/^Created At:[^\n]*\nCompleted At:[^\n]*\n/, "");
+            if (!/^Message sent to "/.test(body.trim())) {
+                const singleFile = pendingAgy.length > 0 ? pendingAgy.shift() : null;
+                hits.push(...hitsFromResult(body, cwd, singleFile));
             }
         }
     }
@@ -248,7 +341,7 @@ function main() {
         if (!existsSync(dir)) continue;
         for (const model of readdirSync(dir)) {
             const mdir = `${dir}/${model}`;
-            if (!existsSync(mdir) || !/^(opus|sonnet)$/.test(model)) continue;
+            if (!existsSync(mdir) || !statSync(mdir).isDirectory()) continue;
             for (const f of readdirSync(mdir)) {
                 const m = /^([TSL]\d+)-(cold|plexer)\.jsonl$/.exec(f);
                 if (!m || !ARMS.has(m[2])) continue;

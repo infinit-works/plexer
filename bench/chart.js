@@ -6,8 +6,10 @@
  *   - `bench/chart-small.svg` (+ `assets/chart-small.svg`) — hero overall geomean + headline suite rows for `README.md`
  *   - `bench/chart.svg`       — full multi-suite & per-model breakdown for `bench/README.md`
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { computeApiCostUsd } from "./cost-model.js";
+import { bootstrapPairedPctDeltaCI } from "./stats.js";
 
 const IN_GHA = "GITHUB_ACTIONS" in process.env;
 const BG_STYLE = IN_GHA ? ".bg{fill:#0000}" : ".bg{fill:#fff}";
@@ -102,8 +104,11 @@ function rainbow(n, L = 0.6, C = 0.2) {
     return Array.from({ length: n }, (_, i) => oklchToHex(L, C, 360 * (i / n)));
 }
 
-const ARMS = ["plexer", "trail", "cold"];
-const COLORS = Object.fromEntries(ARMS.map((arm, i) => [arm, rainbow(ARMS.length)[i]]));
+const ARMS = ["plexer", "cold"];
+const COLORS = {
+    plexer: oklchToHex(0.6, 0.2, 0),
+    cold: oklchToHex(0.6, 0.2, 240),
+};
 
 const PKG_VERSION = (() => {
     try {
@@ -115,7 +120,6 @@ const PKG_VERSION = (() => {
 
 const ARM_META = {
     plexer: { scope: "@plexer/", name: "cli", ver: PKG_VERSION, link: "https://www.npmjs.com/package/@plexer/cli" },
-    trail: { scope: "@trailhq/", name: "trail-code", ver: "0.29.0", link: "https://www.npmjs.com/package/@trailhq/trail-code" },
     cold: { scope: null, name: "cold baseline", ver: "no index", link: null },
 };
 
@@ -177,6 +181,26 @@ function fmtCumShort(n) {
 function fmtSec(ms) {
     const s = ms / 1000;
     return s >= 100 ? `${Math.round(s).toLocaleString("en-US")}s` : `${s.toFixed(1)}s`;
+}
+
+function fmtUsd(usd) {
+    if (!(usd > 0)) return "$0.00";
+    return usd < 0.01 ? `$${usd.toFixed(3)}` : `$${usd.toFixed(2)}`;
+}
+
+function rowApiCostUsd(row, arm, fallbackModel) {
+    const x = row?.[arm];
+    if (!x) return 0;
+    if (typeof x.apiCostUsd === "number") return x.apiCostUsd;
+    return computeApiCostUsd(x, row?._pricingModel || fallbackModel || "claude-sonnet-5-5").totalUsd;
+}
+
+function pctCiLabel(rows, fn) {
+    if (!rows.length) return "";
+    const coldVals = rows.map((r) => fn(r, "cold"));
+    const plexerVals = rows.map((r) => fn(r, "plexer"));
+    const ci = bootstrapPairedPctDeltaCI(coldVals, plexerVals, { iterations: 1000 });
+    return `[${ci.ciLow >= 0 ? "+" : ""}${ci.ciLow.toFixed(0)}..${ci.ciHigh >= 0 ? "+" : ""}${ci.ciHigh.toFixed(0)}% CI]`;
 }
 
 function pctDelta(base, val) {
@@ -287,18 +311,20 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
     // 1. T1–T12 12-task engineering suite
     const tModelSpecs = [
-        { label: "neon-medium", file: "results-neon-medium.json", isClaude: false, isNeon: true },
-        { label: "carbon-medium", file: "results-carbon-medium.json", isClaude: false, isCarbon: true },
-        { label: "argon-medium", file: "results-argon-medium.json", isClaude: false },
-        { label: "hydrogen-medium", file: "results-hydrogen-medium.json", isClaude: false },
-        { label: "opus-5.5", file: "results-opus.json", isClaude: true },
-        { label: "sonnet-5.5", file: "results-sonnet.json", isClaude: true },
+        { label: "orch-neon+h2-h", file: "results-orch-neon-high-hydrogen-high.json", pricingModel: "gemini-4-neon", isClaude: false, isOrchHigh: true },
+        { label: "orch-neon-h+h2-xh", file: "results-orch-neon-high-hydrogen-xhigh.json", pricingModel: "gemini-4-neon", isClaude: false, isOrchHybrid: true },
+        { label: "orch-neon+h2-xh", file: "results-orch-neon-xhigh-hydrogen-xhigh.json", pricingModel: "gemini-4-neon", isClaude: false, isOrchXhigh: true },
+        { label: "neon-medium", file: "results-neon-medium.json", pricingModel: "gemini-4-neon", isClaude: false, isNeon: true },
+        { label: "carbon-medium", file: "results-carbon-medium.json", pricingModel: "gemini-4-carbon", isClaude: false, isCarbon: true },
+        { label: "hydrogen-medium", file: "results-hydrogen-medium.json", pricingModel: "gemini-4-hydrogen", isClaude: false },
+        { label: "opus-5.5", file: "results-opus.json", pricingModel: "claude-opus-5-5", isClaude: true },
+        { label: "sonnet-5.5", file: "results-sonnet.json", pricingModel: "claude-sonnet-5-5", isClaude: true },
     ];
     const tModels = [];
     for (const spec of tModelSpecs) {
         const j = readJsonIfExists(benchDir, spec.file);
-        const rows = (j?.tasks || []).filter((t) => t.cold && t.plexer);
-        if (rows.length === 12) tModels.push({ ...spec, rows });
+        const rows = (j?.tasks || []).filter((t) => t.cold && t.plexer).map((t) => ({ ...t, _pricingModel: spec.pricingModel }));
+        if (rows.length === 12) tModels.push({ ...spec, rows, trials: j?.trials || 1 });
     }
     const tAllRows = tModels.flatMap((m) => m.rows);
     const tColdTok = sum(tAllRows, "cold", (x) => x.toolOutputTokens || 0);
@@ -311,8 +337,12 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
     const tPlexerCalls = sum(tAllRows, "plexer", (x) => x.calls || 0);
     const tColdTurns = sum(tAllRows, "cold", (x) => x.turns || 0);
     const tPlexerTurns = sum(tAllRows, "plexer", (x) => x.turns || 0);
+    const tColdTotal = sum(tAllRows, "cold", (x) => x.totalMs || x.searchMs || 0);
+    const tPlexerTotal = sum(tAllRows, "plexer", (x) => x.totalMs || x.searchMs || 0);
     const tColdSearch = sum(tAllRows, "cold", (x) => x.searchMs || 0);
     const tPlexerSearch = sum(tAllRows, "plexer", (x) => x.searchMs || 0);
+    const tColdUsd = tAllRows.reduce((a, r) => a + rowApiCostUsd(r, "cold"), 0);
+    const tPlexerUsd = tAllRows.reduce((a, r) => a + rowApiCostUsd(r, "plexer"), 0);
     const tColdScore = sum(tAllRows, "cold", (x) => x.score || 0);
     const tPlexerScore = sum(tAllRows, "plexer", (x) => x.score || 0);
     const tMaxScore = sum(tAllRows, "plexer", (x) => x.maxScore || 8);
@@ -325,16 +355,16 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
                 label: "tool output",
                 baseline: fmtTok(tPlexerTok),
                 bars: [
-                    { arm: "plexer", val: tPlexerTok, delta: pctDelta(tColdTok, tPlexerTok), amount: fmtTok(tPlexerTok), extra: countWTL(tAllRows, (x) => x.toolOutputTokens || 0) },
+                    { arm: "plexer", val: tPlexerTok, delta: pctDelta(tColdTok, tPlexerTok), amount: fmtTok(tPlexerTok), extra: `${countWTL(tAllRows, (x) => x.toolOutputTokens || 0)} · ${pctCiLabel(tAllRows, (r, a) => r[a].toolOutputTokens || 0)}` },
                     { arm: "cold", val: tColdTok, amount: fmtTok(tColdTok), extra: `${tAllRows.length} tasks` },
                 ],
             },
             {
-                label: "input tokens",
-                baseline: fmtTok(tPlexerCum),
+                label: "api cost ($)",
+                baseline: fmtUsd(tPlexerUsd),
                 bars: [
-                    { arm: "plexer", val: tPlexerCum, delta: pctDelta(tColdCum, tPlexerCum), amount: fmtTok(tPlexerCum), extra: `${(tPlexerCtx / 1e3).toFixed(1)}k final context (${pctDelta(tColdCtx, tPlexerCtx)})` },
-                    { arm: "cold", val: tColdCum, amount: fmtTok(tColdCum), extra: `${(tColdCtx / 1e3).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}k final context` },
+                    { arm: "plexer", val: Math.max(0.001, tPlexerUsd), delta: pctDelta(tColdUsd, tPlexerUsd), amount: fmtUsd(tPlexerUsd), extra: `${fmtTok(tPlexerCum)} (${pctDelta(tColdCum, tPlexerCum)}) · ${(tPlexerCtx / 1e3).toFixed(1)}k ctx` },
+                    { arm: "cold", val: Math.max(0.001, tColdUsd), amount: fmtUsd(tColdUsd), extra: `${fmtTok(tColdCum)} · ${(tColdCtx / 1e3).toFixed(1)}k ctx` },
                 ],
             },
             {
@@ -346,11 +376,11 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
                 ],
             },
             {
-                label: "search time",
-                baseline: fmtSec(tPlexerSearch),
+                label: "wall time",
+                baseline: fmtSec(tPlexerTotal),
                 bars: [
-                    { arm: "plexer", val: tPlexerSearch, delta: pctDelta(tColdSearch, tPlexerSearch), amount: fmtSec(tPlexerSearch), extra: countWTL(tAllRows, (x) => x.searchMs || 0) },
-                    { arm: "cold", val: tColdSearch, amount: fmtSec(tColdSearch), extra: `${tColdScore}/${tMaxScore} score` },
+                    { arm: "plexer", val: tPlexerTotal, delta: pctDelta(tColdTotal, tPlexerTotal), amount: fmtSec(tPlexerTotal), extra: `search ${fmtSec(tPlexerSearch)} (${pctDelta(tColdSearch, tPlexerSearch)}) · ${countWTL(tAllRows, (x) => x.totalMs || x.searchMs || 0)}` },
+                    { arm: "cold", val: tColdTotal, amount: fmtSec(tColdTotal), extra: `search ${fmtSec(tColdSearch)} · ${tColdScore}/${tMaxScore} score` },
                 ],
             },
         ],
@@ -358,25 +388,21 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
     const tDetail = {
         title: "T1–T12 per-model breakdown",
-        sub: "tool output tokens, tool calls, cumulative input, and search time across 12 tasks per model",
+        sub: "tool output tokens, tool calls, API cost ($), and end-to-end wall time across 12 tasks per model",
         groups: tModels.map((m) => {
             const pTok = sum(m.rows, "plexer", (x) => x.toolOutputTokens || 0);
             const cTok = sum(m.rows, "cold", (x) => x.toolOutputTokens || 0);
             const pCalls = sum(m.rows, "plexer", (x) => x.calls || 0);
             const cCalls = sum(m.rows, "cold", (x) => x.calls || 0);
-            const pCum = sum(m.rows, "plexer", (x) => x.cumulativeInputTokens || 0);
-            const cCum = sum(m.rows, "cold", (x) => x.cumulativeInputTokens || 0);
-            const pSearch = sum(m.rows, "plexer", (x) => x.searchMs || 0);
-            const cSearch = sum(m.rows, "cold", (x) => x.searchMs || 0);
+            const pUsd = m.rows.reduce((a, r) => a + rowApiCostUsd(r, "plexer"), 0);
+            const cUsd = m.rows.reduce((a, r) => a + rowApiCostUsd(r, "cold"), 0);
+            const pWall = sum(m.rows, "plexer", (x) => x.totalMs || x.searchMs || 0);
+            const cWall = sum(m.rows, "cold", (x) => x.totalMs || x.searchMs || 0);
             const pScore = sum(m.rows, "plexer", (x) => x.score || 0);
             const cScore = sum(m.rows, "cold", (x) => x.score || 0);
             const maxS = sum(m.rows, "plexer", (x) => x.maxScore || 8);
-            const pExtra = m.isClaude
-                ? `${pCalls} calls (${pctDeltaInt(cCalls, pCalls)}) · ${fmtSec(pSearch)} · ${pScore}/${maxS}`
-                : `${pCalls} calls (${pctDeltaInt(cCalls, pCalls)}) · ${fmtCumShort(pCum)} (${pctDeltaInt(cCum, pCum)}) · ${fmtSec(pSearch)}`;
-            const cExtra = m.isClaude
-                ? `${cCalls} calls · ${fmtSec(cSearch)} · ${cScore}/${maxS}`
-                : `${cCalls} calls · ${fmtCumShort(cCum)} · ${fmtSec(cSearch)}`;
+            const pExtra = `${pCalls} calls (${pctDeltaInt(cCalls, pCalls)}) · ${fmtUsd(pUsd)} (${pctDeltaInt(cUsd, pUsd)}) · ${fmtSec(pWall)} · ${pScore}/${maxS}`;
+            const cExtra = `${cCalls} calls · ${fmtUsd(cUsd)} · ${fmtSec(cWall)} · ${cScore}/${maxS}`;
             return {
                 label: m.label,
                 baseline: fmtTok(pTok),
@@ -390,18 +416,20 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
     // 2. ScaleAI/SWE-bench_Pro V2 (S1–S8)
     const sweModelSpecs = [
-        { label: "neon-medium", file: "results-swebench-neon-medium.json", isClaude: false, isNeon: true },
-        { label: "carbon-medium", file: "results-swebench-carbon-medium.json", isClaude: false, isCarbon: true },
-        { label: "argon-medium", file: "results-swebench-argon-medium.json", isClaude: false },
-        { label: "hydrogen-medium", file: "results-swebench-hydrogen-medium.json", isClaude: false },
-        { label: "opus-5.5", file: "results-swebench-opus.json", isClaude: true },
-        { label: "sonnet-5.5", file: "results-swebench-sonnet.json", isClaude: true },
+        { label: "orch-neon+h2-h", file: "results-swebench-orch-neon-high-hydrogen-high.json", pricingModel: "gemini-4-neon", isClaude: false, isOrchHigh: true },
+        { label: "orch-neon-h+h2-xh", file: "results-swebench-orch-neon-high-hydrogen-xhigh.json", pricingModel: "gemini-4-neon", isClaude: false, isOrchHybrid: true },
+        { label: "orch-neon+h2-xh", file: "results-swebench-orch-neon-xhigh-hydrogen-xhigh.json", pricingModel: "gemini-4-neon", isClaude: false, isOrchXhigh: true },
+        { label: "neon-medium", file: "results-swebench-neon-medium.json", pricingModel: "gemini-4-neon", isClaude: false, isNeon: true },
+        { label: "carbon-medium", file: "results-swebench-carbon-medium.json", pricingModel: "gemini-4-carbon", isClaude: false, isCarbon: true },
+        { label: "hydrogen-medium", file: "results-swebench-hydrogen-medium.json", pricingModel: "gemini-4-hydrogen", isClaude: false },
+        { label: "opus-5.5", file: "results-swebench-opus.json", pricingModel: "claude-opus-5-5", isClaude: true },
+        { label: "sonnet-5.5", file: "results-swebench-sonnet.json", pricingModel: "claude-sonnet-5-5", isClaude: true },
     ];
     const sweModels = [];
     for (const spec of sweModelSpecs) {
         const j = readJsonIfExists(benchDir, spec.file);
-        const rows = (j?.tasks || []).filter((t) => t.cold && t.plexer);
-        if (rows.length > 0) sweModels.push({ ...spec, rows });
+        const rows = (j?.tasks || []).filter((t) => t.cold && t.plexer).map((t) => ({ ...t, _pricingModel: spec.pricingModel }));
+        if (rows.length > 0) sweModels.push({ ...spec, rows, trials: j?.trials || 1, useDocker: j?.useDocker });
     }
     const sAllRows = sweModels.flatMap((m) => m.rows);
     const sColdTok = sum(sAllRows, "cold", (x) => x.toolOutputTokens || 0);
@@ -410,8 +438,12 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
     const sPlexerCum = sum(sAllRows, "plexer", (x) => x.cumulativeInputTokens || 0);
     const sColdCalls = sum(sAllRows, "cold", (x) => x.calls || 0);
     const sPlexerCalls = sum(sAllRows, "plexer", (x) => x.calls || 0);
+    const sColdWall = sum(sAllRows, "cold", (x) => x.totalMs || x.searchMs || 0);
+    const sPlexerWall = sum(sAllRows, "plexer", (x) => x.totalMs || x.searchMs || 0);
     const sColdSearch = sum(sAllRows, "cold", (x) => x.searchMs || 0);
     const sPlexerSearch = sum(sAllRows, "plexer", (x) => x.searchMs || 0);
+    const sColdUsd = sAllRows.reduce((a, r) => a + rowApiCostUsd(r, "cold"), 0);
+    const sPlexerUsd = sAllRows.reduce((a, r) => a + rowApiCostUsd(r, "plexer"), 0);
     const sColdScore = sum(sAllRows, "cold", (x) => x.score || 0);
     const sPlexerScore = sum(sAllRows, "plexer", (x) => x.score || 0);
     const sMaxScore = sum(sAllRows, "plexer", (x) => x.maxScore || 8);
@@ -429,19 +461,19 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
                 ],
             },
             {
-                label: "input tokens",
-                baseline: fmtTok(sPlexerCum),
+                label: "api cost ($)",
+                baseline: fmtUsd(sPlexerUsd),
                 bars: [
-                    { arm: "plexer", val: sPlexerCum, delta: pctDelta(sColdCum, sPlexerCum), amount: fmtTok(sPlexerCum), extra: `${sPlexerCalls} calls (${pctDelta(sColdCalls, sPlexerCalls)})` },
-                    { arm: "cold", val: sColdCum, amount: fmtTok(sColdCum), extra: `${sColdCalls} calls` },
+                    { arm: "plexer", val: Math.max(0.001, sPlexerUsd), delta: pctDelta(sColdUsd, sPlexerUsd), amount: fmtUsd(sPlexerUsd), extra: `${fmtTok(sPlexerCum)} (${pctDelta(sColdCum, sPlexerCum)}) · ${sPlexerCalls} calls` },
+                    { arm: "cold", val: Math.max(0.001, sColdUsd), amount: fmtUsd(sColdUsd), extra: `${fmtTok(sColdCum)} · ${sColdCalls} calls` },
                 ],
             },
             {
-                label: "search time",
-                baseline: fmtSec(sPlexerSearch),
+                label: "wall time",
+                baseline: fmtSec(sPlexerWall),
                 bars: [
-                    { arm: "plexer", val: sPlexerSearch, delta: pctDelta(sColdSearch, sPlexerSearch), amount: fmtSec(sPlexerSearch), extra: `${sPlexerScore}/${sMaxScore} score` },
-                    { arm: "cold", val: sColdSearch, amount: fmtSec(sColdSearch), extra: `${sColdScore}/${sMaxScore} score` },
+                    { arm: "plexer", val: sPlexerWall, delta: pctDelta(sColdWall, sPlexerWall), amount: fmtSec(sPlexerWall), extra: `search ${fmtSec(sPlexerSearch)} (${pctDelta(sColdSearch, sPlexerSearch)}) · ${sPlexerScore}/${sMaxScore}` },
+                    { arm: "cold", val: sColdWall, amount: fmtSec(sColdWall), extra: `search ${fmtSec(sColdSearch)} · ${sColdScore}/${sMaxScore}` },
                 ],
             },
         ],
@@ -455,19 +487,15 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
             const cTok = sum(m.rows, "cold", (x) => x.toolOutputTokens || 0);
             const pCalls = sum(m.rows, "plexer", (x) => x.calls || 0);
             const cCalls = sum(m.rows, "cold", (x) => x.calls || 0);
-            const pCum = sum(m.rows, "plexer", (x) => x.cumulativeInputTokens || 0);
-            const cCum = sum(m.rows, "cold", (x) => x.cumulativeInputTokens || 0);
-            const pSearch = sum(m.rows, "plexer", (x) => x.searchMs || 0);
-            const cSearch = sum(m.rows, "cold", (x) => x.searchMs || 0);
+            const pUsd = m.rows.reduce((a, r) => a + rowApiCostUsd(r, "plexer"), 0);
+            const cUsd = m.rows.reduce((a, r) => a + rowApiCostUsd(r, "cold"), 0);
+            const pWall = sum(m.rows, "plexer", (x) => x.totalMs || x.searchMs || 0);
+            const cWall = sum(m.rows, "cold", (x) => x.totalMs || x.searchMs || 0);
             const pScore = sum(m.rows, "plexer", (x) => x.score || 0);
             const cScore = sum(m.rows, "cold", (x) => x.score || 0);
             const maxS = sum(m.rows, "plexer", (x) => x.maxScore || 8);
-            const pExtra = m.isClaude
-                ? `${pCalls} calls (${pctDeltaInt(cCalls, pCalls)}) · ${fmtSec(pSearch)} (${pctDeltaInt(cSearch, pSearch)}) · ${pScore}/${maxS}`
-                : `${pCalls} calls (${pctDeltaInt(cCalls, pCalls)}) · ${fmtCumShort(pCum)} (${pctDeltaInt(cCum, pCum)})`;
-            const cExtra = m.isClaude
-                ? `${cCalls} calls · ${fmtSec(cSearch)} · ${cScore}/${maxS}`
-                : `${cCalls} calls · ${fmtCumShort(cCum)}`;
+            const pExtra = `${pCalls} calls (${pctDeltaInt(cCalls, pCalls)}) · ${fmtUsd(pUsd)} (${pctDeltaInt(cUsd, pUsd)}) · ${fmtSec(pWall)} · ${pScore}/${maxS}`;
+            const cExtra = `${cCalls} calls · ${fmtUsd(cUsd)} · ${fmtSec(cWall)} · ${cScore}/${maxS}`;
             return {
                 label: m.label,
                 baseline: fmtTok(pTok),
@@ -481,56 +509,54 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
     // 3. Large-repo & discriminative suite (L1–L8)
     const largeModelSpecs = [
-        { label: "neon-medium", file: "results-large-neon-medium.json", isNeon: true, isCarbon: false },
-        { label: "carbon-medium", file: "results-large-carbon-medium.json", isCarbon: true },
-        { label: "argon-medium", file: "results-large-argon-medium.json", isCarbon: false },
-        { label: "hydrogen-medium", file: "results-large-hydrogen-medium.json", isCarbon: false },
-        { label: "opus-5.5", file: "results-large-opus.json", isCarbon: false },
-        { label: "sonnet-5.5", file: "results-large-sonnet.json", isCarbon: false },
+        { label: "orch-neon+h2-h", file: "results-large-orch-neon-high-hydrogen-high.json", pricingModel: "gemini-4-neon", isOrchHigh: true, isCarbon: false },
+        { label: "orch-neon-h+h2-xh", file: "results-large-orch-neon-high-hydrogen-xhigh.json", pricingModel: "gemini-4-neon", isOrchHybrid: true, isCarbon: false },
+        { label: "orch-neon+h2-xh", file: "results-large-orch-neon-xhigh-hydrogen-xhigh.json", pricingModel: "gemini-4-neon", isOrchXhigh: true, isCarbon: false },
+        { label: "neon-medium", file: "results-large-neon-medium.json", pricingModel: "gemini-4-neon", isNeon: true, isCarbon: false },
+        { label: "carbon-medium", file: "results-large-carbon-medium.json", pricingModel: "gemini-4-carbon", isCarbon: true },
+        { label: "hydrogen-medium", file: "results-large-hydrogen-medium.json", pricingModel: "gemini-4-hydrogen", isCarbon: false },
+        { label: "opus-5.5", file: "results-large-opus.json", pricingModel: "claude-opus-5-5", isCarbon: false },
+        { label: "sonnet-5.5", file: "results-large-sonnet.json", pricingModel: "claude-sonnet-5-5", isCarbon: false },
     ];
     const largeModels = [];
     for (const spec of largeModelSpecs) {
         const j = readJsonIfExists(benchDir, spec.file);
-        const rows = (j?.tasks || []).filter((t) => t.cold && t.trail && t.plexer);
-        if (rows.length > 0) largeModels.push({ ...spec, rows });
+        const rows = (j?.tasks || []).filter((t) => t.cold && t.plexer).map((t) => ({ ...t, _pricingModel: spec.pricingModel }));
+        if (rows.length > 0) largeModels.push({ ...spec, rows, trials: j?.trials || 1, useDocker: j?.useDocker });
     }
     const lAllRows = largeModels.flatMap((m) => m.rows);
     let largeHeadline = null;
     let largeDetail = null;
     if (lAllRows.length > 0) {
         const lPlexerTok = sum(lAllRows, "plexer", (x) => x.toolOutputTokens || 0);
-        const lTrailTok = sum(lAllRows, "trail", (x) => x.toolOutputTokens || 0);
         const lColdTok = sum(lAllRows, "cold", (x) => x.toolOutputTokens || 0);
         const lPlexerCalls = sum(lAllRows, "plexer", (x) => x.calls || 0);
-        const lTrailCalls = sum(lAllRows, "trail", (x) => x.calls || 0);
         const lColdCalls = sum(lAllRows, "cold", (x) => x.calls || 0);
-        const lPlexerPost = sum(lAllRows, "plexer", postT1Of);
-        const lTrailPost = sum(lAllRows, "trail", postT1Of);
-        const lColdPost = sum(lAllRows, "cold", postT1Of);
+        const lPlexerUsd = lAllRows.reduce((a, r) => a + rowApiCostUsd(r, "plexer"), 0);
+        const lColdUsd = lAllRows.reduce((a, r) => a + rowApiCostUsd(r, "cold"), 0);
+        const lPlexerWall = sum(lAllRows, "plexer", (x) => x.totalMs || x.searchMs || 0);
+        const lColdWall = sum(lAllRows, "cold", (x) => x.totalMs || x.searchMs || 0);
         const lPlexerRes = sum(lAllRows, "plexer", isStrictResolved);
-        const lTrailRes = sum(lAllRows, "trail", isStrictResolved);
         const lColdRes = sum(lAllRows, "cold", isStrictResolved);
 
         largeHeadline = {
             title: "Large OSS repositories",
-            sub: `8 multi-file tasks across 440–1,350+ file repos (${lAllRows.length} 3-arm runs) · ${lPlexerRes}/${lAllRows.length} solved`,
+            sub: `8 multi-file tasks across 440–1,350+ file repos (${lAllRows.length} paired runs) · ${lPlexerRes}/${lAllRows.length} solved`,
             groups: [
                 {
                     label: "tool output",
                     baseline: fmtTok(lPlexerTok),
                     bars: [
-                        { arm: "plexer", val: lPlexerTok, delta: `${pctDelta(lTrailTok, lPlexerTok)} vs trail`, amount: fmtTok(lPlexerTok), extra: `${lPlexerCalls} calls · ${lPlexerRes}/${lAllRows.length} resolved` },
-                        { arm: "trail", val: lTrailTok, amount: fmtTok(lTrailTok), extra: `${lTrailCalls} calls · ${lTrailRes}/${lAllRows.length} resolved` },
+                        { arm: "plexer", val: lPlexerTok, delta: pctDelta(lColdTok, lPlexerTok), amount: fmtTok(lPlexerTok), extra: `${lPlexerCalls} calls · ${lPlexerRes}/${lAllRows.length} resolved` },
                         { arm: "cold", val: lColdTok, amount: fmtTok(lColdTok), extra: `${lColdCalls} calls · ${lColdRes}/${lAllRows.length} resolved` },
                     ],
                 },
                 {
-                    label: "new file tokens",
-                    baseline: fmtTok(lPlexerPost),
+                    label: "api cost ($)",
+                    baseline: fmtUsd(lPlexerUsd),
                     bars: [
-                        { arm: "plexer", val: lPlexerPost, delta: `${pctDelta(lTrailPost, lPlexerPost)} vs trail`, amount: fmtTok(lPlexerPost), extra: `${pctDelta(lColdPost, lPlexerPost)} vs cold` },
-                        { arm: "trail", val: lTrailPost, amount: fmtTok(lTrailPost), extra: `${pctDelta(lColdPost, lTrailPost)} vs cold` },
-                        { arm: "cold", val: lColdPost, amount: fmtTok(lColdPost), extra: `${lAllRows.length} sessions` },
+                        { arm: "plexer", val: Math.max(0.001, lPlexerUsd), delta: pctDelta(lColdUsd, lPlexerUsd), amount: fmtUsd(lPlexerUsd), extra: `wall ${fmtSec(lPlexerWall)} (${pctDelta(lColdWall, lPlexerWall)})` },
+                        { arm: "cold", val: Math.max(0.001, lColdUsd), amount: fmtUsd(lColdUsd), extra: `wall ${fmtSec(lColdWall)} · ${lAllRows.length} sessions` },
                     ],
                 },
             ],
@@ -538,175 +564,108 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
 
         largeDetail = {
             title: "Large-repo suite L1–L8 per-model",
-            sub: "pocketbase, tutanota, NodeBB, flipt, and qutebrowser (3-arm tool output & strict resolved)",
+            sub: "pocketbase, tutanota, NodeBB, flipt, and qutebrowser (tool output, API cost $, wall time)",
             groups: largeModels.map((m) => {
                 const pTok = sum(m.rows, "plexer", (x) => x.toolOutputTokens || 0);
-                const trTok = sum(m.rows, "trail", (x) => x.toolOutputTokens || 0);
                 const cTok = sum(m.rows, "cold", (x) => x.toolOutputTokens || 0);
                 const pCalls = sum(m.rows, "plexer", (x) => x.calls || 0);
-                const trCalls = sum(m.rows, "trail", (x) => x.calls || 0);
                 const cCalls = sum(m.rows, "cold", (x) => x.calls || 0);
+                const pUsd = m.rows.reduce((a, r) => a + rowApiCostUsd(r, "plexer"), 0);
+                const cUsd = m.rows.reduce((a, r) => a + rowApiCostUsd(r, "cold"), 0);
                 const pRes = sum(m.rows, "plexer", isStrictResolved);
-                const trRes = sum(m.rows, "trail", isStrictResolved);
                 const cRes = sum(m.rows, "cold", isStrictResolved);
                 return {
                     label: m.label,
                     baseline: fmtTok(pTok),
                     bars: [
-                        { arm: "plexer", val: pTok, delta: `${pctDelta(trTok, pTok)} vs trail`, amount: fmtTok(pTok), extra: `${pCalls} calls · ${pRes}/${m.rows.length} resolved` },
-                        { arm: "trail", val: trTok, amount: fmtTok(trTok), extra: `${trCalls} calls · ${trRes}/${m.rows.length} resolved` },
-                        { arm: "cold", val: cTok, amount: fmtTok(cTok), extra: `${cCalls} calls · ${cRes}/${m.rows.length} resolved` },
+                        { arm: "plexer", val: pTok, delta: pctDelta(cTok, pTok), amount: fmtTok(pTok), extra: `${pCalls} calls · ${fmtUsd(pUsd)} (${pctDeltaInt(cUsd, pUsd)}) · ${pRes}/${m.rows.length}` },
+                        { arm: "cold", val: cTok, amount: fmtTok(cTok), extra: `${cCalls} calls · ${fmtUsd(cUsd)} · ${cRes}/${m.rows.length}` },
                     ],
                 };
             }),
         };
     }
 
-    // 4. 3-arm comparison vs. trail-code (T4, T5, T9 + S1–S8 + L1–L8)
-    const load3ArmRows = (entry) => {
-        const [f, trailFile] = Array.isArray(entry) ? entry : [entry, null];
-        const j = readJsonIfExists(benchDir, f);
-        const trailMap = new Map();
-        if (trailFile) {
-            for (const t of readJsonIfExists(benchDir, trailFile)?.tasks || []) {
-                if (t.trail) trailMap.set(t.id, t.trail);
-            }
-        }
-        return (j?.tasks || [])
-            .map((t) => ({ ...t, trail: t.trail || trailMap.get(t.id) }))
-            .filter((t) => t.cold && t.trail && t.plexer);
-    };
-    const threeModelSpecs = [
-        {
-            label: "neon-med",
-            files: ["results-neon-medium.json", "results-swebench-neon-medium.json", "results-large-neon-medium.json"],
-            isNeon: true,
-            isCarbon: false,
-        },
-        { label: "carbon-med", files: ["results-carbon-medium.json", "results-swebench-carbon-medium.json", "results-large-carbon-medium.json"], isCarbon: true },
-        { label: "argon-med", files: ["results-argon-medium.json", "results-swebench-argon-medium.json", "results-large-argon-medium.json"], isCarbon: false },
-        {
-            label: "hydrogen-med",
-            files: ["results-hydrogen-medium.json", "results-swebench-hydrogen-medium.json", "results-large-hydrogen-medium.json"],
-            isCarbon: false,
-        },
-        {
-            label: "opus-5.5",
-            files: [["results-swebench-opus.json", "results-swebench-opus-trail.json"], "results-opus-agy.json", "results-swebench-opus-agy.json", "results-large-opus.json"],
-            isCarbon: false,
-        },
-        {
-            label: "sonnet-5.5",
-            files: [["results-swebench-sonnet.json", "results-swebench-sonnet-trail.json"], "results-sonnet-agy.json", "results-swebench-sonnet-agy.json", "results-large-sonnet.json"],
-            isCarbon: false,
-        },
-    ];
-    const threeModels = [];
-    for (const spec of threeModelSpecs) {
-        const rows = spec.files.flatMap(load3ArmRows);
-        if (rows.length > 0) threeModels.push({ ...spec, rows });
+    // 4. Optional v2 Scale Ladder & Train vs Holdout suite (auto-detected results-v2-*.json)
+    const v2Files = readdirSync(benchDir).filter((f) => /^results-v2-.*\.json$/i.test(f)).sort();
+    const v2Models = [];
+    for (const file of v2Files) {
+        const j = readJsonIfExists(benchDir, file);
+        const rows = (j?.tasks || []).filter((t) => t.cold && t.plexer).map((t) => ({ ...t, _pricingModel: j?.model || "claude-sonnet-5-5" }));
+        if (rows.length > 0) v2Models.push({ label: j?.model || file, file, rows, trials: j?.trials || 1, useDocker: j?.useDocker !== false });
     }
-    const threeAllRows = threeModels.flatMap((m) => m.rows);
-    const m3PlexerTok = sum(threeAllRows, "plexer", (x) => x.toolOutputTokens || 0);
-    const m3TrailTok = sum(threeAllRows, "trail", (x) => x.toolOutputTokens || 0);
-    const m3ColdTok = sum(threeAllRows, "cold", (x) => x.toolOutputTokens || 0);
-    const m3PlexerCalls = sum(threeAllRows, "plexer", (x) => x.calls || 0);
-    const m3TrailCalls = sum(threeAllRows, "trail", (x) => x.calls || 0);
-    const m3ColdCalls = sum(threeAllRows, "cold", (x) => x.calls || 0);
-    const m3PlexerScore = sum(threeAllRows, "plexer", (x) => x.score || 0);
-    const m3TrailScore = sum(threeAllRows, "trail", (x) => x.score || 0);
-    const m3ColdScore = sum(threeAllRows, "cold", (x) => x.score || 0);
-    const m3MaxScore = sum(threeAllRows, "plexer", (x) => x.maxScore || 8);
-    const m3PlexerPost = sum(threeAllRows, "plexer", postT1Of);
-    const m3TrailPost = sum(threeAllRows, "trail", postT1Of);
-    const m3ColdPost = sum(threeAllRows, "cold", postT1Of);
-    const m3PlexerGrowth = sum(threeAllRows, "plexer", growthOf);
-    const m3TrailGrowth = sum(threeAllRows, "trail", growthOf);
-    const m3ColdGrowth = sum(threeAllRows, "cold", growthOf);
+    const v2AllRows = v2Models.flatMap((m) => m.rows);
+    let v2Headline = null;
+    if (v2AllRows.length > 0) {
+        const v2PlexerTok = sum(v2AllRows, "plexer", (x) => x.toolOutputTokens || 0);
+        const v2ColdTok = sum(v2AllRows, "cold", (x) => x.toolOutputTokens || 0);
+        const v2PlexerUsd = v2AllRows.reduce((a, r) => a + rowApiCostUsd(r, "plexer"), 0);
+        const v2ColdUsd = v2AllRows.reduce((a, r) => a + rowApiCostUsd(r, "cold"), 0);
+        const v2PlexerWall = sum(v2AllRows, "plexer", (x) => x.totalMs || x.searchMs || 0);
+        const v2ColdWall = sum(v2AllRows, "cold", (x) => x.totalMs || x.searchMs || 0);
+        const trainRows = v2AllRows.filter((r) => !r.holdout && !r.negativeControl);
+        const holdRows = v2AllRows.filter((r) => Boolean(r.holdout));
+        const trainPass = sum(trainRows, "plexer", isStrictResolved);
+        const holdPass = sum(holdRows, "plexer", isStrictResolved);
+        const maxTrials = Math.max(...v2Models.map((m) => m.trials || 1));
+        v2Headline = {
+            title: "v2 Scale Ladder (Small → Mega)",
+            sub: `De-leaked OSS suite (${v2AllRows.length} pairs · N=${maxTrials} trials) · Train ${trainPass}/${trainRows.length || 0} · Holdout ${holdPass}/${holdRows.length || 0}`,
+            groups: [
+                {
+                    label: "tool output",
+                    baseline: fmtTok(v2PlexerTok),
+                    bars: [
+                        { arm: "plexer", val: v2PlexerTok, delta: pctDelta(v2ColdTok, v2PlexerTok), amount: fmtTok(v2PlexerTok), extra: `${pctCiLabel(v2AllRows, (r, a) => r[a].toolOutputTokens || 0)}` },
+                        { arm: "cold", val: v2ColdTok, amount: fmtTok(v2ColdTok), extra: `${v2AllRows.length} pairs` },
+                    ],
+                },
+                {
+                    label: "api cost ($)",
+                    baseline: fmtUsd(v2PlexerUsd),
+                    bars: [
+                        { arm: "plexer", val: Math.max(0.001, v2PlexerUsd), delta: pctDelta(v2ColdUsd, v2PlexerUsd), amount: fmtUsd(v2PlexerUsd), extra: `wall ${fmtSec(v2PlexerWall)} (${pctDelta(v2ColdWall, v2PlexerWall)})` },
+                        { arm: "cold", val: Math.max(0.001, v2ColdUsd), amount: fmtUsd(v2ColdUsd), extra: `wall ${fmtSec(v2ColdWall)}` },
+                    ],
+                },
+            ],
+        };
+    }
 
-    const threeHeadline = {
-        title: "Head-to-head vs. trail-code",
-        sub: `${threeAllRows.length} shared 3-arm runs across ${threeModels.length} models + offline Turn-0 & 24-query retrieval`,
-        groups: [
-            {
-                label: "tool output",
-                baseline: fmtTok(m3PlexerTok),
-                bars: [
-                    { arm: "plexer", val: m3PlexerTok, delta: `${pctDelta(m3TrailTok, m3PlexerTok)} vs trail`, amount: fmtTok(m3PlexerTok), extra: `${m3PlexerCalls.toLocaleString("en-US")} calls · ${m3PlexerScore}/${m3MaxScore}` },
-                    { arm: "trail", val: m3TrailTok, amount: fmtTok(m3TrailTok), extra: `${m3TrailCalls.toLocaleString("en-US")} calls · ${m3TrailScore}/${m3MaxScore}` },
-                    { arm: "cold", val: m3ColdTok, amount: fmtTok(m3ColdTok), extra: `${m3ColdCalls.toLocaleString("en-US")} calls · ${m3ColdScore}/${m3MaxScore}` },
-                ],
-            },
-            {
-                label: "new file tokens",
-                baseline: fmtTok(m3PlexerPost),
-                bars: [
-                    { arm: "plexer", val: m3PlexerPost, delta: `${pctDelta(m3TrailPost, m3PlexerPost)} vs trail`, amount: `${Math.round(m3PlexerPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3PlexerGrowth / 1e3).toLocaleString("en-US")}k context growth (${pctDelta(m3ColdGrowth, m3PlexerGrowth)})` },
-                    { arm: "trail", val: m3TrailPost, amount: `${Math.round(m3TrailPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3TrailGrowth / 1e3).toLocaleString("en-US")}k context growth (${pctDelta(m3ColdGrowth, m3TrailGrowth)})` },
-                    { arm: "cold", val: m3ColdPost, amount: `${Math.round(m3ColdPost / 1e3).toLocaleString("en-US")}k tok`, extra: `${Math.round(m3ColdGrowth / 1e3).toLocaleString("en-US")}k context growth` },
-                ],
-            },
-            {
-                label: "turn-0 context",
-                baseline: "2,889 tok",
-                bars: [
-                    { arm: "plexer", val: 2889, delta: "-43.2% vs trail-push", amount: "2,889 tok", extra: "100% file recall · 24/24 Recall@1" },
-                    { arm: "trail", val: 5086, amount: "5,086 tok", extra: "81.2% file recall · 4/24 Recall@1" },
-                ],
-            },
-        ],
-    };
-
-    const threeDetail = {
-        title: "3-arm live per-model (T4, T5, T9 + S1–S8 + L1–L8)",
-        sub: "head-to-head tool output tokens across shared non-Luau tasks per model",
-        groups: threeModels.map((m) => {
-            const pTok = sum(m.rows, "plexer", (x) => x.toolOutputTokens || 0);
-            const trTok = sum(m.rows, "trail", (x) => x.toolOutputTokens || 0);
-            const cTok = sum(m.rows, "cold", (x) => x.toolOutputTokens || 0);
-            const pCalls = sum(m.rows, "plexer", (x) => x.calls || 0);
-            const trCalls = sum(m.rows, "trail", (x) => x.calls || 0);
-            const cCalls = sum(m.rows, "cold", (x) => x.calls || 0);
-            const pCum = sum(m.rows, "plexer", (x) => x.cumulativeInputTokens || 0);
-            const trCum = sum(m.rows, "trail", (x) => x.cumulativeInputTokens || 0);
-            const cCum = sum(m.rows, "cold", (x) => x.cumulativeInputTokens || 0);
-            const pSearch = sum(m.rows, "plexer", (x) => x.searchMs || 0);
-            const trSearch = sum(m.rows, "trail", (x) => x.searchMs || 0);
-            const cSearch = sum(m.rows, "cold", (x) => x.searchMs || 0);
-            const deltaRef = Math.abs(pTok - trTok) < 100 ? `${pctDelta(cTok, pTok)} vs cold` : `${pctDelta(trTok, pTok)} vs trail`;
-            return {
-                label: `${m.label} (${m.rows.length})`,
-                baseline: fmtTok(pTok),
-                bars: [
-                    { arm: "plexer", val: pTok, delta: deltaRef, amount: fmtTok(pTok), extra: `${pCalls} calls · ${fmtCumShort(pCum)} · ${fmtSec(pSearch)}` },
-                    { arm: "trail", val: trTok, amount: fmtTok(trTok), extra: `${trCalls} calls · ${fmtCumShort(trCum)} · ${fmtSec(trSearch)}` },
-                    { arm: "cold", val: cTok, amount: fmtTok(cTok), extra: `${cCalls} calls · ${fmtCumShort(cCum)} · ${fmtSec(cSearch)}` },
-                ],
-            };
-        }),
-    };
-
-    const headlineSuites = [tHeadline, sweHeadline, ...(largeHeadline ? [largeHeadline] : []), threeHeadline];
-    const liveDetailSuites = [tDetail, sweDetail, ...(largeDetail ? [largeDetail] : []), threeDetail];
+    const headlineSuites = [tHeadline, sweHeadline, ...(largeHeadline ? [largeHeadline] : []), ...(v2Headline ? [v2Headline] : [])];
+    const liveDetailSuites = [tDetail, sweDetail, ...(largeDetail ? [largeDetail] : [])];
     const detailSuites = [...liveDetailSuites, COMPACTION_SUITE];
 
     const hasNeon =
         tModels.some((m) => m.isNeon) ||
         sweModels.some((m) => m.isNeon) ||
-        largeModels.some((m) => m.isNeon) ||
-        threeModels.some((m) => m.isNeon);
+        largeModels.some((m) => m.isNeon);
 
     const hasCarbon =
         tModels.some((m) => m.isCarbon) ||
         sweModels.some((m) => m.isCarbon) ||
-        largeModels.some((m) => m.isCarbon) ||
-        threeModels.some((m) => m.isCarbon);
+        largeModels.some((m) => m.isCarbon);
+
+    const hasOrchHigh =
+        tModels.some((m) => m.isOrchHigh) ||
+        sweModels.some((m) => m.isOrchHigh) ||
+        largeModels.some((m) => m.isOrchHigh);
+
+    const hasOrchHybrid =
+        tModels.some((m) => m.isOrchHybrid) ||
+        sweModels.some((m) => m.isOrchHybrid) ||
+        largeModels.some((m) => m.isOrchHybrid);
+
+    const hasOrchXhigh =
+        tModels.some((m) => m.isOrchXhigh) ||
+        sweModels.some((m) => m.isOrchXhigh) ||
+        largeModels.some((m) => m.isOrchXhigh);
 
     const allAgentGroups = [
         ...headlineSuites.flatMap((s) => s.groups),
         ...liveDetailSuites.flatMap((s) => s.groups),
     ];
-    const logs = { plexer: [], trail: [], cold: [] };
+    const logs = { plexer: [], cold: [] };
     for (const g of allAgentGroups) {
         const best = Math.min(...g.bars.map((b) => b.val));
         for (const b of g.bars) {
@@ -719,7 +678,13 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
         geo[arm] = xs.length ? Math.exp(xs.reduce((a, b) => a + b, 0) / xs.length) : 1.0;
     }
 
-    const totalPairedCount = tAllRows.length + sAllRows.length + lAllRows.length;
+    const totalPairedCount = tAllRows.length + sAllRows.length + lAllRows.length + v2AllRows.length;
+    const trialBadge = v2AllRows.length > 0 && Math.max(...v2Models.map((m) => m.trials || 1)) >= 2
+        ? `N=${Math.max(...v2Models.map((m) => m.trials || 1))} · 95% CI`
+        : "N=1 (unreplicated)";
+    const verificationBadge = sweModels.some((m) => m.useDocker) || v2Models.some((m) => m.useDocker)
+        ? "exec-verified"
+        : "heuristic+rubric";
     return {
         headlineSuites,
         detailSuites,
@@ -727,13 +692,19 @@ export function buildBenchmarkData(benchDir = import.meta.dirname) {
         rowCount: allAgentGroups.length,
         hasNeon,
         hasCarbon,
+        hasOrchHigh,
+        hasOrchHybrid,
+        hasOrchXhigh,
         totalPairedCount,
         hasLarge: lAllRows.length > 0,
+        hasV2: v2AllRows.length > 0,
+        trialBadge,
+        verificationBadge,
     };
 }
 
 export function renderChart(includeDetail, benchDir = import.meta.dirname) {
-    const { headlineSuites, detailSuites, geo, rowCount, hasNeon, hasCarbon, totalPairedCount, hasLarge } = buildBenchmarkData(benchDir);
+    const { headlineSuites, detailSuites, geo, rowCount, hasNeon, hasCarbon, hasOrchHigh, hasOrchHybrid, hasOrchXhigh, totalPairedCount, hasLarge, hasV2, trialBadge, verificationBadge } = buildBenchmarkData(benchDir);
     const front = [];
     const behind = [];
 
@@ -741,9 +712,9 @@ export function renderChart(includeDetail, benchDir = import.meta.dirname) {
     front.push(
         `<text x="${M_L}" y="${16 + M_T}" font-size="23" font-weight="800" class="tt">plexer benchmark</text>`
     );
-    const suiteCodeList = hasLarge ? "(T1–T12 · S1–S8 · L1–L8)" : "(T1–T12 · S1–S8)";
+    const suiteCodes = ["T1–T12", "S1–S8", hasLarge ? "L1–L8" : null, hasV2 ? "V1–V14" : null].filter(Boolean).join(" · ");
     front.push(
-        `<text x="${M_L}" y="${37 + M_T}" class="tm s125">${totalPairedCount} paired &amp; 3-arm live evaluations <tspan class="mono">${suiteCodeList}</tspan> · normalized per row to the best arm (shorter = lower cost)</text>`
+        `<text x="${M_L}" y="${37 + M_T}" class="tm s125">${totalPairedCount} paired runs <tspan class="mono">(${suiteCodes})</tspan> · ${esc(trialBadge)} · ${esc(verificationBadge)} · shorter = lower cost</text>`
     );
 
     // ---- shared x-axis: 1.0× to 4.0× scale for both hero and detail -----------
@@ -815,13 +786,16 @@ export function renderChart(includeDetail, benchDir = import.meta.dirname) {
 
     // ---- hero: overall geometric mean (doubles as the legend) ------------------
     y = axisTop + 18;
+    const geminiModels = [
+        hasNeon && "Neon",
+        hasCarbon && "Carbon",
+        "Hydrogen",
+    ].filter(Boolean);
+    const orchTiers = [hasOrchHigh && "High", hasOrchHybrid && "High+XHigh", hasOrchXhigh && "XHigh"].filter(Boolean);
     const modelLineup = [
-        hasNeon && "Gemini 4 Neon",
-        hasCarbon && "Gemini 4 Carbon",
-        "Gemini 4 Argon",
-        "Gemini 4 Hydrogen",
-        "Claude Opus 5.5",
-        "Claude Sonnet 5.5",
+        geminiModels.length ? `Gemini 4 ${geminiModels.join("/")}` : null,
+        orchTiers.length ? `Orchestrator (Neon+H2 ${orchTiers.join("/")})` : null,
+        "Claude Opus/Sonnet 5.5",
     ]
         .filter(Boolean)
         .join(", ");
@@ -892,7 +866,7 @@ export function renderChart(includeDetail, benchDir = import.meta.dirname) {
         `<text x="${M_L}" y="${totalH - 11}" class="tm s95">` +
         (includeDetail
             ? `Engine compaction measured across 24 natural-language intent queries on 6 pinned repositories (14,475 nodes, 29,088 edges) · reproduce via <tspan class="mono">npm run bench</tspan> and <tspan class="mono">node bench/eval-fast.js</tspan>.</text>`
-            : `Full per-model and per-task tables (<tspan class="mono">T1–T12</tspan>, <tspan class="mono">S1–S8</tspan>, <tspan class="mono">L1–L8</tspan>, and 3-arm <tspan class="mono">@trailhq/trail-code</tspan> breakdowns) are in <tspan class="mono">bench/README.md</tspan>.</text>`);
+            : `Full per-model and per-task tables (<tspan class="mono">T1–T12</tspan>, <tspan class="mono">S1–S8</tspan>, and <tspan class="mono">L1–L8</tspan>) are in <tspan class="mono">bench/README.md</tspan>.</text>`);
 
     return documentSvg(behind.join("") + front.join("") + footerSvg, totalH);
 }

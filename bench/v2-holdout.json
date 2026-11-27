@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "lockedAt": "2026-11-26T23:36:00Z",
+  "policy": "Locked unseen holdout repositories and tasks. Never inspect or tune retrieval weights, prompts, or budgets against these repos/tasks.",
+  "holdoutRepos": [
+    "click",
+    "vite",
+    "react",
+    "building-tools",
+    "z"
+  ],
+  "v2HoldoutTaskIds": [
+    "V3",
+    "V12",
+    "V14"
+  ],
+  "v1HoldoutTaskIds": [
+    "T4",
+    "T8",
+    "T12"
+  ],
+  "promptSha256": {
+    "V3": "e33202b2bc4c5a27f5f5ea6a42e199a14a1be90bc07a27a7cfc1e9b1045fff81",
+    "V12": "a658709b70abb5a530d37c5c608d1a419f78fbdece6a23d6cef1da0e8ba1261a",
+    "V14": "16e59e6604f25247f2ff7ef13def51bb228ec588608fc04bd0445ace04e5d8fd"
+  }
+}

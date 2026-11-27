@@ -12,10 +12,11 @@
  *     diagnosis/caller tasks and `all-targets-localized` readiness on edit tasks).
  *  3. Predicted cumulative input tokens across multi-turn sessions (`T0_delta * turns`).
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { HOOK_BUDGETS, queryPromptContext } from "../src/claude/hooks.js";
-import { GEMINI_HOOK_BUDGETS } from "../src/hosts/engine/prompt/budget.js";
+import { GEMINI_HOOK_BUDGETS, isNarrowPrompt } from "../src/hosts/engine/prompt/budget.js";
 import { formatOrientation, relevantRetrieval } from "../src/claude/format.js";
 import { fitAgyEphemeral } from "../src/hosts/engine/agy-context.js";
 import { loadGraphCached } from "../src/context/graph-store.js";
@@ -56,7 +57,7 @@ const T_ORACLE = {
         expectedTurns: 1,
     },
     T5: {
-        files: ["src/graph/refresh.js", "bin/plexer.js", "src/mcp/server.js"],
+        files: ["src/graph/refresh.js", "bin/plexer.js", "src/mcp/tools.js"],
         tokens: ["probeDrift", "ensureFreshGraph", "refreshBefore", "callTool"],
         expectedTurns: 2,
     },
@@ -101,7 +102,7 @@ function estimateBpeTokens(text, isCodeHeavy = false) {
     if (!text) return 0;
     // Calibrated against Claude Code BPE usage:
     // Prose / markdown (`SKILL.md`) averages ~3.3 chars/token.
-    // `L<n>:` numbered code blocks + pointers average ~2.05 chars/token.
+    // `<n>:` numbered code blocks + pointers average ~2.05 chars/token.
     return Math.ceil(Buffer.byteLength(text, "utf8") / (isCodeHeavy ? 2.05 : 3.3));
 }
 
@@ -155,41 +156,59 @@ if (process.argv.includes("--quiet")) {
     const orig = console.log;
     console.log = (...a) => {
         const s = String(a[0] ?? "");
-        if (/^(TOTAL|NeedCov|GEMINI_NeedCov|SCORE|GEMINI_SCORE|opus|sonnet|hydrogen-medium|argon-medium|carbon-medium|\s+plexer|budgets|gemini budgets|calibrated)/.test(s)) orig(...a);
+        if (/^(TOTAL|NeedCov|GEMINI_NeedCov|SCORE|GEMINI_SCORE|ORCH_SCORE|opus|sonnet|neon-medium|hydrogen-medium|carbon-medium|orch-neon-high-hydrogen-high|orch-neon-high-hydrogen-xhigh|orch-neon-xhigh-hydrogen-xhigh|\s+plexer|budgets|gemini budgets|calibrated)/.test(s)) orig(...a);
     };
 }
 
 const NEEDED_PATH = resolve(import.meta.dirname, "needed-spans.json");
 const NEEDED = existsSync(NEEDED_PATH) ? JSON.parse(readFileSync(NEEDED_PATH, "utf8")).tasks : {};
 const TURN_MODEL_PATH = resolve(import.meta.dirname, "turn-model.json");
-const CALIBRATE = process.argv.includes("--calibrate");
+const CALIBRATE = process.argv.includes("--calibrate") || process.argv.includes("--recalibrate-spans");
+const FIXTURES_ONLY = process.argv.includes("--fixtures-only");
 const TURN_MODEL = existsSync(TURN_MODEL_PATH) && !CALIBRATE ? JSON.parse(readFileSync(TURN_MODEL_PATH, "utf8")) : {};
-const HOLDOUT = new Set(TASKS.filter((t) => t.holdout).map((t) => t.id));
+const V2_HOLDOUT_PATH = resolve(import.meta.dirname, "v2-holdout.json");
+const V2_HOLDOUT_IDS = existsSync(V2_HOLDOUT_PATH)
+    ? new Set(JSON.parse(readFileSync(V2_HOLDOUT_PATH, "utf8")).v2HoldoutTaskIds || [])
+    : new Set();
+const HOLDOUT = new Set([...TASKS.filter((t) => t.holdout).map((t) => t.id), ...V2_HOLDOUT_IDS]);
 /** Per-task offline features, filled by `evalSuite` and consumed by `predictLive`. */
 const FEATURES = new Map();
 const GEMINI_FEATURES = new Map();
+const FAST_GEMINI_FEATURES = new Map();
+const XHIGH_GEMINI_FEATURES = new Map();
 
-function recordFeatures(id, suite, ctx, g, t0DeltaTok, hookTok, isEdit) {
+function recordFeatures(id, suite, ctx, g, _t0DeltaTok, hookTok, isEdit) {
+    const t0DeltaTok = ctx ? skillTokens + hookTok : 0;
     const nc = needCoverage(ctx, g, NEEDED[id]);
     FEATURES.set(id, { id, suite, t0DeltaTok, hookTok, isEdit, ...nc });
     return nc;
 }
 
-function recordGeminiFeatures(id, suite, repoDir, promptStr, g, orientTok, isEdit) {
-    const askGem = queryPromptContext(repoDir, promptStr, { geminiProfile: true });
-    const isEditTurn = Boolean(askGem?.isEditPrompt || askGem?.editEnvelope);
-    const rawGem = askGem ? relevantRetrieval(askGem, {}, isEditTurn ? 5 : 4, { geminiProfile: true }) || "" : "";
-    const ctxGem = fitAgyEphemeral(rawGem, 12000);
-    const matched = Boolean(ctxGem && !ctxGem.startsWith("[plexer] no strong match"));
-    const hookTokGem = estimateBpeTokens(ctxGem, true);
-    const t0DeltaTokGem = agyRuleTokens + (matched ? 0 : orientTok) + hookTokGem;
-    const ncGem = needCoverage(ctxGem, g, NEEDED[id]);
-    GEMINI_FEATURES.set(id, { id, suite, t0DeltaTok: t0DeltaTokGem, hookTok: hookTokGem, isEdit, ...ncGem });
-    return ncGem;
+function recordGeminiFeatures(id, suite, repoDir, promptStr, g, _orientTok, isEdit) {
+    const narrowPrompt = isNarrowPrompt(promptStr);
+    const computeProfile = (extraOpts) => {
+        const opts = { geminiProfile: true, narrowPrompt, ...extraOpts };
+        const askGem = queryPromptContext(repoDir, promptStr, opts);
+        const cap = (opts.fastProfile || opts.narrowPrompt) ? 3 : 4;
+        const rawGem = askGem ? relevantRetrieval(askGem, {}, cap, { ...opts, prompt: promptStr }) || "" : "";
+        const ctxGem = fitAgyEphemeral(rawGem, 12000);
+        const matched = Boolean(ctxGem);
+        const hookTokGem = estimateBpeTokens(ctxGem, true);
+        const t0DeltaTokGem = matched ? (agyRuleTokens + hookTokGem) : 0;
+        const ncGem = needCoverage(ctxGem, g, NEEDED[id]);
+        return { id, suite, t0DeltaTok: t0DeltaTokGem, hookTok: hookTokGem, isEdit, ...ncGem };
+    };
+    const gemFeat = computeProfile({});
+    const fastFeat = computeProfile({ fastProfile: true });
+    const xhighFeat = computeProfile({ xhighProfile: true });
+    GEMINI_FEATURES.set(id, gemFeat);
+    FAST_GEMINI_FEATURES.set(id, fastFeat);
+    XHIGH_GEMINI_FEATURES.set(id, xhighFeat);
+    return gemFeat;
 }
 
 function evaluateFamilies(rows, families, featuresMap, scoreLabel) {
-    const feat = (r) => featuresMap.get(r.id);
+    const feat = (r) => (typeof featuresMap === "function" ? featuresMap(r) : featuresMap.get(r.id));
     const turnX = (f) => [1, 1 - f.needCov, 1 - f.locCov, f.isEdit ? 1 : 0];
     const summary = [];
     for (const family of families) {
@@ -212,8 +231,8 @@ function evaluateFamilies(rows, families, featuresMap, scoreLabel) {
         }
         const err = (set) => set.reduce((a, r) => a + Math.abs(Math.max(0, dot(tc, turnX(feat(r)))) - r.turns), 0) / Math.max(1, set.length);
         const hold = P.filter((r) => HOLDOUT.has(r.id));
-        let est = { turns: 0, wallMs: 0, cumIn: 0, uncIn: 0, cost: 0 };
-        let live = { turns: 0, wallMs: 0, cumIn: 0, uncIn: 0, cost: 0 };
+        let est = { turns: 0, wallMs: 0, cumIn: 0, uncIn: 0, cost: 0, usd: 0 };
+        let live = { turns: 0, wallMs: 0, cumIn: 0, uncIn: 0, cost: 0, usd: 0 };
         for (const r of P) {
             const f = feat(r);
             const turns = Math.max(0, dot(tc, turnX(f)));
@@ -223,32 +242,37 @@ function evaluateFamilies(rows, families, featuresMap, scoreLabel) {
             est.cumIn += p.cumIn;
             est.uncIn += p.uncIn;
             est.cost += p.cost;
+            est.usd += p.usd;
             live.turns += r.turns;
             live.wallMs += r.ms;
             live.cumIn += r.cum;
             live.uncIn += r.unc;
             live.cost += r.cost;
+            live.usd += r.usd;
         }
         const C = R.filter((r) => r.arm === "cold");
         const coldMs = C.reduce((a, r) => a + r.ms, 0);
         const coldCum = C.reduce((a, r) => a + r.cum, 0);
         const coldUnc = C.reduce((a, r) => a + r.unc, 0);
         const coldCost = C.reduce((a, r) => a + r.cost, 0);
+        const coldUsd = C.reduce((a, r) => a + r.usd, 0);
         if (process.argv.includes("--coef")) console.log(`${family} cum coef ${JSON.stringify(cost.cum.c.map((v) => +v.toFixed(3)))} unc coef ${JSON.stringify(cost.unc.c.map((v) => +v.toFixed(3)))}`);
         console.log(
             `${family.padEnd(15)} turn-model [${tc.map((v) => v.toFixed(2)).join(", ")}] MAE train=${err(train).toFixed(2)} holdout=${err(hold).toFixed(2)} | ` +
                 `wall R²=${cost.wall.r2.toFixed(2)} cum R²=${cost.cum.r2.toFixed(2)} unc R²=${cost.unc.r2.toFixed(2)}`
         );
         console.log(
-            `  plexer EstTurns=${est.turns.toFixed(1)} (live-at-record ${live.turns}) | EstWall=${(est.wallMs / 1000).toFixed(1)}s ` +
-                `(live ${(live.wallMs / 1000).toFixed(1)}s, cold ${(coldMs / 1000).toFixed(1)}s → ${pct(coldMs, est.wallMs)}) | ` +
+            `  plexer EstTurns=${est.turns.toFixed(1)} (live-at-record ${live.turns}) | EstUsd=$${est.usd.toFixed(2)} (live $${live.usd.toFixed(2)}, cold $${coldUsd.toFixed(2)} → ${pct(coldUsd, est.usd)}) | ` +
+                `EstWall=${(est.wallMs / 1000).toFixed(1)}s (live ${(live.wallMs / 1000).toFixed(1)}s, cold ${(coldMs / 1000).toFixed(1)}s → ${pct(coldMs, est.wallMs)}) | ` +
                 `EstUncached=${(est.uncIn / 1000).toFixed(0)}k (live ${(live.uncIn / 1000).toFixed(0)}k, cold ${(coldUnc / 1000).toFixed(0)}k → ${pct(coldUnc, est.uncIn)}) | ` +
                 `EstCost=${(est.cost / 1000).toFixed(0)}k (live ${(live.cost / 1000).toFixed(0)}k, cold ${(coldCost / 1000).toFixed(0)}k → ${pct(coldCost, est.cost)}) | ` +
                 `EstCum=${(est.cumIn / 1000).toFixed(0)}k (live ${(live.cumIn / 1000).toFixed(0)}k, cold ${(coldCum / 1000).toFixed(0)}k → ${pct(coldCum, est.cumIn)})`
         );
-        summary.push({ family, est, coldMs, coldCum, coldUnc, coldCost });
+        summary.push({ family, est, coldMs, coldCum, coldUnc, coldCost, coldUsd });
     }
     if (summary.length) {
+        const u$ = summary.reduce((a, s) => a + s.est.usd, 0);
+        const cu$ = summary.reduce((a, s) => a + s.coldUsd, 0);
         const w = summary.reduce((a, s) => a + s.est.wallMs, 0);
         const cw = summary.reduce((a, s) => a + s.coldMs, 0);
         const u = summary.reduce((a, s) => a + s.est.uncIn, 0);
@@ -259,7 +283,7 @@ function evaluateFamilies(rows, families, featuresMap, scoreLabel) {
         const cc = summary.reduce((a, s) => a + s.coldCum, 0);
         const label = scoreLabel.padEnd(13);
         console.log(
-            `${label} EstWall vs cold ${pct(cw, w)} | EstUncached vs cold ${pct(cu, u)} | EstCost vs cold ${pct(ck, k)} | EstCum vs cold ${pct(cc, c)}  (lower is better; gate: must not regress)`
+            `${label} EstUsd vs cold ${pct(cu$, u$)} | EstWall vs cold ${pct(cw, w)} | EstUncached vs cold ${pct(cu, u)} | EstCost vs cold ${pct(ck, k)} | EstCum vs cold ${pct(cc, c)}  (lower is better; gate: must not regress)`
         );
     }
 }
@@ -275,7 +299,13 @@ function predictLive() {
     console.log("\n=== Live-calibrated predictions (cost model + NeedCov turn model) ===");
     evaluateFamilies(rows, ["opus", "sonnet"], FEATURES, "SCORE");
     if (GEMINI_FEATURES.size) {
-        evaluateFamilies(rows, ["neon-medium", "carbon-medium", "argon-medium", "hydrogen-medium"], GEMINI_FEATURES, "GEMINI_SCORE");
+        evaluateFamilies(rows, ["neon-medium", "carbon-medium", "hydrogen-medium"], (r) => (r.family === "hydrogen-medium" ? FAST_GEMINI_FEATURES : GEMINI_FEATURES).get(r.id), "GEMINI_SCORE");
+        evaluateFamilies(
+            rows,
+            ["orch-neon-high-hydrogen-high", "orch-neon-high-hydrogen-xhigh", "orch-neon-xhigh-hydrogen-xhigh"],
+            (r) => (r.family === "orch-neon-xhigh-hydrogen-xhigh" ? XHIGH_GEMINI_FEATURES : GEMINI_FEATURES).get(r.id),
+            "ORCH_SCORE",
+        );
     }
     if (CALIBRATE) {
         writeFileSync(TURN_MODEL_PATH, JSON.stringify({ calibrated: new Date().toISOString(), features: "[1, 1-needCov, 1-locCov, isEdit]", ...TURN_MODEL }, null, 1) + "\n");
@@ -495,6 +525,60 @@ function evalSuite() {
 
     const elapsedMs = Math.round(performance.now() - t0Start);
     console.log(`\nCompleted ${tCount + sCount + lCount}-task offline evaluation in ${elapsedMs}ms ($0 API cost).`);
+    const missingTotal = (TASKS.length - tCount) + (SWEBENCH_TASKS.length - sCount) + (LARGE_TASKS.length - lCount);
+    if (missingTotal > 0) {
+        console.log(
+            `Base repo status: T=${tCount}/${TASKS.length}, S=${sCount}/${SWEBENCH_TASKS.length}, L=${lCount}/${LARGE_TASKS.length} present ` +
+                `(${missingTotal} missing — run \`node bench/eval-fast.js --ensure-base\` or \`node bench/eval-fast.js --fixtures-only\`).`
+        );
+    }
+}
+
+async function evalFixturesOnly() {
+    const t0Start = performance.now();
+    const { buildGraph } = await import("../src/graph/build.js");
+    const fixtures = [
+        { name: "ts-service", query: "how are JSON web token signatures verified with key rotation", gold: "src/auth/token-verifier.ts" },
+        { name: "py-worker", query: "how are scheduled cron tasks ordered by priority heap", gold: "worker/scheduler.py" },
+        { name: "go-engine", query: "how are write ahead log records framed and validated", gold: "internal/wal/segment.go" },
+        { name: "luau-reactive", query: "how do reactive signals and effects propagate updates", gold: "src/Graph.luau" },
+        { name: "rust-compiler", query: "where are schema type references checked for cycles", gold: "src/resolve.rs" },
+        { name: "docs-polyglot", query: "how are dependency cycles detected in health checks", gold: "cli/health.js" },
+    ];
+    console.log("=== Fixtures-Only Offline Turn-0 Evaluation (zero repo leakage) ===");
+    const scratch = mkdtempSync(join(tmpdir(), "plexer-eval-fx-"));
+    let hits = 0;
+    let tokSum = 0;
+    try {
+        for (const fx of fixtures) {
+            const srcDir = resolve(import.meta.dirname, "fixtures", fx.name);
+            if (!existsSync(srcDir)) continue;
+            const isoDir = join(scratch, fx.name);
+            cpSync(srcDir, isoDir, { recursive: true });
+            await buildGraph(isoDir, { graphOnly: true, force: true });
+            const askObj = queryPromptContext(isoDir, fx.query);
+            const ctx = askObj ? relevantRetrieval(askObj, {}) || "" : "";
+            const tok = estimateBpeTokens(ctx, true);
+            tokSum += tok;
+            const hitPtrs = (askObj?.hits || []).map((h) => String(h.pointer || ""));
+            const candPtrs = (askObj?.candidateMap || []).map((c) => String(c.pointer || c.path || ""));
+            const matched =
+                hitPtrs.some((p) => p.includes(fx.gold)) ||
+                candPtrs.some((p) => p.includes(fx.gold)) ||
+                ctx.includes(fx.gold);
+            if (matched) hits += 1;
+            console.log(`${fx.name.padEnd(14)} | T0Hook=${String(tok).padStart(4)} tok | GoldMatch=${matched ? "PASS" : "MISS"} | ${fx.gold}`);
+        }
+    } finally {
+        rmSync(scratch, { recursive: true, force: true });
+    }
+    const ms = Math.round(performance.now() - t0Start);
+    console.log(`Fixtures summary: ${hits}/${fixtures.length} gold hits | AvgHook=${Math.round(tokSum / Math.max(1, fixtures.length))} tok | ${ms}ms ($0 API cost).`);
+}
+
+if (FIXTURES_ONLY) {
+    await evalFixturesOnly();
+    process.exit(0);
 }
 
 if (process.argv.includes("--ensure-base") || process.argv.includes("--reindex")) {

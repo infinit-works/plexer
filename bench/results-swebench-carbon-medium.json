@@ -39,25 +39,6 @@
       "totalMs": 3675631,
       "score": 64,
       "maxScore": 64
-    },
-    "trail": {
-      "calls": 458,
-      "turns": 280,
-      "toolOutputTokens": 385814,
-      "uncachedInputTokens": 1443103,
-      "cachedInputTokens": 19060150,
-      "cumulativeInputTokens": 20503253,
-      "turn1ContextTokens": 54832,
-      "turn1UncachedTokens": 54832,
-      "postTurn1UncachedTokens": 1388271,
-      "netContextGrowthTokens": 899748,
-      "cacheMissTurns": 0,
-      "finalContextTokens": 954580,
-      "totalModelOutputTokens": 316300,
-      "searchMs": 5380000,
-      "totalMs": 5532091,
-      "score": 64,
-      "maxScore": 64
     }
   },
   "tasks": [
@@ -113,39 +94,6 @@
           "qutebrowser/browser/webkit/network/networkreply.py"
         ],
         "patch": "diff --git qutebrowser/browser/webkit/network/networkreply.py qutebrowser/browser/webkit/network/networkreply.py\nindex 6f7abea..4fb7dfe 100644\n--- qutebrowser/browser/webkit/network/networkreply.py\n+++ qutebrowser/browser/webkit/network/networkreply.py\n@@ -116,7 +116,7 @@ class ErrorNetworkReply(QNetworkReply):\n         # the device to avoid getting a warning.\n         self.setOpenMode(QIODevice.OpenModeFlag.ReadOnly)\n         self.setError(error, errorstring)\n-        QTimer.singleShot(0, lambda: self.error.emit(error))\n+        QTimer.singleShot(0, lambda: self.errorOccurred.emit(error))\n         QTimer.singleShot(0, lambda: self.finished.emit())\n \n     def abort(self):\ndiff --git tests/unit/browser/webkit/network/test_networkreply.py tests/unit/browser/webkit/network/test_networkreply.py\nindex 5de31bf..fc400c1 100644\n--- tests/unit/browser/webkit/network/test_networkreply.py\n+++ tests/unit/browser/webkit/network/test_networkreply.py\n@@ -78,7 +78,7 @@ def test_error_network_reply(qtbot, req):\n     reply = networkreply.ErrorNetworkReply(\n         req, \"This is an error\", QNetworkReply.NetworkError.UnknownNetworkError)\n \n-    with qtbot.wait_signals([reply.error, reply.finished], order='strict'):\n+    with qtbot.wait_signals([reply.errorOccurred, reply.finished], order='strict'):\n         pass\n \n     reply.abort()  # shouldn't do anything\n",
-        "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "a0064208-cc58-4dd6-832e-85ade176f6fd",
-        "calls": 45,
-        "turns": 25,
-        "toolOutputTokens": 32807,
-        "uncachedInputTokens": 85451,
-        "cachedInputTokens": 965410,
-        "cumulativeInputTokens": 1050861,
-        "turn1ContextTokens": 6425,
-        "turn1UncachedTokens": 6425,
-        "postTurn1UncachedTokens": 79026,
-        "netContextGrowthTokens": 57186,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 63611,
-        "totalModelOutputTokens": 8703,
-        "searchMs": 212000,
-        "totalMs": 234096,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 1,
-        "symRecall": 1,
-        "tokenRecall": 1,
-        "modifiedFiles": [
-          "qutebrowser/browser/webkit/network/networkreply.py",
-          "tests/unit/browser/webkit/network/test_networkreply.py"
-        ],
-        "goldSourceFiles": [
-          "qutebrowser/browser/webkit/network/networkreply.py"
-        ],
         "dockerPassed": null
       },
       "cold": {
@@ -306,45 +254,6 @@
         ],
         "patch": "diff --git qutebrowser/app.py qutebrowser/app.py\nindex 60eedeb..d810bdb 100644\n--- qutebrowser/app.py\n+++ qutebrowser/app.py\n@@ -399,8 +399,8 @@ def on_focus_changed(_old, new):\n         return\n \n     if not isinstance(new, QWidget):\n-        log.misc.debug(\"on_focus_changed called with non-QWidget {!r}\".format(\n-            new))\n+        log.misc.debug(\"on_focus_changed called with non-QWidget {}\".format(\n+            qtutils.qobj_repr(new)))\n         return\n \n     window = new.window()\n@@ -561,7 +561,7 @@ class Application(QApplication):\n     @pyqtSlot(QObject)\n     def on_focus_object_changed(self, obj):\n         \"\"\"Log when the focus object changed.\"\"\"\n-        output = repr(obj)\n+        output = qtutils.qobj_repr(obj)\n         if self._last_focus_object != output:\n             log.misc.debug(\"Focus object changed: {}\".format(output))\n         self._last_focus_object = output\ndiff --git qutebrowser/browser/eventfilter.py qutebrowser/browser/eventfilter.py\nindex 8dbfbd0..0394504 100644\n--- qutebrowser/browser/eventfilter.py\n+++ qutebrowser/browser/eventfilter.py\n@@ -8,7 +8,7 @@ from qutebrowser.qt import machinery\n from qutebrowser.qt.core import QObject, QEvent, Qt, QTimer\n \n from qutebrowser.config import config\n-from qutebrowser.utils import log, message, usertypes\n+from qutebrowser.utils import log, message, usertypes, qtutils\n from qutebrowser.keyinput import modeman\n \n \n@@ -36,7 +36,8 @@ class ChildEventFilter(QObject):\n         if event.type() == QEvent.Type.ChildAdded:\n             child = event.child()\n             log.misc.debug(\"{} got new child {}, installing filter\"\n-                           .format(obj, child))\n+                           .format(qtutils.qobj_repr(obj),\n+                                   qtutils.qobj_repr(child)))\n \n             # Additional sanity check, but optional\n             if self._widget is not None:\n@@ -45,7 +46,8 @@ class ChildEventFilter(QObject):\n             child.installEventFilter(self._filter)\n         elif event.type() == QEvent.Type.ChildRemoved:\n             child = event.child()\n-            log.misc.debug(\"{}: removed child {}\".format(obj, child))\n+            log.misc.debug(\"{}: removed child {}\".format(\n+                qtutils.qobj_repr(obj), qtutils.qobj_repr(child)))\n \n         return False\n \n@@ -240,6 +242,6 @@ class TabEventFilter(QObject):\n             return False\n         if obj is not self._tab.private_api.event_target():\n             log.mouse.debug(\"Ignoring {} to {}\".format(\n-                event.__class__.__name__, obj))\n+                event.__class__.__name__, qtutils.qobj_repr(obj)))\n             return False\n         return self._handlers[evtype](event)\ndiff --git qutebrowser/keyinput/eventfilter.py qutebrowser/keyinput/eventfilter.py\nindex 24d4970..89af5e6 100644\n--- qutebrowser/keyinput/eventfilter.py\n+++ qutebrowser/keyinput/eventfilter.py\n@@ -11,7 +11,7 @@ from qutebrowser.qt.gui import QKeyEvent, QWindow\n \n from qutebrowser.keyinput import modeman\n from qutebrowser.misc import quitter, objects\n-from qutebrowser.utils import objreg, debug, log\n+from qutebrowser.utils import objreg, debug, log, qtutils\n \n \n class EventFilter(QObject):\n@@ -77,7 +77,7 @@ class EventFilter(QObject):\n \n         if self._log_qt_events:\n             try:\n-                source = repr(obj)\n+                source = qtutils.qobj_repr(obj)\n             except AttributeError:  # might not be fully initialized yet\n                 source = type(obj).__name__\n \ndiff --git qutebrowser/keyinput/modeman.py qutebrowser/keyinput/modeman.py\nindex 582a1bf..f0337ec 100644\n--- qutebrowser/keyinput/modeman.py\n+++ qutebrowser/keyinput/modeman.py\n@@ -16,7 +16,7 @@ from qutebrowser.commands import runners\n from qutebrowser.keyinput import modeparsers, basekeyparser\n from qutebrowser.config import config\n from qutebrowser.api import cmdutils\n-from qutebrowser.utils import usertypes, log, objreg, utils\n+from qutebrowser.utils import usertypes, log, objreg, utils, qtutils\n from qutebrowser.browser import hints\n from qutebrowser.misc import objects\n \n@@ -308,10 +308,10 @@ class ModeManager(QObject):\n             focus_widget = objects.qapp.focusWidget()\n             log.modes.debug(\"match: {}, forward_unbound_keys: {}, \"\n                             \"passthrough: {}, is_non_alnum: {}, dry_run: {} \"\n-                            \"--> filter: {} (focused: {!r})\".format(\n+                            \"--> filter: {} (focused: {})\".format(\n                                 match, forward_unbound_keys,\n                                 parser.passthrough, is_non_alnum, dry_run,\n-                                filter_this, focus_widget))\n+                                filter_this, qtutils.qobj_repr(focus_widget)))\n         return filter_this\n \n     def _handle_keyrelease(self, event: QKeyEvent) -> bool:\ndiff --git qutebrowser/utils/qtutils.py qutebrowser/utils/qtutils.py\nindex 5e7c6d2..bca99a2 100644\n--- qutebrowser/utils/qtutils.py\n+++ qutebrowser/utils/qtutils.py\n@@ -639,6 +639,38 @@ def extract_enum_val(val: Union[sip.simplewrapper, int, enum.Enum]) -> int:\n     return val\n \n \n+def qobj_repr(obj: Optional[QObject]) -> str:\n+    \"\"\"Show nicer debug information for a QObject.\n+\n+    Args:\n+        obj: The QObject to represent, or None.\n+\n+    Return:\n+        A string suitable for logging.\n+    \"\"\"\n+    if obj is None:\n+        return repr(obj)\n+\n+    try:\n+        object_name = obj.objectName()\n+        meta_obj = obj.metaObject()\n+        class_name = meta_obj.className() if meta_obj is not None else None\n+    except (AttributeError, RuntimeError, TypeError):\n+        return repr(obj)\n+\n+    orig = repr(obj)\n+    if orig.startswith('<') and orig.endswith('>'):\n+        orig = orig[1:-1]\n+\n+    parts = [orig]\n+    if object_name:\n+        parts.append(f\"objectName={object_name!r}\")\n+    if class_name and f\".{class_name} object at 0x\" not in orig:\n+        parts.append(f\"className={class_name!r}\")\n+\n+    return f\"<{', '.join(parts)}>\"\n+\n+\n _T = TypeVar(\"_T\")\n \n \ndiff --git tests/unit/utils/test_qtutils.py tests/unit/utils/test_qtutils.py\nindex 5b17388..9c220c7 100644\n--- tests/unit/utils/test_qtutils.py\n+++ tests/unit/utils/test_qtutils.py\n@@ -1051,3 +1051,51 @@ class TestLibraryPath:\n def test_extract_enum_val():\n     value = qtutils.extract_enum_val(Qt.KeyboardModifier.ShiftModifier)\n     assert value == 0x02000000\n+\n+\n+class TestQObjRepr:\n+\n+    def test_none(self):\n+        assert qtutils.qobj_repr(None) == \"None\"\n+\n+    def test_non_qobject(self):\n+        obj = object()\n+        assert qtutils.qobj_repr(obj) == repr(obj)\n+\n+    def test_plain_qobject(self):\n+        obj = QObject()\n+        assert qtutils.qobj_repr(obj) == repr(obj)\n+\n+    def test_object_name(self):\n+        obj = QObject()\n+        obj.setObjectName(\"foo\")\n+        inner = repr(obj)[1:-1]\n+        assert qtutils.qobj_repr(obj) == f\"<{inner}, objectName='foo'>\"\n+\n+    def test_custom_repr_with_brackets(self):\n+        class CustomObj(QObject):\n+            def __repr__(self):\n+                return \"<Custom>\"\n+\n+        obj = CustomObj()\n+        assert qtutils.qobj_repr(obj) == \"<Custom, className='CustomObj'>\"\n+\n+    def test_custom_repr_without_brackets(self):\n+        class CustomObj(QObject):\n+            def __repr__(self):\n+                return \"Custom()\"\n+\n+        obj = CustomObj()\n+        obj.setObjectName(\"bar\")\n+        assert qtutils.qobj_repr(obj) == \"<Custom(), objectName='bar', className='CustomObj'>\"\n+\n+    def test_deleted_qobject(self):\n+        from qutebrowser.qt import sip\n+        obj = QObject()\n+        sip.delete(obj)\n+        assert qtutils.qobj_repr(obj) == repr(obj)\n+\n+    def test_uninitialized_qobject(self):\n+        obj = QObject.__new__(QObject)\n+        assert qtutils.qobj_repr(obj) == repr(obj)\n+\n",
         "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "20871916-9a5c-45ae-82f1-6f5dc2f7df98",
-        "calls": 55,
-        "turns": 25,
-        "toolOutputTokens": 48430,
-        "uncachedInputTokens": 142670,
-        "cachedInputTokens": 1763701,
-        "cumulativeInputTokens": 1906371,
-        "turn1ContextTokens": 7133,
-        "turn1UncachedTokens": 7133,
-        "postTurn1UncachedTokens": 135537,
-        "netContextGrowthTokens": 117643,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 124776,
-        "totalModelOutputTokens": 47692,
-        "searchMs": 756000,
-        "totalMs": 777092,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 0.8,
-        "symRecall": 1,
-        "tokenRecall": 0.909,
-        "modifiedFiles": [
-          "qutebrowser/app.py",
-          "qutebrowser/browser/eventfilter.py",
-          "qutebrowser/keyinput/eventfilter.py",
-          "qutebrowser/keyinput/modeman.py",
-          "qutebrowser/utils/qtutils.py"
-        ],
-        "goldSourceFiles": [
-          "qutebrowser/app.py",
-          "qutebrowser/browser/eventfilter.py",
-          "qutebrowser/keyinput/modeman.py",
-          "qutebrowser/utils/qtutils.py"
-        ],
-        "dockerPassed": null
       }
     },
     {
@@ -380,42 +289,6 @@
         "fileRecall": 1,
         "filePrecision": 1,
         "symRecall": 0.857,
-        "tokenRecall": 0.937,
-        "modifiedFiles": [
-          "internal/cleanup/cleanup.go",
-          "internal/cmd/authn.go",
-          "internal/config/authentication.go"
-        ],
-        "goldSourceFiles": [
-          "internal/cleanup/cleanup.go",
-          "internal/cmd/authn.go",
-          "internal/config/authentication.go"
-        ],
-        "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "6626b017-179d-4d4a-98b5-87f97be8516e",
-        "calls": 67,
-        "turns": 48,
-        "toolOutputTokens": 78055,
-        "uncachedInputTokens": 220586,
-        "cachedInputTokens": 4836979,
-        "cumulativeInputTokens": 5057565,
-        "turn1ContextTokens": 6951,
-        "turn1UncachedTokens": 6951,
-        "postTurn1UncachedTokens": 213635,
-        "netContextGrowthTokens": 169538,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 176489,
-        "totalModelOutputTokens": 49019,
-        "searchMs": 745000,
-        "totalMs": 758528,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 1,
-        "symRecall": 0.786,
         "tokenRecall": 0.937,
         "modifiedFiles": [
           "internal/cleanup/cleanup.go",
@@ -604,41 +477,6 @@
         ],
         "patch": "diff --git internal/storage/cache/cache.go internal/storage/cache/cache.go\nindex 5ef2a8a..f11ea6d 100644\n--- internal/storage/cache/cache.go\n+++ internal/storage/cache/cache.go\n@@ -18,8 +18,12 @@ type Store struct {\n \tlogger *zap.Logger\n }\n \n-// storage:evaluationRules:<namespaceKey>:<flagKey>\n-const evaluationRulesCacheKeyFmt = \"s:er:%s:%s\"\n+const (\n+\t// storage:evaluationRules:<namespaceKey>:<flagKey>\n+\tevaluationRulesCacheKeyFmt = \"s:er:%s:%s\"\n+\t// storage:evaluationRollouts:<namespaceKey>:<flagKey>\n+\tevaluationRolloutsCacheKeyFmt = \"s:ero:%s:%s\"\n+)\n \n func NewStore(store storage.Store, cacher cache.Cacher, logger *zap.Logger) *Store {\n \treturn &Store{Store: store, cacher: cacher, logger: logger}\n@@ -74,3 +78,22 @@ func (s *Store) GetEvaluationRules(ctx context.Context, namespaceKey, flagKey st\n \ts.set(ctx, cacheKey, rules)\n \treturn rules, nil\n }\n+\n+func (s *Store) GetEvaluationRollouts(ctx context.Context, namespaceKey, flagKey string) ([]*storage.EvaluationRollout, error) {\n+\tcacheKey := fmt.Sprintf(evaluationRolloutsCacheKeyFmt, namespaceKey, flagKey)\n+\n+\tvar rollouts []*storage.EvaluationRollout\n+\n+\tcacheHit := s.get(ctx, cacheKey, &rollouts)\n+\tif cacheHit {\n+\t\treturn rollouts, nil\n+\t}\n+\n+\trollouts, err := s.Store.GetEvaluationRollouts(ctx, namespaceKey, flagKey)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\n+\ts.set(ctx, cacheKey, rollouts)\n+\treturn rollouts, nil\n+}\ndiff --git internal/storage/cache/cache_test.go internal/storage/cache/cache_test.go\nindex d69db26..8a9b148 100644\n--- internal/storage/cache/cache_test.go\n+++ internal/storage/cache/cache_test.go\n@@ -99,3 +99,51 @@ func TestGetEvaluationRulesCached(t *testing.T) {\n \tassert.Equal(t, expectedRules, rules)\n \tassert.Equal(t, \"s:er:ns:flag-1\", cacher.cacheKey)\n }\n+\n+func TestGetEvaluationRollouts(t *testing.T) {\n+\tvar (\n+\t\texpectedRollouts = []*storage.EvaluationRollout{{Rank: 1}}\n+\t\tstore            = &common.StoreMock{}\n+\t)\n+\n+\tstore.On(\"GetEvaluationRollouts\", context.TODO(), \"ns\", \"flag-1\").Return(\n+\t\texpectedRollouts, nil,\n+\t)\n+\n+\tvar (\n+\t\tcacher      = &cacheSpy{}\n+\t\tlogger      = zaptest.NewLogger(t)\n+\t\tcachedStore = NewStore(store, cacher, logger)\n+\t)\n+\n+\trollouts, err := cachedStore.GetEvaluationRollouts(context.TODO(), \"ns\", \"flag-1\")\n+\tassert.Nil(t, err)\n+\tassert.Equal(t, expectedRollouts, rollouts)\n+\n+\tassert.Equal(t, \"s:ero:ns:flag-1\", cacher.cacheKey)\n+\tassert.Equal(t, []byte(`[{\"rank\":1}]`), cacher.cachedValue)\n+}\n+\n+func TestGetEvaluationRolloutsCached(t *testing.T) {\n+\tvar (\n+\t\texpectedRollouts = []*storage.EvaluationRollout{{Rank: 1}}\n+\t\tstore            = &common.StoreMock{}\n+\t)\n+\n+\tstore.AssertNotCalled(t, \"GetEvaluationRollouts\", context.TODO(), \"ns\", \"flag-1\")\n+\n+\tvar (\n+\t\tcacher = &cacheSpy{\n+\t\t\tcached:      true,\n+\t\t\tcachedValue: []byte(`[{\"rank\":1}]`),\n+\t\t}\n+\n+\t\tlogger      = zaptest.NewLogger(t)\n+\t\tcachedStore = NewStore(store, cacher, logger)\n+\t)\n+\n+\trollouts, err := cachedStore.GetEvaluationRollouts(context.TODO(), \"ns\", \"flag-1\")\n+\tassert.Nil(t, err)\n+\tassert.Equal(t, expectedRollouts, rollouts)\n+\tassert.Equal(t, \"s:ero:ns:flag-1\", cacher.cacheKey)\n+}\ndiff --git internal/storage/storage.go internal/storage/storage.go\nindex e18d0c7..4efb483 100644\n--- internal/storage/storage.go\n+++ internal/storage/storage.go\n@@ -34,24 +34,24 @@ type EvaluationSegment struct {\n \n // EvaluationRollout represents a rollout in the form that helps with evaluation.\n type EvaluationRollout struct {\n-\tNamespaceKey string\n-\tRolloutType  flipt.RolloutType\n-\tRank         int32\n-\tThreshold    *RolloutThreshold\n-\tSegment      *RolloutSegment\n+\tNamespaceKey string            `json:\"namespace_key,omitempty\"`\n+\tRolloutType  flipt.RolloutType `json:\"rollout_type,omitempty\"`\n+\tRank         int32             `json:\"rank,omitempty\"`\n+\tThreshold    *RolloutThreshold `json:\"threshold,omitempty\"`\n+\tSegment      *RolloutSegment   `json:\"segment,omitempty\"`\n }\n \n // RolloutThreshold represents Percentage(s) for use in evaluation.\n type RolloutThreshold struct {\n-\tPercentage float32\n-\tValue      bool\n+\tPercentage float32 `json:\"percentage,omitempty\"`\n+\tValue      bool    `json:\"value,omitempty\"`\n }\n \n // RolloutSegment represents Segment(s) for use in evaluation.\n type RolloutSegment struct {\n-\tValue           bool\n-\tSegmentOperator flipt.SegmentOperator\n-\tSegments        map[string]*EvaluationSegment\n+\tValue           bool                          `json:\"value,omitempty\"`\n+\tSegmentOperator flipt.SegmentOperator         `json:\"segment_operator,omitempty\"`\n+\tSegments        map[string]*EvaluationSegment `json:\"segments,omitempty\"`\n }\n \n // EvaluationConstraint represents a segment constraint that is used for evaluation\n@@ -187,6 +187,8 @@ type EvaluationStore interface {\n \t// Note: Rules MUST be returned in order by Rank\n \tGetEvaluationRules(ctx context.Context, namespaceKey, flagKey string) ([]*EvaluationRule, error)\n \tGetEvaluationDistributions(ctx context.Context, ruleID string) ([]*EvaluationDistribution, error)\n+\t// GetEvaluationRollouts returns rollouts applicable to namespaceKey and flagKey provided\n+\t// Note: Rollouts MUST be returned in order by Rank\n \tGetEvaluationRollouts(ctx context.Context, namespaceKey, flagKey string) ([]*EvaluationRollout, error)\n }\n \n",
         "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "3d9824e7-9c42-458f-b598-e5819da52100",
-        "calls": 33,
-        "turns": 24,
-        "toolOutputTokens": 40089,
-        "uncachedInputTokens": 102784,
-        "cachedInputTokens": 1253074,
-        "cumulativeInputTokens": 1355858,
-        "turn1ContextTokens": 6818,
-        "turn1UncachedTokens": 6818,
-        "postTurn1UncachedTokens": 95966,
-        "netContextGrowthTokens": 76129,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 82947,
-        "totalModelOutputTokens": 16633,
-        "searchMs": 401000,
-        "totalMs": 423237,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 0.667,
-        "symRecall": 1,
-        "tokenRecall": 1,
-        "modifiedFiles": [
-          "internal/storage/cache/cache.go",
-          "internal/storage/cache/cache_test.go",
-          "internal/storage/storage.go"
-        ],
-        "goldSourceFiles": [
-          "internal/storage/cache/cache.go",
-          "internal/storage/storage.go"
-        ],
-        "dockerPassed": null
       }
     },
     {
@@ -764,44 +602,6 @@
         ],
         "patch": "diff --git src/middleware/header.js src/middleware/header.js\nindex aceb38e..88a94bf 100644\n--- src/middleware/header.js\n+++ src/middleware/header.js\n@@ -6,7 +6,6 @@ const _ = require('lodash');\n const validator = require('validator');\n const util = require('util');\n \n-const db = require('../database');\n const user = require('../user');\n const topics = require('../topics');\n const messaging = require('../messaging');\n@@ -75,7 +74,7 @@ middleware.renderHeader = async function renderHeader(req, res, data) {\n \t\tisModerator: user.isModeratorOfAnyCategory(req.uid),\n \t\tprivileges: privileges.global.get(req.uid),\n \t\tuser: user.getUserData(req.uid),\n-\t\tisEmailConfirmSent: req.uid <= 0 ? false : await db.get(`uid:${req.uid}:confirm:email:sent`),\n+\t\tisEmailConfirmSent: req.uid <= 0 ? false : user.email.isValidationPending(req.uid),\n \t\tlanguageDirection: translator.translate('[[language:dir]]', res.locals.config.userLang),\n \t\ttimeagoCode: languages.userTimeagoCode(res.locals.config.userLang),\n \t\tbrowserTitle: translator.translate(controllers.helpers.buildTitle(translator.unescape(data.title))),\ndiff --git src/user/delete.js src/user/delete.js\nindex 8ee7e99..9de08f7 100644\n--- src/user/delete.js\n+++ src/user/delete.js\n@@ -155,6 +155,7 @@ module.exports = function (User) {\n \t\t\tgroups.leaveAllGroups(uid),\n \t\t\tflags.resolveFlag('user', uid, uid),\n \t\t\tUser.reset.cleanByUid(uid),\n+\t\t\tUser.email.expireValidation(uid),\n \t\t]);\n \t\tawait db.deleteAll([`followers:${uid}`, `following:${uid}`, `user:${uid}`]);\n \t\tdelete deletesInProgress[uid];\ndiff --git src/user/email.js src/user/email.js\nindex 6ed3c9d..fe203ea 100644\n--- src/user/email.js\n+++ src/user/email.js\n@@ -24,6 +24,28 @@ UserEmail.available = async function (email) {\n \treturn !exists;\n };\n \n+UserEmail.isValidationPending = async function (uid, email) {\n+\tconst code = await db.get(`confirm:byUid:${uid}`);\n+\tif (email) {\n+\t\tif (!code) {\n+\t\t\treturn false;\n+\t\t}\n+\t\tconst confirmEmail = await db.getObjectField(`confirm:${code}`, 'email');\n+\t\treturn Boolean(confirmEmail && email.toLowerCase() === confirmEmail.toLowerCase());\n+\t}\n+\n+\treturn !!code;\n+};\n+\n+UserEmail.expireValidation = async function (uid) {\n+\tconst keys = [`confirm:byUid:${uid}`];\n+\tconst confirm_code = await db.get(`confirm:byUid:${uid}`);\n+\tif (confirm_code) {\n+\t\tkeys.push(`confirm:${confirm_code}`);\n+\t}\n+\tawait db.deleteAll(keys);\n+};\n+\n UserEmail.sendValidationEmail = async function (uid, options) {\n \t/*\n \t * \tOptions:\n@@ -41,9 +63,8 @@ UserEmail.sendValidationEmail = async function (uid, options) {\n \t}\n \n \tlet confirm_code = utils.generateUUID();\n-\tconst confirm_link = `${nconf.get('url')}/confirm/${confirm_code}`;\n \n-\tconst emailInterval = meta.config.emailConfirmInterval;\n+\tconst emailInterval = meta.config.hasOwnProperty('emailConfirmInterval') ? meta.config.emailConfirmInterval : 10;\n \n \t// If no email passed in (default), retrieve email from uid\n \tif (!options.email || !options.email.length) {\n@@ -52,16 +73,17 @@ UserEmail.sendValidationEmail = async function (uid, options) {\n \tif (!options.email) {\n \t\treturn;\n \t}\n-\tlet sent = false;\n-\tif (!options.force) {\n-\t\tsent = await db.get(`uid:${uid}:confirm:email:sent`);\n-\t}\n-\tif (sent) {\n+\n+\tif (!options.force && await UserEmail.isValidationPending(uid)) {\n \t\tthrow new Error(`[[error:confirm-email-already-sent, ${emailInterval}]]`);\n \t}\n-\tawait db.set(`uid:${uid}:confirm:email:sent`, 1);\n-\tawait db.pexpireAt(`uid:${uid}:confirm:email:sent`, Date.now() + (emailInterval * 60 * 1000));\n+\n \tconfirm_code = await plugins.hooks.fire('filter:user.verify.code', confirm_code);\n+\tconst confirm_link = `${nconf.get('url')}/confirm/${confirm_code}`;\n+\n+\tawait UserEmail.expireValidation(uid);\n+\tawait db.set(`confirm:byUid:${uid}`, confirm_code);\n+\tawait db.pexpireAt(`confirm:byUid:${uid}`, Date.now() + (emailInterval * 60 * 1000));\n \n \tawait db.setObject(`confirm:${confirm_code}`, {\n \t\temail: options.email.toLowerCase(),\n@@ -102,21 +124,19 @@ UserEmail.confirmByCode = async function (code) {\n \t\tthrow new Error('[[error:invalid-data]]');\n \t}\n \n-\tlet oldEmail = await user.getUserField(confirmObj.uid, 'email');\n-\tif (oldEmail) {\n-\t\toldEmail = oldEmail || '';\n-\t\tif (oldEmail === confirmObj.email) {\n-\t\t\treturn;\n-\t\t}\n-\n+\tconst oldEmail = await user.getUserField(confirmObj.uid, 'email');\n+\tif (oldEmail && oldEmail.toLowerCase() !== confirmObj.email.toLowerCase()) {\n \t\tawait db.sortedSetRemove('email:uid', oldEmail.toLowerCase());\n \t\tawait db.sortedSetRemove('email:sorted', `${oldEmail.toLowerCase()}:${confirmObj.uid}`);\n \t\tawait user.auth.revokeAllSessions(confirmObj.uid);\n-\t\tawait events.log('email-change', { oldEmail, newEmail: confirmObj.email });\n+\t\tawait events.log({ type: 'email-change', oldEmail, newEmail: confirmObj.email, uid: confirmObj.uid });\n+\t}\n+\n+\tif (!oldEmail || oldEmail.toLowerCase() !== confirmObj.email.toLowerCase()) {\n+\t\tawait user.setUserField(confirmObj.uid, 'email', confirmObj.email);\n \t}\n \n \tawait Promise.all([\n-\t\tuser.setUserField('email', confirmObj.email),\n \t\tUserEmail.confirmByUid(confirmObj.uid),\n \t\tdb.delete(`confirm:${code}`),\n \t]);\n@@ -141,7 +161,7 @@ UserEmail.confirmByUid = async function (uid) {\n \t\tuser.setUserField(uid, 'email:confirmed', 1),\n \t\tgroups.join('verified-users', uid),\n \t\tgroups.leave('unverified-users', uid),\n-\t\tdb.delete(`uid:${uid}:confirm:email:sent`),\n+\t\tUserEmail.expireValidation(uid),\n \t\tuser.reset.cleanByUid(uid),\n \t]);\n \tawait plugins.hooks.fire('action:user.email.confirmed', { uid: uid, email: currentEmail });\ndiff --git src/user/profile.js src/user/profile.js\nindex 2f19772..4f0ca9c 100644\n--- src/user/profile.js\n+++ src/user/profile.js\n@@ -244,11 +244,11 @@ module.exports = function (User) {\n \t\t}\n \n \t\tif (newEmail) {\n-\t\t\tawait db.delete(`uid:${uid}:confirm:email:sent`);\n \t\t\tawait User.email.sendValidationEmail(uid, {\n \t\t\t\temail: newEmail,\n \t\t\t\tsubject: '[[email:email.verify-your-email.subject]]',\n \t\t\t\ttemplate: 'verify_email',\n+\t\t\t\tforce: true,\n \t\t\t}).catch(err => winston.error(`[user.create] Validation email failed to send\\n[emailer.send] ${err.stack}`));\n \t\t}\n \t}\ndiff --git src/user/reset.js src/user/reset.js\nindex b256fe5..b6e58e8 100644\n--- src/user/reset.js\n+++ src/user/reset.js\n@@ -103,7 +103,7 @@ UserReset.commit = async function (code, password) {\n \t]);\n \tawait user.reset.updateExpiry(uid);\n \tawait user.auth.resetLockout(uid);\n-\tawait db.delete(`uid:${uid}:confirm:email:sent`);\n+\tawait user.email.expireValidation(uid);\n };\n \n UserReset.updateExpiry = async function (uid) {\ndiff --git test/user.js test/user.js\nindex 2b76eae..b5b0584 100644\n--- test/user.js\n+++ test/user.js\n@@ -884,10 +884,9 @@ describe('User', () => {\n \t\t\t});\n \n \t\t\tit('should also generate an email confirmation code for the changed email', async () => {\n-\t\t\t\tconst confirmSent = await db.get(`uid:${uid}:confirm:email:sent`);\n+\t\t\t\tconst pending = await User.email.isValidationPending(uid, 'updatedemail@me.com');\n \t\t\t\tconst event = (await events.getEvents('email-confirmation-sent', 0, 0)).pop();\n-\t\t\t\tconsole.log(event);\n-\t\t\t\tassert.strictEqual(parseInt(confirmSent, 10), 1);\n+\t\t\t\tassert.strictEqual(pending, true);\n \t\t\t\tassert(event);\n \t\t\t\tassert.strictEqual(event.email, 'updatedEmail@me.com');\n \t\t\t\tassert.strictEqual(parseInt(event.uid, 10), uid);\n@@ -1784,7 +1783,7 @@ describe('User', () => {\n \t\t});\n \n \t\tit('should send email confirm', async () => {\n-\t\t\tawait db.delete(`uid:${testUid}:confirm:email:sent`);\n+\t\t\tawait User.email.expireValidation(testUid);\n \t\t\tawait socketUser.emailConfirm({ uid: testUid }, {});\n \t\t});\n \n",
         "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "99d62b5b-8fdb-4706-8d74-599713c3fe8d",
-        "calls": 71,
-        "turns": 52,
-        "toolOutputTokens": 43802,
-        "uncachedInputTokens": 173421,
-        "cachedInputTokens": 3588896,
-        "cumulativeInputTokens": 3762317,
-        "turn1ContextTokens": 6714,
-        "turn1UncachedTokens": 6714,
-        "postTurn1UncachedTokens": 166707,
-        "netContextGrowthTokens": 123383,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 130097,
-        "totalModelOutputTokens": 53861,
-        "searchMs": 827000,
-        "totalMs": 848024,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 1,
-        "symRecall": 1,
-        "tokenRecall": 1,
-        "modifiedFiles": [
-          "src/middleware/header.js",
-          "src/user/email.js",
-          "src/user/profile.js",
-          "src/user/reset.js"
-        ],
-        "goldSourceFiles": [
-          "src/middleware/header.js",
-          "src/user/email.js",
-          "src/user/profile.js",
-          "src/user/reset.js"
-        ],
-        "dockerPassed": null
       }
     },
     {
@@ -906,40 +706,6 @@
           "src/topics/merge.js"
         ],
         "patch": "diff --git src/posts/queue.js src/posts/queue.js\nindex d523420..c6a1ed9 100644\n--- src/posts/queue.js\n+++ src/posts/queue.js\n@@ -48,9 +48,16 @@ module.exports = function (Posts) {\n \t\t}\n \n \t\t// Filter by tid if present\n-\t\tif (isFinite(filter.tid)) {\n+\t\tif (Array.isArray(filter.tid)) {\n+\t\t\tconst tids = filter.tid.map(tid => parseInt(tid, 10));\n+\t\t\tpostData = postData.filter(\n+\t\t\t\titem => item && item.data && item.data.tid && tids.includes(parseInt(item.data.tid, 10))\n+\t\t\t);\n+\t\t} else if (utils.isNumber(filter.tid)) {\n \t\t\tconst tid = parseInt(filter.tid, 10);\n-\t\t\tpostData = postData.filter(item => item.data.tid && parseInt(item.data.tid, 10) === tid);\n+\t\t\tpostData = postData.filter(\n+\t\t\t\titem => item && item.data && item.data.tid && parseInt(item.data.tid, 10) === tid\n+\t\t\t);\n \t\t}\n \n \t\treturn postData;\n@@ -74,7 +81,7 @@ module.exports = function (Posts) {\n \tPosts.shouldQueue = async function (uid, data) {\n \t\tconst [userData, isMemberOfExempt, categoryQueueEnabled] = await Promise.all([\n \t\t\tuser.getUserFields(uid, ['uid', 'reputation', 'postcount']),\n-\t\t\tgroups.isMemberOfAny(uid, meta.config.groupsExemptFromPostQueue),\n+\t\t\tgroups.isMemberOfAny(uid, meta.config.groupsExemptFromPostQueue || []),\n \t\t\tisCategoryQueueEnabled(data),\n \t\t]);\n \n@@ -330,4 +337,27 @@ module.exports = function (Posts) {\n \t\t}\n \t\treturn isModerator && isModeratorOfTargetCid;\n \t};\n+\n+\tPosts.updateQueuedPostsTopic = async function (newTid, tids) {\n+\t\tif (!newTid || !tids || (Array.isArray(tids) && !tids.length)) {\n+\t\t\treturn;\n+\t\t}\n+\t\tconst postData = await Posts.getQueuedPosts({ tid: tids }, { metadata: false });\n+\t\tif (postData.length) {\n+\t\t\tconst keys = postData.map(item => `post:queue:${item.id}`);\n+\t\t\tconst rawData = await db.getObjects(keys);\n+\t\t\tconst bulkKeys = [];\n+\t\t\tconst bulkData = [];\n+\t\t\trawData.forEach((item, idx) => {\n+\t\t\t\tif (item && item.data) {\n+\t\t\t\t\tconst parsed = JSON.parse(item.data);\n+\t\t\t\t\tparsed.tid = newTid;\n+\t\t\t\t\tbulkKeys.push(keys[idx]);\n+\t\t\t\t\tbulkData.push({ data: JSON.stringify(parsed) });\n+\t\t\t\t}\n+\t\t\t});\n+\t\t\tawait db.setObjectBulk(bulkKeys, bulkData);\n+\t\t\tcache.del('post-queue');\n+\t\t}\n+\t};\n };\ndiff --git src/topics/merge.js src/topics/merge.js\nindex 2d1112e..3368449 100644\n--- src/topics/merge.js\n+++ src/topics/merge.js\n@@ -2,6 +2,7 @@\n \n const async = require('async');\n const plugins = require('../plugins');\n+const posts = require('../posts');\n \n module.exports = function (Topics) {\n \tTopics.merge = async function (tids, uid, options) {\n@@ -38,7 +39,10 @@ module.exports = function (Topics) {\n \t\t\t});\n \t\t});\n \n-\t\tawait updateViewCount(mergeIntoTid, tids);\n+\t\tawait Promise.all([\n+\t\t\tposts.updateQueuedPostsTopic(mergeIntoTid, otherTids),\n+\t\t\tupdateViewCount(mergeIntoTid, tids),\n+\t\t]);\n \n \t\tplugins.hooks.fire('action:topic.merge', {\n \t\t\tuid: uid,\n",
-        "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "cc6bfb11-e2a0-444c-8521-acb0010b974c",
-        "calls": 54,
-        "turns": 38,
-        "toolOutputTokens": 29215,
-        "uncachedInputTokens": 122218,
-        "cachedInputTokens": 1783879,
-        "cumulativeInputTokens": 1906097,
-        "turn1ContextTokens": 6644,
-        "turn1UncachedTokens": 6644,
-        "postTurn1UncachedTokens": 115574,
-        "netContextGrowthTokens": 78820,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 85464,
-        "totalModelOutputTokens": 28779,
-        "searchMs": 705000,
-        "totalMs": 713823,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 1,
-        "symRecall": 0.909,
-        "tokenRecall": 0.917,
-        "modifiedFiles": [
-          "src/posts/queue.js",
-          "src/topics/merge.js"
-        ],
-        "goldSourceFiles": [
-          "src/posts/queue.js",
-          "src/topics/merge.js"
-        ],
         "dockerPassed": null
       }
     },
@@ -1061,40 +827,6 @@
         ],
         "patch": "diff --git src/desktop/DesktopDownloadManager.ts src/desktop/DesktopDownloadManager.ts\nindex a2064c3..b1519da 100644\n--- src/desktop/DesktopDownloadManager.ts\n+++ src/desktop/DesktopDownloadManager.ts\n@@ -1,7 +1,7 @@\n import type {Session} from \"electron\"\n import type {DesktopConfig} from \"./config/DesktopConfig.js\"\n import path from \"path\"\n-import {assertNotNull} from \"@tutao/tutanota-utils\"\n+import {assertNotNull, noOp} from \"@tutao/tutanota-utils\"\n import {lang} from \"../misc/LanguageViewModel.js\"\n import type {DesktopNetworkClient} from \"./DesktopNetworkClient.js\"\n import {FileOpenError} from \"../api/common/error/FileOpenError.js\"\n@@ -12,11 +12,9 @@ import type * as FsModule from \"fs\"\n import type {DateProvider} from \"../calendar/date/CalendarUtils.js\"\n import {CancelledError} from \"../api/common/error/CancelledError.js\"\n import {BuildConfigKey, DesktopConfigKey} from \"./config/ConfigKeys.js\"\n-import {WriteStream} from \"fs-extra\"\n // Make sure to only import the type\n import type {DownloadTaskResponse} from \"../native/common/FileApp.js\"\n import type http from \"http\"\n-import type * as stream from \"stream\"\n \n type FsExports = typeof FsModule\n type ElectronExports = typeof Electron.CrossProcessExports\n@@ -66,7 +64,7 @@ export class DesktopDownloadManager {\n \t/**\n \t * Download file into the encrypted files directory.\n \t */\n-\tasync downloadNative(\n+\tdownloadNative(\n \t\tsourceUrl: string,\n \t\tfileName: string,\n \t\theaders: {\n@@ -74,36 +72,60 @@ export class DesktopDownloadManager {\n \t\t\taccessToken: string\n \t\t},\n \t): Promise<DownloadTaskResponse> {\n-\t\t// Propagate error in initial request if it occurs (I/O errors and such)\n-\t\tconst response = await this._net.executeRequest(sourceUrl, {\n-\t\t\tmethod: \"GET\",\n-\t\t\ttimeout: 20000,\n-\t\t\theaders,\n+\t\treturn new Promise((resolve, reject) => {\n+\t\t\tconst downloadDirectory = this._desktopUtils.getTutanotaTempPath(\"download\")\n+\t\t\tthis._fs.mkdirSync(downloadDirectory, {recursive: true})\n+\t\t\tconst encryptedFilePath = path.join(downloadDirectory, fileName)\n+\t\t\tconst fileStream: FsModule.WriteStream = this._fs.createWriteStream(encryptedFilePath, {emitClose: true})\n+\t\t\tfileStream.on(\"finish\", () => fileStream.close())\n+\n+\t\t\tlet cleanedUp = false\n+\t\t\tconst cleanup = (e: Error) => {\n+\t\t\t\tif (cleanedUp) {\n+\t\t\t\t\treturn\n+\t\t\t\t}\n+\t\t\t\tcleanedUp = true\n+\t\t\t\tfileStream\n+\t\t\t\t\t.removeAllListeners(\"close\")\n+\t\t\t\t\t.on(\"close\", () => {\n+\t\t\t\t\t\tfileStream.removeAllListeners(\"close\")\n+\t\t\t\t\t\tthis._fs.promises\n+\t\t\t\t\t\t\t.unlink(encryptedFilePath)\n+\t\t\t\t\t\t\t.catch(noOp)\n+\t\t\t\t\t\t\t.then(() => reject(e))\n+\t\t\t\t\t})\n+\t\t\t\t\t.end()\n+\t\t\t}\n+\n+\t\t\tthis._net\n+\t\t\t\t.request(sourceUrl, {\n+\t\t\t\t\tmethod: \"GET\",\n+\t\t\t\t\theaders,\n+\t\t\t\t\ttimeout: 20000,\n+\t\t\t\t})\n+\t\t\t\t.on(\"response\", response => {\n+\t\t\t\t\tresponse.on(\"error\", cleanup)\n+\t\t\t\t\tif (cleanedUp) {\n+\t\t\t\t\t\treturn\n+\t\t\t\t\t}\n+\t\t\t\t\tif (response.statusCode !== 200) {\n+\t\t\t\t\t\tcleanup(new Error(String(response.statusCode)))\n+\t\t\t\t\t\treturn\n+\t\t\t\t\t}\n+\t\t\t\t\tconst result: DownloadTaskResponse = {\n+\t\t\t\t\t\tstatusCode: response.statusCode,\n+\t\t\t\t\t\tencryptedFileUri: encryptedFilePath,\n+\t\t\t\t\t\terrorId: getHttpHeader(response.headers ?? {}, \"error-id\"),\n+\t\t\t\t\t\tprecondition: getHttpHeader(response.headers ?? {}, \"precondition\"),\n+\t\t\t\t\t\tsuspensionTime:\n+\t\t\t\t\t\t\tgetHttpHeader(response.headers ?? {}, \"suspension-time\") ?? getHttpHeader(response.headers ?? {}, \"retry-after\"),\n+\t\t\t\t\t}\n+\t\t\t\t\tfileStream.on(\"close\", () => resolve(result))\n+\t\t\t\t\tresponse.pipe(fileStream, {end: true})\n+\t\t\t\t})\n+\t\t\t\t.on(\"error\", cleanup)\n+\t\t\t\t.end()\n \t\t})\n-\n-\t\t// Must always be set for our types of requests\n-\t\tconst statusCode = assertNotNull(response.statusCode)\n-\n-\t\tlet encryptedFilePath\n-\t\tif (statusCode == 200) {\n-\t\t\tconst downloadDirectory = await this.getTutanotaTempDirectory(\"download\")\n-\t\t\tencryptedFilePath = path.join(downloadDirectory, fileName)\n-\t\t\tawait this.pipeIntoFile(response, encryptedFilePath)\n-\t\t} else {\n-\t\t\tencryptedFilePath = null\n-\t\t}\n-\n-\t\tconst result = {\n-\t\t\tstatusCode: statusCode,\n-\t\t\tencryptedFileUri: encryptedFilePath,\n-\t\t\terrorId: getHttpHeader(response.headers, \"error-id\"),\n-\t\t\tprecondition: getHttpHeader(response.headers, \"precondition\"),\n-\t\t\tsuspensionTime: getHttpHeader(response.headers, \"suspension-time\") ?? getHttpHeader(response.headers, \"retry-after\"),\n-\t\t}\n-\n-\t\tconsole.log(\"Download finished\", result.statusCode, result.suspensionTime)\n-\n-\t\treturn result\n \t}\n \n \t/**\n@@ -194,23 +216,6 @@ export class DesktopDownloadManager {\n \t\t\t})\n \t\t}\n \t}\n-\n-\tprivate async pipeIntoFile(response: stream.Readable, encryptedFilePath: string) {\n-\t\tconst fileStream: WriteStream = this._fs.createWriteStream(encryptedFilePath, {emitClose: true})\n-\t\ttry {\n-\t\t\tawait pipeStream(response, fileStream)\n-\t\t\tawait closeFileStream(fileStream)\n-\t\t} catch (e) {\n-\t\t\t// Close first, delete second\n-\t\t\t// Also yes, we do need to close it manually:\n-\t\t\t// > One important caveat is that if the Readable stream emits an error during processing, the Writable destination is not closed automatically.\n-\t\t\t// > If an error occurs, it will be necessary to manually close each stream in order to prevent memory leaks.\n-\t\t\t// see https://nodejs.org/api/stream.html#readablepipedestination-options\n-\t\t\tawait closeFileStream(fileStream)\n-\t\t\tawait this._fs.promises.unlink(encryptedFilePath)\n-\t\t\tthrow e\n-\t\t}\n-\t}\n }\n \n function getHttpHeader(headers: http.IncomingHttpHeaders, name: string): string | null {\n@@ -221,19 +226,4 @@ function getHttpHeader(headers: http.IncomingHttpHeaders, name: string): string\n \t} else {\n \t\treturn value ?? null\n \t}\n-}\n-\n-function pipeStream(stream: stream.Readable, into: stream.Writable): Promise<void> {\n-\treturn new Promise((resolve, reject) => {\n-\t\tstream.pipe(into)\n-\t\t\t  .on(\"finish\", resolve)\n-\t\t\t  .on(\"error\", reject)\n-\t})\n-}\n-\n-function closeFileStream(stream: FsModule.WriteStream): Promise<void> {\n-\treturn new Promise((resolve) => {\n-\t\tstream.on(\"close\", resolve)\n-\t\tstream.close()\n-\t})\n }\n\\ No newline at end of file\ndiff --git src/desktop/DesktopNetworkClient.ts src/desktop/DesktopNetworkClient.ts\nindex 72075b7..c7d0752 100644\n--- src/desktop/DesktopNetworkClient.ts\n+++ src/desktop/DesktopNetworkClient.ts\n@@ -26,15 +26,6 @@ export class DesktopNetworkClient {\n \t\treturn this.getModule(url).request(url, opts)\n \t}\n \n-\texecuteRequest(url: string, opts: ClientRequestOptions): Promise<http.IncomingMessage> {\n-\t\treturn new Promise<http.IncomingMessage>((resolve, reject) => {\n-\t\t\tthis.request(url, opts)\n-\t\t\t\t.on(\"response\", resolve)\n-\t\t\t\t.on(\"error\", reject)\n-\t\t\t\t.end()\n-\t\t})\n-\t}\n-\n \tprivate getModule(url: string): typeof import(\"http\") | typeof import(\"https\") {\n \t\tif (url.startsWith(\"https\")) {\n \t\t\treturn https\n",
         "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "03941cf2-cfc4-42f3-9dc1-ad5019114726",
-        "calls": 67,
-        "turns": 33,
-        "toolOutputTokens": 59675,
-        "uncachedInputTokens": 375393,
-        "cachedInputTokens": 2773400,
-        "cumulativeInputTokens": 3148793,
-        "turn1ContextTokens": 7577,
-        "turn1UncachedTokens": 7577,
-        "postTurn1UncachedTokens": 367816,
-        "netContextGrowthTokens": 180979,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 188556,
-        "totalModelOutputTokens": 92041,
-        "searchMs": 1261000,
-        "totalMs": 1284171,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 1,
-        "symRecall": 0.75,
-        "tokenRecall": 0.933,
-        "modifiedFiles": [
-          "src/desktop/DesktopDownloadManager.ts",
-          "src/desktop/DesktopNetworkClient.ts"
-        ],
-        "goldSourceFiles": [
-          "src/desktop/DesktopDownloadManager.ts",
-          "src/desktop/DesktopNetworkClient.ts"
-        ],
-        "dockerPassed": null
       }
     },
     {
@@ -1209,42 +941,6 @@
           "src/misc/credentials/NativeCredentialsEncryption.ts"
         ],
         "patch": "diff --git src/api/worker/facades/DeviceEncryptionFacade.ts src/api/worker/facades/DeviceEncryptionFacade.ts\nindex 2c11136..ce7aeb6 100644\n--- src/api/worker/facades/DeviceEncryptionFacade.ts\n+++ src/api/worker/facades/DeviceEncryptionFacade.ts\n@@ -1,7 +1,16 @@\n /* Facade to interact with encryption mechanisms using device capabilities. You can use this facade if you need to encrypt data from the\n  *  main thread - the facade will delegate all the actual encryption operations to the native thread.\n  * */\n-import {aes256Decrypt, aes256Encrypt, aes256RandomKey, bitArrayToUint8Array, generateIV, uint8ArrayToBitArray} from \"@tutao/tutanota-crypto\"\n+import {\n+\taes256Decrypt,\n+\taes256Encrypt,\n+\taes256RandomKey,\n+\tbitArrayToUint8Array,\n+\tCryptoError as TutanotaCryptoError,\n+\tgenerateIV,\n+\tuint8ArrayToBitArray,\n+} from \"@tutao/tutanota-crypto\"\n+import {CryptoError} from \"../../common/error/CryptoError\"\n \n export interface DeviceEncryptionFacade {\n \t/**\n@@ -20,6 +29,7 @@ export interface DeviceEncryptionFacade {\n \t * Decrypts {param encryptedData} using {param deviceKey}.\n \t * @param deviceKey Key used for encryption - key might be encrypted and/or protected by device specific mechanisms.\n \t * @param encryptedData Data to be decrypted.\n+\t * @throws CryptoError\n \t */\n \tdecrypt(deviceKey: Uint8Array, encryptedData: Uint8Array): Promise<Uint8Array>\n }\n@@ -34,6 +44,14 @@ export class DeviceEncryptionFacadeImpl implements DeviceEncryptionFacade {\n \t}\n \n \tasync decrypt(deviceKey: Uint8Array, encryptedData: Uint8Array): Promise<Uint8Array> {\n-\t\treturn aes256Decrypt(uint8ArrayToBitArray(deviceKey), encryptedData)\n+\t\ttry {\n+\t\t\treturn aes256Decrypt(uint8ArrayToBitArray(deviceKey), encryptedData)\n+\t\t} catch (e) {\n+\t\t\tif (e instanceof TutanotaCryptoError) {\n+\t\t\t\tthrow new CryptoError(\"Could not decrypt data\", e)\n+\t\t\t} else {\n+\t\t\t\tthrow e\n+\t\t\t}\n+\t\t}\n \t}\n }\n\\ No newline at end of file\ndiff --git src/misc/credentials/NativeCredentialsEncryption.ts src/misc/credentials/NativeCredentialsEncryption.ts\nindex e7e4314..330c523 100644\n--- src/misc/credentials/NativeCredentialsEncryption.ts\n+++ src/misc/credentials/NativeCredentialsEncryption.ts\n@@ -6,6 +6,8 @@ import type {CredentialEncryptionMode} from \"./CredentialEncryptionMode\"\n import {Request} from \"../../api/common/MessageDispatcher\"\n import type {Credentials} from \"./Credentials\"\n import type {NativeInterface} from \"../../native/common/NativeInterface\"\n+import {CryptoError} from \"../../api/common/error/CryptoError\"\n+import {KeyPermanentlyInvalidatedError} from \"../../api/common/error/KeyPermanentlyInvalidatedError\"\n \n /**\n  * Credentials encryption implementation that uses the native (platform-specific) keychain implementation. It uses an intermediate key to\n@@ -45,15 +47,23 @@ export class NativeCredentialsEncryption implements CredentialsEncryption {\n \t}\n \n \tasync decrypt(encryptedCredentials: PersistentCredentials): Promise<Credentials> {\n-\t\tconst credentialsKey = await this._credentialsKeyProvider.getCredentialsKey()\n-\t\tconst decryptedAccessToken = await this._deviceEncryptionFacade.decrypt(credentialsKey, base64ToUint8Array(encryptedCredentials.accessToken))\n-\t\tconst accessToken = utf8Uint8ArrayToString(decryptedAccessToken)\n-\t\treturn {\n-\t\t\tlogin: encryptedCredentials.credentialInfo.login,\n-\t\t\tuserId: encryptedCredentials.credentialInfo.userId,\n-\t\t\ttype: encryptedCredentials.credentialInfo.type,\n-\t\t\tencryptedPassword: encryptedCredentials.encryptedPassword,\n-\t\t\taccessToken,\n+\t\ttry {\n+\t\t\tconst credentialsKey = await this._credentialsKeyProvider.getCredentialsKey()\n+\t\t\tconst decryptedAccessToken = await this._deviceEncryptionFacade.decrypt(credentialsKey, base64ToUint8Array(encryptedCredentials.accessToken))\n+\t\t\tconst accessToken = utf8Uint8ArrayToString(decryptedAccessToken)\n+\t\t\treturn {\n+\t\t\t\tlogin: encryptedCredentials.credentialInfo.login,\n+\t\t\t\tuserId: encryptedCredentials.credentialInfo.userId,\n+\t\t\t\ttype: encryptedCredentials.credentialInfo.type,\n+\t\t\t\tencryptedPassword: encryptedCredentials.encryptedPassword,\n+\t\t\t\taccessToken,\n+\t\t\t}\n+\t\t} catch (e) {\n+\t\t\tif (e instanceof CryptoError) {\n+\t\t\t\tthrow new KeyPermanentlyInvalidatedError(`Could not decrypt credentials: ${e.stack ?? e.message}`)\n+\t\t\t} else {\n+\t\t\t\tthrow e\n+\t\t\t}\n \t\t}\n \t}\n \ndiff --git test/client/misc/credentials/NativeCredentialsEncryptionTest.ts test/client/misc/credentials/NativeCredentialsEncryptionTest.ts\nindex 569d941..a614944 100644\n--- test/client/misc/credentials/NativeCredentialsEncryptionTest.ts\n+++ test/client/misc/credentials/NativeCredentialsEncryptionTest.ts\n@@ -7,6 +7,9 @@ import {stringToUtf8Uint8Array, uint8ArrayToBase64} from \"@tutao/tutanota-utils\"\n import type {PersistentCredentials} from \"../../../../src/misc/credentials/CredentialsProvider\"\n import type {Credentials} from \"../../../../src/misc/credentials/Credentials\"\n import type {NativeInterface} from \"../../../../src/native/common/NativeInterface\"\n+import {CryptoError} from \"../../../../src/api/common/error/CryptoError\"\n+import {KeyPermanentlyInvalidatedError} from \"../../../../src/api/common/error/KeyPermanentlyInvalidatedError\"\n+import {assertThrows} from \"@tutao/tutanota-test-utils\"\n \n o.spec(\"NativeCredentialsEncryptionTest\", function () {\n \tconst credentialsKey = new Uint8Array([1, 2, 3])\n@@ -82,5 +85,25 @@ o.spec(\"NativeCredentialsEncryptionTest\", function () {\n \t\t\to(Array.from(deviceEncryptionFacade.decrypt.args[0])).deepEquals(Array.from(credentialsKey))\n \t\t\to(Array.from(deviceEncryptionFacade.decrypt.args[1])).deepEquals(Array.from(stringToUtf8Uint8Array(\"someAccessToken\")))\n \t\t})\n+\n+\t\to(\"maps CryptoError from deviceEncryptionFacade to KeyPermanentlyInvalidatedError\", async function () {\n+\t\t\tconst encryptedCredentials: PersistentCredentials = {\n+\t\t\t\tcredentialInfo: {\n+\t\t\t\t\tlogin: \"test@example.com\",\n+\t\t\t\t\tuserId: \"myUserId1\",\n+\t\t\t\t\ttype: \"internal\",\n+\t\t\t\t},\n+\t\t\t\tencryptedPassword: \"123456789\",\n+\t\t\t\taccessToken: uint8ArrayToBase64(stringToUtf8Uint8Array(\"someAccessToken\")),\n+\t\t\t}\n+\t\t\tdeviceEncryptionFacade = n.mock<DeviceEncryptionFacade>(\"and me too!\", {\n+\t\t\t\tasync decrypt() {\n+\t\t\t\t\tthrow new CryptoError(\"invalid mac\")\n+\t\t\t\t},\n+\t\t\t}).set()\n+\t\t\tencryption = new NativeCredentialsEncryption(credentialsKeyProvider, deviceEncryptionFacade, nativeApp)\n+\n+\t\t\tawait assertThrows(KeyPermanentlyInvalidatedError, () => encryption.decrypt(encryptedCredentials))\n+\t\t})\n \t})\n })\n\\ No newline at end of file\n",
-        "dockerPassed": null
-      },
-      "trail": {
-        "conversationId": "3dfe8725-bb72-4a4c-b18c-2a5d602313e3",
-        "calls": 66,
-        "turns": 35,
-        "toolOutputTokens": 53741,
-        "uncachedInputTokens": 220580,
-        "cachedInputTokens": 2094811,
-        "cumulativeInputTokens": 2315391,
-        "turn1ContextTokens": 6570,
-        "turn1UncachedTokens": 6570,
-        "postTurn1UncachedTokens": 214010,
-        "netContextGrowthTokens": 96070,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 102640,
-        "totalModelOutputTokens": 19572,
-        "searchMs": 473000,
-        "totalMs": 493120,
-        "score": 8,
-        "maxScore": 8,
-        "resolved": true,
-        "fileRecall": 1,
-        "filePrecision": 1,
-        "symRecall": 1,
-        "tokenRecall": 0.944,
-        "modifiedFiles": [
-          "src/api/worker/facades/DeviceEncryptionFacade.ts",
-          "src/misc/credentials/NativeCredentialsEncryption.ts",
-          "test/api/Suite.ts",
-          "test/client/misc/credentials/NativeCredentialsEncryptionTest.ts"
-        ],
-        "goldSourceFiles": [
-          "src/api/worker/facades/DeviceEncryptionFacade.ts",
-          "src/misc/credentials/NativeCredentialsEncryption.ts"
-        ],
         "dockerPassed": null
       }
     }

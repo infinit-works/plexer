@@ -56,7 +56,10 @@
 	},
 	"scripts": {
 		"test": "PLEXER_NO_DAEMON=1 node --test",
-		"bench": "node bench/run.js"
+		"bench": "node bench/run.js",
+		"bench:hard": "node bench/run.js --fixtures --hard --gate",
+		"bench:scale": "node bench/scale-stress.js --nodes 25000 --gate",
+		"bench:leakage": "node bench/audit-leakage.js"
 	},
 	"dependencies": {
 		"commander": "^15.0.0",

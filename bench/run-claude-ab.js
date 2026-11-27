@@ -16,20 +16,27 @@ import { execFileSync, spawn } from "node:child_process";
 import { cpSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TASKS } from "./tasks.js";
-import { gradeManifest, parseTranscript } from "./grade.js";
+import { checkWorktreeIsolation, gradeManifest, parseTranscript } from "./grade.js";
 import { ensureFreshGraph } from "../src/graph/refresh.js";
 import { ensureAbBaseRepos } from "./ensure-base.js";
+import { summarizePairedSuite } from "./stats.js";
 import {
     buildPlexerClaudeSettingsJson,
-    buildTrailClaudeSettingsJson,
-    buildTrailMcpConfigJson,
-    getTrailEnv,
-    getTrailSkillBody,
-    prepareTrailWorktreeDir,
     shutdownBenchDaemon,
-} from "./trail-live-helper.js";
+} from "./agy-bench-helper.js";
 
-const rawModelArg = process.argv[2] || "sonnet";
+const rawArgs = process.argv.slice(2);
+const trialsIdx = rawArgs.indexOf("--trials");
+const TRIALS = trialsIdx >= 0 && Number(rawArgs[trialsIdx + 1]) > 0 ? Math.floor(Number(rawArgs[trialsIdx + 1])) : 1;
+const positionals = [];
+for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === "--trials") {
+        i++;
+        continue;
+    }
+    if (!rawArgs[i].startsWith("--")) positionals.push(rawArgs[i]);
+}
+const rawModelArg = positionals[0] || "sonnet";
 const CLAUDE_MODEL_MAP = {
     sonnet: "claude-sonnet-5-5",
     "sonnet-5-5": "claude-sonnet-5-5",
@@ -40,17 +47,15 @@ const CLAUDE_MODEL_MAP = {
 };
 const modelArg = rawModelArg.replace(/^claude-/, "").replace(/-5-5$/, "");
 const resolvedModelId = CLAUDE_MODEL_MAP[rawModelArg] || rawModelArg;
-const concurrency = Number(process.argv[3] || 4);
-const armFilter = process.argv[4] || "both"; // "both" | "all" | "cold" | "plexer" | "trail" | comma-separated
-const taskFilterArg = process.argv[5] || "all";
-const effortArg = process.argv[6] || "medium";
+const concurrency = Number(positionals[1] || 4);
+const armFilter = positionals[2] || "both"; // "both" | "all" | "cold" | "plexer" | comma-separated
+const taskFilterArg = positionals[3] || "all";
+const effortArg = positionals[4] || "medium";
 const taskFilterSet = taskFilterArg === "all" ? null : new Set(taskFilterArg.split(",").map((s) => s.trim()));
 const armsToRun =
-    armFilter === "both"
+    armFilter === "both" || armFilter === "all"
         ? ["cold", "plexer"]
-        : armFilter === "all"
-          ? ["cold", "plexer", "trail"]
-          : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
+        : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
 
 const logDir = `/tmp/plexer-claude-logs/${modelArg}`;
 
@@ -62,25 +67,18 @@ const basePrompt = [
 
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-let trailSkillBody = "";
 
 const coldSysFile = join(logDir, "cold-system.txt");
 const plexerSysFile = join(logDir, "plexer-system.txt");
-const trailSysFile = join(logDir, "trail-system.txt");
 
 const plexerHookClient = resolve(import.meta.dirname, "../bin/plexer-hook-client.cjs");
 const benchDaemonSock = `/tmp/plexer-claude-bench-${process.pid}.sock`;
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
-const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
-const trailMcpConfigFile = join(logDir, "trail-mcp-config.json");
 function initRuntimeFiles() {
     mkdirSync(logDir, { recursive: true });
     writeFileSync(coldSysFile, `${basePrompt}\n`, "utf8");
     writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
-    writeFileSync(trailSysFile, trailSkillBody ? `${basePrompt}\n\n${trailSkillBody}\n` : `${basePrompt}\n`, "utf8");
-    writeFileSync(trailMcpConfigFile, buildTrailMcpConfigJson(), "utf8");
     writeFileSync(plexerHooksSettingsFile, buildPlexerClaudeSettingsJson(plexerHookClient), "utf8");
-    writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
 }
 
 function resetRepoWorktree(repo, arm) {
@@ -101,13 +99,10 @@ function resetRepoWorktree(repo, arm) {
         }
     }
     execFileSync("git", ["checkout", "--", "."], { cwd: cloneDir, stdio: "ignore" });
-    execFileSync("git", ["clean", "-fd", "-e", "plexer", "-e", "graft", "-e", ".trail"], { cwd: cloneDir, stdio: "ignore" });
+    execFileSync("git", ["clean", "-fd", "-e", "plexer"], { cwd: cloneDir, stdio: "ignore" });
     if (arm === "plexer" && existsSync(`/tmp/plexer-ab-base/indexed/${repo}/plexer`)) {
         rmSync(join(cloneDir, "plexer"), { recursive: true, force: true });
         cpSync(`/tmp/plexer-ab-base/indexed/${repo}/plexer`, join(cloneDir, "plexer"), { recursive: true });
-    } else if (arm === "trail") {
-        rmSync(join(cloneDir, "plexer"), { recursive: true, force: true });
-        prepareTrailWorktreeDir(cloneDir, repo, baseCleanDir);
     }
     const cacheDir = join(cloneDir, "plexer", ".cache");
     if (existsSync(cacheDir)) {
@@ -127,23 +122,19 @@ async function runOne(task, arm) {
     }
     return new Promise((resolveRun, rejectRun) => {
         const outJsonl = join(logDir, `${task.id}-${arm}.jsonl`);
-        const sysFile = arm === "plexer" ? plexerSysFile : arm === "trail" ? trailSysFile : coldSysFile;
-        const settingsFile = arm === "plexer" ? plexerHooksSettingsFile : arm === "trail" ? trailHooksSettingsFile : null;
+        const sysFile = arm === "plexer" ? plexerSysFile : coldSysFile;
+        const settingsFile = arm === "plexer" ? plexerHooksSettingsFile : null;
         const promptText = task.prompt(cloneDir);
 
         const args = [
             "--setting-sources",
             "",
             ...(settingsFile ? ["--settings", settingsFile] : []),
-            ...(arm === "trail" ? ["--mcp-config", trailMcpConfigFile] : []),
             "--disable-slash-commands",
             "--strict-mcp-config",
             "--dangerously-skip-permissions",
             "--tools",
             "Bash,Read,Edit,Write,Grep,Glob",
-            ...(arm === "trail"
-                ? ["--allowedTools", "Bash,Read,Edit,Write,Grep,Glob,mcp__trail__*"]
-                : []),
             "--append-system-prompt-file",
             sysFile,
             "-p",
@@ -158,17 +149,14 @@ async function runOne(task, arm) {
         ];
 
         const outStream = createWriteStream(outJsonl, { flags: "w" });
-        const env =
-            arm === "trail"
-                ? getTrailEnv()
-                : {
-                      ...process.env,
-                      PLEXER_DAEMON_SOCK: benchDaemonSock,
-                      PLEXER_DISABLE_HOOKS: arm === "plexer" ? "0" : "1",
-                      ...(arm === "plexer"
-                          ? { PLEXER_ENABLE_BENCH_HOOKS: "1" }
-                          : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_BENCH_HIDE_CLI: "1" }),
-                  };
+        const env = {
+            ...process.env,
+            PLEXER_DAEMON_SOCK: benchDaemonSock,
+            PLEXER_DISABLE_HOOKS: arm === "plexer" ? "0" : "1",
+            ...(arm === "plexer"
+                ? { PLEXER_ENABLE_BENCH_HOOKS: "1" }
+                : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_BENCH_HIDE_CLI: "1" }),
+        };
         if (arm === "plexer")
             delete env.PLEXER_BENCH_HIDE_CLI;
         const child = spawn("claude", args, {
@@ -213,7 +201,6 @@ async function runWave(jobs, maxParallel) {
 }
 
 async function main() {
-    trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
     initRuntimeFiles();
 
     const selectedTasks = taskFilterSet ? TASKS.filter((t) => taskFilterSet.has(t.id)) : TASKS;
@@ -282,11 +269,16 @@ async function main() {
     }
 
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-    gradeManifest(
+    const summary = gradeManifest(
         manifestPath,
         resultsPath,
         new Set(validRuns.map((r) => `${r.taskId}:${r.arm}`)),
+        { modelName: resolvedModelId }
     );
+    summary.trials = TRIALS;
+    summary.unreplicated = TRIALS < 2;
+    summary.stats = summarizePairedSuite(summary.tasks || []);
+    writeFileSync(resultsPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {

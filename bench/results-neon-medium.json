@@ -51,71 +51,7 @@
     "callLosses": 0,
     "speedWins": 12,
     "speedTies": 0,
-    "speedLosses": 0,
-    "trailComparison": {
-      "taskIds": [
-        "T4",
-        "T5",
-        "T9"
-      ],
-      "cold": {
-        "calls": 49,
-        "turns": 38,
-        "toolOutputTokens": 49057,
-        "uncachedInputTokens": 147698,
-        "cachedInputTokens": 787624,
-        "cumulativeInputTokens": 935322,
-        "turn1ContextTokens": 15240,
-        "turn1UncachedTokens": 15240,
-        "postTurn1UncachedTokens": 132458,
-        "netContextGrowthTokens": 85404,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 100644,
-        "totalModelOutputTokens": 23571,
-        "searchMs": 288000,
-        "totalMs": 338043,
-        "score": 24,
-        "maxScore": 24
-      },
-      "trail": {
-        "calls": 45,
-        "turns": 19,
-        "toolOutputTokens": 30407,
-        "uncachedInputTokens": 109703,
-        "cachedInputTokens": 288751,
-        "cumulativeInputTokens": 398454,
-        "turn1ContextTokens": 18575,
-        "turn1UncachedTokens": 18575,
-        "postTurn1UncachedTokens": 74043,
-        "netContextGrowthTokens": 59053,
-        "cacheMissTurns": 1,
-        "finalContextTokens": 77628,
-        "totalModelOutputTokens": 24634,
-        "searchMs": 215000,
-        "totalMs": 280705,
-        "score": 24,
-        "maxScore": 24
-      },
-      "plexer": {
-        "calls": 17,
-        "turns": 9,
-        "toolOutputTokens": 12075,
-        "uncachedInputTokens": 63431,
-        "cachedInputTokens": 155946,
-        "cumulativeInputTokens": 219377,
-        "turn1ContextTokens": 27228,
-        "turn1UncachedTokens": 27228,
-        "postTurn1UncachedTokens": 36203,
-        "netContextGrowthTokens": 32112,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 59340,
-        "totalModelOutputTokens": 23024,
-        "searchMs": 151000,
-        "totalMs": 214492,
-        "score": 24,
-        "maxScore": 24
-      }
-    }
+    "speedLosses": 0
   },
   "tasks": [
     {
@@ -569,60 +505,6 @@
             "passed": true
           }
         ]
-      },
-      "trail": {
-        "conversationId": "ae629af1-132d-40a9-ae43-2a644cdf7824",
-        "calls": 6,
-        "turns": 4,
-        "toolNames": [
-          "run_command",
-          "run_command",
-          "read_file",
-          "read_file",
-          "read_file",
-          "run_command"
-        ],
-        "toolOutputTokens": 4894,
-        "uncachedInputTokens": 17890,
-        "cachedInputTokens": 36208,
-        "cumulativeInputTokens": 54098,
-        "turn1ContextTokens": 6155,
-        "turn1UncachedTokens": 6155,
-        "postTurn1UncachedTokens": 11735,
-        "netContextGrowthTokens": 7639,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 13794,
-        "totalModelOutputTokens": 3782,
-        "searchMs": 25000,
-        "totalMs": 48678,
-        "score": 8,
-        "maxScore": 8,
-        "checks": [
-          {
-            "id": "resolve_rs_cited",
-            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "zero_size_detection",
-            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "consumes_instance_exception",
-            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "composite_type_rules",
-            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
-            "weight": 2,
-            "passed": true
-          }
-        ]
       }
     },
     {
@@ -721,76 +603,6 @@
         "totalModelOutputTokens": 5947,
         "searchMs": 37000,
         "totalMs": 72608,
-        "score": 8,
-        "maxScore": 8,
-        "checks": [
-          {
-            "id": "fingerprint_def",
-            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "direct_callers",
-            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "cli_commands_using_ensure",
-            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "mcp_freshness",
-            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
-            "weight": 2,
-            "passed": true
-          }
-        ]
-      },
-      "trail": {
-        "conversationId": "884b2500-673e-4d99-8e61-d74f117f05eb",
-        "calls": 22,
-        "turns": 6,
-        "toolNames": [
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "run_command",
-          "read_file",
-          "read_file",
-          "read_file",
-          "read_file",
-          "run_command",
-          "read_file",
-          "read_file",
-          "read_file",
-          "run_command",
-          "run_command"
-        ],
-        "toolOutputTokens": 15792,
-        "uncachedInputTokens": 31354,
-        "cachedInputTokens": 80912,
-        "cumulativeInputTokens": 112266,
-        "turn1ContextTokens": 6096,
-        "turn1UncachedTokens": 6096,
-        "postTurn1UncachedTokens": 25258,
-        "netContextGrowthTokens": 24036,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 30132,
-        "totalModelOutputTokens": 6882,
-        "searchMs": 63000,
-        "totalMs": 94709,
         "score": 8,
         "maxScore": 8,
         "checks": [
@@ -1272,53 +1084,6 @@
         "totalModelOutputTokens": 14451,
         "searchMs": 114000,
         "totalMs": 122248,
-        "score": 8,
-        "maxScore": 8,
-        "checks": [
-          {
-            "id": "unit_and_behavioral_tests",
-            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
-            "weight": 8,
-            "passed": true
-          }
-        ]
-      },
-      "trail": {
-        "conversationId": "923f414d-eec6-4dd7-8ef6-7312f1733287",
-        "calls": 17,
-        "turns": 9,
-        "toolNames": [
-          "run_command",
-          "run_command",
-          "read_file",
-          "read_file",
-          "read_file",
-          "read_file",
-          "run_command",
-          "read_file",
-          "edit_file",
-          "edit_file",
-          "edit_file",
-          "edit_file",
-          "read_file",
-          "edit_file",
-          "run_command",
-          "read_file",
-          "run_command"
-        ],
-        "toolOutputTokens": 9721,
-        "uncachedInputTokens": 60459,
-        "cachedInputTokens": 171631,
-        "cumulativeInputTokens": 232090,
-        "turn1ContextTokens": 6324,
-        "turn1UncachedTokens": 6324,
-        "postTurn1UncachedTokens": 37050,
-        "netContextGrowthTokens": 27378,
-        "cacheMissTurns": 1,
-        "finalContextTokens": 33702,
-        "totalModelOutputTokens": 13970,
-        "searchMs": 127000,
-        "totalMs": 137318,
         "score": 8,
         "maxScore": 8,
         "checks": [

@@ -20,9 +20,77 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { TASKS } from "./tasks.js";
+import { computeApiCostUsd } from "./cost-model.js";
+import { mergeModelBreakdownTotals, pickOrchResultMeta } from "./agy-bench-helper.js";
 
 const BRAIN_DIR = join(homedir(), ".gemini", "antigravity", "brain");
 const CLI_BRAIN_DIR = join(homedir(), ".gemini", "antigravity-cli", "brain");
+
+const ANSWER_KEY_PATTERNS = [
+    /(?:^|[/\\"])bench[/\\](?:tasks|large-tasks|v2-tasks|needed-spans|v2-holdout)\.(?:js|json)\b/i,
+    /(?:^|[/\\"])bench[/\\]swebench(?:[/\\]|$)/i,
+    /(?:^|[/\\"])bench[/\\]results[^/\\]*\.json\b/i,
+];
+const HISTORY_PEEK_RE = /\bgit\s+(?:log|show|reflog|rev-list|whatchanged)\b/;
+
+function scanToolLeakage(inputStr, cmdStr, arm, symmetryViolations) {
+    for (const re of ANSWER_KEY_PATTERNS) {
+        if (re.test(inputStr) || re.test(cmdStr)) {
+            symmetryViolations.push(`Agent accessed benchmark answer key (${re.source})`);
+            break;
+        }
+    }
+    if (HISTORY_PEEK_RE.test(cmdStr)) {
+        symmetryViolations.push("Agent ran git history inspection (history peeking)");
+    }
+    if (
+        arm === "cold" &&
+        /(?:^|[;&|]\s*)plexer\s+(ask|callers|callees|impact|grep|skeleton|map|blast|read)\b/.test(cmdStr) &&
+        !cmdStr.includes("--all-matches")
+    ) {
+        symmetryViolations.push("Cold arm invoked plexer CLI");
+    }
+}
+
+/**
+ * Verify isolated worktree boundaries (especially ensuring no plexer/customization leak in cold arm).
+ */
+export function checkWorktreeIsolation(workDir, arm) {
+    const violations = [];
+    if (!workDir || !existsSync(workDir)) return violations;
+    if (arm === "cold") {
+        if (existsSync(join(workDir, "plexer"))) {
+            violations.push("Cold worktree contains plexer/ directory");
+        }
+        if (existsSync(join(workDir, ".claude"))) {
+            violations.push("Cold worktree contains .claude/ directory");
+        }
+        for (const f of ["CLAUDE.md", "AGENTS.md", "GEMINI.md", join(".agents", "rules", "bench-arm.md")]) {
+            const p = join(workDir, f);
+            if (!existsSync(p)) continue;
+            const txt = readFileSync(p, "utf8");
+            if (f !== join(".agents", "rules", "bench-arm.md") && /\bplexer\b/i.test(txt)) {
+                violations.push(`Cold worktree file ${f} mentions plexer`);
+            } else if (f === join(".agents", "rules", "bench-arm.md") && /plexer instructions/i.test(txt)) {
+                violations.push("Cold worktree bench-arm.md contains plexer instructions");
+            }
+        }
+    }
+    return violations;
+}
+
+/**
+ * Verify run configuration symmetry between cold and plexer arms.
+ */
+export function checkRunConfigSymmetry(coldMeta = {}, plexerMeta = {}) {
+    const violations = [];
+    for (const key of ["model", "effort", "tools", "promptSha256"]) {
+        if (coldMeta[key] !== undefined && plexerMeta[key] !== undefined && coldMeta[key] !== plexerMeta[key]) {
+            violations.push(`Symmetry mismatch on ${key}: cold=${coldMeta[key]} vs plexer=${plexerMeta[key]}`);
+        }
+    }
+    return violations;
+}
 
 /**
  * Parse a subagent's or CLI session's transcript and compute:
@@ -57,6 +125,8 @@ function parseClaudeTranscript(filePath, arm) {
     let turns = 0;
     let toolResponseBytes = 0;
     let uncachedInputTokens = 0;
+    let cacheWriteTokens = 0;
+    let cacheReadTokens = 0;
     let cachedInputTokens = 0;
     let cumulativeInputTokens = 0;
     let turn1ContextTokens = 0;
@@ -109,8 +179,12 @@ function parseClaudeTranscript(filePath, arm) {
                     prevContextTokens = stepCtx;
                 }
                 const rawInp = u.input_tokens || 0;
-                const stepCached = (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+                const stepWrite = u.cache_creation_input_tokens || 0;
+                const stepRead = u.cache_read_input_tokens || 0;
+                const stepCached = stepWrite + stepRead;
                 uncachedInputTokens += rawInp;
+                cacheWriteTokens += stepWrite;
+                cacheReadTokens += stepRead;
                 cachedInputTokens += stepCached;
                 cumulativeInputTokens += rawInp + stepCached;
                 if (rawInp + stepCached > 0) {
@@ -134,20 +208,11 @@ function parseClaudeTranscript(filePath, arm) {
                         didModifyFile = true;
                     }
                     const inputStr = JSON.stringify(tu.input || {});
-                    if (inputStr.includes("bench/tasks.js")) {
-                        symmetryViolations.push("Agent accessed bench/tasks.js");
-                    }
                     const cmdStr = tu.name === "Bash" ? String(tu.input?.command || "") : "";
                     if (/\b(python3?|node\s+-e|sed\s+-[A-Za-z0-9]*i|perl\s+-[A-Za-z0-9]*i|tee\s+|cat\s*>|<<)/i.test(cmdStr)) {
                         didModifyFile = true;
                     }
-                    if (
-                        arm === "cold" &&
-                        /(?:^|[;&|]\s*)plexer\s+(ask|callers|callees|impact|grep|skeleton|map|blast|read)\b/.test(cmdStr) &&
-                        !cmdStr.includes("--all-matches")
-                    ) {
-                        symmetryViolations.push("Cold arm invoked plexer CLI");
-                    }
+                    scanToolLeakage(inputStr, cmdStr, arm, symmetryViolations);
                 }
             }
             for (const c of content) {
@@ -177,9 +242,9 @@ function parseClaudeTranscript(filePath, arm) {
                 resultModelOutputTokens = step.usage.output_tokens;
                 if (cumulativeInputTokens === 0) {
                     uncachedInputTokens = step.usage.input_tokens || 0;
-                    cachedInputTokens =
-                        (step.usage.cache_read_input_tokens || 0) +
-                        (step.usage.cache_creation_input_tokens || 0);
+                    cacheWriteTokens = step.usage.cache_creation_input_tokens || 0;
+                    cacheReadTokens = step.usage.cache_read_input_tokens || 0;
+                    cachedInputTokens = cacheWriteTokens + cacheReadTokens;
                     cumulativeInputTokens = uncachedInputTokens + cachedInputTokens;
                 }
             }
@@ -211,6 +276,8 @@ function parseClaudeTranscript(filePath, arm) {
         turns,
         toolOutputTokens: Math.round(toolResponseBytes / 4),
         uncachedInputTokens,
+        cacheWriteTokens,
+        cacheReadTokens,
         cachedInputTokens,
         cumulativeInputTokens,
         turn1ContextTokens,
@@ -293,6 +360,8 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
     let turns = 0;
     let toolResponseBytes = 0;
     let uncachedInputTokens = 0;
+    let cacheWriteTokens = 0;
+    let cacheReadTokens = 0;
     let cachedInputTokens = 0;
     let cumulativeInputTokens = 0;
     let turn1ContextTokens = 0;
@@ -310,12 +379,26 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
     const responseParts = [];
     const toolNames = [];
     const symmetryViolations = [];
+    const modelBreakdown = {};
+    const modelsUsed = [];
+    let planHandoffs = 0;
+    let planReviews = 0;
+    let pendingPlanReviewFromTool = false;
+    let pendingPlanReviewFromBanner = false;
     let didModifyFile = false;
 
     for (const step of steps) {
         const ts = step.created_at ? Date.parse(step.created_at) : null;
         if ((step.type === "USER_INPUT" || step.type === "SYSTEM_MESSAGE") && firstUserMs === null && ts !== null) {
             firstUserMs = ts;
+        }
+        if (step.type === "SYSTEM_MESSAGE" && typeof step.content === "string" && /\[plan review(?:\s+due)?\]/i.test(step.content)) {
+            if (pendingPlanReviewFromTool) {
+                pendingPlanReviewFromTool = false;
+            } else {
+                planReviews += 1;
+                pendingPlanReviewFromBanner = true;
+            }
         }
         if ((step.type === "EPHEMERAL_MESSAGE" || step.type === "SYSTEM_MESSAGE") && typeof step.content === "string") {
             if (arm === "cold" && (step.content.includes("plexer/INDEX.md") || step.content.includes("[plexer]"))) {
@@ -327,7 +410,10 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
                 lastPlannerMs = ts;
             plannerStepCount += 1;
             const stepUncached = step.input_tokens || 0;
-            const stepCached = step.cache_read_tokens || 0;
+            const stepCacheWrite = step.cache_creation_tokens || step.cache_write_tokens || 0;
+            const stepCacheRead = step.cache_read_tokens || 0;
+            const stepCached = stepCacheWrite + stepCacheRead;
+            const stepOut = step.output_tokens || 0;
             const stepCtx = stepUncached + stepCached;
             if (plannerStepCount === 1) {
                 turn1ContextTokens = stepCtx;
@@ -344,12 +430,36 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
                 prevContextTokens = stepCtx;
             }
             uncachedInputTokens += stepUncached;
+            cacheWriteTokens += stepCacheWrite;
+            cacheReadTokens += stepCacheRead;
             cachedInputTokens += stepCached;
             cumulativeInputTokens += stepUncached + stepCached;
             if (stepUncached + stepCached > 0) {
                 finalContextTokens = stepUncached + stepCached;
             }
-            totalModelOutputTokens += step.output_tokens || 0;
+            totalModelOutputTokens += stepOut;
+            const stepModel = typeof step.model === "string" && step.model.trim() ? step.model.trim() : "unknown";
+            if (!modelBreakdown[stepModel]) {
+                modelsUsed.push(stepModel);
+                modelBreakdown[stepModel] = {
+                    turns: 0,
+                    calls: 0,
+                    uncachedInputTokens: 0,
+                    cacheWriteTokens: 0,
+                    cacheReadTokens: 0,
+                    cachedInputTokens: 0,
+                    cumulativeInputTokens: 0,
+                    totalModelOutputTokens: 0,
+                };
+            }
+            const mb = modelBreakdown[stepModel];
+            mb.turns += 1;
+            mb.uncachedInputTokens += stepUncached;
+            mb.cacheWriteTokens += stepCacheWrite;
+            mb.cacheReadTokens += stepCacheRead;
+            mb.cachedInputTokens += stepCached;
+            mb.cumulativeInputTokens += stepUncached + stepCached;
+            mb.totalModelOutputTokens += stepOut;
             const tc = Array.isArray(step.tool_calls) ? step.tool_calls : [];
             const workCalls = [];
             for (const call of tc) {
@@ -365,11 +475,24 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
             if (workCalls.length > 0) {
                 turns += 1;
                 calls += workCalls.length;
+                mb.calls += workCalls.length;
                 if (firstToolTurnMs === null && ts !== null) {
                     firstToolTurnMs = ts;
                 }
                 for (const call of workCalls) {
                     toolNames.push(call.name);
+                    if (call.name === "exit_plan_mode" || call.name === "ExitPlanMode") {
+                        planHandoffs += 1;
+                        pendingPlanReviewFromTool = false;
+                        pendingPlanReviewFromBanner = false;
+                    } else if (call.name === "enter_plan_mode" || call.name === "EnterPlanMode") {
+                        if (pendingPlanReviewFromBanner) {
+                            pendingPlanReviewFromBanner = false;
+                        } else {
+                            planReviews += 1;
+                            pendingPlanReviewFromTool = true;
+                        }
+                    }
                     if (
                         call.name === "edit_file" ||
                         call.name === "write_file" ||
@@ -381,9 +504,6 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
                         didModifyFile = true;
                     }
                     const argStr = JSON.stringify(call.args || {});
-                    if (argStr.includes("bench/tasks.js")) {
-                        symmetryViolations.push("Agent accessed bench/tasks.js");
-                    }
                     let cmdStr = call.name === "run_command" ? String(call.args?.CommandLine || "") : "";
                     if (cmdStr.startsWith('"') && cmdStr.endsWith('"')) {
                         try {
@@ -395,13 +515,7 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
                     if (/\b(python3?|node\s+-e|sed\s+-[A-Za-z0-9]*i|perl\s+-[A-Za-z0-9]*i|tee\s+|cat\s*>|<<)/i.test(cmdStr)) {
                         didModifyFile = true;
                     }
-                    if (
-                        arm === "cold" &&
-                        /(?:^|[;&|]\s*)plexer\s+(ask|callers|callees|impact|grep|skeleton|map|blast|read)\b/.test(cmdStr) &&
-                        !cmdStr.includes("--all-matches")
-                    ) {
-                        symmetryViolations.push("Cold arm invoked plexer CLI");
-                    }
+                    scanToolLeakage(argStr, cmdStr, arm, symmetryViolations);
                 }
             }
             if (typeof step.content === "string" && step.content.trim().length > 0) {
@@ -450,6 +564,8 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
         turns,
         toolOutputTokens: Math.round(toolResponseBytes / 4),
         uncachedInputTokens,
+        cacheWriteTokens,
+        cacheReadTokens,
         cachedInputTokens,
         cumulativeInputTokens,
         turn1ContextTokens,
@@ -462,6 +578,10 @@ export function parseTranscript(conversationId, arm, streamDurationMs = null) {
         searchMs,
         totalMs,
         toolNames,
+        modelsUsed,
+        modelBreakdown,
+        planHandoffs,
+        planReviews,
         finalResponse,
         symmetryViolations,
         didModifyFile,
@@ -519,12 +639,13 @@ function fmtSec(ms) {
     return `${(ms / 1000).toFixed(1)}s`;
 }
 
-export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
+export function gradeManifest(manifestPath, outPath, activeTaskIds = null, opts = {}) {
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
     const prevResults = outPath && existsSync(outPath) ? JSON.parse(readFileSync(outPath, "utf8")) : null;
     const prevByTask = new Map((prevResults?.tasks ?? []).map((t) => [t.id, t]));
     const rows = [];
     const allViolations = [];
+    const modelName = opts?.modelName || manifest?.model || prevResults?.model || "claude-sonnet-5-5";
 
     for (const task of TASKS) {
         const entry = manifest[task.id] || {};
@@ -557,9 +678,6 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
         const canReusePlexer =
             (!activeTaskIds || !activeTaskIds.has(`${task.id}:plexer`)) &&
             prevTask?.plexer?.score !== undefined;
-        const canReuseTrail =
-            (!activeTaskIds || !activeTaskIds.has(`${task.id}:trail`)) &&
-            prevTask?.trail?.score !== undefined;
 
         const coldGrade = canReuseCold
             ? { score: prevTask.cold.score, maxScore: prevTask.cold.maxScore, checks: prevTask.cold.checks }
@@ -567,29 +685,6 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
         const plexerGrade = canReusePlexer
             ? { score: prevTask.plexer.score, maxScore: prevTask.plexer.maxScore, checks: prevTask.plexer.checks }
             : gradeTaskArm(task, plexerMetrics, entry.plexer?.cloneDir || prevTask?.plexer?.cloneDir);
-
-        let trailCombined = null;
-        if (entry.trail?.conversationId || prevTask?.trail) {
-            const trailMetrics =
-                (!activeTaskIds || activeTaskIds.has(`${task.id}:trail`)) &&
-                entry.trail?.conversationId &&
-                existsSync(entry.trail.conversationId)
-                    ? parseTranscript(entry.trail.conversationId, "trail")
-                    : prevTask?.trail;
-            if (trailMetrics) {
-                const trailGrade = canReuseTrail
-                    ? { score: prevTask.trail.score, maxScore: prevTask.trail.maxScore, checks: prevTask.trail.checks }
-                    : gradeTaskArm(task, trailMetrics, entry.trail?.cloneDir || prevTask?.trail?.cloneDir);
-                for (const v of trailMetrics.symmetryViolations ?? []) {
-                    allViolations.push(`${task.id} (trail): ${v}`);
-                }
-                trailCombined = {
-                    ...trailMetrics,
-                    ...trailGrade,
-                    cloneDir: entry.trail?.cloneDir || prevTask?.trail?.cloneDir,
-                };
-            }
-        }
 
         for (const v of coldMetrics.symmetryViolations ?? []) {
             allViolations.push(`${task.id} (cold): ${v}`);
@@ -606,7 +701,6 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
             title: task.title,
             cold: { ...coldMetrics, ...coldGrade, cloneDir: entry.cold?.cloneDir || prevTask?.cold?.cloneDir },
             plexer: { ...plexerMetrics, ...plexerGrade, cloneDir: entry.plexer?.cloneDir || prevTask?.plexer?.cloneDir },
-            ...(trailCombined ? { trail: trailCombined } : {}),
         });
     }
 
@@ -617,6 +711,8 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 acc[arm].turns += r[arm].turns;
                 acc[arm].toolOutputTokens += r[arm].toolOutputTokens;
                 acc[arm].uncachedInputTokens += r[arm].uncachedInputTokens;
+                acc[arm].cacheWriteTokens += r[arm].cacheWriteTokens || 0;
+                acc[arm].cacheReadTokens += r[arm].cacheReadTokens || 0;
                 acc[arm].cachedInputTokens += r[arm].cachedInputTokens;
                 acc[arm].cumulativeInputTokens += r[arm].cumulativeInputTokens;
                 acc[arm].turn1ContextTokens += r[arm].turn1ContextTokens || 0;
@@ -628,8 +724,11 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 acc[arm].totalModelOutputTokens += r[arm].totalModelOutputTokens;
                 acc[arm].searchMs += r[arm].searchMs;
                 acc[arm].totalMs += r[arm].totalMs;
+                const cost = computeApiCostUsd(r[arm], modelName);
+                acc[arm].apiCostUsd = Number(((acc[arm].apiCostUsd || 0) + cost.totalUsd).toFixed(6));
                 acc[arm].score += r[arm].score;
                 acc[arm].maxScore += r[arm].maxScore;
+                mergeModelBreakdownTotals(acc[arm], r[arm]);
             }
 
             if (r.plexer.toolOutputTokens < r.cold.toolOutputTokens)
@@ -661,6 +760,8 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 turns: 0,
                 toolOutputTokens: 0,
                 uncachedInputTokens: 0,
+                cacheWriteTokens: 0,
+                cacheReadTokens: 0,
                 cachedInputTokens: 0,
                 cumulativeInputTokens: 0,
                 turn1ContextTokens: 0,
@@ -670,6 +771,7 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 cacheMissTurns: 0,
                 finalContextTokens: 0,
                 totalModelOutputTokens: 0,
+                apiCostUsd: 0,
                 searchMs: 0,
                 totalMs: 0,
                 score: 0,
@@ -680,6 +782,8 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 turns: 0,
                 toolOutputTokens: 0,
                 uncachedInputTokens: 0,
+                cacheWriteTokens: 0,
+                cacheReadTokens: 0,
                 cachedInputTokens: 0,
                 cumulativeInputTokens: 0,
                 turn1ContextTokens: 0,
@@ -689,6 +793,7 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
                 cacheMissTurns: 0,
                 finalContextTokens: 0,
                 totalModelOutputTokens: 0,
+                apiCostUsd: 0,
                 searchMs: 0,
                 totalMs: 0,
                 score: 0,
@@ -706,77 +811,36 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
         }
     );
 
-        const trailRows = rows.filter((r) => r.trail);
-    let trailComparison = undefined;
-    if (trailRows.length > 0) {
-        const emptyArm = () => ({
-            calls: 0,
-            turns: 0,
-            toolOutputTokens: 0,
-            uncachedInputTokens: 0,
-            cachedInputTokens: 0,
-            cumulativeInputTokens: 0,
-            turn1ContextTokens: 0,
-            turn1UncachedTokens: 0,
-            postTurn1UncachedTokens: 0,
-            netContextGrowthTokens: 0,
-            cacheMissTurns: 0,
-            finalContextTokens: 0,
-            totalModelOutputTokens: 0,
-            searchMs: 0,
-            totalMs: 0,
-            score: 0,
-            maxScore: 0,
-        });
-        trailComparison = trailRows.reduce(
-            (acc, r) => {
-                for (const arm of ["cold", "trail", "plexer"]) {
-                    acc[arm].calls += r[arm].calls;
-                    acc[arm].turns += r[arm].turns;
-                    acc[arm].toolOutputTokens += r[arm].toolOutputTokens;
-                    acc[arm].uncachedInputTokens += r[arm].uncachedInputTokens;
-                    acc[arm].cachedInputTokens += r[arm].cachedInputTokens;
-                    acc[arm].cumulativeInputTokens += r[arm].cumulativeInputTokens;
-                    acc[arm].turn1ContextTokens += r[arm].turn1ContextTokens || 0;
-                    acc[arm].turn1UncachedTokens += r[arm].turn1UncachedTokens || 0;
-                    acc[arm].postTurn1UncachedTokens += r[arm].postTurn1UncachedTokens || 0;
-                    acc[arm].netContextGrowthTokens += r[arm].netContextGrowthTokens || 0;
-                    acc[arm].cacheMissTurns += r[arm].cacheMissTurns || 0;
-                    acc[arm].finalContextTokens += r[arm].finalContextTokens;
-                    acc[arm].totalModelOutputTokens += r[arm].totalModelOutputTokens;
-                    acc[arm].searchMs += r[arm].searchMs;
-                    acc[arm].totalMs += r[arm].totalMs;
-                    acc[arm].score += r[arm].score;
-                    acc[arm].maxScore += r[arm].maxScore;
-                }
-                return acc;
-            },
-            { taskIds: trailRows.map((r) => r.id), cold: emptyArm(), trail: emptyArm(), plexer: emptyArm() }
-        );
-    }
-
-    const serializeArm = (a) => ({
-        conversationId: a.conversationId,
-        calls: a.calls,
-        turns: a.turns,
-        toolNames: a.toolNames,
-        toolOutputTokens: a.toolOutputTokens,
-        uncachedInputTokens: a.uncachedInputTokens,
-        cachedInputTokens: a.cachedInputTokens,
-        cumulativeInputTokens: a.cumulativeInputTokens,
-        turn1ContextTokens: a.turn1ContextTokens || 0,
-        turn1UncachedTokens: a.turn1UncachedTokens || 0,
-        postTurn1UncachedTokens: a.postTurn1UncachedTokens || 0,
-        netContextGrowthTokens: a.netContextGrowthTokens || 0,
-        cacheMissTurns: a.cacheMissTurns || 0,
-        finalContextTokens: a.finalContextTokens,
-        totalModelOutputTokens: a.totalModelOutputTokens,
-        searchMs: a.searchMs,
-        totalMs: a.totalMs,
-        score: a.score,
-        maxScore: a.maxScore,
-        checks: a.checks,
-    });
+    const serializeArm = (a) => {
+        const apiCost = computeApiCostUsd(a, modelName);
+        return {
+            conversationId: a.conversationId,
+            calls: a.calls,
+            turns: a.turns,
+            toolNames: a.toolNames,
+            toolOutputTokens: a.toolOutputTokens,
+            uncachedInputTokens: a.uncachedInputTokens,
+            cacheWriteTokens: a.cacheWriteTokens ?? 0,
+            cacheReadTokens: a.cacheReadTokens ?? (a.cachedInputTokens || 0),
+            cachedInputTokens: a.cachedInputTokens,
+            cumulativeInputTokens: a.cumulativeInputTokens,
+            turn1ContextTokens: a.turn1ContextTokens || 0,
+            turn1UncachedTokens: a.turn1UncachedTokens || 0,
+            postTurn1UncachedTokens: a.postTurn1UncachedTokens || 0,
+            netContextGrowthTokens: a.netContextGrowthTokens || 0,
+            cacheMissTurns: a.cacheMissTurns || 0,
+            finalContextTokens: a.finalContextTokens,
+            totalModelOutputTokens: a.totalModelOutputTokens,
+            apiCostUsd: apiCost.totalUsd,
+            apiCost,
+            searchMs: a.searchMs,
+            totalMs: a.totalMs,
+            ...pickOrchResultMeta(a),
+            score: a.score,
+            maxScore: a.maxScore,
+            checks: a.checks,
+        };
+    };
 
     const summary = {
         generatedAt: new Date().toISOString(),
@@ -784,10 +848,7 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
             passed: allViolations.length === 0,
             violations: allViolations,
         },
-        totals: {
-            ...totals,
-            ...(trailComparison ? { trailComparison } : {}),
-        },
+        totals,
         tasks: rows.map((r) => ({
             id: r.id,
             category: r.category,
@@ -796,7 +857,6 @@ export function gradeManifest(manifestPath, outPath, activeTaskIds = null) {
             title: r.title,
             cold: serializeArm(r.cold),
             plexer: serializeArm(r.plexer),
-            ...(r.trail ? { trail: serializeArm(r.trail) } : {}),
         })),
     };
 

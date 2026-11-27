@@ -12,9 +12,20 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildGraph } from "../src/graph/build.js";
 import { readFingerprint } from "../src/graph/fingerprint.js";
+import { sqliteHasGraph, sqliteStoreExists } from "../src/storage/sqlite-store.js";
+
+function isIndexedDirReady(idxDir) {
+    const pDir = join(idxDir, "plexer");
+    return (
+        existsSync(join(pDir, ".graph", "wiring.json")) &&
+        Boolean(readFingerprint(pDir)) &&
+        (!sqliteStoreExists(pDir) || sqliteHasGraph(pDir))
+    );
+}
 
 export const AB_BASE_DIR = "/tmp/plexer-ab-base";
 export const SWEBENCH_BASE_DIR = "/tmp/plexer-swebench-base";
+export const V2_BASE_DIR = "/tmp/plexer-v2-base";
 
 const BENCH_REPOS_DIR = process.env.PLEXER_BENCH_REPOS_DIR || join(homedir(), "Projects", "roblox", "libraries");
 
@@ -77,8 +88,7 @@ export async function ensureAbBaseRepos(onlyRepos = null, opts = {}) {
         const currentPin = existsSync(pinStampPath) ? readFileSync(pinStampPath, "utf8").trim() : "";
         if (
             !forceReindex &&
-            existsSync(join(idxDir, "plexer", ".graph", "wiring.json")) &&
-            readFingerprint(join(idxDir, "plexer")) &&
+            isIndexedDirReady(idxDir) &&
             existsSync(cleanDir) &&
             currentPin === ref
         ) {
@@ -205,13 +215,85 @@ export async function ensureSwebenchBaseRepos(onlyIds = null, opts = {}) {
             });
             execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: cleanDir });
         }
-        if (forceReindex || !existsSync(join(indexedDir, "plexer", ".graph", "wiring.json")) || !readFingerprint(join(indexedDir, "plexer"))) {
+        if (forceReindex || !isIndexedDirReady(indexedDir)) {
             rmSync(indexedDir, { recursive: true, force: true });
             mkdirSync(join(SWEBENCH_BASE_DIR, "indexed"), { recursive: true });
             execFileSync("cp", ["-a", cleanDir, indexedDir]);
             await buildGraph(indexedDir, { force: true });
         }
     }
+}
+
+/**
+ * Populate `/tmp/plexer-v2-base/{clean,indexed}/<id>` for `bench/v2-tasks.js`.
+ * Reuses `ab:*` / `swe:*` local bases when mapped, and shallow-clones remote OSS
+ * targets (`git fetch --depth 1`) on demand.
+ */
+export async function ensureV2BaseRepos(onlyTaskIds = null, opts = {}) {
+    const forceReindex = Boolean(opts?.reindex || opts?.force);
+    const { ALL_V2_TASKS, V2_SCALE_REPOS } = await import("./v2-tasks.js");
+    const scaleByRepo = new Map(V2_SCALE_REPOS.map((r) => [r.id, r]));
+
+    const abNeeded = new Set();
+    const sweNeeded = new Set();
+    const v2Tasks = ALL_V2_TASKS.filter((t) => !onlyTaskIds || onlyTaskIds.has(t.id));
+
+    for (const t of v2Tasks) {
+        if (typeof t.baseId === "string" && t.baseId.startsWith("ab:")) {
+            abNeeded.add(t.baseId.slice(3));
+        } else if (typeof t.baseId === "string" && t.baseId.startsWith("swe:")) {
+            sweNeeded.add(t.baseId.slice(4));
+        } else if (t.baseId === "pocketbase") {
+            sweNeeded.add("pocketbase");
+        }
+    }
+    if (abNeeded.size > 0) {
+        await ensureAbBaseRepos(abNeeded, opts);
+    }
+    if (sweNeeded.size > 0) {
+        await ensureSwebenchBaseRepos(sweNeeded, opts);
+    }
+
+    const prepared = new Map();
+    for (const t of v2Tasks) {
+        let cleanDir;
+        let indexedDir;
+        if (typeof t.baseId === "string" && t.baseId.startsWith("ab:")) {
+            const name = t.baseId.slice(3);
+            cleanDir = join(AB_BASE_DIR, "clean", name);
+            indexedDir = join(AB_BASE_DIR, "indexed", name);
+        } else if (typeof t.baseId === "string" && t.baseId.startsWith("swe:")) {
+            const id = t.baseId.slice(4);
+            cleanDir = join(SWEBENCH_BASE_DIR, "clean", id);
+            indexedDir = join(SWEBENCH_BASE_DIR, "indexed", id);
+        } else if (t.baseId === "pocketbase") {
+            cleanDir = join(SWEBENCH_BASE_DIR, "clean", "pocketbase");
+            indexedDir = join(SWEBENCH_BASE_DIR, "indexed", "pocketbase");
+        } else {
+            const spec = scaleByRepo.get(t.baseId || t.repo) || t;
+            const slug = spec.id || t.id;
+            cleanDir = join(V2_BASE_DIR, "clean", slug);
+            indexedDir = join(V2_BASE_DIR, "indexed", slug);
+            if (!existsSync(cleanDir) && spec.repoUrl && spec.baseCommit) {
+                mkdirSync(cleanDir, { recursive: true });
+                execFileSync("git", ["init", "-q"], { cwd: cleanDir });
+                execFileSync("git", ["remote", "add", "origin", spec.repoUrl], { cwd: cleanDir });
+                execFileSync("git", ["fetch", "--depth", "1", "origin", spec.baseCommit], {
+                    cwd: cleanDir,
+                    stdio: "ignore",
+                });
+                execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: cleanDir });
+            }
+            if (
+                existsSync(cleanDir) &&
+                (forceReindex || !isIndexedDirReady(indexedDir))
+            ) {
+                await buildIndexedFromClean(cleanDir, indexedDir, { graphOnly: true });
+            }
+        }
+        prepared.set(t.id, { cleanDir, indexedDir });
+    }
+    return prepared;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {

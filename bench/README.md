@@ -1,10 +1,10 @@
 # `plexer` Benchmarks & Methodology
 
-This directory holds the multi-model benchmark suite, runners, transcript graders, offline evaluators, and visualization scripts for `plexer`. [`bench/tasks.js`](tasks.js) defines 12 engineering tasks (`T1`–`T12`) with rubrics and code-edit checks across 6 repositories (including 2 holdouts). [`bench/swebench/tasks.json`](swebench/tasks.json) bundles 8 tasks (`S1`–`S8`) from **`ScaleAI/SWE-bench_Pro` V2** across `qutebrowser/qutebrowser` (Python), `flipt-io/flipt` (Go), `NodeBB/NodeBB` (JavaScript), and `tutao/tutanota` (TypeScript) alongside container verifier scripts (`test.sh`, `run_script.sh`, `parser.py`, `config.json`). [`bench/large-tasks.js`](large-tasks.js) and [`bench/run-large-ab.js`](run-large-ab.js) define 8 multi-hop architectural and 3–4-file code-edit tasks (`L1`–`L8`) across repos up to **1,350+ files** (including Trail-Code's PocketBase `L1` OAuth2/`RecordUpsert` and `L5` PR #6744 WebP thumbnail tasks). Strict binary `Resolved` verifiers fail any run missing one sibling file, while [`bench/ensure-base.js`](ensure-base.js) populates `/tmp/plexer-ab-base/{clean,indexed}` and `/tmp/plexer-swebench-base/{clean,indexed}`.
+This directory holds the multi-model benchmark suite, runners, transcript graders, offline evaluators, and visualization scripts for `plexer`. [`bench/tasks.js`](tasks.js) defines 12 engineering tasks (`T1`–`T12`) with rubrics and code-edit checks across 6 repositories (including 2 holdouts). [`bench/swebench/tasks.json`](swebench/tasks.json) bundles 8 tasks (`S1`–`S8`) from **`ScaleAI/SWE-bench_Pro` V2** across `qutebrowser/qutebrowser` (Python), `flipt-io/flipt` (Go), `NodeBB/NodeBB` (JavaScript), and `tutao/tutanota` (TypeScript) alongside container verifier scripts (`test.sh`, `run_script.sh`, `parser.py`, `config.json`). [`bench/large-tasks.js`](large-tasks.js) and [`bench/run-large-ab.js`](run-large-ab.js) define 8 multi-hop architectural and 3–4-file code-edit tasks (`L1`–`L8`) across repos up to **1,350+ files** (including PocketBase `L1` OAuth2/`RecordUpsert` and `L5` PR #6744 WebP thumbnail tasks). Strict binary `Resolved` verifiers fail any run missing one sibling file, while [`bench/ensure-base.js`](ensure-base.js) populates `/tmp/plexer-ab-base/{clean,indexed}` and `/tmp/plexer-swebench-base/{clean,indexed}`.
 
-Live evaluations run through [`bench/run-agy-ab.js`](run-agy-ab.js) for headless Google Antigravity (`agy -p` on `neon-medium`, `carbon-medium`, `argon-medium`, and `hydrogen-medium`) and [`bench/run-claude-ab.js`](run-claude-ab.js) for Claude Code (`claude -p --effort medium` on `claude-sonnet-5-5` and `claude-opus-5-5`). [`bench/run-swebench-ab.js`](run-swebench-ab.js) executes `S1`–`S8` across all 6 models with symbol/patch grading and optional Docker verification (`SWEBENCH_DOCKER=1`). For 3-arm comparisons, [`bench/trail-live-helper.js`](trail-live-helper.js) configures `@trailhq/trail-code@0.29.0` via its native `trail init` flow (`SessionStart` `formatOrientation`, `UserPromptSubmit` `handlePrompt` `-n 3`, `PostToolUse` `formatBlastRadius`, and unblocked `mcp__trail__*` and `trail` CLI) alongside `cold` and `plexer`. [`bench/grade.js`](grade.js) parses Antigravity and Claude Code JSONL transcripts, checks cohort symmetry, grades rubrics and strict binary `resolved` status, and reports separated metrics (`toolOutputTokens`, `finalContextTokens`, `uncachedInputTokens`, `cachedInputTokens`, `cumulativeInputTokens`, and `totalModelOutputTokens`).
+Live evaluations run through [`bench/run-agy-ab.js`](run-agy-ab.js) for headless Google Antigravity (`agy -p` on `neon-medium`, `carbon-medium`, `hydrogen-medium`, and the dual-model Orchestrators `orch-neon-high-hydrogen-high` and `orch-neon-xhigh-hydrogen-xhigh`, pairing `gemini-4-neon-{high,xhigh}` planner with `gemini-4-hydrogen-{high,xhigh}` executor) and [`bench/run-claude-ab.js`](run-claude-ab.js) for Claude Code (`claude -p --effort medium` on `claude-sonnet-5-5` and `claude-opus-5-5`). [`bench/run-swebench-ab.js`](run-swebench-ab.js) executes `S1`–`S8` across all 7 model configurations with symbol/patch grading and optional Docker verification (`SWEBENCH_DOCKER=1`). [`bench/grade.js`](grade.js) parses Antigravity and Claude Code JSONL transcripts, tracks per-role `modelBreakdown` and plan transitions (`planHandoffs`, `planReviews`) on Orchestrator runs, checks cohort symmetry, grades rubrics and strict binary `resolved` status, and reports separated metrics (`toolOutputTokens`, `finalContextTokens`, `uncachedInputTokens`, `cachedInputTokens`, `cumulativeInputTokens`, and `totalModelOutputTokens`).
 
-Offline tools replay transcripts and fit cost models at zero API cost. [`bench/replay.js`](replay.js) mines ranged reads, whole-file reads, grep hits, and gold patch hunks across all 28 tasks into [`bench/needed-spans.json`](needed-spans.json), which [`bench/needcov.js`](needcov.js) scores via `needCov`, `locCov`, and `fileCov`. [`bench/eval-fast.js`](eval-fast.js) evaluates Turn-0 BPE budgets, gold file recall, coverage, and predicted metrics (`EstWall`, `EstUncached`, `EstCost`, `EstCum`) across all 28 tasks in ~5.0s. Those predictions use the leave-one-out regressions in [`bench/cost-model.js`](cost-model.js) and [`bench/turn-model.json`](turn-model.json) (`wall_ms`, `outTok`, `uncIn`, `cumIn`, and cache-aware cost `1.25·uncIn + 0.1·cacheRead + 5·outTok`, `R² = 0.84–0.98`). [`bench/graft-arm.js`](graft-arm.js) runs an offline comparison against `@trailhq/trail-code@0.29.0` (`graft-hook` and `graft-push`) across 19 shared 3-arm tasks, while [`bench/trail-table.js`](trail-table.js) computes per-task means and repo-size scaling tables. Interactive and script outputs include [`bench/skill-review.html`](skill-review.html), [`bench/chart.js`](chart.js) ([`bench/chart-small.svg`](chart-small.svg) and [`bench/chart.svg`](chart.svg)), and [`bench/run.js`](run.js) for the 24-query deterministic engine benchmark (`npm run bench`).
+Offline tools replay transcripts and fit cost models at zero API cost. [`bench/replay.js`](replay.js) mines ranged reads, whole-file reads, grep hits, and gold patch hunks across all 28 tasks into [`bench/needed-spans.json`](needed-spans.json), which [`bench/needcov.js`](needcov.js) scores via `needCov`, `locCov`, and `fileCov`. [`bench/eval-fast.js`](eval-fast.js) evaluates Turn-0 BPE budgets, gold file recall, coverage, and predicted metrics (`EstWall`, `EstUncached`, `EstCost`, `EstCum`) across all 28 tasks in ~5.0s. Those predictions use the leave-one-out regressions in [`bench/cost-model.js`](cost-model.js) and [`bench/turn-model.json`](turn-model.json) (`wall_ms`, `outTok`, `uncIn`, `cumIn`, and cache-aware cost `1.25·uncIn + 0.1·cacheRead + 5·outTok`, `R² = 0.84–0.98`). Visualization and engine scripts include [`bench/chart.js`](chart.js) ([`bench/chart-small.svg`](chart-small.svg) and [`bench/chart.svg`](chart.svg)) and [`bench/run.js`](run.js) for the 24-query deterministic engine benchmark (`npm run bench`).
 
 <p align="center">
   <img src="chart.svg" alt="plexer Multi-Suite Benchmark Breakdown" width="100%" />
@@ -12,11 +12,11 @@ Offline tools replay transcripts and fit cost models at zero API cost. [`bench/r
 
 ---
 
-## 1. 6-Model Live A/B Agent Evaluation (`T1`–`T12`: `plexer` vs. Cold Agent)
+## 1. 7-Model Live A/B Agent Evaluation (`T1`–`T12`: `plexer` vs. Cold Agent)
 
 ### Methodology & Controls
 
-We ran a **72-pair (144-session) A/B evaluation** across 12 tasks, 2 arms (`cold` vs. `plexer`), and 6 model configurations all pinned to `--effort medium`. The Antigravity runs cover `neon-medium` (`gemini-4-neon-medium`), `carbon-medium` (`gemini-4-carbon-medium`), `argon-medium` (`gemini-4-argon-medium`), and `hydrogen-medium` (`gemini-4-hydrogen-medium`), while the Claude Code runs cover **Claude Opus 5.5** (`claude-opus-5-5`) and **Claude Sonnet 5.5** (`claude-sonnet-5-5`).
+We ran an **84-pair (168-session) A/B evaluation** across 12 tasks, 2 arms (`cold` vs. `plexer`), and 7 model configurations: 5 single-model configurations pinned to `--effort medium` plus 2 dual-model Antigravity Orchestrator configurations (`orch-neon-high-hydrogen-high` pairing `gemini-4-neon-high` planner with `gemini-4-hydrogen-high` executor, and `orch-neon-xhigh-hydrogen-xhigh` pairing `gemini-4-neon-xhigh` planner with `gemini-4-hydrogen-xhigh` executor). The single-model Antigravity runs cover `neon-medium` (`gemini-4-neon-medium`), `carbon-medium` (`gemini-4-carbon-medium`), and `hydrogen-medium` (`gemini-4-hydrogen-medium`), while the Claude Code runs cover **Claude Opus 5.5** (`claude-opus-5-5`) and **Claude Sonnet 5.5** (`claude-sonnet-5-5`).
 
 The suite spans **6 repositories** (`plexer`, `kohls-admin`, `flux`, `sert`, and 2 unseen holdouts `building-tools` and `z`) in JavaScript, Luau, Rust, and Python (1,445 to 3,614 symbols and up to 6,437 edges). Tasks fall into 3 categories:
 
@@ -31,9 +31,10 @@ The suite spans **6 repositories** (`plexer`, `kohls-admin`, `flux`, `sert`, and
    - Worktrees are exported via `git archive HEAD` with `bench/`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.claude/`, `.cursor/`, `.gemini/`, and `.agents/` stripped. `grade.js` fails any run that accesses `bench/tasks.js`.
 2. **Unseen holdout repositories:** `T4` (`z`), `T8` (`building-tools`), and `T12` (`building-tools`) run on repositories never used to tune retrieval weights or skill instructions.
 3. **Prompt, effort, and environment symmetry:**
-   - Within each model tier, `cold` and `plexer` run with the exact same model, `--effort` flag, tool permissions, and task prompt (`0` symmetry violations across all 144 transcripts).
+   - Within each model tier, `cold` and `plexer` run with the exact same model, effort/orchestrator settings, tool permissions, and task prompt (`0` symmetry violations across all 168 transcripts).
    - The `cold` arm sets `PLEXER_DISABLE_HOOKS=1` so lifecycle hooks never fire. The `plexer` arm enables Turn-0 prompt-context, `PreToolUse` read/shell compaction, and `PostToolUse` span-tracking and blast-radius hooks (`PLEXER_DISABLE_HOOKS=0`).
-   - For Antigravity, [`bench/run-agy-ab.js`](run-agy-ab.js) runs `agy -p --agent bench-{cold,plexer} --model gemini-4-{neon,carbon,argon,hydrogen}-medium --effort medium --dangerously-skip-permissions --disable-slash-commands` with `inheritCustomizations: false` and `inheritMcp: false`.
+   - For single-model Antigravity runs, [`bench/run-agy-ab.js`](run-agy-ab.js) passes `-p --agent bench-{cold,plexer} --model gemini-4-{neon,carbon,hydrogen}-medium --effort medium --dangerously-skip-permissions --disable-slash-commands` with `inheritCustomizations: false` and `inheritMcp: false`.
+   - For Orchestrator Antigravity runs (`orch-neon-high-hydrogen-high` and `orch-neon-xhigh-hydrogen-xhigh`), omitting `--agent` and `--effort` is required because passing `--agent` forces Antigravity into single-model mode even when `enter_plan_mode`/`exit_plan_mode` are listed. [`bench/agy-bench-helper.js`](agy-bench-helper.js) therefore launches `agy -p --model gemini-pro-orchestrator-neon --settings '{"orchestrator":{"planner":"gemini-4-neon-{high,xhigh}","executor":"gemini-4-hydrogen-{high,xhigh}"}}' --output-format stream-json --dangerously-skip-permissions --disable-slash-commands` inside a sterile temporary `HOME` (`createSterileBenchHome`: symlinks only auth, `antigravity-cli`, and host toolchains/caches such as `.rokit` via `ROKIT_ROOT`, keeping `.gemini/config` and `.gemini/skills` empty) while injecting arm rules and hooks through worktree `.agents/rules/bench-arm.md` (with `trigger: always_on`) and `.agents/hooks.json`.
    - For Claude Code, [`bench/run-claude-ab.js`](run-claude-ab.js) passes `--model {sonnet,opus} --effort medium --setting-sources "" --disable-slash-commands --strict-mcp-config --tools "Bash,Read,Edit,Write,Grep,Glob"` and adds `--settings <hook-settings.json>` only on the `plexer` arm.
 
 #### Token Accounting (`bench/grade.js`)
@@ -45,17 +46,18 @@ The suite spans **6 repositories** (`plexer`, `kohls-admin`, `flux`, `sert`, and
 3. **Uncached and Cached Cumulative Input Tokens (`uncachedInputTokens` + `cachedInputTokens` = `cumulativeInputTokens`):**
    - Every LLM turn re-sends the conversation history to that point, so `cumulativeInputTokens` scales as $\mathcal{O}(\text{turns} \times \text{context})$.
    - **Claude Code** caches the system prompt and tool definitions after Turn 1 (`99.98%` of input tokens are `cachedInputTokens` at `0.1x` cost, with only ~8–15 `uncachedInputTokens` per turn) and finishes in 21–79 turns across 12 tasks.
-   - **Antigravity (`neon-medium`, `carbon-medium`, `argon-medium`, and `hydrogen-medium`)** makes more granular line-range `view_file` calls (34–168 turns across 12 tasks) and bills ~10–20% of each turn's prompt as `uncachedInputTokens`. Because `plexer` cuts both tool output per turn and total turns, it reduces Antigravity's cumulative input tokens by **59–78%** on `T1`–`T12` and **41–71%** on `SWE-bench Pro V2`.
+   - **Antigravity (`neon-medium`, `carbon-medium`, and `hydrogen-medium`)** makes more granular line-range `view_file` calls (34–168 turns across 12 tasks) and bills ~10–20% of each turn's prompt as `uncachedInputTokens`. Because `plexer` cuts both tool output per turn and total turns, it reduces Antigravity's cumulative input tokens by **59–78%** on `T1`–`T12` and **41–67%** on `SWE-bench Pro V2`.
 4. **Model Output Tokens (`totalModelOutputTokens`):** Total generated tokens including assistant text, tool-call arguments, and thinking tokens. On Claude Code, this is read from the top-level `result` event's `usage.output_tokens`.
 
 ---
 
-### Multi-Model Summary (`T1`–`T12` Across 6 Model Configurations)
+### Multi-Model Summary (`T1`–`T12` Across 7 Model Configurations)
 
 ```bash
+node bench/run-agy-ab.js orch-neon-high-hydrogen-high 4 both all
+node bench/run-agy-ab.js orch-neon-xhigh-hydrogen-xhigh 4 both all
 node bench/run-agy-ab.js neon-medium 4 both all
 node bench/run-agy-ab.js carbon-medium 4 both all
-node bench/run-agy-ab.js argon-medium 4 both all
 node bench/run-agy-ab.js hydrogen-medium 4 both all
 node bench/run-claude-ab.js opus 4 both all medium
 node bench/run-claude-ab.js sonnet 4 both all medium
@@ -63,24 +65,27 @@ node bench/run-claude-ab.js sonnet 4 both all medium
 
 | Model & Effort (12 Tasks Each) | Symmetry | Correctness (`cold` → `plexer`) | Tool Calls (`cold` → `plexer`) | Tool Output Tokens (`cold` → `plexer`) | Final Context Tokens (`cold` → `plexer`) | Cumulative Input Tokens (`cold` → `plexer`) | Search Wall Time (`cold` → `plexer`) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Antigravity `orch-neon+h2-h`** (`Neon+H2 High`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 244 → **131 (-46.3%)** (`11W/0T/1L`) | 322,662 → **121,568 (-62.3%)** (**`12W/0T/0L`**) | 709.3k → **425.0k (-40.1%)** | 5.69M → **2.29M (-59.7%)** | 1,476.0s → **866.0s (-41.3%)** (`11W/0T/1L`) |
+| **Antigravity `orch-neon+h2-xh`** (`Neon+H2 XHigh`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 300 → **116 (-61.3%)** (**`12W/0T/0L`**) | 512,000 → **98,692 (-80.7%)** (**`12W/0T/0L`**) | 1,035.1k → **398.5k (-61.5%)** | 9.44M → **1.96M (-79.2%)** | 1,811.0s → **1,214.0s (-33.0%)** (`9W/0T/3L`) |
 | **Antigravity `neon-medium`** (`--effort medium`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 181 → **60 (-66.9%)** (**`12W/0T/0L`**) | 155,652 → **37,702 (-75.8%)** (**`12W/0T/0L`**) | 355.6k → **204.4k (-42.5%)** | 3.13M → **0.70M (-77.5%)** | 970.0s → **423.0s (-56.4%)** (**`12W/0T/0L`**) |
 | **Antigravity `carbon-medium`** (`--effort medium`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 292 → **121 (-58.6%)** (**`12W/0T/0L`**) | 323,826 → **115,781 (-64.2%)** (**`12W/0T/0L`**) | 699.7k → **354.1k (-49.4%)** | 8.71M → **2.43M (-72.1%)** | 2,602.0s → **1,457.0s (-44.0%)** (`11W/0T/1L`) |
-| **Antigravity `argon-medium`** (`--effort medium`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 146 → **61 (-58.2%)** (`11W/1T/0L`) | 253,993 → **72,940 (-71.3%)** (**`12W/0T/0L`**) | 534.7k → **253.3k (-52.6%)** | 4.28M → **1.15M (-73.1%)** | 1,417.0s → **791.0s (-44.2%)** (`10W/0T/2L`) |
 | **Antigravity `hydrogen-medium`** (`--effort medium`) | `PASSED (0)` | **96/96 → 96/96** (100%) | 154 → **61 (-60.4%)** (`11W/1T/0L`) | 89,441 → **36,763 (-58.9%)** (`10W/0T/2L`) | 251.6k → **194.2k (-22.8%)** | 2.39M → **0.99M (-58.7%)** | 422.0s → **250.0s (-40.8%)** (`9W/0T/3L`) |
 | **Claude Opus 5.5** (`--effort medium`) | `PASSED (0)` | 94/96 → **96/96 (+2.1%)** | 81 → **28 (-65.4%)** (**`12W/0T/0L`**) | 63,696 → **18,287 (-71.3%)** (**`12W/0T/0L`**) | 225.9k → **177.5k (-21.4%)** | 1.29M → **0.57M (-55.7%)** | 248.9s → **93.1s (-62.6%)** (**`12W/0T/0L`**) |
 | **Claude Sonnet 5.5** (`--effort medium`) | `PASSED (0)` | 94/96 → **96/96 (+2.1%)** | 76 → **27 (-64.5%)** (`11W/1T/0L`) | 45,198 → **11,021 (-75.6%)** (**`12W/0T/0L`**) | 187.9k → **164.3k (-12.5%)** | 0.65M → **0.41M (-37.4%)** | 96.7s → **51.7s (-46.5%)** (`11W/0T/1L`) |
-| **6-Model Total (`72` Task-Model Pairs)** | `PASSED (0)` | 572/576 → **576/576 (100.0%)** | 930 → **358 (-61.5%)** (`69W/3T/0L`) | 931,806 → **292,494 (-68.6%)** (`70W/0T/2L`) | 2,255.5k → **1,347.9k (-40.2%)** | 20.46M → **6.25M (-69.4%)** | 5,756.7s → **3,065.8s (-46.7%)** (`65W/0T/7L`) |
+| **7-Model Total (`84` Task-Model Pairs)** | `PASSED (0)` | 668/672 → **672/672 (100.0%)** | 1,328 → **544 (-59.0%)** (`81W/2T/1L`) | 1,512,475 → **439,814 (-70.9%)** (`82W/0T/2L`) | 3,465.2k → **1,918.1k (-44.6%)** | 31.30M → **9.36M (-70.1%)** | 7,626.7s → **4,354.8s (-42.9%)** (`75W/0T/9L`) |
 
 #### Separated Token Accounting (`T1`–`T12` Totals)
 
 | Model Configuration | Arm | Turns | Tool Output Tok | Final Context Tok | Uncached Input Tok | Cached Input Tok | Cumulative Input Tok | Model Output Tok |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Antigravity `orch-neon+h2-h`** (`High`) | `cold` | 101 | 322,662 | 709,323 | 1,043,920 | 4,644,760 | 5,688,680 | 153,985 |
+| **Antigravity `orch-neon+h2-h`** (`High`) | **`plexer`** | **57 (-43.6%)** | **121,568 (-62.3%)** | **425,018 (-40.1%)** | **566,354 (-45.7%)** | **1,728,121 (-62.8%)** | **2,294,475 (-59.7%)** | **123,547 (-19.8%)** |
+| **Antigravity `orch-neon+h2-xh`** (`XHigh`) | `cold` | 124 | 512,000 | 1,035,073 | 1,568,524 | 7,866,919 | 9,435,443 | 266,818 |
+| **Antigravity `orch-neon+h2-xh`** (`XHigh`) | **`plexer`** | **51 (-58.9%)** | **98,692 (-80.7%)** | **398,518 (-61.5%)** | **538,739 (-65.7%)** | **1,423,495 (-81.9%)** | **1,962,234 (-79.2%)** | **194,076 (-27.3%)** |
 | **Antigravity `neon-medium`** (`medium`) | `cold` | 133 | 155,652 | 355,622 | 517,854 | 2,615,025 | 3,132,879 | 83,262 |
 | **Antigravity `neon-medium`** (`medium`) | **`plexer`** | **34 (-74.4%)** | **37,702 (-75.8%)** | **204,423 (-42.5%)** | **253,631 (-51.0%)** | **449,997 (-82.8%)** | **703,628 (-77.5%)** | **65,242 (-21.6%)** |
 | **Antigravity `carbon-medium`** (`medium`) | `cold` | 168 | 323,826 | 699,692 | 839,204 | 7,869,433 | 8,708,637 | 193,833 |
 | **Antigravity `carbon-medium`** (`medium`) | **`plexer`** | **84 (-50.0%)** | **115,781 (-64.2%)** | **354,140 (-49.4%)** | **408,985 (-51.3%)** | **2,018,418 (-74.4%)** | **2,427,403 (-72.1%)** | **123,702 (-36.2%)** |
-| **Antigravity `argon-medium`** (`medium`) | `cold` | 97 | 253,993 | 534,716 | 649,842 | 3,628,859 | 4,278,701 | 95,735 |
-| **Antigravity `argon-medium`** (`medium`) | **`plexer`** | **41 (-57.7%)** | **72,940 (-71.3%)** | **253,291 (-52.6%)** | **338,310 (-47.9%)** | **813,169 (-77.6%)** | **1,151,479 (-73.1%)** | **64,717 (-32.4%)** |
 | **Antigravity `hydrogen-medium`** (`medium`) | `cold` | 127 | 89,441 | 251,636 | 425,574 | 1,967,710 | 2,393,284 | 72,261 |
 | **Antigravity `hydrogen-medium`** (`medium`) | **`plexer`** | **45 (-64.6%)** | **36,763 (-58.9%)** | **194,209 (-22.8%)** | **261,051 (-38.7%)** | **727,177 (-63.0%)** | **988,228 (-58.7%)** | **51,353 (-28.9%)** |
 | **Claude Opus 5.5** (`medium`) | `cold` | 79 | 63,696 | 225,931 | 182 | 1,287,574 | 1,287,756 | 34,149 |
@@ -134,29 +139,7 @@ Cuts tool output tokens by `-64.2%` (`12W/0T/0L`), final context by `-49.4%`, to
 
 ---
 
-### Tier 3: Antigravity `argon-medium` (`gemini-4-argon-medium --effort medium`)
-
-Cuts tool output tokens by `-71.3%` (`12W/0T/0L`), final context by `-52.6%`, tool calls by `-58.2%` (`11W/1T/0L`), cumulative input by `-73.1%`, and search time by `-44.2%` (`10W/0T/2L`, `96/96` score).
-
-| Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
-| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **T1** Diagnose command target validation & group-role fail-closed behavior | `diagnosis` | `kohls-admin` | 5 (5) | **1 (1)** (-80%) | 6,494 | **471** (-93%) | 39.0s (39.0s) | **15.0s** (16.0s) (-62%) | 8/8 | **8/8** |
-| **T2** Diagnose runaway reactive effect loop detection and disposal | `diagnosis` | `flux` | 4 (4) | **4 (4)** (0%) | 15,649 | **3,763** (-76%) | 28.0s (28.0s) | **27.0s** (48.8s) (-4%) | 8/8 | **8/8** |
-| **T3** Diagnose stateful model test command-redraw shrinking stability | `diagnosis` | `sert` | 6 (4) | **3 (3)** (-50%) | 19,554 | **4,653** (-76%) | 35.0s (35.0s) | 55.0s (80.9s) (+57%) | 8/8 | **8/8** |
-| **T4** Diagnose zero-byte element validation in count-prefixed arrays *(holdout)* | `diagnosis` | `z` | 5 (4) | **0 (0)** (-100%) | 29,982 | **0** (-100%) | 20.0s (53.9s) | **0.0s** (17.0s) (-100%) | 8/8 | **8/8** |
-| **T5** Blast radius of changing working-tree freshness checking | `blast-radius` | `plexer` | 14 (5) | **11 (8)** (-21%) | 30,657 | **19,898** (-35%) | 31.0s (58.9s) | 149.0s (200.5s) (+381%) | 8/8 | **8/8** |
-| **T6** Blast radius of refactoring user permission flag checks | `blast-radius` | `kohls-admin` | 12 (2) | **1 (1)** (-92%) | 16,752 | **2,062** (-88%) | 29.0s (29.0s) | **5.0s** (6.0s) (-83%) | 8/8 | **8/8** |
-| **T7** Blast radius of refactoring manual/engine frame step wiring | `blast-radius` | `flux` | 7 (5) | **2 (1)** (-71%) | 13,870 | **1,433** (-90%) | 61.0s (61.0s) | **10.0s** (32.6s) (-84%) | 8/8 | **8/8** |
-| **T8** Blast radius of refactoring chunked transport invocation *(holdout)* | `blast-radius` | `building-tools` | 11 (5) | **1 (1)** (-91%) | 14,544 | **1,439** (-90%) | 62.0s (62.0s) | **13.0s** (13.0s) (-79%) | 8/8 | **8/8** |
-| **T9** Implement multi-file `--all-matches` mode for `plexer skeleton` | `code-edit` | `plexer` | 17 (9) | **6 (4)** (-65%) | 12,573 | **1,992** (-84%) | 154.0s (161.7s) | **104.0s** (115.7s) (-32%) | 8/8 | **8/8** |
-| **T10** Implement `Store.clear(proxy)` and re-export on `Flux.Store.clear` | `code-edit` | `flux` | 17 (11) | **5 (3)** (-71%) | 27,434 | **7,009** (-74%) | 253.0s (253.0s) | **84.0s** (85.0s) (-67%) | 8/8 | **8/8** |
-| **T11** Add `delay` and `cancel` to simulator `HostHooks`, `server.host`, and `client.host` | `code-edit` | `sert` | 33 (33) | **22 (12)** (-33%) | 49,581 | **24,663** (-50%) | 532.0s (532.0s) | **239.0s** (240.0s) (-55%) | 8/8 | **8/8** |
-| **T12** Implement `History.clear` and `Actions.clearHistory` *(holdout)* | `code-edit` | `building-tools` | 15 (10) | **5 (3)** (-67%) | 16,903 | **5,557** (-67%) | 173.0s (173.0s) | **90.0s** (91.0s) (-48%) | 8/8 | **8/8** |
-| **Total (`T1`–`T12`)** | - | **6 repos** | **146 (97)** | **61 (41) (-58.2%)** | **253,993** | **72,940 (-71.3%)** | **1417.0s (1486.5s)** | **791.0s (946.4s) (-44.2%)** | **96/96** | **96/96** |
-
----
-
-### Tier 4: Antigravity `hydrogen-medium` (`gemini-4-hydrogen-medium --effort medium`)
+### Tier 3: Antigravity `hydrogen-medium` (`gemini-4-hydrogen-medium --effort medium`)
 
 Cuts tool output tokens by `-58.9%` (`10W/0T/2L`), final context by `-22.8%`, tool calls by `-60.4%` (`11W/1T/0L`), cumulative input by `-58.7%`, and search time by `-40.8%` (`9W/0T/3L`, `96/96` score).
 
@@ -178,7 +161,7 @@ Cuts tool output tokens by `-58.9%` (`10W/0T/2L`), final context by `-22.8%`, to
 
 ---
 
-### Tier 5: Claude Opus 5.5 (`claude -p --model claude-opus-5-5 --effort medium`)
+### Tier 4: Claude Opus 5.5 (`claude -p --model claude-opus-5-5 --effort medium`)
 
 Cuts tool output tokens by `-71.3%` (`12W/0T/0L`), tool calls by `-65.4%` (`12W/0T/0L`), and search time by `-62.6%` (`12W/0T/0L`), while raising score from `94/96` to `96/96`.
 
@@ -200,7 +183,7 @@ Cuts tool output tokens by `-71.3%` (`12W/0T/0L`), tool calls by `-65.4%` (`12W/
 
 ---
 
-### Tier 6: Claude Sonnet 5.5 (`claude -p --model claude-sonnet-5-5 --effort medium`)
+### Tier 5: Claude Sonnet 5.5 (`claude -p --model claude-sonnet-5-5 --effort medium`)
 
 Cuts tool output tokens by `-75.6%` (`12W/0T/0L`), tool calls by `-64.5%` (`11W/1T/0L`), and search time by `-46.5%` (`11W/0T/1L`), while raising score from `94/96` to `96/96`.
 
@@ -222,9 +205,77 @@ Cuts tool output tokens by `-75.6%` (`12W/0T/0L`), tool calls by `-64.5%` (`11W/
 
 ---
 
+### Tier 6: Antigravity `orch-neon-xhigh-hydrogen-xhigh` (`gemini-pro-orchestrator-neon`, `Neon XHigh` planner + `Hydrogen XHigh` executor)
+
+Cuts tool output tokens by `-80.7%` (`12W/0T/0L`), final context by `-61.5%`, tool calls by `-61.3%` (`12W/0T/0L`), cumulative input by `-79.2%`, search time by `-33.0%` (`9W/0T/3L`), and total latency by `-30.1%` (`2,462.3s → 1,720.4s`, `96/96` score).
+
+| Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **T1** Diagnose command target validation & group-role fail-closed behavior | `diagnosis` | `kohls-admin` | 12 (5) | **0 (0)** (-100%) | 36,583 | **0** (-100%) | 40.0s (91.3s) | **0.0s** (47.1s) (-100%) | 8/8 | **8/8** |
+| **T2** Diagnose runaway reactive effect loop detection and disposal | `diagnosis` | `flux` | 12 (4) | **5 (3)** (-58%) | 49,674 | **7,381** (-85%) | 24.0s (152.3s) | 35.0s (**139.8s**) (+46%) | 8/8 | **8/8** |
+| **T3** Diagnose stateful model test command-redraw shrinking stability | `diagnosis` | `sert` | 7 (3) | **3 (2)** (-57%) | 25,439 | **3,498** (-86%) | 23.0s (108.9s) | 26.0s (**86.4s**) (+13%) | 8/8 | **8/8** |
+| **T4** Diagnose zero-byte element validation in count-prefixed arrays *(holdout)* | `diagnosis` | `z` | 14 (7) | **0 (0)** (-100%) | 37,360 | **0** (-100%) | 58.0s (117.2s) | **0.0s** (39.2s) (-100%) | 8/8 | **8/8** |
+| **T5** Blast radius of changing working-tree freshness checking | `blast-radius` | `plexer` | 24 (7) | **22 (4)** (-8%) | 47,353 | **25,268** (-47%) | 71.0s (169.9s) | 88.0s (**141.7s**) (+24%) | 8/8 | **8/8** |
+| **T6** Blast radius of refactoring user permission flag checks | `blast-radius` | `kohls-admin` | 27 (9) | **4 (2)** (-85%) | 36,292 | **3,441** (-91%) | 77.0s (156.1s) | **32.0s** (92.9s) (-58%) | 8/8 | **8/8** |
+| **T7** Blast radius of refactoring manual/engine frame step wiring | `blast-radius` | `flux` | 14 (6) | **4 (2)** (-71%) | 31,306 | **3,662** (-88%) | 55.0s (104.4s) | **34.0s** (76.0s) (-38%) | 8/8 | **8/8** |
+| **T8** Blast radius of refactoring chunked transport invocation *(holdout)* | `blast-radius` | `building-tools` | 18 (6) | **5 (3)** (-72%) | 26,775 | **5,894** (-78%) | 66.0s (137.6s) | **44.0s** (121.8s) (-33%) | 8/8 | **8/8** |
+| **T9** Implement multi-file `--all-matches` mode for `plexer skeleton` | `code-edit` | `plexer` | 39 (16) | **21 (10)** (-46%) | 44,094 | **11,635** (-74%) | 352.0s (359.1s) | **254.0s** (259.5s) (-28%) | 8/8 | **8/8** |
+| **T10** Implement `Store.clear(proxy)` and re-export on `Flux.Store.clear` | `code-edit` | `flux` | 41 (23) | **15 (10)** (-63%) | 55,261 | **14,589** (-74%) | 440.0s (445.5s) | **295.0s** (298.7s) (-33%) | 8/8 | **8/8** |
+| **T11** Add `delay` and `cancel` to simulator `HostHooks`, `server.host`, and `client.host` | `code-edit` | `sert` | 50 (21) | **21 (9)** (-58%) | 65,286 | **14,205** (-78%) | 396.0s (402.6s) | **298.0s** (305.8s) (-25%) | 8/8 | **8/8** |
+| **T12** Implement `History.clear` and `Actions.clearHistory` *(holdout)* | `code-edit` | `building-tools` | 42 (17) | **16 (6)** (-62%) | 56,577 | **9,119** (-84%) | 209.0s (217.3s) | **108.0s** (111.6s) (-48%) | 8/8 | **8/8** |
+| **Total (`T1`–`T12`)** | - | **6 repos** | **300 (124)** | **116 (51) (-61.3%)** | **512,000** | **98,692 (-80.7%)** | **1,811.0s (2,462.3s)** | **1,214.0s (1,720.4s) (-33.0%)** | **96/96** | **96/96** |
+
+#### Orchestrator Role Breakdown (`gemini-4-neon-xhigh` Planner vs. `gemini-4-hydrogen-xhigh` Executor)
+
+Aggregated across the multi-role handoff sessions (`T9`–`T12`, `S1`–`S8`, and `L5`–`L8` where `exit_plan_mode` transitioned to the executor):
+
+| Suite (Handoff Tasks) | Arm | Handoffs / Reviews | Planner (`gemini-4-neon-xhigh`) | Executor (`gemini-4-hydrogen-xhigh`) |
+| :--- | :--- | :---: | :---: | :---: |
+| **Engineering `T9`–`T12`** (4 tasks) | `cold` | `4 / 0` | `49t · 107 calls · 3,592k cum · 506k unc` | `32t · 65 calls · 3,375k cum · 485k unc` |
+| **Engineering `T9`–`T12`** (4 tasks) | **`plexer`** | `4 / 0` | **`22t · 43 calls · 640k cum (-82.2%) · 160k unc`** | **`17t · 30 calls · 750k cum (-77.8%) · 203k unc`** |
+| **SWE-bench Pro `S1`–`S8`** (8 tasks) | `cold` | `8 / 0` | `136t · 385 calls · 11,581k cum · 1,137k unc` | `46t · 106 calls · 5,799k cum · 1,100k unc` |
+| **SWE-bench Pro `S1`–`S8`** (8 tasks) | **`plexer`** | `8 / 4` | **`57t · 176 calls · 2,540k cum (-78.1%) · 543k unc`** | **`35t · 75 calls · 2,097k cum (-63.8%) · 532k unc`** |
+| **Large OSS `L5`–`L8`** (4 tasks) | `cold` | `4 / 0` | `34t · 69 calls · 1,095k cum · 207k unc` | `12t · 20 calls · 533k cum · 194k unc` |
+| **Large OSS `L5`–`L8`** (4 tasks) | **`plexer`** | `4 / 0` | **`14t · 35 calls · 329k cum (-70.0%) · 109k unc`** | **`15t · 24 calls · 486k cum (-8.8%) · 152k unc`** |
+
+---
+
+### Tier 7: Antigravity `orch-neon-high-hydrogen-high` (`gemini-pro-orchestrator-neon`, `Neon High` planner + `Hydrogen High` executor)
+
+Cuts tool output tokens by `-62.3%` (`12W/0T/0L`), final context by `-40.1%`, tool calls by `-46.3%` (`11W/0T/1L`), cumulative input by `-59.7%`, search time by `-41.3%` (`11W/0T/1L`), and total latency by `-33.9%` (`1,882.3s → 1,243.4s`, `96/96` score) with zero `[plan review]` bounces across all 3 suites.
+
+| Task | Category | Repo | `cold` Calls (Turns) | `plexer` Calls (Turns) | `cold` Tool Tok | `plexer` Tool Tok | `cold` Search (Total) | `plexer` Search (Total) | `cold` Score | `plexer` Score |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **T1** Diagnose command target validation & group-role fail-closed behavior | `diagnosis` | `kohls-admin` | 7 (4) | **1 (1)** (-86%) | 13,226 | **739** (-94%) | 29.0s (57.5s) | **15.0s** (**31.7s**) (-48%) | 8/8 | **8/8** |
+| **T2** Diagnose runaway reactive effect loop detection and disposal | `diagnosis` | `flux` | 11 (4) | **4 (4)** (-64%) | 15,976 | **4,941** (-69%) | 39.0s (101.6s) | **35.0s** (**90.8s**) (-10%) | 8/8 | **8/8** |
+| **T3** Diagnose stateful model test command-redraw shrinking stability | `diagnosis` | `sert` | 5 (3) | **1 (1)** (-80%) | 16,773 | **7,670** (-54%) | 45.0s (78.0s) | **7.0s** (**41.8s**) (-84%) | 8/8 | **8/8** |
+| **T4** Diagnose zero-byte element validation in count-prefixed arrays *(holdout)* | `diagnosis` | `z` | 7 (4) | **4 (3)** (-43%) | 29,607 | **4,383** (-85%) | 35.0s (83.2s) | **29.0s** (**82.9s**) (-17%) | 8/8 | **8/8** |
+| **T5** Blast radius of changing working-tree freshness checking | `blast-radius` | `plexer` | 17 (6) | 19 (4) (+12%) | 35,384 | **30,593** (-14%) | 47.0s (116.9s) | 50.0s (**108.8s**) (+6%) | 8/8 | **8/8** |
+| **T6** Blast radius of refactoring user permission flag checks | `blast-radius` | `kohls-admin` | 28 (6) | **2 (2)** (-93%) | 25,262 | **2,482** (-90%) | 61.0s (118.8s) | **28.0s** (**75.2s**) (-54%) | 8/8 | **8/8** |
+| **T7** Blast radius of refactoring manual/engine frame step wiring | `blast-radius` | `flux` | 10 (5) | **2 (1)** (-80%) | 21,209 | **1,217** (-94%) | 29.0s (68.5s) | **13.0s** (**48.3s**) (-55%) | 8/8 | **8/8** |
+| **T8** Blast radius of refactoring chunked transport invocation *(holdout)* | `blast-radius` | `building-tools` | 14 (5) | **9 (3)** (-36%) | 18,966 | **11,516** (-39%) | 65.0s (110.9s) | **48.0s** (**102.7s**) (-26%) | 8/8 | **8/8** |
+| **T9** Implement multi-file `--all-matches` mode for `plexer skeleton` | `code-edit` | `plexer` | 30 (13) | **27 (11)** (-10%) | 36,514 | **17,210** (-53%) | 209.0s (215.2s) | **190.0s** (**195.5s**) (-9%) | 8/8 | **8/8** |
+| **T10** Implement `Store.clear(proxy)` and re-export on `Flux.Store.clear` | `code-edit` | `flux` | 36 (21) | **15 (8)** (-58%) | 31,218 | **18,722** (-40%) | 480.0s (483.7s) | **169.0s** (**172.8s**) (-65%) | 8/8 | **8/8** |
+| **T11** Add `delay` and `cancel` to simulator `HostHooks`, `server.host`, and `client.host` | `code-edit` | `sert` | 41 (16) | **25 (11)** (-39%) | 47,460 | **12,786** (-73%) | 265.0s (270.9s) | **203.0s** (**208.4s**) (-23%) | 8/8 | **8/8** |
+| **T12** Implement `History.clear` and `Actions.clearHistory` *(holdout)* | `code-edit` | `building-tools` | 38 (14) | **22 (8)** (-42%) | 31,067 | **9,309** (-70%) | 172.0s (177.1s) | **79.0s** (**84.4s**) (-54%) | 8/8 | **8/8** |
+| **Total (`T1`–`T12`)** | - | **6 repos** | **244 (101)** | **131 (57) (-46.3%)** | **322,662** | **121,568 (-62.3%)** | **1,476.0s (1,882.3s)** | **866.0s (1,243.4s) (-41.3%)** | **96/96** | **96/96** |
+
+#### Orchestrator Role Breakdown (`gemini-4-neon-high` Planner vs. `gemini-4-hydrogen-high` Executor)
+
+| Suite (Handoff Tasks) | Arm | Handoffs / Reviews | Planner (`gemini-4-neon-high`) | Executor (`gemini-4-hydrogen-high`) |
+| :--- | :--- | :---: | :---: | :---: |
+| **Engineering `T9`–`T12`** (4 tasks) | `cold` | `4 / 0` | `34t · 76 calls · 1,666k cum · 281k unc` | `34t · 69 calls · 2,549k cum · 360k unc` |
+| **Engineering `T9`–`T12`** (4 tasks) | **`plexer`** | `4 / 0` | **`17t · 27 calls · 501k cum (-70.0%) · 119k unc`** | **`25t · 62 calls · 1,191k cum (-53.3%) · 232k unc`** |
+| **SWE-bench Pro `S1`–`S8`** (8 tasks) | `cold` | `8 / 0` | `123t · 269 calls · 7,128k cum · 925k unc` | `40t · 97 calls · 3,374k cum · 796k unc` |
+| **SWE-bench Pro `S1`–`S8`** (8 tasks) | **`plexer`** | `8 / 0` | **`55t · 129 calls · 2,261k cum (-68.3%) · 418k unc`** | **`47t · 112 calls · 3,023k cum (-10.4%) · 667k unc`** |
+| **Large OSS `L5`–`L8`** (4 tasks) | `cold` | `4 / 0` | `22t · 45 calls · 530k cum · 103k unc` | `16t · 26 calls · 510k cum · 157k unc` |
+| **Large OSS `L5`–`L8`** (4 tasks) | **`plexer`** | `4 / 0` | **`12t · 25 calls · 269k cum (-49.3%) · 70k unc`** | **`13t · 26 calls · 381k cum (-25.3%) · 166k unc`** |
+
+---
+
 ## 2. External Multi-Language Benchmark: `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`)
 
-[`bench/run-swebench-ab.js`](run-swebench-ab.js) evaluates an 8-task stratified subset (`S1`–`S8`, 2 tasks per language across Python, Go, JavaScript, and TypeScript) from **`ScaleAI/SWE-bench_Pro` V2** across all 6 model configurations:
+[`bench/run-swebench-ab.js`](run-swebench-ab.js) evaluates an 8-task stratified subset (`S1`–`S8`, 2 tasks per language across Python, Go, JavaScript, and TypeScript) from **`ScaleAI/SWE-bench_Pro` V2** across all 7 model configurations:
 
 - **`S1` & `S2` (Python, `qutebrowser/qutebrowser`):** WebKit `NetworkReply` Qt 5.15 `errorOccurred` signal migration (`S1`) and multi-file `KeyMode` / `EventFilter` handling (`S2`).
 - **`S3` & `S4` (Go, `flipt-io/flipt`):** Authentication cleanup service gating (`ShouldRunCleanup`) across `internal/cleanup`, `internal/cmd`, and `internal/config` (`S3`), and evaluation rollout caching (`GetEvaluationRollouts`) across `internal/storage/cache` and `internal/storage` (`S4`).
@@ -232,119 +283,63 @@ Cuts tool output tokens by `-75.6%` (`12W/0T/0L`), tool calls by `-64.5%` (`11W/
 - **`S7` & `S8` (TypeScript, `tutao/tutanota`):** Desktop download manager error handling across `src/desktop/DesktopDownloadManager.ts` and `DesktopNetworkClient.ts` (`S7`), and device credential encryption facade updates across `src/api/worker/facades` and `src/misc/credentials` (`S8`).
 
 ```bash
-node bench/run-swebench-ab.js neon-medium 4 all all
-node bench/run-swebench-ab.js carbon-medium 4 all all
-node bench/run-swebench-ab.js argon-medium 4 all all
-node bench/run-swebench-ab.js hydrogen-medium 4 all all
-node bench/run-swebench-ab.js opus 4 all all
-node bench/run-swebench-ab.js sonnet 4 all all
+node bench/run-swebench-ab.js orch-neon-high-hydrogen-high 4 both all
+node bench/run-swebench-ab.js orch-neon-xhigh-hydrogen-xhigh 4 both all
+node bench/run-swebench-ab.js neon-medium 4 both all
+node bench/run-swebench-ab.js carbon-medium 4 both all
+node bench/run-swebench-ab.js hydrogen-medium 4 both all
+node bench/run-swebench-ab.js opus 4 both all
+node bench/run-swebench-ab.js sonnet 4 both all
 ```
 
-### `SWE-bench Pro V2` Summary Across All 6 Models (`S1`–`S8`, 48 Pairs)
+### `SWE-bench Pro V2` Summary Across All 7 Models (`S1`–`S8`, 56 Pairs)
 
 | Model & Effort (8 Tasks Each) | Patch Score (`cold` → `plexer`) | Tool Calls (`cold` → `plexer`) | Tool Output Tokens (`cold` → `plexer`) | Final Context Tokens (`cold` → `plexer`) | Cumulative Input Tokens (`cold` → `plexer`) | Model Output Tokens (`cold` → `plexer`) | Search Wall Time (`cold` → `plexer`) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Antigravity `orch-neon+h2-h`** (`Neon+H2 High`) | **63/64 → 63/64** (`100%` file recall) | 366 → **241 (-34.2%)** (**`8W/0T/0L`**) | 312,484 → **204,373 (-34.6%)** (`6W/0T/2L`) | 669.7k → **528.7k (-21.1%)** | 10.50M → **5.28M (-49.7%)** | 263,039 → **181,903 (-30.8%)** | 2,956.0s → **1,874.0s (-36.6%)** (**`8W/0T/0L`**) |
+| **Antigravity `orch-neon+h2-xh`** (`Neon+H2 XHigh`) | 64/64 → **63/64** (`100%` file recall) | 491 → **251 (-48.9%)** (**`8W/0T/0L`**) | 528,081 → **196,623 (-62.8%)** (**`8W/0T/0L`**) | 1,079.9k → **542.4k (-49.8%)** | 17.38M → **4.64M (-73.3%)** | 455,081 → **315,790 (-30.6%)** | 3,824.0s → **2,692.0s (-29.6%)** (**`8W/0T/0L`**) |
 | **Antigravity `neon-medium`** (`--effort medium`) | 62/64 → **63/64 (+1.6%)** (`100%` file recall) | 228 → **114 (-50.0%)** (**`8W/0T/0L`**) | 136,801 → **63,245 (-53.8%)** (**`8W/0T/0L`**) | 377.6k → **250.2k (-33.8%)** | 4.56M → **1.53M (-66.5%)** | 128,272 → **82,268 (-35.9%)** | 1,370.0s → **853.0s (-37.7%)** (**`8W/0T/0L`**) |
 | **Antigravity `carbon-medium`** (`--effort medium`) | **64/64 → 64/64** (`100%` file recall) | 457 → **212 (-53.6%)** (**`8W/0T/0L`**) | 380,361 → **176,378 (-53.6%)** (**`8W/0T/0L`**) | 965.9k → **594.5k (-38.4%)** | 20.07M → **6.97M (-65.3%)** | 339,673 → **253,767 (-25.3%)** | 5,681.0s → **3,569.0s (-37.2%)** (**`8W/0T/0L`**) |
-| **Antigravity `argon-medium`** (`--effort medium`) | **64/64 → 64/64** (`100%` file recall) | 273 → **141 (-48.4%)** (**`8W/0T/0L`**) | 295,513 → **116,273 (-60.7%)** (**`8W/0T/0L`**) | 704.6k → **326.9k (-53.6%)** | 11.32M → **3.24M (-71.3%)** | 207,280 → **79,917 (-61.4%)** | 3,013.0s → **2,065.0s (-31.5%)** (`7W/0T/1L`) |
 | **Antigravity `hydrogen-medium`** (`--effort medium`) | 62/64 → **63/64 (+1.6%)** (`100%` file recall) | 193 → **117 (-39.4%)** (**`8W/0T/0L`**) | 89,571 → **59,233 (-33.9%)** (**`8W/0T/0L`**) | 282.7k → **233.7k (-17.3%)** | 2.87M → **1.70M (-40.9%)** | 98,806 → **64,947 (-34.3%)** | 652.0s → **562.0s (-13.8%)** (`6W/0T/2L`) |
 | **Claude Opus 5.5** (`--effort medium`) | 62/64 → **63/64 (+1.6%)** (`100%` file recall) | 39 → 49 (+25.6%) (`2W/3T/3L`) | 24,253 → **18,896 (-22.1%)** (`7W/0T/1L`) | 132.9k → 152.0k (+14.3%) | 645.6k → 913.3k (+41.5%) | 23,373 → 25,841 (+10.6%) | 193.1s → 193.7s (+0.3%) (`4W/0T/4L`) |
 | **Claude Sonnet 5.5** (`--effort medium`) | 60/64 → **62/64 (+3.3%)** (`100%` file recall) | 65 → **26 (-60.0%)** (**`8W/0T/0L`**) | 19,344 → **9,877 (-48.9%)** (**`8W/0T/0L`**) | 125.2k → **123.5k (-1.4%)** | 637.0k → **410.4k (-35.6%)** | 21,386 → **13,109 (-38.7%)** | 120.1s → **54.7s (-54.5%)** (**`8W/0T/0L`**) |
-| **6-Model Total (`48` Task-Model Pairs)** | 374/384 → **379/384** (`100%` file recall) | 1,255 → **659 (-47.5%)** (`42W/3T/3L`) | 945,843 → **443,902 (-53.1%)** (`47W/0T/1L`) | 2,589.0k → **1,680.7k (-35.1%)** | 40.10M → **14.77M (-63.2%)** | 818,790 → **519,849 (-36.5%)** | 11,029.2s → **7,297.4s (-33.8%)** (`41W/0T/7L`) |
+| **7-Model Total (`56` Task-Model Pairs)** | 437/448 → **441/448** (`100%` file recall) | 1,839 → **1,010 (-45.1%)** (`50W/3T/3L`) | 1,490,895 → **728,625 (-51.1%)** (`53W/0T/3L`) | 3,633.9k → **2,424.9k (-33.3%)** | 56.67M → **21.44M (-62.2%)** | 1,329,630 → **937,625 (-29.5%)** | 14,796.2s → **9,798.4s (-33.8%)** (`50W/0T/6L`) |
 
 ---
 
-## 3. Large-Repo Suite (`L1`–`L8`) & Trail-Code (`@trailhq/trail-code@0.29.0`) Comparison
+## 3. Large-Repo & Discriminative Suite (`L1`–`L8`)
 
-### Live 3-Arm Evaluation (`cold` vs. `trail` vs. `plexer`) Across 130 Tasks/Arm
-
-[`bench/run-agy-ab.js`](run-agy-ab.js), [`bench/run-swebench-ab.js`](run-swebench-ab.js), and [`bench/run-large-ab.js`](run-large-ab.js) run a 3rd live arm (`trail` via [`bench/trail-live-helper.js`](trail-live-helper.js)). Trail uses its native `trail init` architecture (`SessionStart` `formatOrientation`, `UserPromptSubmit` `handlePrompt` `-n 3` pointers/snippets, `PostToolUse` `formatBlastRadius`, and unblocked `mcp__trail__*` and `trail` CLI). All six models (`Opus 5.5`, `Sonnet 5.5`, `Gemini 4 Neon`, `Gemini 4 Carbon`, `Gemini 4 Argon`, and `Gemini 4 Hydrogen`) ran on `T4, T5, T9`, `ScaleAI/SWE-bench_Pro` V2 (`S1`–`S8`), and the Large-Repo & Discriminative Suite (`L1`–`L8`):
-
-| Suite (`node bench/trail-table.js --suite 3arm`) | Tasks | Cold Raw Unc | Trail Raw Unc | `plexer` Raw Unc | Cold Post-T1 Unc | Trail Post-T1 Unc | `plexer` Post-T1 Unc | Cold Cumul | Trail Cumul | `plexer` Cumul | Cold Calls | Trail Calls | `plexer` Calls | Cold Score | Trail Score | `plexer` Score |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Claude Code Opus (`S1`–`S8`)** | 8 | 16.6k | 19.4k | 19.0k | 7.7k | 7.3k | **7.0k** | 81k | 118k | 114k | 4.9 | 6.1 | 6.1 | 62/64 | 62/64 | **63/64** |
-| **Claude Code Sonnet (`S1`–`S8`)** | 8 | 15.7k | 17.0k | **15.4k** | 6.8k | 5.0k | **3.6k** | 80k | 62k | **51k** | 8.1 | 3.8 | **3.3** | 60/64 | 62/64 | **62/64** |
-| **AGY Opus (`T4, T5, T9`)** | 3 | 43.5k | 32.7k | **18.1k** | 33.7k | 16.5k | **6.9k** | 372k | 137k | **66k** | 14.3 | 7.3 | **4.7** | 24/24 | 24/24 | **24/24** |
-| **AGY Sonnet (`T4, T5, T9`)** | 3 | 28.4k | 27.6k | **14.6k** | 18.6k | 12.7k | **3.8k** | 157k | 83k | **27k** | 8.7 | 4.0 | **2.3** | 24/24 | 24/24 | **24/24** |
-| **AGY Neon (`T4, T5, T9`)** | 3 | 49.2k | 36.6k | **21.1k** | 44.2k | 24.7k | **12.1k** | 312k | 133k | **73k** | 16.3 | 15.0 | **5.7** | 24/24 | 24/24 | **24/24** |
-| **AGY Carbon (`T4, T5, T9`)** | 3 | 66.4k | 64.4k | **42.0k** | 61.3k | 58.2k | **32.9k** | 567k | 476k | **291k** | 25.3 | 22.3 | **13.0** | 24/24 | 24/24 | **24/24** |
-| **AGY Argon (`T4, T5, T9`)** | 3 | 49.8k | 44.2k | **23.0k** | 39.2k | 33.0k | **14.5k** | 184k | 255k | **104k** | 12.0 | 14.3 | **5.7** | 24/24 | 24/24 | **24/24** |
-| **AGY Hydrogen (`T4, T5, T9`)** | 3 | 37.2k | 28.4k | 28.5k | 31.4k | 21.5k | **19.6k** | 189k | 137k | 177k | 15.3 | 15.0 | **7.7** | 24/24 | 24/24 | **24/24** |
-| **AGY Opus (`S1`–`S8`)** | 8 | 37.7k | 33.3k | **25.0k** | 28.7k | 18.2k | **15.1k** | 269k | 152k | **147k** | 13.3 | **6.9** | 11.0 | 60/64 | 61/64 | **62/64** |
-| **AGY Sonnet (`S1`–`S8`)** | 8 | 26.5k | 27.9k | **18.5k** | 17.5k | 12.8k | **8.6k** | 138k | 97k | **66k** | 10.3 | **4.9** | 7.5 | 60/64 | 63/64 | **62/64** |
-| **AGY Neon (`S1`–`S8`)** | 8 | 65.8k | 54.4k | **37.1k** | 60.1k | 47.5k | **27.9k** | 570k | 402k | **191k** | 28.5 | 27.1 | **14.3** | 62/64 | 63/64 | **63/64** |
-| **AGY Carbon (`S1`–`S8`)** | 8 | 215.4k | 180.4k | **83.9k** | 191.4k | 173.5k | **74.7k** | 2,509k | 2,563k | **872k** | 57.1 | 57.3 | **26.5** | 64/64 | 64/64 | **64/64** |
-| **AGY Argon (`S1`–`S8`)** | 8 | 117.9k | 102.5k | **48.0k** | 99.2k | 91.0k | **38.8k** | 1,414k | 1,401k | **406k** | 34.1 | 33.8 | **17.6** | 64/64 | 63/64 | **64/64** |
-| **AGY Hydrogen (`S1`–`S8`)** | 8 | 53.2k | 55.4k | **37.1k** | 46.7k | 47.9k | **27.3k** | 359k | 414k | **212k** | 24.1 | 27.6 | **14.6** | 62/64 | 62/64 | **63/64** |
-| **Claude Code Opus (`L1`–`L8`)** | 8 | 13.3k | 16.1k | 15.3k | 4.9k | 4.7k | **3.3k** | 45k | 54k | 55k | 3.1 | **2.9** | 3.9 | 64/64 | 64/64 | **64/64** |
-| **Claude Code Sonnet (`L1`–`L8`)** | 8 | 13.2k | 17.2k | 15.0k | 4.9k | 5.9k | **3.2k** | 39k | 49k | 41k | 5.1 | 3.8 | **3.5** | 60/64 | 62/64 | **64/64** |
-| **AGY Neon (`L1`–`L8`)** | 8 | 23.9k | 20.2k | **14.3k** | 18.7k | 13.9k | **5.2k** | 83k | 64k | **29k** | 10.5 | 8.9 | **3.3** | 64/64 | 64/64 | **64/64** |
-| **AGY Carbon (`L1`–`L8`)** | 8 | 54.2k | 52.9k | **27.3k** | 49.0k | 45.6k | **18.5k** | 244k | 217k | **103k** | 14.3 | 12.8 | **6.9** | 64/64 | 64/64 | **64/64** |
-| **AGY Argon (`L1`–`L8`)** | 8 | 28.3k | 20.1k | **14.4k** | 21.4k | 13.8k | **6.3k** | 127k | 66k | **32k** | 9.1 | 7.5 | **3.8** | 64/64 | 64/64 | **64/64** |
-| **AGY Hydrogen (`L1`–`L8`)** | 8 | 20.7k | 19.2k | **17.0k** | 14.8k | 12.1k | **6.7k** | 63k | 57k | **39k** | 9.1 | 8.8 | **3.9** | 64/64 | 64/64 | **64/64** |
-| **TOTAL (`130 tasks/arm`)** | **130** | **6,440k** | **5,789k (-10.1%)** | **3,540k (-45.0%)** | **5,261k** | **4,493k (-14.6%)** | **2,240k (-57.4%)** | **53,514k** | **49,395k (-7.7%)** | **21,082k (-60.6%)** | **2,129** | **1,929 (-9.4%)** | **1,125 (-47.2%)** | **1,018/1,040 (97.9%)** | **1,026/1,040 (98.7%)** | **1,031/1,040 (99.1%)** |
-
-On the Large-Repo & Discriminative Suite (`L1`–`L8`, 48 3-arm sessions across all 6 models), `plexer` resolves **`48/48` (`100.0%`)** strict multi-file tasks (`8/8` on Neon, Carbon, Argon, Hydrogen, Opus, and Sonnet), compared to `47/48` for `trail` and `46/48` for `cold`. It also cuts tool output tokens by **`-65.0%` vs. `cold` (`311.0k → 108.8k`)** and **`-60.1%` vs. `trail` (`272.7k → 108.8k`)**.
-
-#### Repo-Size Scaling Breakdown (`Cold` vs. `Trail` vs. `plexer`)
-
-| Repo Size Bucket | Tasks/Arm | Cold Post-T1 Unc | Trail Post-T1 Unc | `plexer` Post-T1 Unc | Cold Cumul | Trail Cumul | `plexer` Cumul | Cold Calls | Trail Calls | `plexer` Calls | Cold Resolved | Trail Resolved | `plexer` Resolved |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Small (`<250 files`)** | 18 | 38.1k | 27.7k (-27.1%) | **15.0k (-60.7%)** | 297k | 204k (-31.4%) | **123k (-58.6%)** | 15.3 | 13.0 | **6.5** | 18/18 (100%) | 18/18 (100%) | **18/18 (100%)** |
-| **Medium (`350–750 files`)** | 62 | 35.4k | 31.9k (-9.9%) | **14.9k (-57.9%)** | 367k | 364k (-1.0%) | **126k (-65.7%)** | 14.9 | 13.8 | **7.6** | 58/62 (94%) | 61/62 (98%) | **62/62 (100%)** |
-| **Large (`700–1350+ files`)** | 50 | 47.6k | 40.3k (-15.3%) | **20.9k (-56.0%)** | 508k | 464k (-8.7%) | **221k (-56.5%)** | 18.6 | 16.8 | **10.7** | 36/50 (72%) | 41/50 (82%) | **43/50 (86%)** |
-
-### Trail-Comparable Metric Table (`node bench/trail-table.js`)
-
-Trail-Code (`@trailhq/trail-code`) reports per-task means on read-only Q&A prompts (`--max-turns 10`). It tracks **uncached input tokens** (`input_tokens + cache_creation_input_tokens`) and **cache-aware cost** (`1·input + 1.25·cache_write + 0.1·cache_read + 5·output`). Across Claude Code sessions, $\text{UncachedInputTokens} = \text{FinalContextTokens} - \text{Turn1CacheRead} + 2T$. [`bench/trail-table.js`](trail-table.js) separates raw uncached input from **warm-cache uncached input** (normalizing out cold-start worktree system prompt and `SKILL.md` cache-miss noise) and **post-Turn-1 exploration uncached tokens** (new tokens cached after Turn 1 via file reads and greps). It also reports cumulative input tokens, cache-aware cost, and direct 3-arm (`cold` vs. `trail` vs. `plexer`) comparisons:
+[`bench/run-large-ab.js`](run-large-ab.js) evaluates 8 multi-file tasks (`L1`–`L8`) across `pocketbase/pocketbase`, `tutao/tutanota`, `qutebrowser/qutebrowser`, `flipt-io/flipt`, and `NodeBB/NodeBB` (440 to 1,350+ files). Tasks `L1`–`L4` trace cross-subsystem blast radius, and `L5`–`L8` apply coordinated 2–4 file edits under strict binary resolution (`100%` gold sibling files plus contract checks).
 
 ```bash
-node bench/trail-table.js --suite qa
-node bench/trail-table.js --suite all
-node bench/trail-table.js --suite swe
-node bench/trail-table.js --suite large
-node bench/trail-table.js --suite 3arm
+node bench/run-large-ab.js orch-neon-high-hydrogen-high 4 both all
+node bench/run-large-ab.js orch-neon-xhigh-hydrogen-xhigh 4 both all
+node bench/run-large-ab.js neon-medium 4 both all
+node bench/run-large-ab.js carbon-medium 4 both all
+node bench/run-large-ab.js hydrogen-medium 4 both all
+node bench/run-large-ab.js opus 4 both all
+node bench/run-large-ab.js sonnet 4 both all
 ```
 
-| Model & Suite (Per-Task Mean) | Tool Calls (`cold` → `plexer`) | Uncached Input (`cold` → `plexer`) | Warm-Cache Uncached (`cold` → `plexer`) | Post-Turn-1 Uncached (`cold` → `plexer`) | Cumulative Input (`cold` → `plexer`) | Cache-Aware Cost (`cold` → `plexer`) | Search Time (`cold` → `plexer`) |
+### Large-Repo Summary Across All 7 Models (`L1`–`L8`, 56 Pairs)
+
+| Model & Effort (8 Tasks Each) | Strict Resolved (`cold` → `plexer`) | Score (`cold` → `plexer`) | Tool Calls (`cold` → `plexer`) | Tool Output Tokens (`cold` → `plexer`) | Final Context Tokens (`cold` → `plexer`) | Cumulative Input Tokens (`cold` → `plexer`) | Search Wall Time (`cold` → `plexer`) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Opus 5.5: Q&A (`T1`–`T8`)** | 5.8 → **1.4 (-76%)** | 12,608 → **8,412 (-33%)** | 11,331 → **6,665 (-41%)** | 10,031 → **2,193 (-78%)** | 86,533 → **31,790 (-63%)** | 35,377 → **21,579 (-39%)** | 13.4s → **2.9s (-78%)** |
-| **Sonnet 5.5: Q&A (`T1`–`T8`)** | 4.8 → **1.3 (-74%)** | 9,655 → **6,306 (-35%)** | 8,377 → **5,364 (-36%)** | 7,235 → **1,263 (-83%)** | 46,218 → **23,320 (-50%)** | 24,615 → **15,653 (-36%)** | 4.6s → **1.3s (-73%)** |
-| **Neon Medium: Q&A (`T1`–`T8`)** | 11.6 → **3.3 (-72%)** | 33,479 → **18,426 (-45%)** | 17,312 → **7,728 (-55%)** | 28,454 → **7,511 (-74%)** | 154,258 → **34,639 (-78%)** | 68,743 → **40,556 (-41%)** | 43.3s → **15.5s (-64%)** |
-| **Carbon Medium: Q&A (`T1`–`T8`)** | 15.3 → **5.5 (-64%)** | 47,653 → **24,073 (-49%)** | 35,039 → **16,185 (-54%)** | 42,615 → **15,563 (-63%)** | 272,494 → **95,392 (-65%)** | 119,524 → **69,236 (-42%)** | 84.5s → **54.3s (-36%)** |
-| **Opus 5.5: All (`T1`–`T12`)** | 6.8 → **2.3 (-65%)** | 13,111 → **8,940 (-32%)** | 12,260 → **7,588 (-38%)** | 10,899 → **3,530 (-68%)** | 107,313 → **47,521 (-56%)** | 40,034 → **24,961 (-38%)** | 20.7s → **7.8s (-63%)** |
-| **Sonnet 5.5: All (`T1`–`T12`)** | 6.3 → **2.3 (-64%)** | 9,950 → **7,339 (-26%)** | 8,956 → **6,362 (-29%)** | 7,750 → **2,267 (-71%)** | 54,530 → **34,113 (-37%)** | 26,953 → **18,901 (-30%)** | 8.1s → **4.3s (-47%)** |
-| **Neon Medium: All (`T1`–`T12`)** | 15.1 → **5.0 (-67%)** | 43,155 → **21,136 (-51%)** | 23,059 → **10,443 (-55%)** | 38,088 → **10,721 (-72%)** | 261,073 → **58,636 (-78%)** | 99,639 → **52,070 (-48%)** | 80.8s → **35.3s (-56%)** |
-| **Carbon Medium: All (`T1`–`T12`)** | 24.3 → **10.1 (-59%)** | 69,934 → **34,082 (-51%)** | 51,738 → **22,928 (-56%)** | 64,859 → **25,356 (-61%)** | 725,720 → **202,284 (-72%)** | 216,276 → **102,445 (-53%)** | 216.8s → **121.4s (-44%)** |
-| **Opus 5.5: SWE-bench (`S1`–`S8`)** | 4.9 → 6.1 (`0%` vs `trail`) | 11,751 → 13,982 (+6% vs `trail`) | 10,048 → 11,806 (**`-4%` vs `trail`**) | 7,740 → **7,033 (-9%, `-3%` vs `trail`)** | 80,703 → 114,168 (**`-3%` vs `trail`**) | 36,189 → 43,643 (+3% vs `trail`) | 24.1s → 24.2s (+2% vs `trail`) |
-| **Sonnet 5.5: SWE-bench (`S1`–`S8`)** | 8.1 → **3.3 (-60%, `-13%` vs `trail`)** | 10,653 → **10,282 (-3%, `-4%` vs `trail`)** | 8,948 → **8,104 (-9%, `-17%` vs `trail`)** | 6,795 → **3,562 (-48%, `-29%` vs `trail`)** | 79,626 → **51,295 (-36%, `-18%` vs `trail`)** | 33,577 → **25,145 (-25%, `-7%` vs `trail`)** | 15.0s → **6.8s (-54%, `-42%` vs `trail`)** |
-| **Neon Medium: SWE-bench (`S1`–`S8`)** | 28.5 → **14.3 (-50%, `-47%` vs `trail`)** | 65,781 → **37,051 (-44%, `-32%` vs `trail`)** | 40,636 → **24,685 (-39%, `-28%` vs `trail`)** | 60,082 → **27,897 (-54%, `-41%` vs `trail`)** | 570,356 → **190,911 (-67%, `-53%` vs `trail`)** | 196,409 → **103,855 (-47%, `-35%` vs `trail`)** | 171.3s → **106.6s (-38%, `-37%` vs `trail`)** |
-| **Carbon Medium: SWE-bench (`S1`–`S8`)** | 57.1 → **26.5 (-54%, `-54%` vs `trail`)** | 215,371 → **83,887 (-61%, `-53%` vs `trail`)** | 114,209 → **67,749 (-41%, `-40%` vs `trail`)** | 191,431 → **74,737 (-61%, `-57%` vs `trail`)** | 2,509,098 → **871,750 (-65%, `-66%` vs `trail`)** | 657,039 → **321,277 (-51%, `-48%` vs `trail`)** | 710.1s → **446.1s (-37%, `-34%` vs `trail`)** |
-| **Opus 5.5: Large (`L1`–`L8`)** | 3.1 → 3.9 | 8,236 → 10,292 (**`-29%` vs `trail`**) | 6,687 → 8,116 (**`-10%` vs `trail`**) | 4,861 → **3,345 (-31%, `-29%` vs `trail`)** | 45,052 → 55,231 (+3% vs `trail`) | 23,484 → 27,347 (**`-14%` vs `trail`**) | 7.3s → 8.7s |
-| **Sonnet 5.5: Large (`L1`–`L8`)** | 5.1 → **3.5 (-32%, `-7%` vs `trail`)** | 8,010 → 9,887 (**`-37%` vs `trail`**) | 6,459 → 7,709 (**`-23%` vs `trail`**) | 4,893 → **3,203 (-35%, `-46%` vs `trail`)** | 39,286 → 41,097 (**`-16%` vs `trail`**) | 22,081 → 23,087 (**`-26%` vs `trail`**) | 5.1s → **4.2s (-17%, `-38%` vs `trail`)** |
-| **Neon Medium: Large (`L1`–`L8`)** | 10.5 → **3.3 (-69%, `-63%` vs `trail`)** | 23,890 → **14,254 (-40%, `-29%` vs `trail`)** | 9,915 → **6,378 (-36%, `-32%` vs `trail`)** | 18,727 → **5,246 (-72%, `-62%` vs `trail`)** | 83,312 → **29,471 (-65%, `-54%` vs `trail`)** | 48,183 → **31,076 (-36%, `-24%` vs `trail`)** | 40.3s → **16.1s (-60%, `-61%` vs `trail`)** |
-| **Carbon Medium: Large (`L1`–`L8`)** | 14.3 → **6.9 (-52%, `-46%` vs `trail`)** | 54,202 → **27,312 (-50%, `-48%` vs `trail`)** | 23,117 → **14,323 (-38%, `-40%` vs `trail`)** | 49,015 → **18,541 (-62%, `-59%` vs `trail`)** | 244,041 → **102,959 (-58%, `-53%` vs `trail`)** | 110,492 → **67,535 (-39%, `-35%` vs `trail`)** | 104.8s → **75.3s (-28%, `-29%` vs `trail`)** |
-
-### Offline Head-to-Head vs. `@trailhq/trail-code@0.29.0` (`node bench/graft-arm.js`)
-
-[`bench/graft-arm.js`](graft-arm.js) compares `plexer`'s `UserPromptSubmit` hook against `@trailhq/trail-code@0.29.0` across all 19 shared Rust, JS, TS, Python, and Go tasks (`T4`, `T5`, `T9`, `S1`–`S8`, `L1`–`L8`) after stripping harness boilerplate so both tools receive clean task queries. It tests both `graft-hook` (`trail ask <prompt> --json -n 3`, pointers only) and `graft-push` (`trail ask <prompt> --source -n 5`, Trail-Code's benchmark push bundle):
-
-```bash
-node bench/graft-arm.js
-```
-
-| Arm (`T4, T5, T9, S1–S8, L1–L8` Mean, 19 Tasks) | Turn-0 Tokens | Gold File Recall | `NeedCov` (Inlined Lines) | `LocCov` (Located Symbols) | Predicted Wall (`EstWall`) | Predicted Uncached (`EstUncached`) | Post-Turn-0 Uncached (`EstPostT0Unc`) | Predicted Cost (`EstCost`) | Predicted CumInput (`EstCum`) |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`plexer` (`16/19` `EstCum` wins, `19/19` vs `graft-push`)** | **2,889 tok** | **100.0%** | **34.3%** | **66.8%** | **36.8s** | **20.9k** | **15.1k** | **51.5k** | **106k** |
-| `graft-hook` (`ask --json -n 3`) | 207 tok | 67.9% | 0.0% | 25.3% | 45.4s | 18.0k | 17.6k | 54.3k | 125k |
-| `graft-push` (`ask --source -n 5`) | 5,086 tok | 81.2% | 26.4% | 39.1% | 40.3s | 26.3k | 16.1k | 63.0k | 141k |
+| **Antigravity `orch-neon+h2-h`** (`Neon+H2 High`) | **8/8 → 8/8** | **64/64 → 64/64** | 108 → **60 (-44.4%)** | 84,349 → **38,266 (-54.6%)** | 244.2k → **206.2k (-15.6%)** | 1.45M → **0.84M (-42.0%)** | 532.0s → **395.0s (-25.8%)** |
+| **Antigravity `orch-neon+h2-xh`** (`Neon+H2 XHigh`) | **8/8 → 8/8** | **64/64 → 64/64** | 131 → **70 (-46.6%)** | 123,421 → **43,581 (-64.7%)** | 304.4k → **220.8k (-27.4%)** | 2.08M → **1.00M (-51.7%)** | 669.0s → **646.0s (-3.4%)** |
+| **Antigravity `neon-medium`** (`--effort medium`) | **8/8 → 8/8** | **64/64 → 64/64** | 84 → **26 (-69.0%)** | 49,391 → **14,277 (-71.1%)** | 132.0k → **103.8k (-21.4%)** | 666.5k → **235.8k (-64.6%)** | 322.0s → **129.0s (-59.9%)** |
+| **Antigravity `carbon-medium`** (`--effort medium`) | **8/8 → 8/8** | **64/64 → 64/64** | 114 → **55 (-51.8%)** | 105,659 → **43,246 (-59.1%)** | 237.6k → **167.3k (-29.6%)** | 1.95M → **823.7k (-57.8%)** | 838.0s → **602.0s (-28.2%)** |
+| **Antigravity `hydrogen-medium`** (`--effort medium`) | **8/8 → 8/8** | **64/64 → 64/64** | 73 → **31 (-57.5%)** | 37,590 → **14,186 (-62.3%)** | 115.5k → **104.2k (-9.7%)** | 502.4k → **310.5k (-38.2%)** | 137.0s → **104.0s (-24.1%)** |
+| **Claude Opus 5.5** (`--effort medium`) | **8/8 → 8/8** | **64/64 → 64/64** | 25 → 31 (+24.0%) | 17,993 → **10,163 (-43.5%)** | 106.1k → 122.5k (+15.5%) | 360.4k → 441.8k (+22.6%) | 58.7s → 69.3s (+17.9%) |
+| **Claude Sonnet 5.5** (`--effort medium`) | 6/8 → **8/8** | 60/64 → **64/64** | 41 → **28 (-31.7%)** | 17,706 → **10,543 (-40.5%)** | 105.3k → 120.3k (+14.3%) | 314.3k → 328.8k (+4.6%) | 40.9s → **33.9s (-17.2%)** |
+| **7-Model Total (`56` Pairs)** | 54/56 → **56/56** | 444/448 → **448/448** | 576 → **301 (-47.7%)** (`47W/4T/5L`) | 436,109 → **174,262 (-60.0%)** (`54W/0T/2L`) | 1,245.0k → **1,045.2k (-16.0%)** | 7.32M → **3.98M (-45.6%)** | 2,597.7s → **1,979.2s (-23.8%)** (`40W/2T/14L`) |
 
 ### 3-Tier Offline Optimization Suite (`node bench/eval-fast.js`)
 
 [`bench/eval-fast.js`](eval-fast.js) evaluates retrieval ranking, named-definition pinning (`src/claude/pin.js`), and hook budgets across all 28 tasks (`T1`–`T12` + `S1`–`S8` + `L1`–`L8`) in ~5.0s at `$0` API cost:
 1. **Transcript-mined ground truth (`bench/replay.js` → `bench/needed-spans.json`):** Captures every line range and symbol that `cold` agents read or grepped across `T1`–`T12`, `S1`–`S8`, and `L1`–`L8`, plus SWE-bench and Large-Repo gold patch hunks.
-2. **Coverage metrics (`bench/needcov.js`):** Computes `NeedCov` (weighted share of needed lines inlined with `L<n>:` numbers at Turn 0: `T=18.0%`, `S=26.9%`, `L=27.2%` for Claude; `T=20.9%`, `S=42.9%`, `L=42.3%` for Gemini) and `LocCov` (share of needed symbols pointed to or inlined at Turn 0: `T=45.1%`, `S=52.6%`, `L=86.1%` for Claude; `T=50.1%`, `S=58.8%`, `L=85.9%` for Gemini), with separate holdout reporting (`T4`, `T8`, `T12`).
-3. **Live-calibrated cost model (`bench/cost-model.js` & `bench/turn-model.json`):** Uses per-family linear models fit on the recorded live runs (`wall R² = 0.92–0.94` on Claude and `0.90–0.98` on Gemini, `cum R² = 0.84–0.95` with `1.0 × (turns + 1) × t0Tok` Turn-0 re-billing), achieving **`100.0%` Gold File Recall on `S1`–`S8` and `L1`–`L8`** (`94.4%` on `T1`–`T12`), **`84.8%` `TokCov` on `T1`–`T12`**, **`-25.8%` `EstWall`**, **`-4.3%` `EstUncached`**, **`-17.9%` `EstCost`**, and **`-24.7%` `EstCum`** on Claude (`-44.9%`, `-45.9%`, `-50.5%`, and `-63.5%` across Gemini 4 models) vs. `cold`.
+2. **Coverage metrics (`bench/needcov.js`):** Computes `NeedCov` (weighted share of needed lines inlined with `<n>:` numbers at Turn 0: `T=6.6%`, `S=19.2%`, `L=24.2%`, `holdout=6.4%` for Claude; `T=16.8%`, `S=35.0%`, `L=40.2%`, `holdout=22.7%` for Gemini) and `LocCov` (share of needed symbols pointed to or inlined at Turn 0: `T=34.4%`, `S=47.6%`, `L=86.6%`, `holdout=34.6%` for Claude; `T=38.8%`, `S=57.4%`, `L=91.7%`, `holdout=48.3%` for Gemini), with separate holdout reporting (`T4`, `T8`, `T12`).
+3. **Live-calibrated cost model (`bench/cost-model.js` & `bench/turn-model.json`):** Uses per-family linear models fit on the recorded live runs (`wall R² = 0.91–0.92` on Claude, `0.90–0.98` on single-model Gemini, and `0.95–0.99` on Orchestrator `Neon+H2` `High` and `XHigh`; `cum R² = 0.84–0.93` with `1.0 × (turns + 1) × t0Tok` Turn-0 re-billing), achieving **`100.0%` Gold File Recall on `S1`–`S8` and `L1`–`L8`** (`94.4%` on `T1`–`T12`), **`67.3%` `TokCov` on `T1`–`T12`**, **`-19.0%` `EstWall`**, **`-1.4%` `EstUncached`**, **`-13.4%` `EstCost`**, and **`-20.7%` `EstCum`** on Claude (`-45.1%`, `-47.4%`, `-50.4%`, and `-64.2%` across single-model Gemini 4; `-39.1%`, `-47.4%`, `-47.1%`, and `-58.7%` across Orchestrator `Neon+H2` `High` & `XHigh`) vs. `cold`.
 
 ```bash
 node bench/eval-fast.js
@@ -366,7 +361,7 @@ node bench/run.js --json
 
 ### Results Across 6 Repositories (24 Intent Queries)
 
-- **Retrieval accuracy:** **100.0% Recall@1 (24/24)**, **100.0% Recall@3 (24/24)**, **100.0% Recall@5 (24/24)**, and **1.000 MRR**. By comparison, `@trailhq/trail-code@0.25.0` reaches `16.7% Recall@1` / `0.201 MRR` across all 6 repos and `50.0% Recall@1` / `0.604 MRR` on the shared non-Luau repos (`plexer` + `z`).
+- **Retrieval accuracy:** **100.0% Recall@1 (24/24)**, **100.0% Recall@3 (24/24)**, **100.0% Recall@5 (24/24)**, and **1.000 MRR**.
 
 | Repository | Graph Size (Nodes / Edges) | `wiring.json` | `check` | `ask --source` Latency & Tokens (vs Raw Files) | `callers` (`d=2`) | `skeleton` | `map` |
 | :--- | ---: | ---: | ---: | :--- | ---: | ---: | ---: |
@@ -376,3 +371,33 @@ node bench/run.js --json
 | **`sert`** (Luau + Py) | 2,926 / 6,070 | 1,915 KB | 58.9ms | **11.6ms** / 938 tok (**-91%** vs 10,757 raw) | **1.74ms** | **0.04ms** | 0.01ms |
 | **`building-tools`** (Luau) | 1,970 / 4,769 | 1,437 KB | 33.3ms | **10.5ms** / 1,346 tok (**-75%** vs 5,306 raw) | **0.99ms** | **0.02ms** | 0.01ms |
 | **`z`** (Luau + Rust + Py) | 3,614 / 6,437 | 2,465 KB | 71.5ms | **20.6ms** / 1,234 tok (**-92%** vs 15,116 raw) | **0.58ms** | **0.04ms** | 0.06ms |
+
+---
+
+## 5. Track A: Verified Regression Fixes (Apples-to-Apples on v1 Baselines)
+
+Track A addressed the regressions uncovered in the initial 196-pair run while keeping the v1 benchmark files untouched. We trimmed `SKILL.md` from `1,020 B` to `319 B`, dynamically slimmed Claude Turn-0 budgets, switched edit excerpts to contiguous verbatim slices without mid-body gaps, and disabled redundant shell rewrites and post-edit blast noise. On the graph side, we extracted Python Qt signal and class-attribute edges alongside CommonJS dotted namespace members (`src/graph/extract.js`, `src/graph/resolve.js`, `src/claude/pin.js`), added fast Gemini budget scaling (`FAST_GEMINI_HOOK_BUDGETS`), and moved PageRank to a flat typed-array CSR sparse frontier (`src/ask/graph-rank.js`).
+
+Across untouched v1 baselines, offline `node bench/eval-fast.js` cut `L1–L8` Turn-0 hook volume from `35.3 kB` (`+2,478` avg tok) to **`27.6 kB`** (`+1,795` tok). That raised `L6` symbol coverage to **`5/5`**, `L7` need coverage from `27%` to **`54%`**, and `SCORE` `EstUncached` from `+1.3%` to **`-1.4%`** (`EstCost -13.3%`, `EstCum -20.5%`). On `tutanota` (`L8`, 1,350 files / 11,544 nodes / 37,842 edges), `preparePageRankTopology` dropped from `34.9ms` to **`18.3ms`**, cold `ask` from `174.9ms` to **`131.6ms`**, warm `ask` from `50.0ms` to **`23.7ms`**, and warm `ask --source` from `37.8–41.2ms` to **`20.8ms`**.
+
+| Model & Task | Before Track A (`plexer` vs `cold`) | After Track A (`plexer` vs `cold`) |
+| :--- | :--- | :--- |
+| **Claude `opus L6`** (NodeBB) | `7` calls (`+74.0%` cum) | **`2` vs `2` calls (`+12.7%` cum, `15.1s` vs `16.6s`, `8/8`)** |
+| **Claude `opus L8`** (tutanota) | `8` calls (`+143.3%` cum) | **`4` vs `5` calls (`+0.5%` cum, `25.3s` vs `26.1s`, `8/8`)** |
+| **Claude `opus S3`** (flipt) | `9` calls (`+61.2%` cum) | **`7` vs `11` calls (`-27.3%` cum, `45.8s` vs `59.5s`, `8/8`)** |
+| **Claude `opus S6` / `S7`** | `8` calls (`+102.5%`) / `10` calls (`+121.3%`) | **`4` vs `3` calls (`+26.0%`, `8/8`) / `6` vs `7` calls (`+2.6%`, `54.3s`)** |
+| **Claude `sonnet L7`** (qutebrowser) | `5` calls (`+43.1%` cum) | **`3` vs `7` calls (`-14.3%` cum, `13.4s` vs `16.4s`, `8/8`)** |
+| **Orchestrator `L7` & `S6`** | `25` calls (`L7`), `8→7` (`S6`) | **`10` vs `17` calls (`-29.4%` cum, `L7`) · `25` vs `50` calls (`-57.6%` cum, `S6`)** |
+| **Fast Gemini `hydrogen T6` & `T9`** | `3` calls (`+80.1%` cum, `T6`) / `+60.8%` (`T9`) | **`1` vs `3` calls (`-10.1%` cum, `T6`) · `+51.3%` cum (`19` vs `20` calls, `T9`)** |
+
+---
+
+## 6. Track B: De-Leaked v2 Multi-Scale & Execution-Verified Suite
+
+To evaluate repo scaling and generalization without benchmark leakage, v2 tasks and statistical tooling live separately from the v1 archive (`bench/tasks.js`, `bench/large-tasks.js`):
+
+1. **De-leaked 4-tier OSS scale ladder + negative controls ([`bench/v2-tasks.js`](v2-tasks.js)):** Spans Small (`<250` files: `plexer`, holdout `pallets/click`), Medium (`400–800` files: de-leaked `pocketbase`, `qutebrowser`, `flipt`, `NodeBB`), Large (`1,000–2,500` files: `tutanota`, holdout `vitejs/vite`), and Mega (`3,000–10,000+` files: `microsoft/TypeScript`, holdout `facebook/react`), plus 4 negative controls (`N1` local typo, `N2` ambiguous `Validate`, `N3` dynamic hooks, `N4` non-indexed `package.json`).
+2. **Locked holdouts & automated leakage audit ([`bench/v2-holdout.json`](v2-holdout.json), [`bench/audit-leakage.js`](audit-leakage.js)):** Fails any discovery or symptom prompt that leaks file paths, directory hints, or `>1` gold symbols, and verifies SHA-256 prompt locks (`npm run bench:leakage` → `18/18` clean, `0` violations).
+3. **Hybrid Docker & native execution verification ([`bench/verify-exec.js`](verify-exec.js)):** SWE-bench Docker verifier runs default-on (`--rm --network=none`) alongside pinned language containers (`python:3.12-slim`, `node:24-slim`, `golang:1.23-alpine`) and native test suites. Passing `--no-docker` records `verificationMode: "unverified-heuristic"` and `resolved: null` rather than claiming heuristic resolution.
+4. **Published cache-aware API `$` costing & paired multi-trial stats ([`bench/cost-model.js`](cost-model.js), [`bench/stats.js`](stats.js), [`bench/run-v2-ab.js`](run-v2-ab.js)):** Separates `cacheWriteTokens` from `cacheReadTokens` in [`bench/grade.js`](grade.js), computes real USD costs per model family and Orchestrator `modelBreakdown`, defaults v2 sweeps to `--trials 3` (stamping `N=1 unreplicated` otherwise), and reports median, IQR, 95% seeded bootstrap CIs, paired Wilcoxon signed-rank p-values, and exact sign tests split across `train`, `holdout`, `negativeControl`, and `byTier`.
+5. **Hard retrieval & 25k-node synthetic scale stress ([`bench/hard-retrieval.js`](hard-retrieval.js), [`bench/scale-stress.js`](scale-stress.js)):** `npm run bench:hard` evaluates 116 queries across ambiguous symbols, Python signals, ESM barrels/CommonJS namespaces, polyglot multi-hop paths, modern language templates (TSX, Vue, Svelte, Astro, C++, Kotlin, Rust, Bash, SQL, HCL, Protobuf, GraphQL), and out-of-scope queries (**99.0% Recall@1**, **100.0% Recall@3**, **0.995 MRR**, **0.0% negative false positives**). `npm run bench:scale` builds and queries a 27,092-node (37,512-edge) polyglot monorepo on SQLite v3 (**2,078.6ms** cold build, **107.2ms** 1-file dirty-cone refresh, **9.18ms** p50 / **13.05ms** p95 `ask --source`, **0.02ms** p50 `callers`, **226.7ms** `blast`, **7.51ms** Turn-0 hook, **26.63ms** daemon RPC, **339 MB** RSS).

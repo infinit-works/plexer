@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Large-Repo & Discriminative Suite (`L1`–`L8`) 3-arm A/B/C benchmark runner.
+ * Large-Repo & Discriminative Suite (`L1`–`L8`) 2-arm A/B benchmark runner.
  *
- * Evaluates `cold` vs `trail` vs `plexer` across 8 tasks (`L1`–`L8`) spanning 4
+ * Evaluates `cold` vs `plexer` across 8 tasks (`L1`–`L8`) spanning 4
  * real-world repositories (`pocketbase/pocketbase`, `tutao/tutanota`,
  * `qutebrowser/qutebrowser`, `flipt-io/flipt`, `NodeBB/NodeBB`):
  *  - `L1`–`L4`: Deep cross-subsystem & multi-hop caller blast-radius traces
@@ -11,29 +11,47 @@
  *               per-file contract checks) and `0..8` rubric scoring.
  *
  * Usage:
- *   node bench/run-large-ab.js <model> [concurrency=4] [arm=all] [taskFilter=all] [--regrade]
+ *   node bench/run-large-ab.js <model> [concurrency=4] [arm=both] [taskFilter=all] [--regrade]
  */
 import { execFileSync, spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { createConnection } from "node:net";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { readFingerprint } from "../src/graph/fingerprint.js";
 import { LARGE_TASKS } from "./large-tasks.js";
+import { ALL_V2_TASKS } from "./v2-tasks.js";
 import { ensureSwebenchBaseRepos } from "./ensure-base.js";
-import { gradeTaskArm, parseTranscript } from "./grade.js";
+import { checkWorktreeIsolation, gradeTaskArm, parseTranscript } from "./grade.js";
+import { verifyTaskExecution } from "./verify-exec.js";
+import { computeApiCostUsd } from "./cost-model.js";
+import { summarizePairedSuite } from "./stats.js";
 import {
+    attachProcessTimeout,
+    BASE_AGY_MODELS,
+    buildAgyCliArgs,
     buildPlexerAgyHooksJson,
     buildPlexerClaudeSettingsJson,
-    buildTrailAgyHooksJson,
-    buildTrailClaudeSettingsJson,
-    buildTrailMcpConfigJson,
-    getTrailEnv,
-    getTrailSkillBody,
-    prepareTrailWorktreeDir,
-} from "./trail-live-helper.js";
+    configureAgyWorktreeArm,
+    createSterileBenchHome,
+    isAgyModelAlias,
+    mergeModelBreakdownTotals,
+    normalizeAgyModelAlias,
+    pickOrchResultMeta,
+    resolveAgyModelConfig,
+    shutdownBenchDaemon,
+} from "./agy-bench-helper.js";
 
-const positionals = process.argv.slice(2).filter((a) => !a.startsWith("--"));
-const rawModelArg = positionals[0] || "sonnet";
+const rawArgs = process.argv.slice(2);
+const trialsIdx = rawArgs.indexOf("--trials");
+const TRIALS = trialsIdx >= 0 && Number(rawArgs[trialsIdx + 1]) > 0 ? Math.floor(Number(rawArgs[trialsIdx + 1])) : 1;
+const positionals = [];
+for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === "--trials") {
+        i++;
+        continue;
+    }
+    if (!rawArgs[i].startsWith("--")) positionals.push(rawArgs[i]);
+}
+const rawModelArg = positionals[0] || "sonnet"; // "neon-medium" | "carbon-medium" | "hydrogen-medium" | "orch-neon-high-hydrogen-high" | "orch-neon-xhigh-hydrogen-xhigh" | "sonnet" | "opus"
 export const CLAUDE_MODELS = {
     sonnet: "claude-sonnet-5-5",
     "sonnet-5-5": "claude-sonnet-5-5",
@@ -43,19 +61,13 @@ export const CLAUDE_MODELS = {
     "claude-opus-5-5": "claude-opus-5-5",
 };
 export function normalizeModelArg(raw = "sonnet") {
-    return raw.startsWith("neon") ||
-        raw.startsWith("argon") ||
-        raw.startsWith("hydrogen") ||
-        raw.startsWith("carbon") ||
-        raw.startsWith("gemini-") ||
-        raw.endsWith("-agy")
-        ? raw
-        : raw.replace(/^claude-/, "").replace(/-5-5$/, "");
+    return normalizeAgyModelAlias(raw);
 }
-const modelArg = normalizeModelArg(rawModelArg);
+const modelCfg = resolveAgyModelConfig(rawModelArg, "medium");
+const modelArg = modelCfg.isOrchestrator ? modelCfg.canonicalAlias : normalizeModelArg(rawModelArg);
 const resolvedClaudeModel = CLAUDE_MODELS[rawModelArg] || rawModelArg;
 const concurrency = Number(positionals[1] || 4);
-const armFilter = positionals[2] || "all";
+const armFilter = positionals[2] || "both";
 const taskFilterArg = positionals[3] || "all";
 const REINDEX = process.argv.includes("--reindex");
 const taskFilterSet =
@@ -63,65 +75,16 @@ const taskFilterSet =
         ? null
         : new Set(taskFilterArg.split(",").map((s) => s.trim()));
 const armsToRun =
-    armFilter === "both"
+    armFilter === "both" || armFilter === "all"
         ? ["cold", "plexer"]
-        : armFilter === "all"
-          ? ["cold", "plexer", "trail"]
-          : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
+        : armFilter.split(",").map((s) => s.trim()).filter(Boolean);
 
 export function resolveIsAgy(mArg, env = process.env) {
-    return env.FORCE_CLAUDE_CLI === "1"
-        ? false
-        : env.FORCE_AGY_CLI === "1" ||
-          mArg.startsWith("neon") ||
-          mArg.startsWith("argon") ||
-          mArg.startsWith("hydrogen") ||
-          mArg.startsWith("carbon") ||
-          mArg.startsWith("gemini-") ||
-          mArg.endsWith("-agy");
+    return isAgyModelAlias(mArg, env);
 }
-const isAgy =
-    process.env.FORCE_CLAUDE_CLI === "1"
-        ? false
-        : process.env.FORCE_AGY_CLI === "1" ||
-          modelArg.startsWith("neon") ||
-          modelArg.startsWith("argon") ||
-          modelArg.startsWith("hydrogen") ||
-          modelArg.startsWith("carbon") ||
-          modelArg.startsWith("gemini-") ||
-          modelArg.endsWith("-agy");
-export const AGY_MODELS = {
-    "neon-low": { model: "gemini-4-neon-low", effort: "low" },
-    "neon-medium": { model: "gemini-4-neon-medium", effort: "medium" },
-    "neon-high": { model: "gemini-4-neon-high", effort: "high" },
-    "neon-xhigh": { model: "gemini-4-neon-xhigh", effort: "xhigh" },
-    "gemini-4-neon-low": { model: "gemini-4-neon-low", effort: "low" },
-    "gemini-4-neon-medium": { model: "gemini-4-neon-medium", effort: "medium" },
-    "gemini-4-neon-high": { model: "gemini-4-neon-high", effort: "high" },
-    "gemini-4-neon-xhigh": { model: "gemini-4-neon-xhigh", effort: "xhigh" },
-    "carbon-low": { model: "gemini-4-carbon-low", effort: "low" },
-    "carbon-medium": { model: "gemini-4-carbon-medium", effort: "medium" },
-    "carbon-high": { model: "gemini-4-carbon-high", effort: "high" },
-    "gemini-4-carbon-low": { model: "gemini-4-carbon-low", effort: "low" },
-    "gemini-4-carbon-medium": { model: "gemini-4-carbon-medium", effort: "medium" },
-    "gemini-4-carbon-high": { model: "gemini-4-carbon-high", effort: "high" },
-    "argon-low": { model: "gemini-4-argon-low", effort: "low" },
-    "argon-medium": { model: "gemini-4-argon-medium", effort: "medium" },
-    "argon-high": { model: "gemini-4-argon-high", effort: "high" },
-    "hydrogen-low": { model: "gemini-4-hydrogen-low", effort: "low" },
-    "hydrogen-medium": { model: "gemini-4-hydrogen-medium", effort: "medium" },
-    "hydrogen-high": { model: "gemini-4-hydrogen-high", effort: "high" },
-    "hydrogen-xhigh": { model: "gemini-4-hydrogen-xhigh", effort: "xhigh" },
-    "gemini-4-hydrogen-low": { model: "gemini-4-hydrogen-low", effort: "low" },
-    "gemini-4-hydrogen-medium": { model: "gemini-4-hydrogen-medium", effort: "medium" },
-    "gemini-4-hydrogen-high": { model: "gemini-4-hydrogen-high", effort: "high" },
-    "gemini-4-hydrogen-xhigh": { model: "gemini-4-hydrogen-xhigh", effort: "xhigh" },
-    sonnet: { model: "claude-sonnet-5-5-medium", effort: "medium" },
-    "sonnet-agy": { model: "claude-sonnet-5-5-medium", effort: "medium" },
-    opus: { model: "claude-opus-5-5-medium", effort: "medium" },
-    "opus-agy": { model: "claude-opus-5-5-medium", effort: "medium" },
-    "gemini-4-argon-medium": { model: "gemini-4-argon-medium", effort: "medium" },
-};
+const isAgy = resolveIsAgy(rawModelArg);
+export const AGY_MODELS = BASE_AGY_MODELS;
+let sterileHome = null;
 
 const BASE_CACHE_DIR = "/tmp/plexer-swebench-base";
 const logDir = process.env.PLEXER_BENCH_LOG_DIR
@@ -140,60 +103,20 @@ const basePrompt = [
 const skillMdRaw = readFileSync(resolve(import.meta.dirname, "../SKILL.md"), "utf8");
 const skillBody = skillMdRaw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
 const agyRuleBody = readFileSync(resolve(import.meta.dirname, "../rules/AGENTS.md"), "utf8").trim();
-let trailSkillBody = "";
 
 const coldSysFile = join(logDir, "cold-system.txt");
 const plexerSysFile = join(logDir, "plexer-system.txt");
-const trailSysFile = join(logDir, "trail-system.txt");
 
 const plexerHookClient = resolve(import.meta.dirname, "../bin/plexer-hook-client.cjs");
 const plexerHooksSettingsFile = join(logDir, "plexer-hooks-settings.json");
-const trailHooksSettingsFile = join(logDir, "trail-hooks-settings.json");
-const trailMcpConfigFile = join(logDir, "trail-mcp-config.json");
 function initRuntimeFiles() {
     mkdirSync(logDir, { recursive: true });
     writeFileSync(coldSysFile, `${basePrompt}\n`, "utf8");
     writeFileSync(plexerSysFile, `${basePrompt}\n\n${skillBody}\n`, "utf8");
-    writeFileSync(trailSysFile, trailSkillBody ? `${basePrompt}\n\n${trailSkillBody}\n` : `${basePrompt}\n`, "utf8");
-    writeFileSync(trailMcpConfigFile, buildTrailMcpConfigJson(), "utf8");
     writeFileSync(plexerHooksSettingsFile, buildPlexerClaudeSettingsJson(plexerHookClient), "utf8");
-    writeFileSync(trailHooksSettingsFile, buildTrailClaudeSettingsJson(), "utf8");
 }
 
 const agyHooksJson = buildPlexerAgyHooksJson(plexerHookClient);
-const trailAgyHooksJson = buildTrailAgyHooksJson();
-
-function makeAgyAgentMd(name, desc, body, hooksPath = null) {
-    return [
-        "---",
-        `name: ${name}`,
-        `description: ${desc}`,
-        "tools:",
-        "  - view_file",
-        "  - multi_replace_file_content",
-        "  - replace_file_content",
-        "  - write_to_file",
-        "  - run_command",
-        "  - manage_task",
-        ...(hooksPath ? ["hooks:", `  - ${hooksPath}`] : []),
-        "hidden: true",
-        "inheritCustomizations: false",
-        "inheritMcp: false",
-        "---",
-        "",
-        "# Agent System Instructions",
-        "",
-        body,
-        "When running shell commands with `run_command`, always set `WaitMsBeforeAsync: 10000` so commands complete synchronously.",
-        "",
-    ].join("\n");
-}
-
-const coldAgyMd = makeAgyAgentMd(
-    "bench-cold",
-    "Cold baseline software engineering agent for Large-Repo A/B benchmarking.",
-    `${basePrompt}\n\nIMPORTANT: Do NOT read or use any external skill files under ~/.gemini/ or ~/.agents/ or run \`plexer\` or \`trail\` commands; use standard repository tools only.`
-);
 
 const reindexedBaseIds = new Set();
 
@@ -229,7 +152,7 @@ export async function prepareWorktree(task, arm) {
             execFileSync("cp", ["-a", srcDir, workDir]);
         }
         execFileSync("git", ["checkout", "--", "."], { cwd: workDir, stdio: "ignore" });
-        execFileSync("git", ["clean", "-fd", "-e", "plexer", "-e", ".agents", "-e", "graft", "-e", ".trail"], {
+        execFileSync("git", ["clean", "-fd", "-e", "plexer", "-e", ".agents"], {
             cwd: workDir,
             stdio: "ignore",
         });
@@ -240,59 +163,41 @@ export async function prepareWorktree(task, arm) {
             rmSync(join(workDir, "plexer"), { recursive: true, force: true });
         }
     }
-    if (arm === "trail") {
-        rmSync(join(workDir, "plexer"), { recursive: true, force: true });
-        prepareTrailWorktreeDir(workDir, task.baseId, cleanDir);
+    const cacheDir = join(workDir, "plexer", ".cache");
+    if (existsSync(cacheDir)) {
+        for (const f of readdirSync(cacheDir)) {
+            if (f.startsWith("session-")) rmSync(join(cacheDir, f), { force: true });
+        }
     }
 
     const excludePath = join(workDir, ".git", "info", "exclude");
     if (existsSync(excludePath)) {
         const cur = readFileSync(excludePath, "utf8");
-        if (!cur.includes("graft/")) {
-            writeFileSync(excludePath, `${cur.trimEnd()}\n.agents/\npLexer/\nplexer/\ngraft/\n.trail/\n`, "utf8");
+        if (!cur.includes("plexer/")) {
+            writeFileSync(excludePath, `${cur.trimEnd()}\n.agents/\nplexer/\n`, "utf8");
         }
     }
 
     if (isAgy) {
-        const agentsDir = join(workDir, ".agents", "agents");
-        mkdirSync(agentsDir, { recursive: true });
-        const hooksPath = join(workDir, ".agents", "hooks.json");
-        writeFileSync(join(agentsDir, "bench-cold.md"), coldAgyMd, "utf8");
-        writeFileSync(
-            join(agentsDir, "bench-plexer.md"),
-            makeAgyAgentMd(
-                "bench-plexer",
-                "Plexer-equipped software engineering agent for Large-Repo A/B benchmarking.",
-                `${basePrompt}\n\nIMPORTANT: Do NOT read external skill files under ~/.gemini/ or ~/.agents/; your plexer instructions are already loaded below.\n\n${agyRuleBody}`,
-                hooksPath
-            ),
-            "utf8"
-        );
-        if (trailSkillBody) {
-            writeFileSync(
-                join(agentsDir, "bench-trail.md"),
-                makeAgyAgentMd(
-                    "bench-trail",
-                    "Trail-equipped software engineering agent for Large-Repo A/B benchmarking.",
-                    `${basePrompt}\n\nIMPORTANT: Do NOT read or use any external skill files under ~/.gemini/ or ~/.agents/ or run \`plexer\` commands.\n\n${trailSkillBody}`,
-                    hooksPath
-                ),
-                "utf8"
-            );
-        }
-        if (arm === "plexer") {
-            writeFileSync(hooksPath, `${agyHooksJson}\n`, "utf8");
-        } else if (arm === "trail") {
-            writeFileSync(hooksPath, `${trailAgyHooksJson}\n`, "utf8");
-        } else if (existsSync(hooksPath)) {
-            rmSync(hooksPath, { force: true });
-        }
+        configureAgyWorktreeArm({
+            workDir,
+            arm,
+            modelCfg,
+            basePrompt,
+            agyRuleBody,
+            agyHooksJson,
+            suiteDesc: "Large-Repo A/B benchmarking",
+            includeWaitHint: true,
+        });
     }
 
     return workDir;
 }
 
-export function gradeLargeTask(task, workDir, parsed) {
+const LARGE_TO_V2_VERIFIER_MAP = { L5: "V5", L6: "V9", L7: "V7", L8: "V11" };
+
+export function gradeLargeTask(task, workDir, parsed, opts = {}) {
+    const useDocker = opts.useDocker !== undefined ? Boolean(opts.useDocker) : !process.argv.includes("--no-docker");
     if (task.category === "code-edit" && typeof task.verify === "function") {
         const v = task.verify(workDir);
         const modSet = new Set(v.modifiedFiles || []);
@@ -300,10 +205,29 @@ export function gradeLargeTask(task, workDir, parsed) {
         const matchedGold = gold.filter((f) => modSet.has(f));
         const fileRecall = gold.length > 0 ? Number((matchedGold.length / gold.length).toFixed(3)) : 1;
         const hasEdits = Boolean(parsed.didModifyFile || modSet.size > 0);
+        const heuristicResolved = Boolean(hasEdits && v.resolved);
+
+        const mappedId = LARGE_TO_V2_VERIFIER_MAP[task.id];
+        const v2VerifierTask = mappedId ? ALL_V2_TASKS.find((t) => t.id === mappedId) : null;
+        let verificationMode = useDocker ? "docker" : "unverified-heuristic";
+        let execPassed = null;
+        let resolved = null;
+        if (v2VerifierTask?.verifier?.kind === "docker") {
+            const execRes = verifyTaskExecution(v2VerifierTask, workDir, { useDocker });
+            verificationMode = execRes.verificationMode;
+            execPassed = execRes.passed;
+            resolved = useDocker ? Boolean(heuristicResolved && execRes.resolved === true) : null;
+        } else {
+            verificationMode = "heuristic";
+            resolved = heuristicResolved;
+        }
         return {
             score: hasEdits ? v.score : 0,
             maxScore: v.maxScore || 8,
-            resolved: Boolean(hasEdits && v.resolved),
+            resolved,
+            heuristicResolved,
+            execPassed,
+            verificationMode,
             fileRecall,
             modifiedFiles: v.modifiedFiles || [],
             goldSourceFiles: gold,
@@ -316,6 +240,7 @@ export function gradeLargeTask(task, workDir, parsed) {
         score: g.score,
         maxScore: g.maxScore || 8,
         resolved,
+        verificationMode: "rubric",
         fileRecall: Number((g.score / (g.maxScore || 8)).toFixed(3)),
         goldSourceFiles: task.goldFiles || [],
         checks: g.checks || [],
@@ -331,41 +256,21 @@ async function runOne(task, arm) {
         let cmd;
         let args;
         if (isAgy) {
-            const cfg = AGY_MODELS[modelArg] || { model: modelArg, effort: "medium" };
             cmd = "agy";
-            args = [
-                "-p",
-                promptText,
-                "--agent",
-                arm === "plexer" ? "bench-plexer" : arm === "trail" ? "bench-trail" : "bench-cold",
-                "--model",
-                cfg.model,
-                "--effort",
-                cfg.effort,
-                "--output-format",
-                "stream-json",
-                "--dangerously-skip-permissions",
-                "--disable-slash-commands",
-            ];
+            args = buildAgyCliArgs({ promptText, arm, modelCfg });
         } else {
             cmd = "claude";
-            const settingsFile =
-                arm === "plexer" ? plexerHooksSettingsFile : arm === "trail" ? trailHooksSettingsFile : null;
-            const sysFile =
-                arm === "plexer" ? plexerSysFile : arm === "trail" ? trailSysFile : coldSysFile;
+            const settingsFile = arm === "plexer" ? plexerHooksSettingsFile : null;
+            const sysFile = arm === "plexer" ? plexerSysFile : coldSysFile;
             args = [
                 "--setting-sources",
                 "",
                 ...(settingsFile ? ["--settings", settingsFile] : []),
-                ...(arm === "trail" ? ["--mcp-config", trailMcpConfigFile] : []),
                 "--disable-slash-commands",
                 "--strict-mcp-config",
                 "--dangerously-skip-permissions",
                 "--tools",
                 "Bash,Read,Edit,Write,Grep,Glob",
-                ...(arm === "trail"
-                    ? ["--allowedTools", "Bash,Read,Edit,Write,Grep,Glob,mcp__trail__*"]
-                    : []),
                 "--append-system-prompt-file",
                 sysFile,
                 "-p",
@@ -382,21 +287,20 @@ async function runOne(task, arm) {
 
         const tmpJsonl = `${outJsonl}.tmp`;
         const outStream = createWriteStream(tmpJsonl, { flags: "w" });
-        const env =
-            arm === "trail"
-                ? getTrailEnv()
-                : {
-                      ...process.env,
-                      ...(arm === "plexer" ? { PLEXER_DAEMON_SOCK: benchDaemonSock } : {}),
-                      ...(arm === "plexer"
-                          ? (isAgy ? {} : { PLEXER_ENABLE_BENCH_HOOKS: "1" })
-                          : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_DISABLE_HOOKS: "1", PLEXER_BENCH_HIDE_CLI: "1" }),
-                      GIT_CONFIG_COUNT: "2",
-                      GIT_CONFIG_KEY_0: "commit.gpgsign",
-                      GIT_CONFIG_VALUE_0: "false",
-                      GIT_CONFIG_KEY_1: "tag.gpgsign",
-                      GIT_CONFIG_VALUE_1: "false",
-                  };
+        const sterileOverlay = isAgy && modelCfg.isOrchestrator ? (sterileHome?.envOverlay ?? {}) : {};
+        const env = {
+            ...process.env,
+            ...sterileOverlay,
+            ...(arm === "plexer" ? { PLEXER_DAEMON_SOCK: benchDaemonSock } : {}),
+            ...(arm === "plexer"
+                ? (isAgy ? {} : { PLEXER_ENABLE_BENCH_HOOKS: "1" })
+                : { PLEXER_ENABLE_BENCH_HOOKS: "0", PLEXER_DISABLE_HOOKS: "1", PLEXER_BENCH_HIDE_CLI: "1" }),
+            GIT_CONFIG_COUNT: "2",
+            GIT_CONFIG_KEY_0: "commit.gpgsign",
+            GIT_CONFIG_VALUE_0: "false",
+            GIT_CONFIG_KEY_1: "tag.gpgsign",
+            GIT_CONFIG_VALUE_1: "false",
+        };
         if (arm === "plexer") {
             if (isAgy)
                 delete env.PLEXER_ENABLE_BENCH_HOOKS;
@@ -415,21 +319,31 @@ async function runOne(task, arm) {
         child.stderr.on("data", (d) => {
             stderr += d.toString();
         });
+        let timedOut = false;
+        const clearRunTimeout = attachProcessTimeout(child, {
+            label: `[${modelArg}] ${task.id} (${arm})`,
+            onTimeout: () => {
+                timedOut = true;
+            },
+        });
 
         child.on("error", (err) => {
+            clearRunTimeout();
             outStream.end();
             rejectRun(err);
         });
         child.on("close", (code) => {
+            clearRunTimeout();
+            const exitCode = timedOut ? 124 : (code ?? 1);
             outStream.end(() => {
-                if (code === 0) {
+                if (exitCode === 0) {
                     renameSync(tmpJsonl, outJsonl);
                 }
-                const targetJsonl = code === 0 ? outJsonl : tmpJsonl;
+                const targetJsonl = exitCode === 0 ? outJsonl : tmpJsonl;
                 const parsed = parseTranscript(targetJsonl, arm);
                 const grade = gradeLargeTask(task, workDir, parsed);
                 console.log(
-                    `[${modelArg}] ${task.id} (${arm}) calls=${parsed.calls} (${parsed.turns}t) toolTok=${parsed.toolOutputTokens} search=${(parsed.searchMs / 1000).toFixed(1)}s score=${grade.score}/8 resolved=${grade.resolved}`
+                    `[${modelArg}] ${task.id} (${arm}) exit=${exitCode}${timedOut ? " (timeout)" : ""} calls=${parsed.calls} (${parsed.turns}t) toolTok=${parsed.toolOutputTokens} search=${(parsed.searchMs / 1000).toFixed(1)}s score=${grade.score}/8 resolved=${grade.resolved}`
                 );
                 resolveRun({
                     taskId: task.id,
@@ -438,7 +352,7 @@ async function runOne(task, arm) {
                     transcriptPath: targetJsonl,
                     parsed,
                     grade,
-                    code,
+                    code: exitCode,
                 });
             });
         });
@@ -458,33 +372,7 @@ async function runWave(jobs, maxParallel) {
     return results;
 }
 
-async function shutdownBenchDaemon(sockPath) {
-    await new Promise((resolveDone) => {
-        if (!existsSync(sockPath)) {
-            resolveDone();
-            return;
-        }
-        const sock = createConnection(sockPath);
-        const timer = setTimeout(() => {
-            sock.destroy();
-            resolveDone();
-        }, 200);
-        sock.on("connect", () => {
-            sock.write(`${JSON.stringify({ id: 1, type: "shutdown" })}\n`);
-            clearTimeout(timer);
-            sock.end();
-            resolveDone();
-        });
-        sock.on("error", () => {
-            clearTimeout(timer);
-            resolveDone();
-        });
-    });
-    rmSync(sockPath, { force: true });
-}
-
 async function main() {
-    trailSkillBody = armsToRun.includes("trail") ? await getTrailSkillBody() : "";
     initRuntimeFiles();
 
     const selectedTasks = taskFilterSet ? LARGE_TASKS.filter((t) => taskFilterSet.has(t.id)) : LARGE_TASKS;
@@ -512,6 +400,9 @@ async function main() {
         for (const t of selectedTasks) {
             await ensureBaseLargeRepo(t, REINDEX);
         }
+        if (isAgy && modelCfg.isOrchestrator) {
+            sterileHome = createSterileBenchHome(`large-${modelArg}`);
+        }
 
         const jobs = [];
         for (const t of selectedTasks) {
@@ -530,6 +421,8 @@ async function main() {
             });
         } finally {
             await shutdownBenchDaemon(benchDaemonSock);
+            sterileHome?.cleanup();
+            sterileHome = null;
         }
         if (runs.length === 0) {
             console.error(`[${modelArg}] All runs failed or returned 0 tokens; preserving existing results.`);
@@ -555,6 +448,7 @@ async function main() {
             gold_files: t.goldFiles,
         };
         for (const r of runs.filter((x) => x.taskId === t.id)) {
+            const pricingModel = isAgy ? modelCfg.model : resolvedClaudeModel;
             existing[r.arm] = {
                 conversationId: r.parsed.conversationId,
                 calls: r.parsed.calls,
@@ -562,6 +456,8 @@ async function main() {
                 toolNames: r.parsed.toolNames,
                 toolOutputTokens: r.parsed.toolOutputTokens,
                 uncachedInputTokens: r.parsed.uncachedInputTokens,
+                cacheWriteTokens: r.parsed.cacheWriteTokens ?? 0,
+                cacheReadTokens: r.parsed.cacheReadTokens ?? (r.parsed.cachedInputTokens || 0),
                 cachedInputTokens: r.parsed.cachedInputTokens,
                 cumulativeInputTokens: r.parsed.cumulativeInputTokens,
                 turn1ContextTokens: r.parsed.turn1ContextTokens || 0,
@@ -571,12 +467,14 @@ async function main() {
                 cacheMissTurns: r.parsed.cacheMissTurns || 0,
                 finalContextTokens: r.parsed.finalContextTokens,
                 totalModelOutputTokens: r.parsed.totalModelOutputTokens,
+                apiCostUsd: computeApiCostUsd(r.parsed, pricingModel).totalUsd,
                 searchMs: r.parsed.searchMs,
                 totalMs: r.parsed.totalMs,
+                ...pickOrchResultMeta(r.parsed),
                 ...r.grade,
             };
         }
-        if (existing.cold || existing.plexer || existing.trail) {
+        if (existing.cold || existing.plexer) {
             byId.set(t.id, existing);
         }
     }
@@ -603,10 +501,9 @@ async function main() {
         resolvedCount: 0,
         taskCount: 0,
     });
-    const hasAnyTrail = taskRows.some((r) => r.trail);
     const totals = taskRows.reduce(
         (acc, r) => {
-            for (const arm of ["cold", "plexer", ...(r.trail ? ["trail"] : [])]) {
+            for (const arm of ["cold", "plexer"]) {
                 acc[arm].calls += r[arm].calls;
                 acc[arm].turns += r[arm].turns;
                 acc[arm].toolOutputTokens += r[arm].toolOutputTokens;
@@ -626,19 +523,20 @@ async function main() {
                 acc[arm].maxScore += r[arm].maxScore;
                 acc[arm].resolvedCount += r[arm].resolved ? 1 : 0;
                 acc[arm].taskCount += 1;
+                mergeModelBreakdownTotals(acc[arm], r[arm]);
             }
             return acc;
         },
         {
             cold: emptyArmTotals(),
             plexer: emptyArmTotals(),
-            ...(hasAnyTrail ? { trail: emptyArmTotals() } : {}),
         }
     );
 
+    const stats = summarizePairedSuite(taskRows);
     writeFileSync(
         resultsPath,
-        `${JSON.stringify({ generatedAt: new Date().toISOString(), model: modelArg, totals, tasks: taskRows }, null, 2)}\n`,
+        `${JSON.stringify({ generatedAt: new Date().toISOString(), model: modelArg, trials: TRIALS, unreplicated: TRIALS < 2, useDocker: !process.argv.includes("--no-docker"), totals, stats, tasks: taskRows }, null, 2)}\n`,
         "utf8"
     );
     console.log(`Saved Large-Repo Suite L1–L8 results to ${resultsPath}`);

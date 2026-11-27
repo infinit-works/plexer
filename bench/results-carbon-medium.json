@@ -51,71 +51,7 @@
     "callLosses": 0,
     "speedWins": 11,
     "speedTies": 0,
-    "speedLosses": 1,
-    "trailComparison": {
-      "taskIds": [
-        "T4",
-        "T5",
-        "T9"
-      ],
-      "cold": {
-        "calls": 76,
-        "turns": 38,
-        "toolOutputTokens": 94276,
-        "uncachedInputTokens": 199133,
-        "cachedInputTokens": 1502610,
-        "cumulativeInputTokens": 1701743,
-        "turn1ContextTokens": 15282,
-        "turn1UncachedTokens": 15282,
-        "postTurn1UncachedTokens": 183851,
-        "netContextGrowthTokens": 161953,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 177235,
-        "totalModelOutputTokens": 46767,
-        "searchMs": 586000,
-        "totalMs": 767466,
-        "score": 24,
-        "maxScore": 24
-      },
-      "trail": {
-        "calls": 67,
-        "turns": 39,
-        "toolOutputTokens": 86723,
-        "uncachedInputTokens": 193209,
-        "cachedInputTokens": 1235171,
-        "cumulativeInputTokens": 1428380,
-        "turn1ContextTokens": 18625,
-        "turn1UncachedTokens": 18625,
-        "postTurn1UncachedTokens": 174584,
-        "netContextGrowthTokens": 149639,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 168264,
-        "totalModelOutputTokens": 45436,
-        "searchMs": 627000,
-        "totalMs": 795586,
-        "score": 24,
-        "maxScore": 24
-      },
-      "plexer": {
-        "calls": 39,
-        "turns": 25,
-        "toolOutputTokens": 46032,
-        "uncachedInputTokens": 126061,
-        "cachedInputTokens": 746066,
-        "cumulativeInputTokens": 872127,
-        "turn1ContextTokens": 27223,
-        "turn1UncachedTokens": 27223,
-        "postTurn1UncachedTokens": 98838,
-        "netContextGrowthTokens": 86474,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 113697,
-        "totalModelOutputTokens": 34981,
-        "searchMs": 402000,
-        "totalMs": 567074,
-        "score": 24,
-        "maxScore": 24
-      }
-    }
+    "speedLosses": 1
   },
   "tasks": [
     {
@@ -522,52 +458,6 @@
             "passed": true
           }
         ]
-      },
-      "trail": {
-        "conversationId": "57aeaed5-07c3-4787-b52f-fc931904f980",
-        "calls": 9,
-        "turns": 5,
-        "toolOutputTokens": 14427,
-        "uncachedInputTokens": 29229,
-        "cachedInputTokens": 79851,
-        "cumulativeInputTokens": 109080,
-        "turn1ContextTokens": 6174,
-        "turn1UncachedTokens": 6174,
-        "postTurn1UncachedTokens": 23055,
-        "netContextGrowthTokens": 21010,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 27184,
-        "totalModelOutputTokens": 5652,
-        "searchMs": 44000,
-        "totalMs": 88943,
-        "score": 8,
-        "maxScore": 8,
-        "checks": [
-          {
-            "id": "resolve_rs_cited",
-            "description": "Cites compiler/src/resolve.rs with line numbers around check_zero_size_arrays / zero_size_array / consumes_instance",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "zero_size_detection",
-            "description": "Identifies bounds.prefixed() and Layout::compact(schema).size(elem).max == 0",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "consumes_instance_exception",
-            "description": "Identifies consumes_instance(schema, elem) as the exception (taking an Instance from remote arguments)",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "composite_type_rules",
-            "description": "Explains that Tuple/Struct require ANY element/field to consume an Instance, fixed array T[N] requires N > 0 and element consumes_instance, and Union requires non-empty variants where ALL variants consume an Instance",
-            "weight": 2,
-            "passed": true
-          }
-        ]
       }
     },
     {
@@ -658,52 +548,6 @@
         "totalModelOutputTokens": 10659,
         "searchMs": 124000,
         "totalMs": 214098,
-        "score": 8,
-        "maxScore": 8,
-        "checks": [
-          {
-            "id": "fingerprint_def",
-            "description": "Cites probeDrift and/or isClean in src/graph/fingerprint.js",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "direct_callers",
-            "description": "Identifies ensureFreshGraph in src/graph/refresh.js as the direct caller of probeDrift and isClean",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "cli_commands_using_ensure",
-            "description": "Identifies refreshBefore in bin/plexer.js and the CLI commands calling it (ask, skeleton, callers, callees, impact, blast, grep, map)",
-            "weight": 2,
-            "passed": true
-          },
-          {
-            "id": "mcp_freshness",
-            "description": "Identifies callTool / ensureFreshGraph in src/mcp/tools.js",
-            "weight": 2,
-            "passed": true
-          }
-        ]
-      },
-      "trail": {
-        "conversationId": "a9085392-7719-41e7-96f6-36e870a41e75",
-        "calls": 25,
-        "turns": 17,
-        "toolOutputTokens": 47311,
-        "uncachedInputTokens": 90173,
-        "cachedInputTokens": 520706,
-        "cumulativeInputTokens": 610879,
-        "turn1ContextTokens": 6113,
-        "turn1UncachedTokens": 6113,
-        "postTurn1UncachedTokens": 84060,
-        "netContextGrowthTokens": 69686,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 75799,
-        "totalModelOutputTokens": 16298,
-        "searchMs": 190000,
-        "totalMs": 297241,
         "score": 8,
         "maxScore": 8,
         "checks": [
@@ -1114,34 +958,6 @@
         "totalModelOutputTokens": 18531,
         "searchMs": 271000,
         "totalMs": 290231,
-        "score": 8,
-        "maxScore": 8,
-        "checks": [
-          {
-            "id": "unit_and_behavioral_tests",
-            "description": "All existing npm tests pass AND skeleton/formatSkeleton/CLI pass automated verification for --all-matches",
-            "weight": 8,
-            "passed": true
-          }
-        ]
-      },
-      "trail": {
-        "conversationId": "6dac99bc-df48-47e4-99f6-f44ad998f1a7",
-        "calls": 33,
-        "turns": 17,
-        "toolOutputTokens": 24985,
-        "uncachedInputTokens": 73807,
-        "cachedInputTokens": 634614,
-        "cumulativeInputTokens": 708421,
-        "turn1ContextTokens": 6338,
-        "turn1UncachedTokens": 6338,
-        "postTurn1UncachedTokens": 67469,
-        "netContextGrowthTokens": 58943,
-        "cacheMissTurns": 0,
-        "finalContextTokens": 65281,
-        "totalModelOutputTokens": 23486,
-        "searchMs": 393000,
-        "totalMs": 409402,
         "score": 8,
         "maxScore": 8,
         "checks": [

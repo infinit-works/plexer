@@ -12,7 +12,7 @@
  *  - `fileCov`: share of needed files (any kind of need) the injection names.
  */
 
-const PTR = /([\w./@-]+\.[A-Za-z]+):L(\d+)(?:-L(\d+))?/g;
+const PTR = /([\w./@-]+\.[A-Za-z0-9]+):L(\d+)(?:-L(\d+))?/g;
 
 /** Parse hook text into inlined line sets and pointer ranges per file. */
 export function parseInjection(ctx) {
@@ -22,24 +22,35 @@ export function parseInjection(ctx) {
     const addLine = (f, n) => f && (inl.get(f) ?? inl.set(f, new Set()).get(f)).add(n);
     let cur = null;
     for (const line of String(ctx || "").split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            cur = null;
+            continue;
+        }
         for (const m of line.matchAll(PTR)) addPtr(m[1], Number(m[2]), Number(m[3] || m[2]));
-        const head = /^\s*\d+\.\s.*?:\s([\w./@-]+\.[A-Za-z]+):L\d+/.exec(line);
+        const head = /^\s*\d+\.\s.*?(?::|—)\s([\w./@-]+\.[A-Za-z0-9]+):L\d+/.exec(line);
         if (head) {
             cur = head[1];
             continue;
         }
-        const helper = /^(?:\/\/\s*)+[^:]+:\s.*\(([\w./@-]+\.[A-Za-z]+):L\d+/.exec(line);
+        const helper = /^(?:\/\/\s*)+[^:]+:\s.*\(([\w./@-]+\.[A-Za-z0-9]+):L\d+/.exec(line);
         if (helper) {
             cur = helper[1];
             continue;
         }
-        const cs = /\(([\w./@-]+\.[A-Za-z]+):L\d+(?:-L\d+)?\)\s*→\s*L(\d+):/.exec(line);
+        const cs = /\(([\w./@-]+\.[A-Za-z0-9]+):L\d+(?:-L\d+)?\)\s*→\s*L?(\d+):/.exec(line);
         if (cs) {
             addLine(cs[1], Number(cs[2]));
             continue;
         }
-        const code = /^L(\d+):/.exec(line);
-        if (code) addLine(cur, Number(code[1]));
+        const code = /^L?(\d+):/.exec(line);
+        if (code) {
+            addLine(cur, Number(code[1]));
+            continue;
+        }
+        if (/^(?:\[|#{1,6}\s|\d+\.\s|={3,}|-{3,})/.test(trimmed)) {
+            cur = null;
+        }
     }
     return { inl, ptrs };
 }

@@ -621,187 +621,23 @@ for (const r of REPOS) {
 }
 const retrieval = evaluateRetrieval();
 
-async function benchTrailComparison() {
-    if (corpusKind !== "local")
-        return null;
-    const trailDist = "/tmp/trail-eval/node_modules/@trailhq/trail-code/dist";
-    if (!existsSync(trailDist))
-        return null;
-    const tAskMod = await import(`${trailDist}/ask/ask.js`);
-    const tGrepMod = await import(`${trailDist}/search/grep.js`);
-    const tTravMod = await import(`${trailDist}/graph/traverse.js`);
-    const tMapMod = await import(`${trailDist}/graph/map.js`);
-    const tLoadMod = await import(`${trailDist}/graph/load.js`);
-    const tBuildMod = await import(`${trailDist}/graph/build.js`);
-    const tCheckMod = await import(`${trailDist}/graph/check.js`);
-    const tSkillMod = await import(`${trailDist}/claude/skill-template.js`);
-    const { skillTemplate: plexerSkillTemplate } = await import("../src/claude/shim-template.js");
-
-    const pRaw = typeof plexerSkillTemplate === "function" ? plexerSkillTemplate() : String(plexerSkillTemplate || "");
-    const tRaw = typeof tSkillMod.skillTemplate === "function" ? tSkillMod.skillTemplate() : String(tSkillMod.skillTemplate || "");
-    const plexerSkillBytes = Buffer.byteLength(pRaw.replace(/^---\n[\s\S]*?\n---\n+/, "").trim(), "utf8");
-    const trailSkillBytes = Buffer.byteLength(tRaw.replace(/^---\n[\s\S]*?\n---\n+/, "").trim(), "utf8");
-
-    const sharedRepos = REPOS.filter((r) => existsSync(`/tmp/trail-repos/${r.name}/graft`));
-    const trailEngine = [];
-    for (const r of sharedRepos) {
-        const dir = `/tmp/trail-repos/${r.name}`;
-        const outDir = `${dir}/graft`;
-        await tBuildMod.buildGraph(dir, { contextDir: outDir, graphOnly: true });
-        const tB0 = performance.now();
-        await tBuildMod.buildGraph(dir, { contextDir: outDir, graphOnly: true });
-        const warmBuildMs = performance.now() - tB0;
-        const tC0 = performance.now();
-        await tCheckMod.checkGraph(dir, { contextDir: outDir });
-        const checkMs = performance.now() - tC0;
-        const g = tLoadMod.loadGraphCached(outDir);
-        tAskMod.ask(dir, r.query, { contextDir: outDir, source: true });
-        tGrepMod.grepGraph(g, dir, r.grep, { fixed: true });
-        const wSyms = tTravMod.resolveSymbol(g, r.sym);
-        if (wSyms[0])
-            tTravMod.edgeWalk(g, wSyms[0], "in", 2);
-        tAskMod.skeleton(dir, r.file, { contextDir: outDir });
-        tMapMod.buildRepoMap(g);
-        const N = 8;
-        let tAskSrc = 0;
-        let askSrcOut = "";
-        for (let i = 0; i < N; i++) {
-            const t0 = performance.now();
-            askSrcOut = tAskMod.formatAsk(tAskMod.ask(dir, r.query, { contextDir: outDir, source: true }));
-            tAskSrc += performance.now() - t0;
-        }
-        let tAskNoSrc = 0;
-        for (let i = 0; i < N; i++) {
-            const t0 = performance.now();
-            tAskMod.formatAsk(tAskMod.ask(dir, r.query, { contextDir: outDir, source: false }));
-            tAskNoSrc += performance.now() - t0;
-        }
-        let tGrep = 0;
-        for (let i = 0; i < N; i++) {
-            const t0 = performance.now();
-            tGrepMod.grepGraph(g, dir, r.grep, { fixed: true });
-            tGrep += performance.now() - t0;
-        }
-        let tCallers = 0;
-        for (let i = 0; i < N; i++) {
-            const t0 = performance.now();
-            const syms = tTravMod.resolveSymbol(g, r.sym);
-            if (syms[0])
-                tTravMod.edgeWalk(g, syms[0], "in", 2);
-            tCallers += performance.now() - t0;
-        }
-        let tSkel = 0;
-        for (let i = 0; i < N; i++) {
-            const t0 = performance.now();
-            tAskMod.formatSkeleton(tAskMod.skeleton(dir, r.file, { contextDir: outDir }));
-            tSkel += performance.now() - t0;
-        }
-        let tMap = 0;
-        for (let i = 0; i < N; i++) {
-            const t0 = performance.now();
-            tMapMod.formatRepoMap(tMapMod.buildRepoMap(g));
-            tMap += performance.now() - t0;
-        }
-        const wiringBytes = statSync(join(outDir, ".graph", "wiring.json")).size;
-        trailEngine.push({
-            name: r.name,
-            nodes: g.nodes.length,
-            edges: g.edges.length,
-            wiringKB: Math.round(wiringBytes / 1024),
-            warmBuildMs: +warmBuildMs.toFixed(1),
-            checkMs: +checkMs.toFixed(1),
-            askSourceMs: +(tAskSrc / N).toFixed(2),
-            askNoSourceMs: +(tAskNoSrc / N).toFixed(2),
-            grepMs: +(tGrep / N).toFixed(2),
-            callersMs: +(tCallers / N).toFixed(2),
-            skeletonMs: +(tSkel / N).toFixed(2),
-            mapMs: +(tMap / N).toFixed(2),
-            askSourceTokens: estTokens(askSrcOut),
-        });
-    }
-
-    let tHits1 = 0, tHits3 = 0, tHits5 = 0, tRr = 0;
-    let tShared1 = 0, tShared3 = 0, tShared5 = 0, tSharedRr = 0, sharedTotal = 0;
-    let pShared1 = 0, pShared3 = 0, pShared5 = 0, pSharedRr = 0;
-    for (let idx = 0; idx < GOLD_QUERIES.length; idx++) {
-        const q = GOLD_QUERIES[idx];
-        const pRank = retrieval.details[idx]?.rank ?? 0;
-        const dir = `/tmp/trail-repos/${q.repo}`;
-        const outDir = `${dir}/graft`;
-        const isShared = existsSync(join(outDir, ".graph", "wiring.json"));
-        let rank = 0;
-        if (isShared) {
-            sharedTotal++;
-            if (pRank === 1) pShared1++;
-            if (pRank > 0 && pRank <= 3) pShared3++;
-            if (pRank > 0 && pRank <= 5) pShared5++;
-            if (pRank > 0) pSharedRr += 1 / pRank;
-            const res = tAskMod.ask(dir, q.query, { contextDir: outDir, limit: 5 });
-            for (let i = 0; i < (res.hits || []).length; i++) {
-                const h = res.hits[i];
-                const ptrLower = String(h.pointer || "").toLowerCase();
-                const titleLower = String(h.title || "").toLowerCase();
-                const pathOk = q.goldPath ? ptrLower.includes(q.goldPath.toLowerCase()) : true;
-                const symOk = q.goldSym ? titleLower.includes(q.goldSym.toLowerCase()) : true;
-                if (pathOk && symOk) {
-                    rank = i + 1;
-                    break;
-                }
-            }
-            if (rank === 1) tShared1++;
-            if (rank > 0 && rank <= 3) tShared3++;
-            if (rank > 0 && rank <= 5) tShared5++;
-            if (rank > 0) tSharedRr += 1 / rank;
-        }
-        if (rank === 1) tHits1++;
-        if (rank > 0 && rank <= 3) tHits3++;
-        if (rank > 0 && rank <= 5) tHits5++;
-        if (rank > 0) tRr += 1 / rank;
-    }
-
-    return {
-        skillFootprint: {
-            plexerBytes: plexerSkillBytes,
-            plexerBpeTok: Math.ceil(plexerSkillBytes / 3.3),
-            trailBytes: trailSkillBytes,
-            trailBpeTok: Math.ceil(trailSkillBytes / 3.3),
-        },
-        trailEngine,
-        trailRetrievalAll24: {
-            total: GOLD_QUERIES.length,
-            recallAt1: +(tHits1 / GOLD_QUERIES.length).toFixed(3),
-            recallAt3: +(tHits3 / GOLD_QUERIES.length).toFixed(3),
-            recallAt5: +(tHits5 / GOLD_QUERIES.length).toFixed(3),
-            mrr: +(tRr / GOLD_QUERIES.length).toFixed(3),
-        },
-        sharedRetrieval8: {
-            total: sharedTotal,
-            plexer: {
-                recallAt1: +(pShared1 / (sharedTotal || 1)).toFixed(3),
-                recallAt3: +(pShared3 / (sharedTotal || 1)).toFixed(3),
-                recallAt5: +(pShared5 / (sharedTotal || 1)).toFixed(3),
-                mrr: +(pSharedRr / (sharedTotal || 1)).toFixed(3),
-            },
-            trail: {
-                recallAt1: +(tShared1 / (sharedTotal || 1)).toFixed(3),
-                recallAt3: +(tShared3 / (sharedTotal || 1)).toFixed(3),
-                recallAt5: +(tShared5 / (sharedTotal || 1)).toFixed(3),
-                mrr: +(tSharedRr / (sharedTotal || 1)).toFixed(3),
-            },
-        },
-    };
-}
-
-const trailComparison = await benchTrailComparison();
 const askGateMs = Number(process.env.PLEXER_BENCH_MAX_ASK_MS || 25);
 const maxAskSourceMs = repoMetrics.length > 0 ? Math.max(...repoMetrics.map((m) => m.askSourceMs)) : Infinity;
+const runHard = process.argv.includes("--hard");
+const runScale = process.argv.includes("--scale");
+const hardRetrieval = runHard ? (await import("./hard-retrieval.js")).runHardRetrievalSuite({ gate: process.argv.includes("--gate") }) : null;
+const resolvedHard = hardRetrieval ? await hardRetrieval : null;
+const scaleStress = runScale ? await (await import("./scale-stress.js")).runScaleStress({ targetNodes: 25000, gate: process.argv.includes("--gate"), json: process.argv.includes("--json") }) : null;
+
 const gateEnforced = corpusKind === "fixtures" || process.argv.includes("--gate");
 const gatePassed =
     repoMetrics.length === REPOS.length &&
     retrieval.total === GOLD_QUERIES.length &&
     retrieval.recallAt1 === 1 &&
     retrieval.mrr === 1 &&
-    maxAskSourceMs < askGateMs;
+    maxAskSourceMs < askGateMs &&
+    (!resolvedHard || resolvedHard.gate.passed) &&
+    (!scaleStress || scaleStress.gate.passed);
 const gate = {
     corpus: corpusKind,
     enforced: gateEnforced,
@@ -810,6 +646,8 @@ const gate = {
     askGateMs,
     recallAt1: retrieval.recallAt1,
     mrr: retrieval.mrr,
+    ...(resolvedHard ? { hardGatePassed: resolvedHard.gate.passed } : {}),
+    ...(scaleStress ? { scaleGatePassed: scaleStress.gate.passed } : {}),
 };
 
 if (gateEnforced && !gatePassed) {
@@ -817,7 +655,7 @@ if (gateEnforced && !gatePassed) {
 }
 
 if (process.argv.includes("--json")) {
-    console.log(JSON.stringify({ corpus: corpusKind, repoMetrics, retrieval, gate, trailComparison }, null, 2));
+    console.log(JSON.stringify({ corpus: corpusKind, repoMetrics, retrieval, ...(resolvedHard ? { hardRetrieval: resolvedHard } : {}), ...(scaleStress ? { scaleStress } : {}), gate }, null, 2));
 } else {
     console.log(`# Plexer Engine Benchmark (corpus: ${corpusKind})\n`);
     console.log("## 1. Latency & Token Budgets by Repository\n");
@@ -849,21 +687,16 @@ if (process.argv.includes("--json")) {
             console.log(`- [${d.repo}] "${d.query}" → rank ${d.rank} (top: ${d.topHit})`);
         }
     }
-    if (trailComparison) {
-        const sf = trailComparison.skillFootprint;
-        const sfPct = Math.round((1 - sf.plexerBytes / sf.trailBytes) * 100);
-        console.log("\n## 3. Head-to-Head vs `@trailhq/trail-code@0.25.0`\n");
-        console.log(`- **Turn-0 Skill Footprint (\`SKILL.md\` body)**: Plexer **${sf.plexerBytes} B (~${sf.plexerBpeTok} tok)** vs Trail **${sf.trailBytes} B (~${sf.trailBpeTok} tok)** (**-${sfPct}%** smaller)`);
-        console.log(`- **Retrieval Across All 24 Queries (6 Repos)**: Plexer **Recall@1 ${(retrieval.recallAt1 * 100).toFixed(1)}% / MRR ${retrieval.mrr.toFixed(3)}** vs Trail **Recall@1 ${(trailComparison.trailRetrievalAll24.recallAt1 * 100).toFixed(1)}% / MRR ${trailComparison.trailRetrievalAll24.mrr.toFixed(3)}**`);
-        console.log(`- **Retrieval on Shared Repos (\`plexer\` + \`z\`, 8 Queries)**: Plexer **Recall@1 ${(trailComparison.sharedRetrieval8.plexer.recallAt1 * 100).toFixed(1)}% / MRR ${trailComparison.sharedRetrieval8.plexer.mrr.toFixed(3)}** vs Trail **Recall@1 ${(trailComparison.sharedRetrieval8.trail.recallAt1 * 100).toFixed(1)}% / MRR ${trailComparison.sharedRetrieval8.trail.mrr.toFixed(3)}**\n`);
-        console.log("| Repo / Engine | Nodes / Edges | Warm Refresh | `check` | `ask --source` | `ask` | `grep` | `callers` | `skeleton` | `map` | `ask --source` Tokens |");
-        console.log("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
-        for (const tm of trailComparison.trailEngine) {
-            const pm = repoMetrics.find((m) => m.name === tm.name);
-            if (pm) {
-                console.log(`| \`${pm.name}\` (**plexer**) | **${pm.nodes.toLocaleString()} / ${pm.edges.toLocaleString()}** | **${pm.warmBuildMs}ms** | **${pm.checkMs}ms** | **${pm.askSourceMs}ms** | **${pm.askNoSourceMs}ms** | **${pm.grepMs}ms** | **${pm.callersMs}ms** | **${pm.skeletonMs}ms** | **${pm.mapMs}ms** | **${pm.askSourceTokens}** |`);
-            }
-            console.log(`| \`${tm.name}\` (trail@0.25.0) | ${tm.nodes.toLocaleString()} / ${tm.edges.toLocaleString()} | ${tm.warmBuildMs}ms | ${tm.checkMs}ms | ${tm.askSourceMs}ms | ${tm.askNoSourceMs}ms | ${tm.grepMs}ms | ${tm.callersMs}ms | ${tm.skeletonMs}ms | ${tm.mapMs}ms | ${tm.askSourceTokens} |`);
-        }
+    if (resolvedHard) {
+        console.log(
+            `\n## 3. Hard Retrieval & Negative-Control Stress (${resolvedHard.totalQueries} Queries)\n\n` +
+                `- **Recall@1**: ${(resolvedHard.recallAt1 * 100).toFixed(1)}% | **Recall@3**: ${(resolvedHard.recallAt3 * 100).toFixed(1)}% | **MRR**: ${resolvedHard.mrr.toFixed(3)} | **Neg False-Positives**: ${(resolvedHard.negFalsePositiveRate * 100).toFixed(1)}% (${resolvedHard.negFalsePositives}/${resolvedHard.negativeQueries}) — **${resolvedHard.gate.passed ? "PASS" : "FAIL"}**`
+        );
+    }
+    if (scaleStress) {
+        console.log(
+            `\n## 4. Synthetic 25k-Node Scale Stress (${scaleStress.nodes.toLocaleString()} nodes, ${scaleStress.edges.toLocaleString()} edges)\n\n` +
+                `- **Dirty 1-file**: ${scaleStress.dirtyCone1FileMs}ms | **ask --source p50**: ${scaleStress.askSourceP50Ms}ms | **callers p50**: ${scaleStress.callersD2P50Ms}ms | **daemon RPC**: ${scaleStress.daemonRpcMs}ms | **RSS**: ${scaleStress.peakRssMb}MB — **${scaleStress.gate.passed ? "PASS" : "FAIL"}**`
+        );
     }
 }
