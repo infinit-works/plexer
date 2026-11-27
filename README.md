@@ -29,7 +29,7 @@ plexer viz                                           # Launch local Canvas graph
 After initialization, lifecycle hooks run through a shared cross-host dispatcher (`src/hosts/engine/dispatcher.js`) and the local `plexerd` socket daemon across Claude Code, Codex, Gemini CLI, and Antigravity. On Turn 0, hooks stay silent (`0 B`) on out-of-bounds general prompts and inject repository orientation, prompt-matched `<n>:` code spans, and co-edit or test pointers only when grounded in the index. Before tool execution, `PreToolUse` / `BeforeTool` hooks snap file reads to unseen AST spans, deduplicate repeated searches and `git diff` calls, and route `cat`/`head`/`tail`/`sed`/`grep`/`rg` shell lookups through `plexer`. After edits and plan handoffs, `PostToolUse` / `AfterTool` hooks refresh changed files incrementally and warn when signature or export edits affect callers. Run `plexer uninstall --yes` (or `plexer retract --yes`) to remove host wiring cleanly.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@2.0.0/assets/how-it-works.svg" alt="How plexer works: your codebase (36 languages and SFCs) is indexed by plexer init into plexer/, powering Turn-0 retrieval, caller traversal, blast radius, and the interactive graph viewer." width="100%" />
+  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@2.1.0/assets/how-it-works.svg" alt="How plexer works: your codebase (36 languages and SFCs) is indexed by plexer init into plexer/, powering Turn-0 retrieval, caller traversal, blast radius, and the interactive graph viewer." width="100%" />
 </p>
 
 ## Architecture

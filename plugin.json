@@ -1,7 +1,7 @@
 {
   "name": "plexer",
   "displayName": "Plexer",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Offline code graph, Turn-0 span retrieval, anti-pagination file hooks, and live health treemap visualizer for coding agents.",
   "author": "Infinit Works",
   "homepage": "https://github.com/infinit-works/plexer#readme",
