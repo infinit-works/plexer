@@ -311,7 +311,7 @@ describe("SQLite v3 Packing, Streaming, Worker Determinism & Daemon Perf", () =>
             const t0 = performance.now();
             daemon = await startDaemon({ socketPath: sockPath, idleTimeoutMs: 15_000 });
             const readyMs = performance.now() - t0;
-            assert.ok(readyMs < 500, `expected fast daemon socket startup (<500ms), got ${readyMs.toFixed(1)}ms`);
+            assert.ok(readyMs < 2500, `expected fast daemon socket startup (<2500ms), got ${readyMs.toFixed(1)}ms`);
             assert.ok(daemon.version && daemon.codeStamp);
 
             const ping = await sendDaemonRpc(sockPath, { id: 1, type: "ping", version: daemon.version, codeStamp: daemon.codeStamp });

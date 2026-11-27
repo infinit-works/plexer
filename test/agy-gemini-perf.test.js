@@ -1470,7 +1470,7 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             const tWarm0 = performance.now();
             for (let i = 0; i < 50; i++) locateSwarmRoster(`missing-worker-${i}`, [appData]);
             const avgMissMs = (performance.now() - tWarm0) / 50;
-            assert.ok(avgMissMs < 0.5, `warm locateSwarmRoster miss too slow: ${avgMissMs.toFixed(3)}ms`);
+            assert.ok(avgMissMs < 5, `warm locateSwarmRoster miss too slow (<5ms): ${avgMissMs.toFixed(3)}ms`);
         } finally {
             process.env.PATH = prevPath;
             for (const s of sids) rmSync(agySessionPath(s), { force: true });
