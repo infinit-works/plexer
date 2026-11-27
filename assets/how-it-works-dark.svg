@@ -1,0 +1,293 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="452" viewBox="0 0 960 452" role="img" aria-label="How Plexer helps AI coding agents: on the same prompt to fix a session timeout bug, an agent without Plexer runs multiple grep searches and reads entire files before editing, while an agent with Plexer receives the exact lines and callers upfront and edits directly. Run plexer init once per repo; works automatically in Claude Code, Cursor, Codex, Antigravity, and 8 more agents, 100% local and free.">
+  <title>How Plexer Helps AI Coding Agents</title>
+  <desc>Before and after comparison for a shared prompt ("Fix the session timeout bug"). Without Plexer: the AI agent searches the repo for "timeout", reads entire files (session.ts and config.ts), searches again for callers, and opens more files before editing, filling its context window. With Plexer: Plexer automatically provides the exact lines (session.ts:42-44) and callers (middleware.ts:18 and refresh.ts:64) upfront so the agent edits the bug directly while Plexer updates the local map automatically. Footer: run plexer init once per repo; works automatically in Claude Code, Cursor, Codex, Antigravity and 8 more; 100% local, $0.</desc>
+
+  <defs>
+    <style>
+      .sans {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "Noto Sans", Helvetica, Arial, sans-serif;
+      }
+      .mono {
+        font-family: ui-monospace, "SF Mono", "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+      }
+
+      /* Surfaces (GitHub Primer Dark) */
+      .card { fill: #161B22; stroke: #30363D; stroke-width: 1.25; }
+      .card-with { fill: #161B22; stroke: #444C56; stroke-width: 1.5; }
+      .prompt-bar { fill: #161B22; stroke: #30363D; stroke-width: 1.25; }
+      .well { fill: #0D1117; stroke: #30363D; stroke-width: 1; }
+      .well-accent { fill: #0D1117; stroke: #1F4D7A; stroke-width: 1.15; }
+      .well-head { fill: #1C2128; }
+      .well-head-blue { fill: #112338; }
+      .footer-bar { fill: #161B22; stroke: #30363D; stroke-width: 1; }
+      .hairline { stroke: #21262D; stroke-width: 1; }
+      .hairline-blue { stroke: #1D4168; stroke-width: 1; }
+
+      /* Typography */
+      .title { font-size: 15px; font-weight: 700; fill: #F0F6FC; letter-spacing: -0.01em; }
+      .sub { font-size: 11.5px; font-weight: 500; fill: #9198A1; }
+      .prompt-txt { font-size: 13px; font-weight: 600; fill: #F0F6FC; }
+      .b { font-weight: 700; }
+      .b6 { font-weight: 600; }
+      .s10 { font-size: 10px; }
+      .s105 { font-size: 10.5px; }
+      .s11 { font-size: 11px; }
+      .s115 { font-size: 11.5px; }
+
+      /* Ink and Brand Colors */
+      .ink { fill: #F0F6FC; }
+      .muted { fill: #9198A1; }
+      .subtle { fill: #6E7681; }
+      .blue { fill: #38A3F8; }
+      .mag { fill: #F05292; }
+      .coral { fill: #F4897B; }
+      .green { fill: #3FB950; }
+      .white { fill: #FFFFFF; }
+
+      /* Badges and Pills */
+      .badge-neutral { fill: #0D1117; stroke: #30363D; stroke-width: 1; }
+      .badge-brand { fill: #0D1117; stroke: #1F4D7A; stroke-width: 1; }
+      .pill-prompt { fill: #0D1117; stroke: #30363D; stroke-width: 1; }
+      .pill-coral { fill: #2B1716; stroke: #6E3630; stroke-width: 1; }
+      .pill-mag { fill: #2E1324; stroke: #6E2246; stroke-width: 1; }
+      .pill-cmd { fill: #0D1117; stroke: #30363D; stroke-width: 1; }
+      .chip-mag { fill: #2E1324; stroke: #6E2246; stroke-width: 1; }
+
+      /* Step Indicators and Timelines */
+      .timeline-muted { stroke: #30363D; stroke-width: 1.5; }
+      .step-muted { fill: #161B22; stroke: #484F58; stroke-width: 1.25; }
+      .step-blue { fill: #1F8CEB; }
+      .step-green { fill: #2EA043; }
+      .dot-blue { fill: #38A3F8; }
+
+      /* Progress Bars */
+      .meter-track { fill: #21262D; }
+      .meter-bloat { fill: #D16859; }
+
+      /* Connectors and Syntax Highlighting */
+      .track-muted { fill: none; stroke: #3D444D; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+      .track-brand { fill: none; stroke: #1F4D7A; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+      .arr-muted { fill: #6E7681; }
+      .arr-blue { fill: #38A3F8; }
+      .arr-mag { fill: #F05292; }
+      .syn-kw { fill: #79C0FF; font-weight: 600; }
+      .syn-fn { fill: #F472B6; font-weight: 600; }
+      .syn-const { fill: #FFA657; font-weight: 600; }
+
+      /* Subtle Motion */
+      .pulse {
+        fill: none;
+        stroke-width: 2.25;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-dasharray: 26 140;
+        stroke-dashoffset: 26;
+        opacity: 0;
+      }
+      .pulse-in { stroke: #38A3F8; animation: flow-in 4s linear infinite; }
+      .pulse-step { stroke: #F05292; animation: flow-step 4s linear infinite; }
+
+      @keyframes flow-in {
+        0% { stroke-dashoffset: 26; opacity: 0; }
+        8% { opacity: 0.95; }
+        38% { opacity: 0.95; }
+        46%, 100% { stroke-dashoffset: -110; opacity: 0; }
+      }
+      @keyframes flow-step {
+        0%, 50% { stroke-dashoffset: 26; opacity: 0; }
+        58% { opacity: 0.95; }
+        82% { opacity: 0.95; }
+        92%, 100% { stroke-dashoffset: -110; opacity: 0; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .pulse-in, .pulse-step { animation: none; }
+        .pulse { opacity: 0; }
+      }
+    </style>
+
+    <linearGradient id="accent-bar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38A3F8"/>
+      <stop offset="50%" stop-color="#8B75E8"/>
+      <stop offset="100%" stop-color="#F05292"/>
+    </linearGradient>
+
+    <linearGradient id="logo-grad" x1="0.276" y1="3" x2="5.724" y2="3" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F05292" stop-opacity="0.9"/>
+      <stop offset="30%" stop-color="#38A3F8"/>
+      <stop offset="70%" stop-color="#38A3F8"/>
+      <stop offset="100%" stop-color="#F05292" stop-opacity="0.9"/>
+    </linearGradient>
+
+    <clipPath id="with-clip">
+      <rect width="462" height="316" rx="12"/>
+    </clipPath>
+  </defs>
+
+  <!-- ================= TOP PROMPT & BRANCH CONNECTORS ================= -->
+  <g>
+    <!-- Shared stem & Left branch (Without Plexer) -->
+    <path d="M 480 50 V 61 H 247 Q 239 61 239 69 V 71" class="track-muted"/>
+    <path d="M 235 69 L 239 76 L 243 69 Z" class="arr-muted"/>
+
+    <!-- Right branch (With Plexer) -->
+    <path d="M 480 61 H 713 Q 721 61 721 69 V 71" class="track-brand"/>
+    <path d="M 480 50 V 61 H 713 Q 721 61 721 69 V 71" pathLength="100" class="pulse pulse-in"/>
+    <path d="M 717 69 L 721 76 L 725 69 Z" class="arr-blue"/>
+
+    <!-- Shared Prompt Pill -->
+    <rect x="331" y="10" width="298" height="40" rx="10" class="prompt-bar"/>
+    <rect x="343" y="19" width="84" height="22" rx="6" class="pill-prompt"/>
+    <text x="385" y="33.5" text-anchor="middle" class="sans muted b6 s105">Your prompt</text>
+    <text x="439" y="34.5" class="sans prompt-txt">&quot;Fix the session timeout bug&quot;</text>
+  </g>
+
+  <!-- ================= LEFT CARD: WITHOUT PLEXER ================= -->
+  <g transform="translate(8, 76)">
+    <rect width="462" height="316" rx="12" class="card"/>
+
+    <!-- Header -->
+    <rect x="18" y="18" width="26" height="26" rx="7" class="badge-neutral"/>
+    <!-- Search icon -->
+    <circle cx="29.5" cy="29.5" r="4.5" fill="none" stroke="#9198A1" stroke-width="1.6"/>
+    <path d="M 33 33 L 36.5 36.5" stroke="#9198A1" stroke-width="1.6" stroke-linecap="round"/>
+
+    <text x="54" y="31" class="sans title">Without Plexer</text>
+    <text x="54" y="47" class="sans sub">Your agent searches blindly, one file at a time</text>
+
+    <rect x="362" y="20" width="82" height="22" rx="11" class="pill-coral"/>
+    <text x="403" y="34.5" text-anchor="middle" class="sans coral b6 s105">Slow &amp; noisy</text>
+
+    <!-- Blind Search Steps Well -->
+    <rect x="18" y="62" width="426" height="182" rx="8" class="well"/>
+    <line x1="39" y1="80" x2="39" y2="226" class="timeline-muted"/>
+
+    <!-- Row 1 -->
+    <circle cx="39" cy="83" r="8.5" class="step-muted"/>
+    <text x="39" y="86.5" text-anchor="middle" class="sans muted b6 s10">1</text>
+    <text x="58" y="86.5" class="sans ink b6 s115">Search repo for &quot;timeout&quot;</text>
+    <text x="430" y="86.5" text-anchor="end" class="mono muted s105">47 matches</text>
+    <line x1="58" y1="100" x2="430" y2="100" class="hairline"/>
+
+    <!-- Row 2 -->
+    <circle cx="39" cy="117" r="8.5" class="step-muted"/>
+    <text x="39" y="120.5" text-anchor="middle" class="sans muted b6 s10">2</text>
+    <text x="58" y="120.5" class="sans ink b6 s115">Read entire <tspan class="mono">session.ts</tspan></text>
+    <text x="430" y="120.5" text-anchor="end" class="mono muted s105">420 lines</text>
+    <line x1="58" y1="134" x2="430" y2="134" class="hairline"/>
+
+    <!-- Row 3 -->
+    <circle cx="39" cy="151" r="8.5" class="step-muted"/>
+    <text x="39" y="154.5" text-anchor="middle" class="sans muted b6 s10">3</text>
+    <text x="58" y="154.5" class="sans ink b6 s115">Read entire <tspan class="mono">config.ts</tspan></text>
+    <text x="430" y="154.5" text-anchor="end" class="mono muted s105">280 lines</text>
+    <line x1="58" y1="168" x2="430" y2="168" class="hairline"/>
+
+    <!-- Row 4 -->
+    <circle cx="39" cy="185" r="8.5" class="step-muted"/>
+    <text x="39" y="188.5" text-anchor="middle" class="sans muted b6 s10">4</text>
+    <text x="58" y="188.5" class="sans ink b6 s115">Search again for callers</text>
+    <text x="430" y="188.5" text-anchor="end" class="mono muted s105">2 more files</text>
+    <line x1="58" y1="202" x2="430" y2="202" class="hairline"/>
+
+    <!-- Row 5 -->
+    <circle cx="39" cy="219" r="8.5" class="step-muted"/>
+    <text x="39" y="222.5" text-anchor="middle" class="sans muted b6 s10">5</text>
+    <text x="58" y="222.5" class="sans muted b6 s115">Finally starts editing</text>
+    <text x="430" y="222.5" text-anchor="end" class="sans coral b6 s105">after 4 detours</text>
+
+    <!-- Context Meter -->
+    <rect x="18" y="254" width="426" height="48" rx="8" class="well"/>
+    <text x="30" y="272" class="sans muted b6 s105">Context used</text>
+    <text x="432" y="272" text-anchor="end" class="sans coral b6 s105">Whole files read, extra turns</text>
+    <rect x="30" y="283" width="402" height="8" rx="4" class="meter-track"/>
+    <rect x="30" y="283" width="338" height="8" rx="4" class="meter-bloat"/>
+  </g>
+
+  <!-- ================= RIGHT CARD: WITH PLEXER ================= -->
+  <g transform="translate(490, 76)">
+    <rect width="462" height="316" rx="12" class="card-with"/>
+    <rect width="462" height="3" fill="url(#accent-bar)" clip-path="url(#with-clip)"/>
+
+    <!-- Header -->
+    <rect x="18" y="18" width="26" height="26" rx="7" class="badge-brand"/>
+    <!-- Plexer mark -->
+    <g transform="translate(22, 22) scale(3)">
+      <path stroke="url(#logo-grad)" stroke-width="0.62" fill="none" d="M2.293 2.293L3.707 3.707A1 1 0 1 0 3.707 2.293L2.293 3.707A1 1 0 1 1 2.293 2.293Z"/>
+    </g>
+
+    <text x="54" y="31" class="sans title">With Plexer</text>
+    <text x="54" y="47" class="sans sub">Plexer sends the exact lines and callers upfront</text>
+
+    <rect x="352" y="20" width="92" height="22" rx="11" class="pill-mag"/>
+    <text x="398" y="34.5" text-anchor="middle" class="sans mag b6 s105">Fast &amp; focused</text>
+
+    <!-- Step 1: Exact Context Card -->
+    <rect x="18" y="62" width="426" height="120" rx="8" class="well-accent"/>
+    <path d="M 26 62 H 436 Q 444 62 444 70 V 88 H 18 V 70 Q 18 62 26 62 Z" class="well-head-blue"/>
+    <line x1="18" y1="88" x2="444" y2="88" class="hairline-blue"/>
+
+    <circle cx="35" cy="75" r="8.5" class="step-blue"/>
+    <text x="35" y="78.5" text-anchor="middle" class="sans white b s10">1</text>
+    <text x="52" y="78.5" class="sans ink b6 s115">Plexer hands your agent exact context</text>
+    <text x="432" y="78.5" text-anchor="end" class="mono blue b6 s105">session.ts:42-44</text>
+
+    <!-- Tiny 3-line Code Preview -->
+    <text x="48" y="105" text-anchor="end" class="mono subtle s105">42:</text>
+    <text x="56" y="105" xml:space="preserve" class="mono ink s105"><tspan class="syn-kw">function</tspan> <tspan class="syn-fn">checkSession</tspan>(s, now) {</text>
+
+    <text x="48" y="121" text-anchor="end" class="mono subtle s105">43:</text>
+    <text x="68.5" y="121" xml:space="preserve" class="mono ink s105"><tspan class="syn-kw">return</tspan> now - s.createdAt &lt; <tspan class="syn-const">TTL_MS</tspan></text>
+
+    <text x="48" y="137" text-anchor="end" class="mono subtle s105">44:</text>
+    <text x="56" y="137" class="mono ink s105">}</text>
+
+    <line x1="30" y1="148" x2="432" y2="148" class="hairline"/>
+
+    <!-- Callers Row -->
+    <rect x="30" y="156" width="52" height="18" rx="4" class="chip-mag"/>
+    <text x="56" y="168.5" text-anchor="middle" class="sans mag b6 s10">Callers</text>
+    <text x="92" y="168.5" class="mono ink s105">middleware.ts:18<tspan class="muted">,</tspan><tspan dx="6">refresh.ts:64</tspan></text>
+    <text x="432" y="168.5" text-anchor="end" class="sans muted s10">2 call sites</text>
+
+    <!-- Connector Step 1 -> Step 2 -->
+    <path d="M 35 182 V 192" class="track-brand"/>
+    <path d="M 35 182 V 192" pathLength="100" class="pulse pulse-step"/>
+    <path d="M 31.5 190 L 35 195.5 L 38.5 190 Z" class="arr-mag"/>
+
+    <!-- Step 2: Direct Edit Card -->
+    <rect x="18" y="196" width="426" height="48" rx="8" class="well"/>
+    <circle cx="35" cy="220" r="8.5" class="step-green"/>
+    <path d="M 31.5 220 L 34 222.5 L 38.8 217.5" fill="none" stroke="#FFFFFF" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="52" y="216" class="sans ink b6 s115">Agent edits the bug directly</text>
+    <text x="52" y="232.5" class="sans muted s105">Checks both callers, and Plexer updates the map automatically</text>
+
+    <!-- Context Meter -->
+    <rect x="18" y="254" width="426" height="48" rx="8" class="well"/>
+    <text x="30" y="272" class="sans muted b6 s105">Context used</text>
+    <text x="432" y="272" text-anchor="end" class="sans blue b6 s105">Exact lines upfront, straight to editing</text>
+    <rect x="30" y="283" width="402" height="8" rx="4" class="meter-track"/>
+    <rect x="30" y="283" width="76" height="8" rx="4" fill="url(#accent-bar)"/>
+  </g>
+
+  <!-- ================= FOOTER STRIP ================= -->
+  <g transform="translate(8, 404)">
+    <rect width="944" height="38" rx="10" class="footer-bar"/>
+
+    <!-- Segment 1: Setup -->
+    <rect x="12" y="8" width="96" height="22" rx="5" class="pill-cmd"/>
+    <text x="60" y="22.5" text-anchor="middle" class="mono s105"><tspan class="blue b">$</tspan><tspan class="ink b6" dx="4">plexer init</tspan></text>
+    <text x="118" y="23" class="sans muted s11">Run once per repo</text>
+
+    <line x1="234" y1="10" x2="234" y2="28" class="hairline"/>
+
+    <!-- Segment 2: Agent Compatibility -->
+    <text x="518" y="23" text-anchor="middle" class="sans muted s11">Automatic in <tspan class="ink b6">Claude Code, Cursor, Codex, Antigravity</tspan> &amp; 8 more</text>
+
+    <line x1="802" y1="10" x2="802" y2="28" class="hairline"/>
+
+    <!-- Segment 3: Local & Free -->
+    <circle cx="822" cy="19" r="3.5" class="dot-blue"/>
+    <text x="833" y="23" class="sans ink b6 s11">100% local, $0</text>
+  </g>
+</svg>

@@ -1,14 +1,40 @@
-# `plexer`
+<div align="right">
+<a href="https://github.com/infinit-works/plexer"><img align="left" src="https://raw.githubusercontent.com/infinit-works/plexer/main/assets/logo.svg" width="128" alt="Plexer"></a>
+<a href="https://www.npmjs.com/package/@plexer/cli"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/link-npm-dark.svg"><img alt="npm" src="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/link-npm.svg"></picture></a>
+<a href="https://github.com/infinit-works/plexer/blob/main/bench/README.md"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/link-benchmarks-dark.svg"><img alt="Benchmarks" src="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/link-benchmarks.svg"></picture></a>
+<a href="https://github.com/infinit-works/plexer/releases"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/link-releases-dark.svg"><img alt="Releases" src="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/link-releases.svg"></picture></a>
+<a href="https://discord.gg/kohl"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/kohltastrophe/kohltastrophe/main/.github/img/link-discord-dark.svg"><img alt="Discord" src="https://raw.githubusercontent.com/kohltastrophe/kohltastrophe/main/.github/img/link-discord.svg"></picture></a>
+</div>
+<br/>
+<br/>
+<br/>
+<br/>
 
-`plexer` builds a local, offline structural code graph for coding agents inside a `plexer/` directory. Using bundled WASM Tree-sitter grammars and Node.js built-in SQLite storage, it indexes symbols, call edges, type relationships, imports, and exact line spans so agents retrieve definitions, callers, and git diff blast radius without exploratory file paging.
+<div align="center">
 
-- Cuts cumulative input tokens by 63.5%, tool output by 61.0%, tool calls by 50.4%, and search time by 35.5% across 196 paired evaluations (392 live runs) ([see benchmarks](#benchmarks)).
-- Local `node:sqlite` WAL storage and incremental dirty-cone rebuilds re-parse changed files without rescanning unchanged modules.
-- Queries return BM25F + PageRank-ranked hits with `<n>:` crux excerpts in 6.8–20.6ms (`100%` Recall@1 across 24 benchmark queries) with zero API keys or network calls.
-- One-command setup wires skills, `PreInvocation`/`PreToolUse`/`PostToolUse` hooks, and a stdio MCP server (`plexer mcp`) across 12 coding agents, including a native Antigravity 2 plugin.
-- 36 languages and single-file components parse offline, including TypeScript/TSX, JavaScript/JSX, Vue, Svelte, Astro, Rust, Go, Python, and Luau/Rojo projects, with a Canvas viewer (`plexer viz`) and health queue (`plexer health`).
+# Index once. Read less. Ship faster.
 
-## Quickstart
+_Plexer builds a local SQLite code graph for coding agents. It indexes symbols, call edges, and exact line spans so agents retrieve definitions, callers, and blast radius without paging through files._
+
+[![CI](https://img.shields.io/github/actions/workflow/status/infinit-works/plexer/release.yml?style=for-the-badge)](https://github.com/infinit-works/plexer/actions/workflow/status/infinit-works/plexer/release.yml) [![npm](https://img.shields.io/npm/v/@plexer/cli?style=for-the-badge)](https://www.npmjs.com/package/@plexer/cli) [![License](https://img.shields.io/github/license/infinit-works/plexer?style=for-the-badge)](https://github.com/infinit-works/plexer/blob/main/LICENSE) [![GitHub Release](https://img.shields.io/github/v/release/infinit-works/plexer?style=for-the-badge)](https://github.com/infinit-works/plexer/releases)
+
+---
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/h3-index-dark.svg"><img alt="Index once stay current" src="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/h3-index.svg"></picture>
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/infinit-works/plexer/main/assets/how-it-works-dark.svg"><img src="https://raw.githubusercontent.com/infinit-works/plexer/main/assets/how-it-works.svg" width="100%" alt="How plexer works: your codebase (36 languages and SFCs) is parsed via WASM Tree-sitter into a local SQLite code graph with dirty-cone rebuilds, delivering Turn-0 line spans, lifecycle hooks, callers and blast radius, health queue, Canvas viz, and MCP across 12 hosts."></picture>
+
+</div>
+
+Bundled WASM Tree-sitter grammars parse 36 languages and single-file components into `<repo>/plexer/` backed by `node:sqlite` WAL storage. Dirty-cone rebuilds re-parse changed modules and affected importers.
+
+---
+
+<div align="center">
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/h3-read-dark.svg"><img alt="Read less hit the right lines" src="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/h3-read.svg"></picture>
+
+<div align="left">
 
 Requires **Node.js >= 22.13** (uses built-in `node:sqlite`).
 
@@ -16,73 +42,57 @@ Requires **Node.js >= 22.13** (uses built-in `node:sqlite`).
 npm install -g @plexer/cli
 
 plexer init --global   # Link ~/.local/bin/plexer and install global skills, hooks, and opt-in MCP
-plexer init            # Index the current repository (<repo>/plexer/) and wire detected hosts
+plexer init            # Index this repository (<repo>/plexer/) and wire detected hosts
 
-plexer ask "freshness fingerprints" --source         # Rank symbols and inline <n>: source
-plexer callers resolveSymbol --depth 2               # Trace incoming callers across 2 hops
+plexer ask "parseWalkDepth" -n 1                     # Rank symbols with call sites and <n>: source
+plexer callers parseWalkDepth --depth 2              # Trace incoming callers across 2 hops
 plexer skeleton src/graph/traverse.js                # List file signatures and line spans
 plexer read src/graph/traverse.js:parseWalkDepth     # Read exact <file:symbol> or <file:Lx-Ly> spans
 plexer blast --base main --markdown                  # Compute diff blast radius against main
-plexer viz                                           # Launch local Canvas graph explorer
+plexer health scan                                   # Audit codebase health and build triage queue
+plexer viz                                           # Open the local HTML5 Canvas explorer
 ```
 
-After initialization, lifecycle hooks run through a shared cross-host dispatcher (`src/hosts/engine/dispatcher.js`) and the local `plexerd` socket daemon across Claude Code, Codex, Gemini CLI, and Antigravity. On Turn 0, hooks stay silent (`0 B`) on out-of-bounds general prompts and inject repository orientation, prompt-matched `<n>:` code spans, and co-edit or test pointers only when grounded in the index. Before tool execution, `PreToolUse` / `BeforeTool` hooks snap file reads to unseen AST spans, deduplicate repeated searches and `git diff` calls, and route `cat`/`head`/`tail`/`sed`/`grep`/`rg` shell lookups through `plexer`. After edits and plan handoffs, `PostToolUse` / `AfterTool` hooks refresh changed files incrementally and warn when signature or export edits affect callers. Run `plexer uninstall --yes` (or `plexer retract --yes`) to remove host wiring cleanly.
+Sample output (`plexer ask "parseWalkDepth" -n 1`):
 
-<p align="center">
-  <img src="https://cdn.jsdelivr.net/npm/@plexer/cli@2.1.0/assets/how-it-works.svg" alt="How plexer works: your codebase (36 languages and SFCs) is indexed by plexer init into plexer/, powering Turn-0 retrieval, caller traversal, blast radius, and the interactive graph viewer." width="100%" />
-</p>
+```text
+plexer ask — "parseWalkDepth"  (lexical)
 
-## Architecture
+1. parseWalkDepth · function — src/graph/traverse.js:L11-L20
+   Parse a walk depth (`number | "all" | "full" | "max" | undefined`) into a positive integer or `Infinity` (returns `NaN` when invalid).
+   related: ← resolveTraceDepth (src/mcp/tools.js:L319-L324)
+   call sites (5):
+     ← blastRadius (src/blast/blast.js:L921-L956) → 924: const parsedDepth = parseWalkDepth(opts?.depth, 2);
+     ← blastRadiusFromDir (src/blast/blast.js:L60-L83) → 72: const parsedDepth = parseWalkDepth(dirOpts.depth, 2);
+     ← blastRadiusIn (src/blast/blast.js:L1210-L1246) → 1215: const parsedDepth = parseWalkDepth(depth, 2);
+     ← resolveCliDepth (src/graph/traverse-cli.js:L747-L756) → 750: const d = parseWalkDepth(raw, defaultDepth);
+     ← callers (src/index.js:L813-L832) → 815: const depth = parseWalkDepth(opts.depth, 1);
 
-`plexer` stores parsed file caches, dependency edges, and packed `Int32Array` multi-channel BM25 postings (`ask_term_postings` across `name`, `path`, `sig`, `summary`, `literals`, `body`, `stem`, `exact_ident`) in schema-v3 `<outDir>/.cache/index.sqlite` using `node:sqlite` in WAL mode alongside `<outDir>/.graph/wiring.json`. Manifest-mounted local dependencies (`default.project.json`, `.luaurc`, `tsconfig.json`, `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`) auto-include referenced subtrees while keeping unreferenced `vendor/` or `node_modules/` directories excluded. When files change, the incremental dirty-cone builder binary-merges changed posting slices and resolves modified files, their importers, and affected barrel re-exports without rebuilding the whole graph.
-
-At Turn 0, prompt retrieval classifies confidence (`high` or `exploratory`) and adapts output to the prompt. High-confidence queries inline compact `<n>:` crux excerpts and pinned definitions (`src/hosts/engine/prompt/pin.js`), while exploratory queries return an 8-entry diverse candidate map (`candidateMap`) with caller/callee counts and file pointers rather than speculative code blocks.
-
-For repeated queries and hook invocations, `plexerd` caches repo graphs and session state over a user-scoped Unix socket so hooks avoid cold disk reads (`--no-daemon` bypasses the socket for single CLI calls). Multi-root workspaces federate across `.code-workspace` or `plexer/workspace.json` files, and the Antigravity 2 plugin (`plugin.json`, `hooks.json`) adds a live graph sidecar (`sidecar://plexer/viz/`).
-
-## CLI Reference
-
-Global options apply across commands: `--dir <path>` selects a custom context directory instead of `<repo>/plexer`, `--session <id>` tracks seen spans across calls, and `--no-daemon` skips the `plexerd` fast path. Query commands automatically refresh modified files unless `--no-refresh` is set, and support `--json`.
-
-| Command | Purpose and Key Flags |
-| :--- | :--- |
-| `plexer version` | Print the installed `@plexer/cli` version. |
-| `plexer init [dir]` | Build `plexer/` and wire detected hosts (`--global`, `--no-global`, `--agents <ids...>`, `--all-agents`, `--no-agents`, `--list-agents`, `--mcp`, `--no-mcp`, `--no-hooks`, `--no-build`, `--dry-run`, `-y`). |
-| `plexer setup` | Install global binary symlink, skills, hooks, and optional `--mcp` (`--agents`, `--no-bin`, `--no-skills`, `--no-hooks`, `--dry-run`). |
-| `plexer uninstall [dir]` | Remove host wiring and optionally `plexer/` (`alias: retract`, `-y`, `--dry-run`, `--keep-cache`, `--no-global`, `--json`). |
-| `plexer build [dir]` | Build or incrementally refresh the graph (`--cards`, `--no-reuse`, `-e <exts...>`, `--only-dir <path>`, `--include-dir <name\|path>`, `--follow-submodules`, `--follow-nested-repos`). |
-| `plexer check [dir]` | Report added, changed, removed, or stale files against the built graph (`-e`, `--json`). |
-| `plexer ask <queries...>` | Rank symbols by BM25F and PageRank; accepts multiple queries (`-n <limit>`, `--source`, `--no-source`, `--full`, `--in <path...>`, `--no-graph-rank`, `--json`). |
-| `plexer skeleton <targets...>` | List symbol signatures, exact line spans, and doc summaries for files or directories (`--all-matches`, `--json`). |
-| `plexer read <spans...>` | Read exact `<n>:` ranges for `<file:symbol>` or `<file:Lx-Ly>` spans and coalesce overlaps (`--callers`, `--full`, `--json`). |
-| `plexer grep <patterns...>` | Search indexed files by regex or fixed string (`--fixed`, `-i`, `-C <lines>`, `--source`, `--no-source`, `--full`, `--in <path...>`, `--json`). |
-| `plexer callers <syms...>` | Walk incoming edges (`--direction <in\|out>`, `-d <depth\|all>`, `--source`, `--no-source`, `--full`, `--in <path...>`, `--json`). |
-| `plexer callees <syms...>` | Walk outgoing callees (`-d <depth\|all>`, `--source`, `--no-source`, `--full`, `--in <path...>`, `--json`). |
-| `plexer impact <syms...>` | Walk 2-hop incoming callers (`-d <depth\|all>`, `--source`, `--no-source`, `--full`, `--in <path...>`, `--json`). |
-| `plexer map [dir]` | Summarize directory clusters, hub symbols, and git hotspots (`--max-dirs <n>`, `--churn`, `--json`). |
-| `plexer blast [dir]` | Compute git diff blast radius (`--base <ref>`, `-d <depth\|all>`, `--format <text\|markdown\|mermaid\|json>`, `--markdown`, `--mermaid`, `--export-viz <dir>`, `--no-owners`, `--pr-author <who...>`). |
-| `plexer viz [dir]` | Serve the local HTML5 Canvas viewer (`-p <port>`, `--no-open`, `--export <dir>`, `--title <text>`, `--tabs <context,code,modules,symbols,outline,treemap>`). |
-| `plexer mcp [dir]` | Start the newline-delimited JSON-RPC 2.0 MCP server exposing 9 `plexer_*` tools. |
-| `plexer health [sub]` | Scan codebase health and manage the `plexer/.health/` queue (`scan`, `next`, `backlog`, `status`, `show`, `resolve`, `suppress`, `plan`, `review`, `autofix`, `move`, `tree`, `viz`, `detect`, `zone`, `exclude`, `directives`, `config`, `prompt`). |
-
-## Codebase Health Queue
-
-`plexer health` pairs static AST and graph detectors (dead code, duplication, dependency cycles, cohesion, complexity, test gaps, and Luau/Roblox checks) with a persistent queue under `plexer/.health/`:
-
-```bash
-plexer health scan .          # Run AST/graph detectors and refresh the health queue
-plexer health next            # Pop the highest-leverage open item from the queue
-plexer health resolve <id>    # Mark an item resolved after fixing and verifying callers
-plexer health prompt          # Output the autonomous review prompt for your agent
+11: export function parseWalkDepth(raw, defaultDepth = 1) {
+12:     if (raw === undefined || raw === null)
+13:         return defaultDepth;
+14:     if (raw === Number.POSITIVE_INFINITY)
+15:         return Number.POSITIVE_INFINITY;
+16:     if (typeof raw === "string" && /^(all|full|max)$/i.test(raw.trim()))
+17:         return Number.POSITIVE_INFINITY;
+18:     const d = Number(raw);
+19:     return Number.isFinite(d) && d >= 1 ? Math.floor(d) : Number.NaN;
+20: }
 ```
 
-## Benchmarks
+Lifecycle hooks run automatically across Claude Code, Google Antigravity, Codex, Gemini CLI, and Cursor through the local `plexerd` socket daemon. On Turn 0, hooks emit `0 B` on unrelated prompts and inject grounded `<n>:` spans when indexed symbols match. Pre-tool hooks snap reads to unseen AST ranges, deduplicate repeated searches and diffs, and route shell lookups through `plexer`. Post-edit hooks refresh modified files and warn when signature changes affect callers. Run `plexer uninstall --yes` (or `plexer retract --yes`) to remove host wiring cleanly.
 
-We evaluated `plexer` against a cold baseline (no index or hooks) across **196 paired evaluations (392 live runs)** on **28 tasks**, **7 model configurations**, and **11 repositories** up to **1,350+ files**. Full methodology, Track A regression fixes, and Track B v2 suites live in [`bench/README.md`](bench/README.md). Across the 196 baseline evaluations (`T1`–`T12`, `S1`–`S8`, `L1`–`L8`), `plexer` cuts cumulative input tokens by **63.5%** (`95.3M → 34.8M`), tool output tokens by **61.0%** (`3,439k → 1,343k`), and uncached input tokens by **48.4%** (`12.72M → 6.56M`). It cuts tool calls by **50.4%** (`3,743 → 1,855`) and search time by **35.5%** (`25,021s → 16,132s`), while raising task accuracy from `98.8%` to **`99.6%`**. Runs span **Gemini 4 Neon**, **Carbon**, **Hydrogen**, and **Orchestrator** in both **High (`Neon High + Hydrogen High`)** and **XHigh (`Neon XHigh + Hydrogen XHigh`)** in Google Antigravity alongside **Claude Opus 5.5** and **Sonnet 5.5** in Claude Code.
+</div>
 
-<p align="center">
-  <img src="assets/chart-small.svg" alt="plexer Benchmark Summary: Engineering Tasks, SWE-bench Pro V2, and Large OSS Repositories" width="100%" />
-</p>
+---
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/h3-ship-dark.svg"><img alt="Ship faster spend fewer tokens" src="https://raw.githubusercontent.com/infinit-works/plexer/main/.github/img/h3-ship.svg"></picture>
+
+<a href="https://github.com/infinit-works/plexer/blob/main/bench/README.md"><img src="https://raw.githubusercontent.com/infinit-works/plexer/main/assets/chart-small.svg" width="100%" alt="plexer Benchmark Summary: Engineering Tasks, SWE-bench Pro V2, and Large OSS Repositories"></a>
+
+</div>
+
+We ran **196 paired live evaluations (392 sessions)** against a cold baseline across **28 tasks**, **7 model configurations** (Google Antigravity `Gemini 4 Neon`, `Carbon`, `Hydrogen`, and `Orchestrator` `High`/`XHigh`, plus Claude Code `Opus 5.5` and `Sonnet 5.5`), and **11 repositories** up to **1,350+ files**. Overall, `plexer` cuts cumulative input tokens by **63.5%** (`95.3M → 34.8M`), tool output by **61.0%**, uncached input by **48.4%**, tool calls by **50.4%**, and search time by **35.5%**, while raising accuracy from `98.8%` to **`99.6%`**. Full methodology, Track A regression checks, and Track B v2 suites live in [`bench/README.md`](https://github.com/infinit-works/plexer/blob/main/bench/README.md).
 
 | Benchmark Suite | Input Tokens | Tool Output | Tool Calls | Search Time | Accuracy |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -91,19 +101,117 @@ We evaluated `plexer` against a cold baseline (no index or hooks) across **196 p
 | **Large OSS repos** (440–1,350+ files, 56 pairs) | **-45.6%** (`7.32M → 3.98M`) | **-60.0%** (`436k → 174k`) | **-47.7%** (`576 → 301`) | **-23.8%** (`2,598s → 1,979s`) | **100.0%** (`56/56` solved vs. `54/56`) |
 | **All 196 paired evaluations** (28 tasks × 7 models) | **-63.5%** (`95.3M → 34.8M`) | **-61.0%** (`3,439k → 1,343k`) | **-50.4%** (`3,743 → 1,855`) | **-35.5%** (`25,021s → 16,132s`) | **99.6%** (`1,561/1,568` vs. `1,549/1,568`) |
 
-In offline benchmarks (`npm run bench`, 24 queries across 6 repos), `plexer` hits **100.0% Recall@1 (`24/24`)** and **1.000 MRR** in **6.8–20.6ms** (`0.01–1.74ms` for `callers`, `skeleton`, and `map`). The v2 offline suites add a 116-query hard retrieval and negative-control runner (`npm run bench:hard`: **99.0% Recall@1**, **100.0% Recall@3**, **0.995 MRR**, **0.0% negative false positives**). A 25k-node multi-language scale check (`npm run bench:scale`) covers 27,092 nodes and 37,512 edges. Measured latency is **2,078.6ms** cold build, **107.2ms** 1-file dirty-cone refresh, **9.18ms** p50 (**13.05ms** p95) `ask --source`, and **26.63ms** daemon RPC at **339 MB** RSS. All v2 tasks also pass a prompt-leakage linter (`npm run bench:leakage`).
+Offline engine suites verify retrieval accuracy, negative controls, zero leakage (`npm run bench:leakage`), and 25k-node scale:
 
-## Supported Hosts and Languages
+| Offline Suite | Coverage | Measured Results |
+| :--- | :--- | :--- |
+| `npm run bench` | 24 queries across 6 repos | **100.0% Recall@1** (`24/24`), **1.000 MRR**, **6.8–20.6ms** (`0.01–1.74ms` for `callers`/`skeleton`/`map`) |
+| `npm run bench:hard` | 116 hard & negative queries | **99.0% Recall@1**, **100.0% Recall@3**, **0.995 MRR**, **0.0%** negative false positives |
+| `npm run bench:scale` | 27,092 nodes, 37,512 edges | **2,078.6ms** cold build, **107.2ms** 1-file dirty cone, **9.18ms** p50 (`13.05ms` p95) `ask --source`, **26.63ms** daemon RPC, **339 MB** RSS |
 
-- **Hosts (12 registered IDs via `plexer init --list-agents`):** `claude` (Claude Code), `antigravity` (Google Antigravity), `agents` (`AGENTS.md` / Codex-style CLIs), `opencode` (OpenCode), `cursor` (Cursor), `gemini` (Gemini CLI), `windsurf` (Windsurf), `copilot` (GitHub Copilot), `kiro` (Kiro), `grok` (Grok xAI), `adal` (AdaL), and `hermes` (Hermes Agent).
-- **Languages and SFCs (36):**
-  - **Depth tier (9):** TypeScript (`ts`, `mts`, `cts`, `tsx`), JavaScript (`js`, `mjs`, `cjs`, `jsx`), Python (`py`, `pyi`), Go (`go`), Java (`java`), Kotlin (`kt`, `kts`), Swift (`swift`), PHP (`php`), and R (`r`, `R`).
-  - **Breadth tier (24):** Rust (`rs`), C (`c`, `h`), C++ (`cpp`, `cc`, `cxx`, `hpp`, `hh`, `hxx`, `h++`, `c++`, `inl`, `ipp`, `tpp`, `ixx`), Ruby (`rb`), C# (`cs`), Scala (`scala`, `sc`), Elixir (`ex`, `exs`), Solidity (`sol`), OCaml (`ml`, `mli`), Zig (`zig`), Dart (`dart`), Clojure (`clj`, `cljs`, `cljc`, `bb`), Nix (`nix`), Lua (`lua`), Luau (`luau`, including Rojo `default.project.json` and `.luaurc`), Bash (`sh`, `bash`, `zsh`), SQL (`sql`), HCL (`tf`, `tfvars`, `hcl`), Protobuf (`proto`), GraphQL (`graphql`, `gql`), Objective-C (`m`, `mm`), Haskell (`hs`), Gleam (`gleam`), and CUDA (`cu`, `cuh`).
-  - **Container SFCs (3):** Vue (`vue`), Svelte (`svelte`), and Astro (`astro`).
+---
+
+## Hosts & Integrations
+
+`plexer init` detects installed coding agents (`plexer init --list-agents` lists all 12 IDs) and writes host instructions, skills, lifecycle hooks, or MCP configs.
+
+| Host | ID | Instructions / Skills | Lifecycle Hooks & Extras | MCP (`plexer mcp`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Claude Code** | `claude` | Skill + instructions | Full hooks + statusline | Opt-in (`--mcp`) |
+| **Google Antigravity** | `antigravity` | Antigravity 2 plugin + skills | Full hooks + live Canvas sidecar | Opt-in (`--mcp`) |
+| **Codex / `AGENTS.md` CLIs** | `agents` | `AGENTS.md` + global skill | Full hooks (`~/.codex/hooks.json`) | Opt-in (`--mcp`) |
+| **Gemini CLI** | `gemini` | `GEMINI.md` + global skill | `BeforeAgent` / `BeforeTool` / `AfterTool` hooks | Opt-in (`--mcp`) |
+| **Cursor** | `cursor` | `.cursor/rules/plexer.mdc` | Prompt & post-edit hooks (`.cursor/hooks.json`) | Default on (`.cursor/mcp.json`) |
+| **Windsurf** | `windsurf` | `.windsurf/rules/plexer.md` | — | Default on |
+| **GitHub Copilot** | `copilot` | `.github/copilot-instructions.md` | — | Default on (`.vscode/mcp.json`) |
+| **OpenCode** | `opencode` | `AGENTS.md` | — | Default on (`opencode.json`) |
+| **Kiro** | `kiro` | `.kiro/steering/plexer.md` | — | Default on (`.kiro/settings/mcp.json`) |
+| **Grok (xAI)** | `grok` | `.grok/skills/plexer/SKILL.md` | — | Default on (`.grok/config.toml`) |
+| **Hermes Agent** | `hermes` | `AGENTS.md` | — | CLI via instructions |
+| **AdaL** | `adal` | `.adal/skills/plexer/SKILL.md` | — | CLI via skill |
+
+For editors without hook support, `plexer mcp` runs a newline-delimited JSON-RPC 2.0 stdio server exposing 9 `plexer_*` tools (`plexer_find_code`, `plexer_read`, `plexer_trace_calls`, `plexer_find_all`, `plexer_file_api`, `plexer_repo_map`, `plexer_blast`, `plexer_health`, `plexer_check_freshness`). Multi-root queries automatically federate repositories declared in `.code-workspace` or `plexer/workspace.json`.
+
+## Codebase Health & Visualization
+
+`plexer health` pairs 10 static AST and graph detector categories (duplicates, dead code, coupling, cohesion, tests, catches, types, traps, slop, and security, including Luau/Roblox checks) with 20 subjective review dimensions. Findings feed a persistent triage queue in `plexer/.health/` with commands for `scan`, `next`, `resolve`, `suppress`, `plan`, `review`, `autofix --dry-run`, `move`, and `viz`.
+
+`plexer viz` serves an interactive 60fps HTML5 Canvas explorer with graph, module, symbol, outline, and treemap views (or writes one standalone HTML page with `--export <dir>`). In Google Antigravity, the bundled plugin (`plugin.json`, `hooks.json`) opens this explorer directly in a live sidecar pane (`sidecar://plexer/viz/`).
+
+## CLI Reference
+
+Global flags work across subcommands: `--dir <path>` overrides `<repo>/plexer`, `--session <id>` deduplicates repeated span reads, and `--no-daemon` skips the `plexerd` socket fast path. Query commands refresh modified files automatically unless `--no-refresh` is set, and support `--json`.
+
+| Command | What it does |
+| :--- | :--- |
+| `plexer init [dir]` | Build `<repo>/plexer/` and wire detected hosts (`--global` for binary, skills, hooks, and opt-in `--mcp`) |
+| `plexer ask <queries...>` | Rank symbols by BM25F and PageRank with inline `<n>:` source excerpts |
+| `plexer skeleton <files...>` | Print symbol signatures, line spans, and doc summaries without reading full bodies |
+| `plexer read <spans...>` | Read exact `<file:symbol>` or `<file:Lx-Ly>` spans and coalesce overlaps |
+| `plexer callers <symbols...>` | Walk incoming callers (`callees` walks outgoing; `impact` defaults to depth 2) |
+| `plexer grep <patterns...>` | Search indexed files by regex or fixed string grouped by enclosing symbol |
+| `plexer map [dir]` | Summarize directory clusters, global hubs, and git churn hotspots |
+| `plexer blast [baseOrDir]` | Compute git diff blast radius with test coverage and owner hints |
+| `plexer health [sub]` | Scan codebase health and manage the `plexer/.health/` triage queue |
+| `plexer viz [dir]` | Serve the local HTML5 Canvas viewer or export standalone HTML |
+
+<details>
+<summary>Full CLI reference (all 18 commands and flags)</summary>
+
+| Command | Purpose and Flags |
+| :--- | :--- |
+| `plexer version` | Print the installed `@plexer/cli` version. |
+| `plexer init [dir]` | Build `plexer/` and wire detected hosts (`-g`/`--global`, `--no-global`, `--no-bin`, `--no-skills`, `--no-build`, `--agents <ids...>`, `--all-agents`, `--no-agents`, `--list-agents`, `--mcp`, `--no-mcp`, `--no-hooks`, `--no-statusline`, `--dry-run`, `-y`/`--yes`). |
+| `plexer setup` | Install global binary symlink, skill symlinks, hooks, and optional `--mcp` (`--agents <ids...>`, `--no-bin`, `--no-skills`, `--mcp`, `--no-mcp`, `--no-hooks`, `--dry-run`). |
+| `plexer uninstall [dir]` | Remove host wiring and optionally `plexer/` (`alias: retract`, `-y`/`--yes`, `--dry-run`, `--keep-cache`, `--no-global`, `--json`). |
+| `plexer build [dir]` | Build or incrementally refresh the graph (`-e`/`--extensions <exts...>`, `--no-reuse`, `--follow-submodules`, `--follow-nested-repos`, `--include-dir <name>`, `--only-dir <path>`, `--cards`, `--no-gitignore`, `--no-ignore`). |
+| `plexer check [dir]` | Report added, changed, removed, or stale files against the built graph (`-e`, `--json`). |
+| `plexer ask <queries...>` | Rank symbols by BM25F and PageRank (`-n <limit>`, `--source`, `--no-source`, `--full`, `--in <path>`, `--no-graph-rank`, `--json`, `--no-refresh`). |
+| `plexer skeleton <files...>` | List symbol signatures, line spans, and doc summaries (`--all-matches`, `--json`, `--no-refresh`). |
+| `plexer read <spans...>` | Read exact `<n>:` ranges for `<file:symbol>` or `<file:Lx-Ly>` spans (`--full`, `--callers`, `--json`, `--no-refresh`). |
+| `plexer grep <patterns...>` | Search indexed files by regex or fixed string (`-i`, `-F`/`--fixed`, `-C <lines>`, `--source`, `--no-source`, `--full`, `--in <path>`, `--json`, `--no-refresh`). |
+| `plexer callers <symbols...>` | Walk incoming edges (`--direction <in\|out>`, `-d`/`--depth <n\|all>`, `--source`, `--no-source`, `--full`, `--in <path>`, `--json`, `--no-refresh`). |
+| `plexer callees <symbols...>` | Walk outgoing edges (`-d`/`--depth <n\|all>`, `--source`, `--no-source`, `--full`, `--in <path>`, `--json`, `--no-refresh`). |
+| `plexer impact <symbols...>` | Walk 2-hop incoming callers (`-d`/`--depth <n\|all>`, `--source`, `--no-source`, `--full`, `--in <path>`, `--json`, `--no-refresh`). |
+| `plexer map [dir]` | Summarize directory clusters, hub symbols, and git churn (`--max-dirs <n>`, `--churn`, `--json`, `--no-refresh`). |
+| `plexer blast [baseOrDir] [dir]` | Compute git diff blast radius (`--base <ref>`, `-d`/`--depth <n\|all>`, `--format <text\|markdown\|mermaid\|json>`, `--markdown`, `--mermaid`, `--json`, `--export-viz <dir>`, `--title <text>`, `--no-owners`, `--pr-author <who...>`, `--no-refresh`). |
+| `plexer viz [dir]` | Serve the local HTML5 Canvas viewer (`-p <port>`, `--no-open`, `--export <dir>`, `--title <text>`, `--tabs <context,code,modules,symbols,outline,treemap>`). |
+| `plexer mcp [dir]` | Start the newline-delimited JSON-RPC 2.0 MCP server exposing 9 `plexer_*` tools. |
+| `plexer health [args...]` | Scan codebase health and manage `plexer/.health/` (`scan`, `next`, `backlog`, `status`, `show`, `resolve`, `suppress`, `plan`, `review`, `autofix`, `move`, `tree`, `viz`, `detect`, `zone`, `exclude`, `directives`, `config`, `prompt`). |
+
+</details>
+
+## Supported Languages
+
+All **36 languages and single-file components** run via bundled WASM Tree-sitter grammars with no external compiler setup. Depth-tier resolution covers **9 core languages** (TypeScript, JavaScript, Python, Go, Java, Kotlin, Swift, PHP, R). Breadth-tier parsing adds **24 languages** including Rust, C, C++, Ruby, C#, Luau, Elixir, and Solidity, alongside **3 SFC containers** (Vue, Svelte, Astro).
+
+<details>
+<summary>All 36 languages and file extensions</summary>
+
+| Tier | Count | Languages and Extensions |
+| :--- | :---: | :--- |
+| **Depth tier** | 9 | TypeScript (`.ts`, `.mts`, `.cts`, `.tsx`), JavaScript (`.js`, `.mjs`, `.cjs`, `.jsx`), Python (`.py`, `.pyi`), Go (`.go`), Java (`.java`), Kotlin (`.kt`, `.kts`), Swift (`.swift`), PHP (`.php`), R (`.r`, `.R`) |
+| **Breadth tier** | 24 | Rust (`.rs`), C (`.c`, `.h`), C++ (`.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.h++`, `.c++`, `.inl`, `.ipp`, `.tpp`, `.ixx`), Ruby (`.rb`), C# (`.cs`), Scala (`.scala`, `.sc`), Elixir (`.ex`, `.exs`), Solidity (`.sol`), OCaml (`.ml`, `.mli`), Zig (`.zig`), Dart (`.dart`), Clojure (`.clj`, `.cljs`, `.cljc`, `.bb`), Nix (`.nix`), Lua (`.lua`), Luau (`.luau`, plus Rojo `default.project.json` and `.luaurc`), Bash (`.sh`, `.bash`, `.zsh`), SQL (`.sql`), HCL (`.tf`, `.tfvars`, `.hcl`), Protobuf (`.proto`), GraphQL (`.graphql`, `.gql`), Objective-C (`.m`, `.mm`), Haskell (`.hs`), Gleam (`.gleam`), CUDA (`.cu`, `.cuh`) |
+| **Container SFCs** | 3 | Vue (`.vue`), Svelte (`.svelte`), Astro (`.astro`) |
+
+</details>
+
+## Architecture
+
+`plexer` persists parsed symbols, call edges, and packed BM25 postings in a local `node:sqlite` WAL database alongside a JSON wiring graph. Dirty-cone incremental updates, adaptive Turn-0 confidence scoring, and the `plexerd` Unix socket daemon keep repeated queries sub-millisecond to tens of milliseconds.
+
+<details>
+<summary>Storage layout, ranking, and daemon internals</summary>
+
+- **Storage (`<outDir>/.cache/index.sqlite` & `<outDir>/.graph/wiring.json`):** Schema-v3 SQLite WAL tables store file caches, dependency edges, and packed `Int32Array` `ask_term_postings` across 8 channels (`name`, `path`, `sig`, `summary`, `literals`, `body`, `stem`, `exact_ident`).
+- **Manifest mounts & dirty cones:** Project manifests (`default.project.json`, `.luaurc`, `tsconfig.json`, `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`) auto-include referenced local dependencies while keeping unreferenced `vendor/` and `node_modules/` directories excluded. On edit, incremental dirty-cone rebuilds binary-merge updated posting slices across modified modules, their importers, and affected barrel re-exports.
+- **Turn-0 routing & `plexerd`:** Prompt retrieval classifies prompts as `high` confidence (returning pinned definitions and crux excerpts) or `exploratory` (returning an 8-entry `candidateMap` with caller and callee counts). For repeated hook and CLI invocations, `plexerd` caches repository graphs and session seen-span state over a user-scoped Unix socket (`--no-daemon` bypasses the socket).
+
+</details>
 
 ## Programmatic API
 
-Ships with TypeScript declarations in `src/index.d.ts`. `Plexer.ask`, `Plexer.skeleton`, `Plexer.grep`, and `Plexer.callers` accept either a single string or `string[]` batches and transparently federate repositories configured through `plexer/workspace.json` or VS Code/Antigravity `.code-workspace` files.
+Ships with TypeScript declarations in [`src/index.d.ts`](https://github.com/infinit-works/plexer/blob/main/src/index.d.ts). `Plexer.ask`, `Plexer.skeleton`, `Plexer.grep`, and `Plexer.callers` accept a single string or `string[]` batches and federate `.code-workspace` or `plexer/workspace.json` configurations.
 
 ```ts
 import { Plexer, formatAsk, formatReadSpans, formatSkeleton } from "@plexer/cli";
@@ -123,6 +231,13 @@ console.log(apis.map((s) => formatSkeleton(s)).join("\n"));
 console.log(formatReadSpans(plexer.read("/path/to/repo", ["src/graph/fingerprint.js:probeDrift"])));
 ```
 
-## License
+## Sponsors
 
-MIT © Infinit Works
+Plexer is free and MIT-licensed. If Plexer is useful to you or your team, you can support its development through [GitHub Sponsors](https://github.com/sponsors/kohltastrophe) or [Ko-fi](https://ko-fi.com/kohltastrophe).
+
+<div align="center">
+  <a href="https://github.com/sponsors/kohltastrophe"><img src="https://raw.githubusercontent.com/kohltastrophe/kohltastrophe/badges/sponsor-github.svg" alt="GitHub Sponsors" /></a>&nbsp;&nbsp;<a href="https://ko-fi.com/kohltastrophe"><img src="https://raw.githubusercontent.com/kohltastrophe/kohltastrophe/badges/sponsor-kofi.svg" alt="Ko-fi" /></a>
+  <br/><br/>
+  <a href="https://github.com/sponsors/kohltastrophe"><img src="https://raw.githubusercontent.com/kohltastrophe/kohltastrophe/badges/sponsors.svg" alt="Sponsors" /></a>
+</div>
+
