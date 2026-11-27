@@ -29,7 +29,7 @@ function plexerBlocks(helpers) {
         ],
         PostToolUse: [
             { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd('post-edit', helpers), timeout: 10 }] },
-            { matcher: 'Read|ExitPlanMode', hooks: [{ type: 'command', command: hookCmd('post-tool-use', helpers), timeout: 8 }] },
+            { matcher: 'Read|ExitPlanMode|Bash', hooks: [{ type: 'command', command: hookCmd('post-tool-use', helpers), timeout: 8 }] },
         ],
         UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('prompt', helpers), timeout: 15 }] }],
         SessionStart: [{ matcher: 'startup|resume|compact', hooks: [{ type: 'command', command: hookCmd('session-start', helpers), timeout: 8 }] }],

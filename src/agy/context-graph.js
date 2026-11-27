@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -8,6 +8,7 @@ import { normalizeRelFile, parsePointerSpan } from './spans.js';
 import { tryRealpath } from '../util/fs.js';
 import { readJson } from '../util/state.js';
 import { agyLastRepoPath, agySessionPath, agyTempDir, readAgySession } from './session.js';
+import { sqliteWalRevision } from '../storage/sqlite-store.js';
 import { contextDirFor } from '../util/paths.js';
 
 const IGNORED_ROLES = new Set(['narrator', 'monitor']);
@@ -136,23 +137,72 @@ function extractStepToolTouches(step, touches) {
     }
 }
 
-function parseTranscriptTouches(transcriptPath) {
-    const touches = [];
+function parseTranscriptDelta(transcriptPath, startOffset, endOffset, touches) {
+    const byteLen = endOffset - startOffset;
+    if (byteLen <= 0)
+        return startOffset;
+    let fd = null;
     try {
-        const text = readFileSync(transcriptPath, 'utf8');
-        for (const line of text.split('\n')) {
-            if (!line.trim())
-                continue;
-            try {
-                extractStepToolTouches(JSON.parse(line), touches);
-            } catch {
-                continue;
+        fd = openSync(transcriptPath, 'r');
+        const buf = Buffer.allocUnsafe(byteLen);
+        let totalRead = 0;
+        while (totalRead < byteLen) {
+            const n = readSync(fd, buf, totalRead, byteLen - totalRead, startOffset + totalRead);
+            if (n <= 0)
+                break;
+            totalRead += n;
+        }
+        if (totalRead === 0)
+            return startOffset;
+        const slice = totalRead === byteLen ? buf : buf.subarray(0, totalRead);
+        const lastNewline = slice.lastIndexOf(0x0a);
+        let parsedEnd = startOffset;
+        if (lastNewline !== -1) {
+            const completeText = slice.subarray(0, lastNewline + 1).toString('utf8');
+            for (const line of completeText.split('\n')) {
+                if (!line.trim())
+                    continue;
+                try {
+                    extractStepToolTouches(JSON.parse(line), touches);
+                } catch {
+                    continue;
+                }
+            }
+            parsedEnd = startOffset + lastNewline + 1;
+        }
+        const tailBuf = slice.subarray(lastNewline + 1);
+        if (tailBuf.length > 0) {
+            const tailText = tailBuf.toString('utf8').trim();
+            if (!tailText) {
+                parsedEnd = startOffset + totalRead;
+            } else {
+                try {
+                    extractStepToolTouches(JSON.parse(tailText), touches);
+                    parsedEnd = startOffset + totalRead;
+                } catch {
+                    // Partial line still flushing; keep offset at last complete newline.
+                }
             }
         }
+        return parsedEnd;
     } catch {
-        // Ignore unreadable or partially flushed transcript lines.
+        return startOffset;
+    } finally {
+        if (fd !== null) {
+            try { closeSync(fd); } catch { /* ignore */ }
+        }
     }
-    return touches;
+}
+
+function touchTranscriptCacheLru(transcriptPath, entry) {
+    if (transcriptTouchCache.has(transcriptPath)) {
+        transcriptTouchCache.delete(transcriptPath);
+    } else if (transcriptTouchCache.size >= MAX_TRANSCRIPT_CACHE) {
+        const oldestKey = transcriptTouchCache.keys().next().value;
+        if (oldestKey !== undefined)
+            transcriptTouchCache.delete(oldestKey);
+    }
+    transcriptTouchCache.set(transcriptPath, entry);
 }
 
 function readRawTranscriptTouches(transcriptPath) {
@@ -166,16 +216,32 @@ function readRawTranscriptTouches(transcriptPath) {
         return null;
     }
     const cached = transcriptTouchCache.get(transcriptPath);
-    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size)
-        return cached.touches;
-
-    const touches = parseTranscriptTouches(transcriptPath);
-    if (transcriptTouchCache.size >= MAX_TRANSCRIPT_CACHE) {
-        const oldestKey = transcriptTouchCache.keys().next().value;
-        if (oldestKey !== undefined)
-            transcriptTouchCache.delete(oldestKey);
+    if (cached && cached.dev === st.dev && cached.ino === st.ino) {
+        if (cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+            touchTranscriptCacheLru(transcriptPath, cached);
+            return cached.touches;
+        }
+        if (st.size >= cached.offset) {
+            if (st.size > cached.offset) {
+                cached.offset = parseTranscriptDelta(transcriptPath, cached.offset, st.size, cached.touches);
+            }
+            cached.mtimeMs = st.mtimeMs;
+            cached.size = st.size;
+            touchTranscriptCacheLru(transcriptPath, cached);
+            return cached.touches;
+        }
     }
-    transcriptTouchCache.set(transcriptPath, { mtimeMs: st.mtimeMs, size: st.size, touches });
+
+    const touches = [];
+    const offset = parseTranscriptDelta(transcriptPath, 0, st.size, touches);
+    touchTranscriptCacheLru(transcriptPath, {
+        dev: st.dev,
+        ino: st.ino,
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        offset,
+        touches,
+    });
     return touches;
 }
 
@@ -198,17 +264,27 @@ function readTranscriptTouchSets(transcriptPath, repoRoot, realRepoRoot, altRoot
 }
 
 const brainSwarmIndexCache = new Map();
+const STALE_SWARM_ROSTER_MS = 24 * 60 * 60 * 1000;
 
-function indexRosterFileMembers(entry, coordinatorId, membersPath) {
-    const prevMtime = entry.rosterFiles.get(membersPath);
-    const curMtime = statMtimeMs(membersPath);
-    if (curMtime === 0 || (prevMtime !== undefined && prevMtime === curMtime))
-        return;
-    entry.rosterFiles.set(membersPath, curMtime);
+function clearCoordinatorEntries(entry, coordinatorId) {
     for (const [k, v] of entry.memberToCoord) {
         if (v.coordinatorId === coordinatorId)
             entry.memberToCoord.delete(k);
     }
+}
+
+function indexRosterFileMembers(entry, coordinatorId, membersPath, now = Date.now(), includeStale = false) {
+    const prevMtime = entry.rosterFiles.get(membersPath);
+    const curMtime = statMtimeMs(membersPath);
+    if (curMtime === 0 || (!includeStale && (now - curMtime) > STALE_SWARM_ROSTER_MS)) {
+        entry.rosterFiles.delete(membersPath);
+        clearCoordinatorEntries(entry, coordinatorId);
+        return;
+    }
+    if (prevMtime !== undefined && prevMtime === curMtime)
+        return;
+    entry.rosterFiles.set(membersPath, curMtime);
+    clearCoordinatorEntries(entry, coordinatorId);
     const roster = readJson(membersPath);
     const members = roster?.members && typeof roster.members === 'object' ? Object.values(roster.members) : [];
     for (const m of members) {
@@ -217,11 +293,13 @@ function indexRosterFileMembers(entry, coordinatorId, membersPath) {
     }
 }
 
-function scanAppDataRosterForWorker(appData, conversationId) {
+function scanAppDataRosterForWorker(appData, conversationId, opts = {}) {
     const brainDir = join(appData, 'brain');
     if (!existsSync(brainDir))
         return null;
     const dirMtime = statMtimeMs(brainDir);
+    const now = Date.now();
+    const includeStale = opts?.includeStale === true;
     let entry = brainSwarmIndexCache.get(brainDir);
     if (!entry) {
         entry = { dirMtime: -1, seenIds: new Set(), rosterFiles: new Map(), memberToCoord: new Map() };
@@ -238,12 +316,12 @@ function scanAppDataRosterForWorker(appData, conversationId) {
         for (const id of ids) {
             const membersPath = join(brainDir, id, '.system_generated', 'swarm', 'members.json');
             if (existsSync(membersPath))
-                indexRosterFileMembers(entry, id, membersPath);
+                indexRosterFileMembers(entry, id, membersPath, now, includeStale);
         }
     }
-    for (const membersPath of entry.rosterFiles.keys()) {
+    for (const membersPath of [...entry.rosterFiles.keys()]) {
         const coordinatorId = basename(dirname(dirname(dirname(membersPath))));
-        indexRosterFileMembers(entry, coordinatorId, membersPath);
+        indexRosterFileMembers(entry, coordinatorId, membersPath, now, includeStale);
     }
     const hit = entry.memberToCoord.get(conversationId);
     if (!hit)
@@ -254,9 +332,21 @@ function scanAppDataRosterForWorker(appData, conversationId) {
         : null;
 }
 
-export function locateSwarmRoster(conversationId, appDataDirs) {
+export function locateSwarmRoster(conversationId, appDataDirsOrOpts, maybeOpts = {}) {
     if (!conversationId)
         return null;
+    let appDataDirs;
+    let opts;
+    if (Array.isArray(appDataDirsOrOpts)) {
+        appDataDirs = appDataDirsOrOpts;
+        opts = maybeOpts ?? {};
+    } else if (appDataDirsOrOpts && typeof appDataDirsOrOpts === 'object') {
+        opts = appDataDirsOrOpts;
+        appDataDirs = Array.isArray(opts.appDataDirs) ? opts.appDataDirs : findAppDataDirs(opts);
+    } else {
+        opts = maybeOpts ?? {};
+        appDataDirs = findAppDataDirs(opts);
+    }
     for (const appData of appDataDirs) {
         const directMembers = join(appData, 'brain', conversationId, '.system_generated', 'swarm', 'members.json');
         if (!existsSync(directMembers))
@@ -265,8 +355,10 @@ export function locateSwarmRoster(conversationId, appDataDirs) {
         if (roster && typeof roster === 'object')
             return { appData, coordinatorId: conversationId, membersPath: directMembers, roster };
     }
+    if (opts?.skipBrainScan === true)
+        return null;
     for (const appData of appDataDirs) {
-        const found = scanAppDataRosterForWorker(appData, conversationId);
+        const found = scanAppDataRosterForWorker(appData, conversationId, opts);
         if (found)
             return found;
     }
@@ -327,7 +419,7 @@ function buildWorkerSwarmEntry(name, member, found, repoRoot, realRepoRoot, inde
  */
 export function discoverConversationSwarm(conversationId, repoRoot, opts = {}) {
     const appDataDirs = findAppDataDirs(opts);
-    const found = locateSwarmRoster(conversationId, appDataDirs);
+    const found = locateSwarmRoster(conversationId, appDataDirs, opts);
     if (!found) {
         return { coordinatorId: conversationId || null, title: null, membersPath: null, workers: [] };
     }
@@ -395,11 +487,13 @@ function findLatestAgySessionForRepo(repoRoot) {
 /**
  * Lightweight mtime-only revision token for sidecar polling (`GET /api/rev`).
  */
-export function computeSidecarRev({ repoRoot, sid, appDataDirs } = {}) {
+export function computeSidecarRev({ repoRoot, sid, appDataDirs, skipBrainScan } = {}) {
     if (!repoRoot)
         return 'empty';
     const ctxDir = contextDirFor(repoRoot);
+    const walRev = sqliteWalRevision(ctxDir);
     const graphMtime =
+        (walRev ? Math.round(walRev.mtimeMs + walRev.walMtimeMs) : 0) +
         statMtimeMs(join(ctxDir, '.graph', 'wiring.json')) +
         statMtimeMs(join(ctxDir, '.health', 'state.json'));
     const effectiveSid = sid || null;
@@ -408,7 +502,7 @@ export function computeSidecarRev({ repoRoot, sid, appDataDirs } = {}) {
         : statMtimeMs(agyLastRepoPath());
     let swarmMtime = 0;
     if (effectiveSid) {
-        const found = locateSwarmRoster(effectiveSid, findAppDataDirs({ appDataDirs }));
+        const found = locateSwarmRoster(effectiveSid, findAppDataDirs({ appDataDirs }), { skipBrainScan });
         if (found) {
             swarmMtime = statMtimeMs(found.membersPath);
             const members = found.roster?.members && typeof found.roster.members === 'object'
@@ -649,26 +743,53 @@ function appendIndexedFileEdges(graph, nodeByRel, edges, edgeSeen) {
     if (!graph?.edges || nodeByRel.size <= 1)
         return;
     const nodeBySymbolId = new Map();
-    for (const sym of graph.nodes ?? []) {
-        const rel = normalizeRelFile(sym.path);
-        if (rel && nodeByRel.has(rel))
-            nodeBySymbolId.set(sym.id, nodeByRel.get(rel));
+    if (graph._nodesByPath instanceof Map) {
+        for (const [rel, node] of nodeByRel) {
+            const syms = graph._nodesByPath.get(rel);
+            if (!syms)
+                continue;
+            for (const sym of syms)
+                nodeBySymbolId.set(sym.id, node);
+        }
+    } else {
+        for (const sym of graph.nodes ?? []) {
+            const rel = normalizeRelFile(sym.path);
+            if (rel && nodeByRel.has(rel))
+                nodeBySymbolId.set(sym.id, nodeByRel.get(rel));
+        }
     }
-    for (const e of graph.edges) {
+    if (nodeBySymbolId.size === 0)
+        return;
+    const tryPushEdge = (e) => {
         const srcNode = nodeBySymbolId.get(e.source);
         const dstNode = nodeBySymbolId.get(e.target);
         if (!srcNode || !dstNode || srcNode.id === dstNode.id)
-            continue;
+            return false;
         const key = `${srcNode.id}->${dstNode.id}`;
         if (edgeSeen.has(key))
-            continue;
+            return false;
         edgeSeen.add(key);
         edges.push({
             source: srcNode.id, target: dstNode.id, relation: e.relation || 'references',
             description: `${srcNode.relFile} references ${dstNode.relFile}`,
         });
-        if (edges.length >= 160)
-            break;
+        return edges.length >= 160;
+    };
+    if (graph._outEdges instanceof Map) {
+        for (const symId of nodeBySymbolId.keys()) {
+            const outList = graph._outEdges.get(symId);
+            if (!outList)
+                continue;
+            for (const e of outList) {
+                if (tryPushEdge(e))
+                    return;
+            }
+        }
+        return;
+    }
+    for (const e of graph.edges) {
+        if (tryPushEdge(e))
+            return;
     }
 }
 

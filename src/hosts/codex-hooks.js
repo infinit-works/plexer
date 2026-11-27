@@ -11,8 +11,8 @@ import { dirExists } from '../util/fs.js';
 
 const GEMINI_HOOK_DEFS = [
     { event: 'BeforeAgent', matcher: '*', name: 'plexer-before-agent', sub: 'gemini-before-agent', timeout: 15000 },
-    { event: 'BeforeTool', matcher: 'read_file|run_shell_command|grep_search', name: 'plexer-before-tool', sub: 'gemini-before-tool', timeout: 8000 },
-    { event: 'AfterTool', matcher: 'read_file|write_file|replace', name: 'plexer-after-tool', sub: 'gemini-after-tool', timeout: 8000 },
+    { event: 'BeforeTool', matcher: 'read_file|run_shell_command|grep_search|glob', name: 'plexer-before-tool', sub: 'gemini-before-tool', timeout: 8000 },
+    { event: 'AfterTool', matcher: 'read_file|write_file|replace|ExitPlanMode', name: 'plexer-after-tool', sub: 'gemini-after-tool', timeout: 8000 },
 ];
 
 const CURSOR_HOOK_DEFS = [
@@ -46,7 +46,9 @@ export function hookTargets(home) {
 const DESIRED_ENTRIES = [
     { event: 'SessionStart', matcher: 'startup|resume|compact', sub: 'session-start', timeout: 10 },
     { event: 'UserPromptSubmit', sub: 'prompt', timeout: 15 },
+    { event: 'PreToolUse', matcher: 'Read|Bash|Grep|Glob|shell', sub: 'pre-tool-use', timeout: 8 },
     { event: 'PostToolUse', matcher: 'apply_patch|Write|Edit|MultiEdit', sub: 'post-edit', timeout: 10 },
+    { event: 'PostToolUse', matcher: 'Read|Bash|shell', sub: 'post-tool-use', timeout: 8 },
     { event: 'Stop', sub: 'stop', timeout: 10 },
 ];
 export function installCodexHooks(home) {
@@ -66,14 +68,14 @@ export function geminiHookTargets({ home, repo } = {}) {
     const out = [];
     if (home) {
         out.push(
-            { id: 'gemini-hook-shim-global', path: join(home, '.gemini', 'hooks', 'plexer', 'plexer-hooks.cjs'), what: 'global Gemini hook shim' },
-            { id: 'gemini-hooks-global', path: join(home, '.gemini', 'settings.json'), what: 'global Gemini CLI hook entries' },
+            { hostId: 'gemini', scope: 'global', kind: 'hook', id: 'gemini-hook-shim-global', path: join(home, '.gemini', 'hooks', 'plexer', 'plexer-hooks.cjs'), what: 'global Gemini hook shim' },
+            { hostId: 'gemini', scope: 'global', kind: 'hook', id: 'gemini-hooks-global', path: join(home, '.gemini', 'settings.json'), what: 'global Gemini CLI hook entries' },
         );
     }
     if (repo) {
         out.push(
-            { id: 'gemini-hook-shim', path: join(repo, '.gemini', 'helpers', 'plexer-hooks.cjs'), what: 'repo Gemini hook shim' },
-            { id: 'gemini-hooks', path: join(repo, '.gemini', 'settings.json'), what: 'repo Gemini CLI hook entries' },
+            { hostId: 'gemini', scope: 'repo', kind: 'hook', id: 'gemini-hook-shim', path: join(repo, '.gemini', 'helpers', 'plexer-hooks.cjs'), what: 'repo Gemini hook shim' },
+            { hostId: 'gemini', scope: 'repo', kind: 'hook', id: 'gemini-hooks', path: join(repo, '.gemini', 'settings.json'), what: 'repo Gemini CLI hook entries' },
         );
     }
     return out;
@@ -99,8 +101,8 @@ export function installGeminiHooks({ home, repo } = {}) {
 export function cursorHookTargets(repo) {
     if (!repo) return [];
     return [
-        { id: 'cursor-hook-shim', path: join(repo, '.cursor', 'helpers', 'plexer-hooks.cjs'), what: 'Cursor hook shim' },
-        { id: 'cursor-hooks', path: join(repo, '.cursor', 'hooks.json'), what: 'Cursor hook entries' },
+        { hostId: 'cursor', scope: 'repo', kind: 'hook', id: 'cursor-hook-shim', path: join(repo, '.cursor', 'helpers', 'plexer-hooks.cjs'), what: 'Cursor hook shim' },
+        { hostId: 'cursor', scope: 'repo', kind: 'hook', id: 'cursor-hooks', path: join(repo, '.cursor', 'hooks.json'), what: 'Cursor hook entries' },
     ];
 }
 

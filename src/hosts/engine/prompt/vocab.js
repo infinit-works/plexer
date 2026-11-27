@@ -1,4 +1,5 @@
-import { loadAskIndexCached, loadAskVocabCached, recordNodeCompoundVocab, stemToken, tokenize } from '../../../ask/index-file.js';
+import { loadAskIndexCached, loadAskVocabCached, recordNodeCompoundVocab } from '../../../ask/index-file.js';
+import { stemToken, tokenize } from '../../../ask/tokenize.js';
 import { loadGraphCached } from '../../../context/graph-store.js';
 
 export const PROMPT_BOILERPLATE_NOISE = new Set([

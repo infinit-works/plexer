@@ -325,8 +325,16 @@ function stripIgnoreEntries(path, entries, apply, { deleteIfBlank = true } = {})
         .split('\n')
         .filter((l) => {
         const t = l.trim();
-        if (t.startsWith('#') && (t.includes('plexer') || t.includes('.ignore before .gitignore, so this re-admits the tree to search only')))
+        if (
+            t.startsWith('#')
+            && (
+                t.startsWith("# plexer's local graph cache")
+                || t.startsWith("# plexer's cards are gitignored")
+                || t.includes('.ignore before .gitignore, so this re-admits the tree to search only')
+            )
+        ) {
             return false;
+        }
         return !entries.some((re) => re.test(t));
     })
         .join('\n')
@@ -525,6 +533,13 @@ function targets(repo, opts) {
     for (const t of mcpTargets(repo, allIds, { home })) {
         if (opts.global === false && t.scope === 'global')
             continue;
+        if (t.hostId === 'gemini' && t.scope === 'repo') {
+            enqueueTarget({
+                hostId: 'gemini', path: t.path, what: 'repo Gemini hooks and MCP', scope: 'repo',
+                run: (a) => stripGeminiSettings(t.path, a),
+            });
+            continue;
+        }
         enqueueTarget({
             hostId: t.hostId, path: t.path, what: t.what, scope: t.scope,
             run: (a) => (t.format === 'toml' ? removeTomlSection(t.path, a) : removeJsonKey(t.path, t.topKey, a)),

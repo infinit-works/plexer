@@ -1,17 +1,18 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
-import { editedFilePath, handlePostEdit, handleStop, recordFileEdit } from '../../claude/hooks.js';
+import { editedFilePath, handleStop, recordFileEdit } from '../../claude/edit-hooks.js';
 import { formatBlastRadius } from '../../claude/format.js';
 import { loadGraphCached } from '../../context/graph-store.js';
 import { nearestPlexerRoot } from '../../graph/root.js';
 import { pickRepoForTargetPath } from '../../agy/multi-workspace.js';
-import { buildPlanExecutionHandoff } from '../../agy/plan-handoff.js';
+import { buildPlanExecutionHandoff, resolvePlanTargetFiles } from '../../agy/plan-handoff.js';
 import { invalidateEditedSpans, mergeSpan, normalizeRelFile } from '../../agy/spans.js';
+import { detectShellSourceEdit, tokenizeShellSegment } from '../../agy/shell-rewrite.js';
 import { checkSwarmEditCollision } from '../../agy/swarm-sync.js';
 import { contextDirFor } from '../../util/paths.js';
 import { spanRange } from '../../util/span.js';
-import { readStats } from '../../util/state.js';
-import { isGeminiModelProfile } from './prompt/budget.js';
+import { readSession, readStats, writeSession } from '../../util/state.js';
+import { isExtraHighEffortInput, isGeminiModelProfile, isHighOrExtraHighEffortInput, isOrchestratorInput } from './prompt/budget.js';
 import { isIgnoredTouchedPath } from './agy-transcript.js';
 import {
     HOST_KINDS, activeWorkspaceDirs, buildMidLoopHint, emitHookPayload, findNearestRepoAncestor,
@@ -24,41 +25,102 @@ const READ_TOOLS_RE = /^(?:read_file|view_file|Read)$/i;
 const EDIT_TOOLS_RE = /^(?:edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|Edit|Write|MultiEdit|apply_patch|replace)$/i;
 const AGY_READ_MAX_LINES = 800;
 const AGY_READ_MAX_BYTES = 46080;
+const READ_CHUNK_SIZE = 65536;
+const MAX_OFFSET_SCAN_BYTES = 8 * 1024 * 1024;
 
-function computeEffectiveReadEndLine(absTarget, startLine) {
+function findByteOffsetForLine(fd, targetLine, fileSize) {
+    if (targetLine <= 1) return 0;
+    const buf = Buffer.allocUnsafe(READ_CHUNK_SIZE);
+    let pos = 0;
+    let line = 1;
+    const limit = Math.min(fileSize, MAX_OFFSET_SCAN_BYTES);
+    while (pos < limit) {
+        const toRead = Math.min(READ_CHUNK_SIZE, limit - pos);
+        const bytesRead = readSync(fd, buf, 0, toRead, pos);
+        if (bytesRead <= 0) break;
+        for (let i = 0; i < bytesRead; i++) {
+            if (buf[i] === 10) {
+                line += 1;
+                if (line >= targetLine) return pos + i + 1;
+            }
+        }
+        pos += bytesRead;
+    }
+    return null;
+}
+
+function computeEffectiveReadEndLine(absTarget, startLine, maxRequestedEnd = Infinity) {
+    const reqCap = Number.isFinite(maxRequestedEnd) && maxRequestedEnd >= startLine
+        ? Math.min(maxRequestedEnd, startLine + AGY_READ_MAX_LINES - 1)
+        : startLine + AGY_READ_MAX_LINES - 1;
+    let fd = null;
     try {
         if (!absTarget || !existsSync(absTarget))
-            return startLine + AGY_READ_MAX_LINES - 1;
+            return reqCap;
         const st = statSync(absTarget);
-        if (!st.isFile() || st.size === 0 || st.size > 512 * 1024)
-            return startLine + AGY_READ_MAX_LINES - 1;
-        const raw = readFileSync(absTarget, 'utf8');
+        if (!st.isFile() || st.size === 0)
+            return reqCap;
+        fd = openSync(absTarget, 'r');
+        const byteStart = findByteOffsetForLine(fd, startLine, st.size);
+        if (byteStart === null || byteStart >= st.size)
+            return startLine;
+        const maxWindow = AGY_READ_MAX_BYTES + 4096;
+        const toRead = Math.min(maxWindow, st.size - byteStart);
+        const buf = Buffer.allocUnsafe(toRead);
+        let totalRead = 0;
+        while (totalRead < toRead) {
+            const n = readSync(fd, buf, totalRead, toRead - totalRead, byteStart + totalRead);
+            if (n <= 0) break;
+            totalRead += n;
+        }
+        if (totalRead === 0) return startLine;
+        const raw = buf.subarray(0, totalRead).toString('utf8');
         const lines = raw.split(/\r\n|\n/);
-        if (lines.length > 1 && lines[lines.length - 1] === '')
+        if (lines.length > 1 && lines[lines.length - 1] === '' && byteStart + totalRead >= st.size)
             lines.pop();
-        if (startLine > lines.length)
-            return Math.max(startLine, lines.length);
-        const maxEnd = Math.min(lines.length, startLine + AGY_READ_MAX_LINES - 1);
+        const maxAvail = Math.min(lines.length, reqCap - startLine + 1);
         let bytes = 0;
         let end = startLine - 1;
-        for (let ln = startLine; ln <= maxEnd; ln++) {
-            const lb = Buffer.byteLength(lines[ln - 1], 'utf8') + 1;
+        for (let i = 0; i < maxAvail; i++) {
+            const lb = Buffer.byteLength(lines[i], 'utf8') + 1;
             if (end >= startLine && bytes + lb > AGY_READ_MAX_BYTES)
                 break;
             bytes += lb;
-            end = ln;
+            end = startLine + i;
         }
         return Math.max(startLine, end);
     }
     catch {
-        return startLine + AGY_READ_MAX_LINES - 1;
+        return reqCap;
     }
+    finally {
+        if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
+    }
+}
+
+function extractToolOutputLineRange(input) {
+    const rawOut = input?.toolCall?.output ?? input?.tool_response ?? input?.toolOutput ?? input?.output ?? '';
+    const text = typeof rawOut === 'string'
+        ? rawOut
+        : (typeof rawOut?.text === 'string' ? rawOut.text : (typeof rawOut?.content === 'string' ? rawOut.content : ''));
+    if (!text) return null;
+    const m = /\bShowing lines\s+(\d+)\s*[-–]\s*(\d+)\b/i.exec(text)
+        || /\bPartial read\s*\(\s*lines\s+(\d+)\s*[-–]\s*(\d+)\b/i.exec(text);
+    if (!m) return null;
+    const start = Number.parseInt(m[1], 10);
+    const end = Number.parseInt(m[2], 10);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) return null;
+    return { start, end };
 }
 
 function isInsideArtifactDir(targetPath, artifactDir) {
     if (!targetPath || !artifactDir || !targetPath.toLowerCase().endsWith('.md')) return false;
     const rel = relative(resolve(artifactDir), resolve(targetPath));
     return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+export function isEnterPlanToolCall(toolName) {
+    return toolName === 'enter_plan_mode' || toolName === 'EnterPlanMode';
 }
 
 export function isPlanToolCall(toolName, toolInput, input, targetPath = '') {
@@ -72,7 +134,8 @@ export function isPlanToolCall(toolName, toolInput, input, targetPath = '') {
 
 function extractPlanText(toolName, toolInput, input, targetPath) {
     if (toolName === 'exit_plan_mode' || toolName === 'ExitPlanMode') {
-        const direct = toolInput?.plan ?? input?.toolCall?.output ?? input?.tool_response ?? '';
+        const direct = toolInput?.plan ?? toolInput?.Plan ?? toolInput?.planContent ?? toolInput?.Instructions
+            ?? input?.toolCall?.output ?? input?.tool_response ?? '';
         return typeof direct === 'string' ? direct : '';
     }
     const inline = toolInput?.CodeContent ?? toolInput?.Content ?? toolInput?.content
@@ -91,32 +154,92 @@ export function stagePlanHandoff({ workspaceDirs, toolName, toolInput, input, ta
     const resolvedTarget = targetPath || unquoteArg(toolInput?.Path ?? toolInput?.TargetFile ?? toolInput?.AbsolutePath ?? toolInput?.file_path ?? '');
     if (!isPlanToolCall(toolName, toolInput, input, resolvedTarget)) return null;
     const isExitPlan = toolName === 'exit_plan_mode' || toolName === 'ExitPlanMode';
+    const planText = extractPlanText(toolName, toolInput, input, resolvedTarget);
+    const planTargetFiles = resolvePlanTargetFiles(workspaceDirs, planText, { getGraph: opts.getGraph });
+    if (planTargetFiles.length > 0) {
+        agyState.planTargetFiles = [...new Set([...(agyState.planTargetFiles ?? []), ...planTargetFiles])];
+        agyState.editTargetFiles = [...new Set([...(agyState.editTargetFiles ?? []), ...planTargetFiles])].slice(0, 6);
+    }
     if (isExitPlan) {
+        agyState.isOrchestratorModel = true;
+        const m = String(input?.modelName ?? input?.model ?? '').trim();
+        if (m) agyState.plannerModel = m;
         agyState.orchestratorPhase = 'execute';
+        agyState.isEditPrompt = true;
+        agyState.editedInPrompt = false;
+        agyState.preEditInvocations = 0;
+        agyState.preEditToolTurns = 0;
+        agyState.lastPreEditToolAtMs = 0;
+        agyState.exploreGuardStage = 0;
+        agyState.exploreGuardEmitted = false;
         agyState.pendingPlanAwaitApproval = false;
     }
-    const planText = extractPlanText(toolName, toolInput, input, resolvedTarget);
+    if (opts.deferHandoffBuild && isExitPlan) {
+        agyState.pendingPlanText = planText || null;
+        agyState.pendingPlanWorkspaceDirs = Array.isArray(workspaceDirs) ? [...workspaceDirs] : [];
+        agyState.pendingPlanHandoff = null;
+        agyState.pendingPlanSpans = [];
+        return { deferred: true, targetFiles: planTargetFiles };
+    }
     const geminiProfile = isGeminiModelProfile(input, opts.hostKind || 'agy');
-    const handoff = buildPlanExecutionHandoff(workspaceDirs, planText, agyState, { getGraph: opts.getGraph, geminiProfile });
+    const xhighProfile = isExtraHighEffortInput(input);
+    const highProfile = isHighOrExtraHighEffortInput(input)
+        || isHighOrExtraHighEffortInput({ modelName: agyState?.plannerModel })
+        || (isOrchestratorInput(input, agyState) && !/(?:^|[-_\s(])(?:low|medium)(?:$|[)\s_-])/i.test(String(input?.modelName ?? agyState?.plannerModel ?? '')));
+    const handoff = buildPlanExecutionHandoff(workspaceDirs, planText, agyState, {
+        getGraph: opts.getGraph,
+        geminiProfile,
+        xhighProfile,
+        highProfile,
+        includeExecuteDirective: isExitPlan,
+    });
+    agyState.pendingPlanText = null;
+    agyState.pendingPlanWorkspaceDirs = [];
     agyState.pendingPlanHandoff = handoff?.text || null;
     agyState.pendingPlanSpans = handoff?.text ? (handoff.spans ?? []) : [];
     agyState.pendingPlanAwaitApproval = Boolean(!isExitPlan && handoff?.text);
     return handoff;
 }
 
-export function recordReadPostTool({ agyState, workspaceDirs, repoRoot, targetPath, toolArgs, recordMidLoop = true }) {
-    if (!targetPath || !existsSync(contextDirFor(repoRoot))) return null;
+export function recordReadPostTool({ agyState, workspaceDirs, repoRoot, targetPath, toolArgs, input = null, recordMidLoop = true, hostKind = null }) {
+    if (!repoRoot || !targetPath || !existsSync(contextDirFor(repoRoot))) return null;
     const rel = normalizeRelFile(relative(resolve(repoRoot), resolve(targetPath)));
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
-    const startLine = Math.max(1, Number(toolArgs?.StartLine ?? toolArgs?.start_line ?? toolArgs?.offset ?? 1) || 1);
+    const hasByteOffset = toolArgs?.ByteOffset !== undefined && toolArgs?.ByteOffset !== null && toolArgs?.ByteOffset !== '';
+    const outputRange = extractToolOutputLineRange(input);
+    if (hasByteOffset && !outputRange) return null;
+    const absTarget = resolve(repoRoot, rel);
+    const hasExplicitLineStart = toolArgs?.StartLine !== undefined && toolArgs?.StartLine !== null && toolArgs?.StartLine !== ''
+        || (toolArgs?.start_line !== undefined && toolArgs?.start_line !== null && toolArgs?.start_line !== '');
+    const hasOffset = toolArgs?.offset !== undefined && toolArgs?.offset !== null && toolArgs?.offset !== '';
+    let parsedStart = Number(toolArgs?.StartLine ?? toolArgs?.start_line ?? 1);
+    if (!hasExplicitLineStart && hasOffset) {
+        const offNum = Number(toolArgs.offset);
+        parsedStart = (hostKind === 'gemini' || offNum === 0) && Number.isFinite(offNum) && offNum >= 0
+            ? Math.floor(offNum) + 1
+            : offNum;
+    }
+    const startLine = outputRange
+        ? outputRange.start
+        : Math.max(1, Number(parsedStart) || 1);
     const limit = Number(toolArgs?.limit ?? 0);
     const explicitEnd = Number(toolArgs?.EndLine ?? toolArgs?.end_line ?? (limit > 0 ? startLine + limit - 1 : 0));
-    const endLine = Number.isFinite(explicitEnd) && explicitEnd >= startLine
-        ? explicitEnd
-        : computeEffectiveReadEndLine(resolve(repoRoot, rel), startLine);
+    const requestedCap = Number.isFinite(explicitEnd) && explicitEnd >= startLine ? explicitEnd : Infinity;
+    let endLine = computeEffectiveReadEndLine(absTarget, startLine, requestedCap);
+    if (outputRange) {
+        endLine = Math.min(endLine, outputRange.end);
+    }
+    if (endLine < startLine) return null;
     const key = `${labelPrefixForRepo(workspaceDirs, repoRoot)}${rel}`;
     agyState.seenSpans = agyState.seenSpans && typeof agyState.seenSpans === 'object' ? agyState.seenSpans : {};
     mergeSpan(agyState.seenSpans, key, startLine, endLine);
+    try {
+        const st = statSync(absTarget);
+        if (st.isFile()) {
+            agyState.seenMtimes = agyState.seenMtimes && typeof agyState.seenMtimes === 'object' ? agyState.seenMtimes : {};
+            agyState.seenMtimes[key] = st.mtimeMs;
+        }
+    } catch { /* ignore */ }
     agyState.lastReadRelFile = rel;
     if (recordMidLoop && !agyState.turn0Matched && !agyState.midLoopHintEmitted && !agyState.pendingMidLoopFile) {
         agyState.pendingMidLoopFile = rel;
@@ -181,6 +304,7 @@ function diffChunkLines(oldText, newText) {
     let suffixLen = 0;
     while (suffixLen < minLen - prefixLen && oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]) suffixLen++;
     return {
+        oldLines,
         newLines,
         prefixLen,
         changedOld: oldLines.slice(prefixLen, oldLines.length - suffixLen),
@@ -207,22 +331,40 @@ function findChunkStartLineOnDisk(diskLines, needleLines) {
     return 0;
 }
 
-function resolveMinChangedLine(editedFile, chunks) {
-    if (!Array.isArray(chunks) || chunks.length === 0) return 1;
+function invalidateSpansForEditChunks(seenSpans, key, editedFile, chunks) {
+    if (!Array.isArray(chunks) || chunks.length === 0) {
+        invalidateEditedSpans(seenSpans, key, 1);
+        return;
+    }
     let diskLines = null;
-    let minChanged = Infinity;
+    const resolvedRanges = [];
+    let allSameLineCount = true;
     for (const chunk of chunks) {
-        const { newLines, prefixLen } = diffChunkLines(chunk?.oldText, chunk?.newText);
+        const { oldLines, newLines, prefixLen, changedOld, changedNew } = diffChunkLines(chunk?.oldText, chunk?.newText);
         let baseStart = Number(chunk?.startLine) > 0 ? Number(chunk.startLine) : 0;
         if (!baseStart && chunk?.newText) {
             diskLines ??= readDiskLinesSafe(editedFile);
             baseStart = findChunkStartLineOnDisk(diskLines, newLines);
         }
-        if (baseStart > 0 && (baseStart + prefixLen) < minChanged) {
-            minChanged = baseStart + prefixLen;
+        if (!(baseStart > 0)) {
+            invalidateEditedSpans(seenSpans, key, 1);
+            return;
         }
+        const chgStart = baseStart + prefixLen;
+        if (oldLines.length !== newLines.length) {
+            allSameLineCount = false;
+        }
+        const changedLen = Math.max(1, changedOld.length, changedNew.length);
+        resolvedRanges.push({ start: chgStart, end: chgStart + changedLen - 1 });
     }
-    return Number.isFinite(minChanged) ? minChanged : 1;
+    if (allSameLineCount) {
+        for (const r of resolvedRanges) {
+            invalidateEditedSpans(seenSpans, key, r.start, r.end);
+        }
+        return;
+    }
+    const minChanged = Math.min(...resolvedRanges.map((r) => r.start));
+    invalidateEditedSpans(seenSpans, key, minChanged);
 }
 
 function hasSeenFileInState(seenSpans, relNorm, prefix = '') {
@@ -246,8 +388,8 @@ export function editTouchesSignatureOrExport(repoRoot, editedFile, rel, toolArgs
     }
     const graph = typeof opts.getGraph === 'function' ? opts.getGraph(repoRoot) : loadGraphCached(contextDirFor(repoRoot));
     const nodeStarts = [];
-    for (const n of graph?.nodes ?? []) {
-        if (n.kind === 'file' || n.path !== rel) continue;
+    for (const n of graph?._nodesByPath?.get(rel) ?? []) {
+        if (n.kind === 'file') continue;
         const r = spanRange(n.span);
         if (r?.start) nodeStarts.push(r.start);
     }
@@ -282,16 +424,27 @@ export function markEditMutationOnState(agyState) {
     agyState.editSeq = (Number(agyState.editSeq) || 0) + 1;
     agyState.seenSearchKeys = [];
     agyState.lastBlockedSearchKey = null;
+    agyState.blockedSearchKeys = [];
+}
+
+function clearTurn0SeenKey(agyState, ...paths) {
+    if (!Array.isArray(agyState?.turn0SeenKeys) || agyState.turn0SeenKeys.length === 0) return;
+    const targets = paths.filter(Boolean).map((p) => normalizeRelFile(p));
+    if (targets.length === 0) return;
+    agyState.turn0SeenKeys = agyState.turn0SeenKeys.filter((k) => {
+        const nk = normalizeRelFile(k);
+        return !targets.some((t) => nk === t || nk.endsWith(`/${t}`) || t.endsWith(`/${nk}`));
+    });
 }
 
 export function recordEditBlastForAgy(workspaceDirs, repoRoot, targetPath, agyState, opts = {}, toolArgs = null) {
-    if (!targetPath || isIgnoredTouchedPath(targetPath, repoRoot) || !existsSync(contextDirFor(repoRoot))) return;
+    if (!repoRoot || !targetPath || isIgnoredTouchedPath(targetPath, repoRoot) || !existsSync(contextDirFor(repoRoot))) return;
     markEditMutationOnState(agyState);
     const editedFile = isAbsolute(targetPath) ? targetPath : join(repoRoot, targetPath);
     const rel = normalizeRelFile(relative(resolve(repoRoot), resolve(editedFile)));
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) return;
     agyState.lastTouchedPath = editedFile;
-    recordFileEdit(repoRoot, editedFile);
+    recordFileEdit(repoRoot, editedFile, { skipBlast: true });
     const prefix = labelPrefixForRepo(workspaceDirs, repoRoot);
     const key = `${prefix}${rel}`;
     agyState.emittedBlastFiles = Array.isArray(agyState.emittedBlastFiles) ? agyState.emittedBlastFiles : [];
@@ -300,8 +453,8 @@ export function recordEditBlastForAgy(workspaceDirs, repoRoot, targetPath, agySt
         return pFile === rel || pFile === key || rel.endsWith(`/${pFile}`);
     });
     const chunks = extractEditChunks(toolArgs);
-    const minChangedLine = resolveMinChangedLine(editedFile, chunks);
-    invalidateEditedSpans(agyState.seenSpans, key, minChangedLine);
+    invalidateSpansForEditChunks(agyState.seenSpans, key, editedFile, chunks);
+    clearTurn0SeenKey(agyState, rel, key);
     if (agyState.fileSliceCounts && typeof agyState.fileSliceCounts === 'object') {
         delete agyState.fileSliceCounts[rel];
         delete agyState.fileSliceCounts[key];
@@ -331,20 +484,58 @@ export function recordEditBlastForAgy(workspaceDirs, repoRoot, targetPath, agySt
 
 export function handleAgyPostTool(input, opts = {}) {
     if (isEarlyIsolatedBenchCall(input, opts)) return emitHookPayload('{}\n', opts);
-    const { sid, agyState, dir } = loadAgyContext(input, opts);
+    const { sid, agyState, dir } = loadAgyContext(input, { ...opts, skipTranscriptParse: true });
     const workspaceDirs = activeWorkspaceDirs(input, agyState, dir, opts);
     const toolName = String(input?.toolCall?.name ?? input?.tool_name ?? '');
     const toolArgs = input?.toolCall?.args ?? input?.tool_input ?? input?.args ?? {};
     const targetPath = resolveToolTargetPath(input);
     const repoRoot = pickRepoForTargetPath(targetPath, workspaceDirs, dir);
     const callOpts = opts.sessionId ? opts : { ...opts, sessionId: sid };
-    const staged = stagePlanHandoff({ workspaceDirs, toolName, toolInput: toolArgs, input, targetPath, agyState, opts: callOpts });
+    if (isEnterPlanToolCall(toolName)) {
+        agyState.isOrchestratorModel = true;
+        const m = String(input?.modelName ?? input?.model ?? '').trim();
+        if (m) agyState.executorModel = m;
+        agyState.orchestratorPhase = 'plan';
+        agyState.pendingPlanHandoff = null;
+        agyState.pendingPlanText = null;
+        agyState.pendingPlanWorkspaceDirs = [];
+        agyState.pendingPlanSpans = [];
+        agyState.pendingPlanAwaitApproval = false;
+        saveAgyContext(sid, agyState, opts);
+        return emitHookPayload('{}\n', opts);
+    }
+    const staged = stagePlanHandoff({ workspaceDirs, toolName, toolInput: toolArgs, input, targetPath, agyState, opts: { ...callOpts, deferHandoffBuild: true } });
     if (staged) { saveAgyContext(sid, agyState, opts); return emitHookPayload('{}\n', opts); }
     if (!isIsolatedBenchDir(repoRoot, opts.envFlags)) {
-        if (READ_TOOLS_RE.test(toolName)) recordReadPostTool({ agyState, workspaceDirs, repoRoot, targetPath, toolArgs });
+        if (READ_TOOLS_RE.test(toolName)) recordReadPostTool({ agyState, workspaceDirs, repoRoot, targetPath, toolArgs, input });
         else if (EDIT_TOOLS_RE.test(toolName)) {
-            agyState.editedInPrompt = true;
-            recordEditBlastForAgy(workspaceDirs, repoRoot, targetPath, agyState, callOpts, toolArgs);
+            const hasEditError = Boolean(
+                input?.is_error
+                || (typeof input?.error === 'string' && input.error.trim().length > 0)
+                || (input?.error && typeof input.error === 'object')
+                || input?.tool_response?.is_error,
+            );
+            if (hasEditError) {
+                if (repoRoot && targetPath && !isIgnoredTouchedPath(targetPath, repoRoot)) {
+                    const editedFile = isAbsolute(targetPath) ? targetPath : join(repoRoot, targetPath);
+                    const rel = normalizeRelFile(relative(resolve(repoRoot), resolve(editedFile)));
+                    if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+                        const prefix = labelPrefixForRepo(workspaceDirs, repoRoot);
+                        invalidateEditedSpans(agyState.seenSpans, `${prefix}${rel}`, 1);
+                        if (prefix) invalidateEditedSpans(agyState.seenSpans, rel, 1);
+                        clearTurn0SeenKey(agyState, rel, `${prefix}${rel}`);
+                        if (Array.isArray(agyState.blockedReadKeys)) {
+                            agyState.blockedReadKeys = agyState.blockedReadKeys.filter((k) => !k.startsWith(`${rel}:`));
+                        }
+                        if (typeof agyState.lastBlockedReadKey === 'string' && agyState.lastBlockedReadKey.startsWith(`${rel}:`)) {
+                            agyState.lastBlockedReadKey = null;
+                        }
+                    }
+                }
+            } else {
+                agyState.editedInPrompt = true;
+                recordEditBlastForAgy(workspaceDirs, repoRoot, targetPath, agyState, callOpts, toolArgs);
+            }
         }
     }
     saveAgyContext(sid, agyState, opts);
@@ -371,7 +562,8 @@ export function handleAgyPostEdit(input, opts = {}) {
 export function handleAgyStop(input, opts = {}) {
     const allow = `${JSON.stringify({ decision: 'allow' })}\n`;
     if (isEarlyIsolatedBenchCall(input, opts)) return emitHookPayload(allow, opts);
-    const { agyState, dir } = loadAgyContext(input, opts);
+    const { sid, agyState, dir } = loadAgyContext(input, opts);
+    if (agyState._dirtyTranscriptOffset) saveAgyContext(sid, agyState, opts);
     for (const wsDir of activeWorkspaceDirs(input, agyState, dir, opts)) {
         if (!isIsolatedBenchDir(wsDir, opts.envFlags)) {
             if (typeof opts.scheduleRefresh === 'function') {
@@ -390,18 +582,76 @@ function emitContextIfAny(hostKind, additionalContext, opts) {
     return emitHookPayload(`${JSON.stringify({ hookSpecificOutput: { hookEventName: spec.postToolEvent, additionalContext } })}\n`, opts);
 }
 
-function handleHostReadPostTool(hostKind, root, targetPath, toolInput, sid, opts) {
+function isIndexedSourceFile(repoRoot, rel, opts = {}) {
+    if (!rel || /\.(?:md|mdx|txt|rst|adoc|json|ya?ml|toml|lock|ini|cfg|conf|env|csv|svg|png|jpg|gif)$/i.test(rel)) {
+        return false;
+    }
+    try {
+        const graph = typeof opts.getGraph === 'function' ? opts.getGraph(repoRoot) : loadGraphCached(contextDirFor(repoRoot));
+        const nodes = graph?._nodesByPath?.get(rel);
+        return Boolean(Array.isArray(nodes) && nodes.some((n) => n.kind !== 'doc'));
+    } catch {
+        return false;
+    }
+}
+
+function handleHostReadPostTool(hostKind, root, targetPath, toolInput, sid, opts, input = null) {
     const targetRepo = nearestPlexerRoot(targetPath || root)?.root ?? root;
     if (isIsolatedBenchDir(targetRepo, opts.envFlags) || !existsSync(contextDirFor(targetRepo))) return emitContextIfAny(hostKind, '', opts);
     const agyState = readEngineSession(sid, opts);
-    const rel = recordReadPostTool({ agyState, workspaceDirs: [targetRepo], repoRoot: targetRepo, targetPath, toolArgs: toolInput, recordMidLoop: false });
+    const rel = recordReadPostTool({ agyState, workspaceDirs: [targetRepo], repoRoot: targetRepo, targetPath, toolArgs: toolInput, input, recordMidLoop: false, hostKind });
     let hint = null;
-    if (rel && !agyState.turn0Matched && !agyState.midLoopHintEmitted) {
+    if (rel && !agyState.turn0Matched && !agyState.midLoopHintEmitted && isIndexedSourceFile(targetRepo, rel, opts)) {
         hint = buildMidLoopHint(targetRepo, contextDirFor(targetRepo), rel, opts);
         agyState.midLoopHintEmitted = true;
     }
     saveAgyContext(sid, agyState, opts);
     return emitContextIfAny(hostKind, hint, opts);
+}
+
+const GIT_MUTATION_RE = /\bgit\s+(?:checkout|restore|reset|apply|am|cherry-pick|revert|merge|rebase|stash\s+(?:pop|apply))\b/;
+
+function handleHostShellPostTool(hostKind, root, toolInput, sid, opts) {
+    const cmd = unquoteArg(toolInput?.command ?? toolInput?.CommandLine ?? '');
+    if (!cmd) return emitContextIfAny(hostKind, '', opts);
+    const isGitMut = GIT_MUTATION_RE.test(cmd);
+    const shellEdit = !isGitMut ? detectShellSourceEdit(cmd, root, opts.getGraph) : null;
+    if (!isGitMut && !shellEdit) return emitContextIfAny(hostKind, '', opts);
+    const agyState = readEngineSession(sid, opts);
+    if (!agyState.seenSpans || typeof agyState.seenSpans !== 'object') agyState.seenSpans = {};
+    if (shellEdit?.files?.length) {
+        for (const rel of shellEdit.files) {
+            invalidateEditedSpans(agyState.seenSpans, rel, 1);
+            clearTurn0SeenKey(agyState, rel);
+            if (agyState.seenMtimes) delete agyState.seenMtimes[rel];
+        }
+        markEditMutationOnState(agyState);
+        agyState.editedInPrompt = true;
+    } else if (isGitMut) {
+        const toks = tokenizeShellSegment(cmd) ?? [];
+        const dashDash = toks.indexOf('--');
+        const pathArgs = dashDash >= 0
+            ? toks.slice(dashDash + 1).filter((t) => t && t !== '.' && !t.startsWith('-'))
+            : [];
+        if (pathArgs.length > 0 && /\bgit\s+(?:checkout|restore)\b/.test(cmd)) {
+            for (const rawArg of pathArgs) {
+                const absP = isAbsolute(rawArg) ? rawArg : join(root, rawArg);
+                const rel = normalizeRelFile(relative(resolve(root), resolve(absP)));
+                if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+                    invalidateEditedSpans(agyState.seenSpans, rel, 1);
+                    clearTurn0SeenKey(agyState, rel);
+                    if (agyState.seenMtimes) delete agyState.seenMtimes[rel];
+                }
+            }
+        } else {
+            agyState.seenSpans = {};
+            agyState.seenMtimes = {};
+            agyState.turn0SeenKeys = [];
+        }
+        markEditMutationOnState(agyState);
+    }
+    saveAgyContext(sid, agyState, opts);
+    return emitContextIfAny(hostKind, '', opts);
 }
 
 export function handleHostPostTool(hostKind, input, opts = {}) {
@@ -413,7 +663,8 @@ export function handleHostPostTool(hostKind, input, opts = {}) {
     const toolInput = input?.tool_input ?? input?.toolCall?.args ?? input?.args ?? {};
     const targetPath = unquoteArg(toolInput?.file_path ?? toolInput?.path ?? toolInput?.Path ?? input?.file_path ?? '');
     const sid = resolveHostSessionId(input, opts.envFlags);
-    if (/^(?:Read|read_file|view_file)$/i.test(toolName)) return handleHostReadPostTool(hostKind, root, targetPath, toolInput, sid, opts);
+    if (/^(?:Read|read_file|view_file)$/i.test(toolName)) return handleHostReadPostTool(hostKind, root, targetPath, toolInput, sid, opts, input);
+    if (/^(?:Bash|run_shell_command|shell)$/i.test(toolName)) return handleHostShellPostTool(hostKind, root, toolInput, sid, opts);
     if (/^(?:ExitPlanMode|exit_plan_mode)$/i.test(toolName)) {
         const agyState = readEngineSession(sid, opts);
         const handoff = stagePlanHandoff({ workspaceDirs: [root], toolName, toolInput, input, targetPath, agyState, opts });
@@ -422,19 +673,86 @@ export function handleHostPostTool(hostKind, input, opts = {}) {
         return emitContextIfAny(hostKind, handoff?.text ?? '', opts);
     }
     const edited = editedFilePath(input, root) || targetPath;
-    if (edited && !isIgnoredTouchedPath(edited, root)) {
-        const agyState = readEngineSession(sid, opts);
-        markEditMutationOnState(agyState);
-        const rel = normalizeRelFile(relative(resolve(root), resolve(root, edited)));
-        if (rel && !rel.startsWith('..') && !isAbsolute(rel)) invalidateEditedSpans(agyState.seenSpans, rel, 1);
-        saveAgyContext(sid, agyState, opts);
+    const hasEditError = Boolean(
+        input?.is_error
+        || (typeof input?.error === 'string' && input.error.trim().length > 0)
+        || (input?.error && typeof input.error === 'object')
+        || input?.tool_response?.is_error,
+    );
+    if (hasEditError) {
+        if (edited && !isIgnoredTouchedPath(edited, root)) {
+            const agyState = readEngineSession(sid, opts);
+            const absEdited = isAbsolute(edited) ? edited : join(root, edited);
+            const rel = normalizeRelFile(relative(resolve(root), resolve(absEdited)));
+            if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+                invalidateEditedSpans(agyState.seenSpans, rel, 1);
+                clearTurn0SeenKey(agyState, rel);
+            }
+            saveAgyContext(sid, agyState, opts);
+        }
+        return hostKind === 'cursor' ? emitHookPayload('{}\n', opts) : emitContextIfAny(hostKind, '', opts);
     }
     if (hostKind === 'cursor') {
-        if (edited) recordFileEdit(root, edited);
+        if (edited && !isIgnoredTouchedPath(edited, root)) {
+            const agyState = readEngineSession(sid, opts);
+            markEditMutationOnState(agyState);
+            const absEdited = isAbsolute(edited) ? edited : join(root, edited);
+            const rel = normalizeRelFile(relative(resolve(root), resolve(absEdited)));
+            if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+                invalidateSpansForEditChunks(agyState.seenSpans, rel, absEdited, extractEditChunks(toolInput));
+            }
+            saveAgyContext(sid, agyState, opts);
+            recordFileEdit(root, edited, { skipBlast: true });
+            if (typeof opts.onFileEdited === 'function') opts.onFileEdited(root, absEdited);
+        }
         return emitHookPayload('{}\n', opts);
     }
-    if (hostKind === 'gemini') return emitContextIfAny('gemini', edited ? recordFileEdit(root, edited) : null, opts);
-    return handlePostEdit({ ...input, session_id: sid, tool_input: { ...(input?.tool_input ?? {}), ...(edited ? { file_path: edited } : {}) } }, root, opts);
+    if (!edited || isIgnoredTouchedPath(edited, root)) return emitContextIfAny(hostKind, '', opts);
+    const agyState = readEngineSession(sid, opts);
+    markEditMutationOnState(agyState);
+    const absEdited = isAbsolute(edited) ? edited : join(root, edited);
+    const rel = normalizeRelFile(relative(resolve(root), resolve(absEdited)));
+    if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+        invalidateSpansForEditChunks(agyState.seenSpans, rel, absEdited, extractEditChunks(toolInput));
+        clearTurn0SeenKey(agyState, rel);
+    }
+    const touched = recordFileEdit(root, edited, { skipBlast: true });
+    let gatedBr = null;
+    if (touched && rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+        const agyOrientedInRoot = Array.isArray(agyState.orientedDirs) && agyState.orientedDirs.includes(resolve(root));
+        const agyInTurn0 = agyOrientedInRoot && (agyState.injectedPointers ?? []).some((p) => {
+            const pf = String(p).split(':')[0].replace(/\\/g, '/');
+            return pf === rel || rel.endsWith(`/${pf}`);
+        });
+        const targetKnownForClaude = hostKind === 'claude' && Array.isArray(agyState.editTargetFiles)
+            && agyState.editTargetFiles.some((tf) => tf === rel || rel.endsWith(`/${tf}`));
+        if (!agyInTurn0 && !targetKnownForClaude && editTouchesSignatureOrExport(root, absEdited, rel, toolInput, opts)) {
+            const legacySess = readSession(root, sid);
+            const legacyEmitted = Array.isArray(legacySess.emittedBlastFiles) ? legacySess.emittedBlastFiles : [];
+            const legacyInTurn0 = (legacySess.injectedPointers ?? []).some((p) => {
+                const pf = String(p).split(':')[0].replace(/\\/g, '/');
+                return pf === rel || rel.endsWith(`/${pf}`);
+            });
+            if (!legacyEmitted.includes(rel) && !legacyInTurn0) {
+                const graph = typeof opts.getGraph === 'function' ? opts.getGraph(root) : loadGraphCached(contextDirFor(root));
+                const blastCap = hostKind === 'claude' ? 4 : 8;
+                const blastMaxBytes = hostKind === 'claude' ? 350 : 600;
+                gatedBr = graph
+                    ? formatBlastRadius(graph, absEdited, blastCap, root, {
+                        maxBytes: blastMaxBytes,
+                        isPathSeen: (callerRel) => hasSeenFileInState(agyState.seenSpans, normalizeRelFile(callerRel), ''),
+                    })
+                    : null;
+                if (gatedBr) {
+                    legacySess.emittedBlastFiles = [...legacyEmitted, rel];
+                    writeSession(root, sid, legacySess);
+                }
+            }
+        }
+    }
+    if (typeof opts.onFileEdited === 'function') opts.onFileEdited(root, absEdited);
+    saveAgyContext(sid, agyState, opts);
+    return emitContextIfAny(hostKind, gatedBr, opts);
 }
 
 export function handleHostStopHook(input, opts = {}) {

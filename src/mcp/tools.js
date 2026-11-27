@@ -3,50 +3,129 @@
  * `callTool` never throws — hosts get soft errors as isError content.
  */
 import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { isWithinRoot, tryRealpath } from '../util/fs.js';
-import { ask, formatAsk, skeleton, formatSkeleton, readSpans, formatReadSpans, suggestClosestFiles, suggestNearTargets } from '../ask/ask.js';
-import { applySeenSpansFilter, isSpanCovered, mergeSpan, parsePointerSpan, recordRetrievalSpans } from '../agy/spans.js';
+import { applySeenSpansFilter, invalidateEditedSpans, isSpanCovered, mergeSpan, parsePointerSpan, recordRetrievalSpans } from '../agy/spans.js';
 import { resolveAgyWorkspaceDirs } from '../agy/multi-workspace.js';
-import { checkGraph, formatGraphCheckReport } from '../graph/check.js';
 import { loadGraphCached } from '../context/graph-store.js';
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from '../graph/refresh.js';
 import { contextDirFor } from '../context/node-file.js';
 import { resolveSymbol } from '../context/symbol-query.js';
-import { edgeWalk, parseWalkDepth } from '../graph/traverse.js';
-import { renderMatchBlock } from '../graph/traverse-cli.js';
-import { linkTestsForGraph } from '../graph/test-links.js';
-import { fileReader } from '../blast/evidence.js';
-import { blastRadiusIn } from '../blast/blast.js';
-import { changedFiles, refExists } from '../blast/diff.js';
-import { analyzeGitHistory } from '../blast/history.js';
-import { markdownReport, mermaidDiagram, textReport } from '../blast/render.js';
-import { grepGraph } from '../search/grep.js';
-import { formatGrepResult, zeroHitNote } from '../search/grep-cli.js';
-import { buildRepoMap, formatRepoMap } from '../graph/map.js';
-import { health } from '../health/health.js';
-import { formatHealthMarkdown, formatHealthText } from '../health/render.js';
+import { parseWalkDepth } from '../graph/traverse.js';
 import { hasPlexerIndex, isAutoBuildableRepo, nearestPlexerRoot } from '../graph/root.js';
-import {
-    federateAsk,
-    federateCallers,
-    federateCheck,
-    federateGrep,
-    federateMap,
-    federateRead,
-    federateSkeleton,
-    loadWorkspaceGraphs,
-    readWorkspace,
-} from '../graph/workspace.js';
+import { readWorkspaceMeta } from '../graph/workspace-path.js';
 import { readAgyLastRepo } from '../agy/session.js';
 import { isCanonicalMcpTool } from './tool-names.js';
 
+let askModPromise;
+let readSpansModPromise;
+let skeletonModPromise;
+let textHelpersModPromise;
+let traverseModPromise;
+let traverseCliModPromise;
+let testLinksModPromise;
+let spanModPromise;
+let checkModPromise;
+let blastModPromise;
+let grepModPromise;
+let grepCliModPromise;
+let mapModPromise;
+let historyModPromise;
+let healthModPromise;
+let healthRenderModPromise;
+let workspaceModPromise;
+
+const getAskMod = () => (askModPromise ??= import('../ask/ask.js'));
+const getReadSpansMod = () => (readSpansModPromise ??= import('../ask/read-spans.js'));
+const getSkeletonMod = () => (skeletonModPromise ??= import('../ask/skeleton.js'));
+const getTextHelpersMod = () => (textHelpersModPromise ??= import('../ask/text-helpers.js'));
+const getTraverseMod = () => (traverseModPromise ??= import('../graph/traverse.js'));
+const getTraverseCliMod = () => (traverseCliModPromise ??= import('../graph/traverse-cli.js'));
+const getTestLinksMod = () => (testLinksModPromise ??= import('../graph/test-links.js'));
+const getSpanMod = () => (spanModPromise ??= import('../util/span.js'));
+const getCheckMod = () => (checkModPromise ??= import('../graph/check.js'));
+const getBlastMod = () => (blastModPromise ??= Promise.all([
+    import('../blast/blast.js'),
+    import('../blast/diff.js'),
+    import('../blast/render.js'),
+]));
+const getGrepMods = () => (grepModPromise ??= Promise.all([
+    import('../search/grep.js'),
+    import('../search/grep-cli.js'),
+]));
+const getMapMod = () => (mapModPromise ??= import('../graph/map.js'));
+const getHistoryMod = () => (historyModPromise ??= import('../blast/history.js'));
+const getHealthMods = () => (healthModPromise ??= Promise.all([
+    import('../health/health.js'),
+    import('../health/render.js'),
+]));
+const getWorkspaceMod = () => (workspaceModPromise ??= import('../graph/workspace.js'));
+
 const NO_GRAPH = 'no graph found — run `plexer build` first';
-const DIR_PROP = { type: 'string', description: 'optional repository root directory (defaults to current workspace)' };
+const DIR_PROP = { type: 'string' };
+const MCP_HARD_MAX_BYTES = 8800;
+const FRESHNESS_COALESCE_TTL_MS = 300;
+const freshnessCheckCache = new Map();
+
+export function invalidateMcpFreshnessCache(repoRoot = null) {
+    if (!repoRoot) {
+        freshnessCheckCache.clear();
+        return;
+    }
+    const prefix = `${resolve(repoRoot)}::`;
+    for (const k of freshnessCheckCache.keys()) {
+        if (k.startsWith(prefix)) freshnessCheckCache.delete(k);
+    }
+}
+
+async function ensureFreshGraphCoalesced(targetRoot, opts = {}) {
+    const absRoot = resolve(targetRoot);
+    const key = `${absRoot}::${opts.contextDir || ''}`;
+    const now = Date.now();
+    const cached = freshnessCheckCache.get(key);
+    if (cached && now - cached.ts < FRESHNESS_COALESCE_TTL_MS) {
+        return { refreshed: false, drift: null, cached: true };
+    }
+    const res = await ensureFreshGraph(targetRoot, opts);
+    if (freshnessCheckCache.size >= 32) {
+        freshnessCheckCache.delete(freshnessCheckCache.keys().next().value);
+    }
+    freshnessCheckCache.set(key, { ts: now });
+    return res;
+}
+
+function capMcpText(text, maxBytes = MCP_HARD_MAX_BYTES) {
+    if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') <= maxBytes)
+        return text;
+    const suffix = '\n… (truncated to MCP 8.8 KB cap)\n';
+    const limit = maxBytes - Buffer.byteLength(suffix, 'utf8');
+    const kept = [];
+    let bytes = 0;
+    for (const line of text.split('\n')) {
+        const lb = Buffer.byteLength(line, 'utf8') + 1;
+        if (bytes + lb > limit)
+            break;
+        kept.push(line);
+        bytes += lb;
+    }
+    let out = kept.join('\n');
+    const fences = (out.match(/^```/gm) || []).length;
+    if (fences % 2 === 1)
+        out += '\n```';
+    return `${out}${suffix}`;
+}
+
 export const READ_ONLY_ANNOTATIONS = {
     readOnlyHint: true,
     destructiveHint: false,
     idempotentHint: true,
+    openWorldHint: false,
+};
+export const HEALTH_ANNOTATIONS = {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
     openWorldHint: false,
 };
 
@@ -56,9 +135,10 @@ function unknownSymbolText(query, suggestions = []) {
     return `no symbol "${query}" in the graph — check spelling or run \`plexer build\``;
 }
 
-function collectWorkspacePaths(root, dirOverride) {
+async function collectWorkspacePaths(root, dirOverride) {
+    const { loadWorkspaceGraphs } = await getWorkspaceMod();
     const paths = [];
-    for (const { child, graph } of loadWorkspaceGraphs(root, dirOverride).loaded) {
+    for (const { graph, child } of loadWorkspaceGraphs(root, dirOverride).loaded) {
         const seen = new Set();
         for (const n of graph.nodes) {
             if (n.path && !seen.has(n.path)) {
@@ -70,7 +150,11 @@ function collectWorkspacePaths(root, dirOverride) {
     return paths.sort();
 }
 
-function suggestWorkspaceSymbols(root, dirOverride, symbols) {
+async function suggestWorkspaceSymbols(root, dirOverride, symbols) {
+    const [{ loadWorkspaceGraphs }, { suggestNearTargets }] = await Promise.all([
+        getWorkspaceMod(),
+        getTextHelpersMod(),
+    ]);
     const out = new Set();
     for (const { graph } of loadWorkspaceGraphs(root, dirOverride).loaded) {
         for (const sym of symbols) {
@@ -87,24 +171,15 @@ function suggestWorkspaceSymbols(root, dirOverride, symbols) {
 export const TOOLS = [
     {
         name: 'plexer_find_code',
-        description: 'Query the repo context graph in plain words. Returns ranked nodes with exact file:line spans and contiguous source (or windowed excerpts with … gap markers) inlined for top hits.',
+        description: 'Rank repo symbols with <n>: source.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
-                query: {
-                    description: 'one or more plain-word queries (string, ";"-separated sub-queries, or array of strings)',
-                    oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-                },
-                limit: { type: 'number', description: 'max results (default 5)' },
-                full: {
-                    type: 'boolean',
-                    description: 'inline whole definition spans (up to 80 lines) across all returned hits',
-                },
-                in: {
-                    type: 'string',
-                    description: 'narrow to nodes under this repo-relative path prefix',
-                },
+                query: { description: 'query, ";"-split, or string[]' },
+                limit: { type: 'number' },
+                full: { type: 'boolean', description: '80L/hit' },
+                in: { type: 'string', description: 'path prefix' },
                 dir: DIR_PROP,
             },
             required: ['query'],
@@ -112,19 +187,14 @@ export const TOOLS = [
     },
     {
         name: 'plexer_read',
-        description: 'Read one or more exact file:Lx-Ly line spans or file:symbol definitions (or unique basenames) with L<n>: line numbers.',
+        description: 'Read file:Lx-Ly, file:symbol, or file spans (<n>: lines).',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
-                spans: {
-                    description: 'one or more file:Lx-Ly, file:Lx, file:symbol, or file spans (comma-separated string or array of strings)',
-                    oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-                },
-                full: {
-                    type: 'boolean',
-                    description: 'return full requested spans without the 9 KB batch cap',
-                },
+                spans: { description: 'file:Lx-Ly|Lx|symbol|file (csv/array)' },
+                full: { type: 'boolean', description: 'uncapped' },
+                include_callers: { type: 'boolean', description: 'cross-file callers' },
                 dir: DIR_PROP,
             },
             required: ['spans'],
@@ -132,19 +202,13 @@ export const TOOLS = [
     },
     {
         name: 'plexer_file_api',
-        description: "Signatures-only view of one or more files (~200 tokens): every definition's signature and line span.",
+        description: 'Signatures + spans for file(s).',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
-                file: {
-                    description: 'one or more repo-relative paths (or unique basenames) of files (comma-separated string or array)',
-                    oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-                },
-                all_matches: {
-                    type: 'boolean',
-                    description: 'return skeletons for all matching files when a basename is ambiguous',
-                },
+                file: { description: 'path(s) or basename(s) (csv/array)' },
+                all_matches: { type: 'boolean' },
                 dir: DIR_PROP,
             },
             required: ['file'],
@@ -152,30 +216,23 @@ export const TOOLS = [
     },
     {
         name: 'plexer_check_freshness',
-        description: 'Report whether the graph is in sync with the working tree.',
+        description: 'Check graph sync with working tree.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: { type: 'object', properties: { dir: DIR_PROP } },
     },
     {
         name: 'plexer_trace_calls',
-        description: 'Precomputed call/reference/import/inheritance edges for one or more symbols or files. Defaults to direct callers (direction:"in"); set direction:"out" for callees, or depth:2 / depth:"all" for transitive blast radius before a rename or multi-file refactor.',
+        description: 'Call/ref/import edges (depth 2|"all" for renames).',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
-                symbol: {
-                    description: 'bare name, qualified (Mod.fn, Class:method, path:symbol), or file path (comma-separated string or array for multiple)',
-                    oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-                },
-                direction: {
-                    type: 'string',
-                    enum: ['in', 'out'],
-                    description: '"in" (default) = callers/dependents; "out" = callees/dependencies',
-                },
-                depth: { description: 'transitive walk depth (default 1 = direct edges; 2 = blast radius; "all" = full connected closure)' },
-                source: { type: 'boolean', description: 'inline target definition and call-site source excerpts (default true)' },
-                full: { type: 'boolean', description: 'inline extended source excerpts across callers' },
-                in: { type: 'string', description: 'narrow matches to nodes under this repo-relative path prefix' },
+                symbol: { description: 'name, Type.method, path:sym, or path (csv/array)' },
+                direction: { type: 'string', enum: ['in', 'out'] },
+                depth: { description: '1, N, or "all"' },
+                source: { type: 'boolean' },
+                full: { type: 'boolean' },
+                in: { type: 'string' },
                 dir: DIR_PROP,
             },
             required: ['symbol'],
@@ -183,21 +240,18 @@ export const TOOLS = [
     },
     {
         name: 'plexer_find_all',
-        description: 'Exhaustive regex or literal search over indexed files, grouped by enclosing symbol and ranked by incoming edge count.',
+        description: 'Regex/literal grep grouped by symbol.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
-                pattern: {
-                    description: 'one or more short symbol names, regex patterns, or literal strings (with fixed: true)',
-                    oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-                },
-                in: { type: 'string', description: 'narrow to files under this repo-relative path prefix' },
-                ignore_case: { type: 'boolean', description: 'case-insensitive match' },
-                fixed: { type: 'boolean', description: 'treat pattern as a literal string, not a regex' },
-                context: { type: 'number', description: 'lines of surrounding context to show around each hit' },
-                source: { type: 'boolean', description: 'show surrounding source context around each hit (default true)' },
-                full: { type: 'boolean', description: 'show extended surrounding source context (4 lines) around each hit' },
+                pattern: { description: 'pattern(s) or literal(s)' },
+                in: { type: 'string' },
+                ignore_case: { type: 'boolean' },
+                fixed: { type: 'boolean', description: 'literal' },
+                context: { type: 'number' },
+                source: { type: 'boolean' },
+                full: { type: 'boolean' },
                 dir: DIR_PROP,
             },
             required: ['pattern'],
@@ -205,143 +259,54 @@ export const TOOLS = [
     },
     {
         name: 'plexer_repo_map',
-        description: 'Token-budgeted repo orientation: directory clusters, per-directory hubs, and global hotspots.',
+        description: 'Directory hubs and hotspots.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
-                max_dirs: { type: 'number', description: 'max directory entries shown (default 16)' },
-                churn: { type: 'boolean', description: 'Include git churn hotspots when true.' },
+                max_dirs: { type: 'number' },
+                churn: { type: 'boolean' },
                 dir: DIR_PROP,
             },
         },
     },
     {
         name: 'plexer_blast',
-        description: 'Git diff blast radius: what symbols, modules, and tests depend on the lines changed in the working tree or since a base ref.',
+        description: 'Git diff blast radius: callers and tests.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
-                base: { type: 'string', description: 'diff against this git ref merge-base with HEAD (default: working tree vs HEAD)' },
-                depth: { description: 'transitive hops over incoming edges, or "all" (default 2)' },
-                format: {
-                    type: 'string',
-                    enum: ['text', 'markdown', 'mermaid'],
-                    description: 'output format: "text" (default), "markdown" (PR-ready), or "mermaid" (diagram)',
-                },
+                base: { type: 'string', description: 'git ref' },
+                depth: { description: 'hops or "all"' },
+                format: { type: 'string', enum: ['text', 'markdown', 'mermaid'] },
                 dir: DIR_PROP,
             },
         },
     },
     {
         name: 'plexer_health',
-        description: 'Codebase health engine and execution queue: check strict/overall/objective/verified scores (`status`), run mechanical & Luau/Roblox detectors (`scan`), inspect the next prioritized fix items or parallel subagent work lanes (`next`), resolve or skip findings (`resolve`, `skip`, `wontfix`, `reopen`), or run diff-scoped health checks (`diff: true`).',
-        // Source-mutating actions (`autofix`, `move`) are intentionally excluded from MCP so `plexer_health`
-        // never modifies repository source files (only `plexer/.health/` local cache metadata) and preserves
-        // zero-prompt MCP auto-approval across Claude Code, Codex, and Cursor.
-        annotations: READ_ONLY_ANNOTATIONS,
+        description: 'Repo health audits and fix queue.',
+        annotations: HEALTH_ANNOTATIONS,
         inputSchema: {
             type: 'object',
             properties: {
                 action: {
                     type: 'string',
                     enum: ['status', 'scan', 'next', 'backlog', 'show', 'tree', 'detect', 'prompt', 'resolve', 'skip', 'wontfix', 'reopen'],
-                    description: 'health command action (default "status")',
                 },
-                detector: {
-                    type: 'string',
-                    description: 'specific detector name for action="detect" or "scan" (e.g. "signature_variance", "package_census", "roblox_security")',
-                },
-                patterns: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'issue ID, file, or detector patterns for show/resolve/skip/wontfix/reopen',
-                },
-                count: {
-                    type: 'number',
-                    description: 'number of queue items for action="next" or "backlog" (default 1 for next, 20 for backlog)',
-                },
-                cluster: {
-                    type: 'string',
-                    description: 'filter action="next" to a specific cluster',
-                },
-                group: {
-                    type: 'string',
-                    enum: ['item', 'file', 'detector'],
-                    description: 'group action="next" items by item (default), file, or detector',
-                },
-                explain: {
-                    type: 'boolean',
-                    description: 'include ranking and score-impact rationale in action="next"',
-                },
-                lanes: {
-                    type: 'boolean',
-                    description: 'compute graph-disjoint parallel subagent workstream lanes in action="next"',
-                },
-                status: {
-                    type: 'string',
-                    enum: ['open', 'fixed', 'wontfix', 'deferred', 'false_positive'],
-                    description: 'filter action="show" by issue status',
-                },
-                chronic: {
-                    type: 'boolean',
-                    description: 'filter action="show" to recurring or reopened issues across multiple scans',
-                },
-                code: {
-                    type: 'boolean',
-                    description: 'inline source code excerpts in action="show"',
-                },
-                note: {
-                    type: 'string',
-                    description: 'resolution or skip note',
-                },
-                attest: {
-                    type: 'string',
-                    description: 'explicit attestation for resolve, permanent skip (wontfix), or false_positive',
-                },
-                confirm: {
-                    type: 'boolean',
-                    description: 'confirm issue resolution or skip',
-                },
-                permanent: {
-                    type: 'boolean',
-                    description: 'mark skipped issue as permanent wontfix (requires attest)',
-                },
-                false_positive: {
-                    type: 'boolean',
-                    description: 'mark skipped issue as permanent false_positive (requires attest)',
-                },
-                diff: {
-                    type: 'boolean',
-                    description: 'when true, restrict findings to files touched in the working tree or since `base`',
-                },
-                base: {
-                    type: 'string',
-                    description: 'optional git ref for diff comparison',
-                },
-                in: {
-                    type: 'string',
-                    description: 'optional directory prefix filter (e.g. "src/graph")',
-                },
-                only: {
-                    type: 'string',
-                    description: 'comma-separated categories to run (duplicates,dead,coupling,cohesion,tests,catches,types,traps,slop,security)',
-                },
-                skip: {
-                    type: 'string',
-                    description: 'comma-separated categories to skip',
-                },
-                max: {
-                    type: 'number',
-                    description: 'maximum findings to return (default 10)',
-                },
-                format: {
-                    type: 'string',
-                    enum: ['text', 'markdown', 'json'],
-                    description: 'output format (default "text")',
-                },
+                target: { type: 'string' },
+                in: { type: 'string' },
+                diff: { type: 'boolean' },
+                count: { type: 'number' },
+                format: { type: 'string', enum: ['text', 'markdown', 'json'] },
+                note: { type: 'string' },
+                attest: { type: 'string' },
                 dir: DIR_PROP,
+                options: {
+                    type: 'object',
+                    description: 'Flags: cluster, group, status, chronic, confirm, permanent, detector, patterns, base, only, skip, max',
+                },
             },
         },
     },
@@ -401,21 +366,30 @@ function parsePatternList(raw) {
  * note), one block per match, joined with a blank line — the same grouping
  * `plexer callers` uses for multi-match symbols. `showDepth` tags each hit with
  * its BFS depth (for transitive `depth>1` walks). */
-function renderMatches(root, direction, showDepth, matches, hitsFor, graph, withSource = false, full = false) {
+async function renderMatches(root, direction, showDepth, matches, hitsFor, graph, withSource = false, full = false, seenSpans = null) {
+    const [{ fileReader }, { linkTestsForGraph }, { renderMatchBlock }] = await Promise.all([
+        getSpanMod(),
+        getTestLinksMod(),
+        getTraverseCliMod(),
+    ]);
     const read = fileReader(root);
     const testLinks = graph ? linkTestsForGraph(graph) : null;
     const seenSourceIds = new Set();
-    const maxCap = full ? 8800 : 5800;
+    const shownTargetSpans = seenSpans ? [] : null;
+    const maxCap = MCP_HARD_MAX_BYTES;
     const singleCap = full ? 8000 : 5400;
     const maxBytesPerSymbol = matches.length > 1 ? Math.max(1200, Math.floor(maxCap / matches.length)) : singleCap;
     let totalBytes = 0;
-    return matches
+    const rendered = matches
         .map((m) => {
             const remaining = matches.length > 1 ? Math.max(0, maxCap - totalBytes) : maxBytesPerSymbol;
             const sourceBudget = { bytes: 0, maxBytes: Math.min(maxBytesPerSymbol, remaining) };
             const block = renderMatchBlock(m, hitsFor(m), direction, showDepth, matches.length, read, {
                 source: withSource && remaining > 0,
+                full,
                 seenSourceIds,
+                seenSpans: !full ? seenSpans : null,
+                shownTargetSpans,
                 sourceBudget,
                 graph,
                 testLinks,
@@ -424,9 +398,16 @@ function renderMatches(root, direction, showDepth, matches, hitsFor, graph, with
             return block;
         })
         .join('\n\n');
+    const finalText = capMcpText(rendered, MCP_HARD_MAX_BYTES);
+    if (seenSpans && shownTargetSpans && Buffer.byteLength(finalText, 'utf8') <= MCP_HARD_MAX_BYTES) {
+        for (const sp of shownTargetSpans) {
+            mergeSpan(seenSpans, sp.file, sp.start, sp.end);
+        }
+    }
+    return finalText;
 }
 
-function runBlastOnRepo(root, dirOverride, args) {
+async function runBlastOnRepo(root, dirOverride, args) {
     const contextDir = contextDirFor(root, dirOverride);
     const w = loadGraphCached(contextDir);
     if (!w)
@@ -434,6 +415,7 @@ function runBlastOnRepo(root, dirOverride, args) {
     const parsedDepth = resolveTraceDepth(args.depth, 2);
     if (parsedDepth.error)
         return { text: parsedDepth.error, isError: true };
+    const [{ blastRadiusIn }, { changedFiles, refExists }, { markdownReport, mermaidDiagram, textReport }] = await getBlastMod();
     const base = typeof args.base === 'string' && args.base.trim() ? args.base.trim() : undefined;
     if (base !== undefined && !refExists(root, base)) {
         return {
@@ -448,16 +430,20 @@ function runBlastOnRepo(root, dirOverride, args) {
     const report = blastRadiusIn(w, contextDir, diff.files, diff.basis, parsedDepth.depth, { rootDir: root });
     const fmt = args.format === 'markdown' || args.format === 'mermaid' ? args.format : 'text';
     if (fmt === 'mermaid') {
-        return { text: mermaidDiagram(report) ?? '%% no dependents to draw', isError: false };
+        return { text: capMcpText(mermaidDiagram(report) ?? '%% no dependents to draw'), isError: false };
     }
     const text = fmt === 'markdown' ? markdownReport(report, { root }) : textReport(report);
-    return { text, isError: false };
+    return { text: capMcpText(text), isError: false };
 }
 
-function workspaceFindAll(root, dirOverride, args) {
+async function workspaceFindAll(root, dirOverride, args) {
     const patterns = parsePatternList(args.pattern);
     if (patterns.length === 0)
         return { text: 'plexer_find_all requires a pattern', isError: true };
+    const [{ federateGrep }, [, { formatGrepResult, zeroHitNote }]] = await Promise.all([
+        getWorkspaceMod(),
+        getGrepMods(),
+    ]);
     const contextLines = typeof args.context === 'number' && Number.isFinite(args.context)
         ? Math.max(0, Math.min(50, Math.trunc(args.context)))
         : args.source === false
@@ -465,6 +451,7 @@ function workspaceFindAll(root, dirOverride, args) {
             : args.full === true
                 ? 4
                 : 2;
+    const perPatternBudget = patterns.length >= 2 ? Math.max(950, Math.floor(8600 / patterns.length)) : 4800;
     const chunks = patterns.map((pat) => {
         const { result, coverage } = federateGrep(root, dirOverride, pat, {
             ignoreCase: typeof args.ignore_case === 'boolean' ? args.ignore_case : undefined,
@@ -473,30 +460,32 @@ function workspaceFindAll(root, dirOverride, args) {
             source: contextLines > 0,
             in: optIn(args),
         });
-        const text = result.totalHits === 0 ? zeroHitNote(result) : formatGrepResult(result);
+        const text = result.totalHits === 0 ? zeroHitNote(result) : formatGrepResult(result, { maxBytes: perPatternBudget });
         return coverage ? `${text}\n${coverage}` : text;
     });
-    return { text: chunks.join('\n\n'), isError: false };
+    return { text: capMcpText(chunks.join('\n\n')), isError: false };
 }
 
-function workspaceBlast(root, dirOverride, args) {
+async function workspaceBlast(root, dirOverride, args) {
+    const { loadWorkspaceGraphs } = await getWorkspaceMod();
     const wg = loadWorkspaceGraphs(root, dirOverride);
     if (wg.loaded.length === 0)
         return { text: NO_GRAPH, isError: true };
     const chunks = [];
     for (const { child } of wg.loaded) {
-        const res = runBlastOnRepo(join(root, child), undefined, args);
+        const res = await runBlastOnRepo(join(root, child), undefined, args);
         if (!res.isError) {
             chunks.push(`## ${child}/\n${res.text.trimEnd()}`);
         }
     }
     if (chunks.length === 0)
         return { text: 'could not read a diff in any workspace repository', isError: true };
-    return { text: `${chunks.join('\n\n')}\n`, isError: false };
+    return { text: capMcpText(`${chunks.join('\n\n')}\n`), isError: false };
 }
 
-function workspaceHealth(root, dirOverride, args) {
-    const ws = readWorkspace(root, dirOverride);
+async function workspaceHealth(root, dirOverride, args) {
+    const { loadWorkspaceGraphs } = await getWorkspaceMod();
+    const ws = readWorkspaceMeta(root, dirOverride);
     const children = ws?.children?.length
         ? ws.children
         : loadWorkspaceGraphs(root, dirOverride).loaded.map((l) => l.child);
@@ -508,7 +497,7 @@ function workspaceHealth(root, dirOverride, args) {
     for (const child of children) {
         const childPath = typeof child === 'string' ? child : child.path;
         const childName = typeof child === 'string' ? child : (child.name ?? child.path);
-        const res = singleHealth(join(root, childPath), args, undefined);
+        const res = await singleHealth(join(root, childPath), args, undefined);
         if (res.isError && res.text !== NO_GRAPH)
             return res;
         if (!res.isError) {
@@ -528,13 +517,18 @@ function workspaceHealth(root, dirOverride, args) {
     return { text: `${chunks.join('\n\n')}\n`, isError: false };
 }
 
-function workspaceRead(root, dirOverride, args, seenSpans = null) {
+async function workspaceRead(root, dirOverride, args, seenSpans = null) {
     const specs = parseCommaOrArrayList(args.spans ?? args.file);
     if (specs.length === 0)
         return { text: 'plexer_read requires spans', isError: true };
-    const r = federateRead(root, dirOverride, specs, { full: args.full === true });
+    const [{ federateRead }, { formatReadSpans }, { suggestClosestFiles }] = await Promise.all([
+        getWorkspaceMod(),
+        getReadSpansMod(),
+        getTextHelpersMod(),
+    ]);
+    const r = federateRead(root, dirOverride, specs, { full: args.full === true, callers: args.include_callers === true });
     if (r.blocks.some((b) => b.error && !b.error.includes('did you mean:'))) {
-        const wsPaths = collectWorkspacePaths(root, dirOverride);
+        const wsPaths = await collectWorkspacePaths(root, dirOverride);
         for (const b of r.blocks) {
             if (b.error && !b.error.includes('did you mean:') && !b.error.includes('sensitive')) {
                 const rawPath = String(b.spec ?? '').split(':')[0];
@@ -551,14 +545,19 @@ function workspaceRead(root, dirOverride, args, seenSpans = null) {
     };
 }
 
-function workspaceFileApi(root, dirOverride, args) {
+async function workspaceFileApi(root, dirOverride, args) {
     const files = parseCommaOrArrayList(args.file);
     if (files.length === 0)
         return { text: 'plexer_file_api requires a file', isError: true };
+    const [{ federateSkeleton }, { formatSkeleton }, { suggestClosestFiles }] = await Promise.all([
+        getWorkspaceMod(),
+        getSkeletonMod(),
+        getTextHelpersMod(),
+    ]);
     const skelOpts = { allMatches: Boolean(args.all_matches) };
     const results = files.map((f) => federateSkeleton(root, dirOverride, f, skelOpts));
     if (results.some((r) => !r.entries?.length && r.note && !r.note.includes('ambiguous') && !r.note.includes('did you mean:'))) {
-        const wsPaths = collectWorkspacePaths(root, dirOverride);
+        const wsPaths = await collectWorkspacePaths(root, dirOverride);
         for (const r of results) {
             if (!r.entries?.length && r.note && !r.note.includes('ambiguous') && !r.note.includes('did you mean:')) {
                 const hints = suggestClosestFiles(r.file, wsPaths, 3);
@@ -571,29 +570,37 @@ function workspaceFileApi(root, dirOverride, args) {
         ? formatSkeleton(results[0])
         : `${results.map((r) => formatSkeleton(r).trimEnd()).join('\n\n')}\n`;
     const isError = results.every((r) => !r.entries?.length && Boolean(r.note || r.error));
-    return { text, isError };
+    return { text: capMcpText(text), isError };
 }
 
-function workspaceTraceCalls(root, dirOverride, args) {
+async function workspaceTraceCalls(root, dirOverride, args, seenSpans = null) {
     const symbols = parseCommaOrArrayList(args.symbol ?? args.file);
     if (symbols.length === 0)
         return { text: 'plexer_trace_calls requires a symbol', isError: true };
     const parsedDepth = resolveTraceDepth(args.depth, 1);
     if (parsedDepth.error)
         return { text: parsedDepth.error, isError: true };
+    const { federateCallers } = await getWorkspaceMod();
+    const shownTargetSpans = seenSpans ? [] : null;
     const { text, found } = federateCallers(root, dirOverride, symbols.length === 1 ? symbols[0] : symbols, {
         direction: args.direction === 'out' ? 'out' : 'in',
         depth: parsedDepth.depth,
         source: args.full === true ? true : args.source !== false,
         full: args.full === true,
         in: optIn(args),
+        seenSpans: args.full === true ? null : seenSpans,
+        shownTargetSpans,
     });
+    if (seenSpans && shownTargetSpans && Buffer.byteLength(text, 'utf8') <= MCP_HARD_MAX_BYTES) {
+        for (const sp of shownTargetSpans)
+            mergeSpan(seenSpans, sp.file, sp.start, sp.end);
+    }
     if (!found && !text.includes('did you mean:')) {
-        const hints = suggestWorkspaceSymbols(root, dirOverride, symbols);
+        const hints = await suggestWorkspaceSymbols(root, dirOverride, symbols);
         if (hints.length)
             return { text: `${text.trimEnd()} — did you mean: ${hints.join(', ')}?\n`, isError: true };
     }
-    return { text, isError: !found };
+    return { text: capMcpText(text), isError: !found };
 }
 
 /** When the MCP server is rooted at a workspace parent, the ask/read/callers/grep/
@@ -608,21 +615,23 @@ async function callWorkspaceTool(root, dirOverride, name, args, seenSpans = null
             if (parsedLimit.error)
                 return { text: parsedLimit.error, isError: true };
             const { limit } = parsedLimit;
+            const [{ federateAsk }, { formatAsk }] = await Promise.all([getWorkspaceMod(), getAskMod()]);
             const blocks = queries.map((q) => {
                 const r = federateAsk(root, dirOverride, q, { limit, source: true, full: args.full === true, in: optIn(args) });
-                return formatAskWithSeenSpans(r, seenSpans, args.full === true);
+                return formatAskWithSeenSpans(r, seenSpans, args.full === true, formatAsk);
             });
-            return { text: `${blocks.join('\n\n')}\n`, isError: false };
+            return { text: capMcpText(`${blocks.join('\n\n')}\n`), isError: false };
         }
         case 'plexer_read':
             return workspaceRead(root, dirOverride, args, seenSpans);
         case 'plexer_file_api':
             return workspaceFileApi(root, dirOverride, args);
         case 'plexer_trace_calls':
-            return workspaceTraceCalls(root, dirOverride, args);
+            return workspaceTraceCalls(root, dirOverride, args, seenSpans);
         case 'plexer_find_all':
             return workspaceFindAll(root, dirOverride, args);
-        case 'plexer_repo_map':
+        case 'plexer_repo_map': {
+            const [{ federateMap }, { analyzeGitHistory }] = await Promise.all([getWorkspaceMod(), getHistoryMod()]);
             return {
                 text: federateMap(root, dirOverride, {
                     maxDirs: parseMaxDirs(args),
@@ -631,11 +640,13 @@ async function callWorkspaceTool(root, dirOverride, name, args, seenSpans = null
                 }),
                 isError: false,
             };
+        }
         case 'plexer_blast':
             return workspaceBlast(root, dirOverride, args);
         case 'plexer_health':
             return workspaceHealth(root, dirOverride, args);
         case 'plexer_check_freshness': {
+            const { federateCheck } = await getWorkspaceMod();
             const { text } = await federateCheck(root, dirOverride);
             return { text, isError: false };
         }
@@ -679,7 +690,7 @@ function sessionSeenSpansFor(sessionState, targetRoot) {
     return sessionState.seenSpansByRepo[key];
 }
 
-function formatAskWithSeenSpans(askResult, seenSpans, forceFull = false) {
+function formatAskWithSeenSpans(askResult, seenSpans, forceFull, formatAsk) {
     let cur = askResult;
     if (seenSpans && !forceFull) {
         cur = applySeenSpansFilter(askResult, seenSpans)?.ask ?? askResult;
@@ -695,7 +706,7 @@ function applyReadSeenSpans(readResult, seenSpans, forceFull = false) {
         const parsed = parsePointerSpan(`${b.file}:${b.span}`);
         if (!parsed) continue;
         if (!forceFull && isSpanCovered(seenSpans, parsed.file, parsed.start, parsed.end)) {
-            b.code = `// [already in session context: ${parsed.file}:L${parsed.start}-L${parsed.end} — pass full:true to force re-read]`;
+            b.code = `// [seen: ${parsed.file}:L${parsed.start}-L${parsed.end}; full:true]`;
         } else {
             mergeSpan(seenSpans, parsed.file, parsed.start, parsed.end);
         }
@@ -765,24 +776,47 @@ export async function callTool(root, name, args, dirOverride, sessionState = nul
         if (isFilesystemRoot(targetRoot)) {
             return { text: NO_GRAPH, isError: true };
         }
-        const startupRoot = resolve(root);
+        const startupRoot = root ? resolve(root) : '';
         const mcpRoots = Array.isArray(sessionState?.roots) ? sessionState.roots : [];
-        const isTrustedRoot = isInsideRoot(startupRoot, targetRoot)
-            || mcpRoots.some((r) => isInsideRoot(r, targetRoot))
-            || hasPlexerIndex(targetRoot)
-            || getAgyRoots().some((d) => isInsideRoot(d, targetRoot));
+        const hasStartupRoot = Boolean(startupRoot && !isFilesystemRoot(startupRoot));
+        const isTmpStartupWithMcpRoots = mcpRoots.length > 0 && startupRoot === resolve(tmpdir());
+        const trustedViaStartup = hasStartupRoot && !isTmpStartupWithMcpRoots && isInsideRoot(startupRoot, targetRoot);
+        const trustedViaMcp = mcpRoots.some((r) => isInsideRoot(r, targetRoot));
+        const isTrustedRoot = (hasStartupRoot || mcpRoots.length > 0)
+            ? (trustedViaStartup || trustedViaMcp)
+            : (hasPlexerIndex(targetRoot) || getAgyRoots().some((d) => isInsideRoot(d, targetRoot)));
         if (!isTrustedRoot) {
             return { text: NO_GRAPH, isError: true };
         }
-        const ws = readWorkspace(targetRoot, dirOverride);
+        const ws = readWorkspaceMeta(targetRoot, dirOverride);
         let note = null;
+        const seenSpans = sessionSeenSpansFor(sessionState, targetRoot);
         if (!NO_REFRESH_TOOLS.has(name)) {
             const r = ws
                 ? await ensureFreshChildren(targetRoot, ws.children, { contextDir: dirOverride, autoBuild: isTrustedRoot })
-                : await ensureFreshGraph(targetRoot, { contextDir: dirOverride, autoBuild: isTrustedRoot });
+                : await ensureFreshGraphCoalesced(targetRoot, { contextDir: dirOverride, autoBuild: isTrustedRoot });
+            if (r?.refreshed) {
+                const changedFiles = [
+                    ...(Array.isArray(r.drift?.changed) ? r.drift.changed : []),
+                    ...(Array.isArray(r.drift?.removed) ? r.drift.removed : []),
+                ];
+                if (seenSpans && changedFiles.length > 0) {
+                    for (const rel of changedFiles) {
+                        invalidateEditedSpans(seenSpans, rel, 1);
+                    }
+                }
+                if (seenSpans && Array.isArray(r.children)) {
+                    for (const ch of r.children) {
+                        const childPrefix = ch?.child ? `${ch.child}/` : '';
+                        for (const rel of [...(ch?.drift?.changed ?? []), ...(ch?.drift?.removed ?? [])]) {
+                            invalidateEditedSpans(seenSpans, `${childPrefix}${rel}`, 1);
+                            invalidateEditedSpans(seenSpans, rel, 1);
+                        }
+                    }
+                }
+            }
             note = refreshNote(r);
         }
-        const seenSpans = sessionSeenSpansFor(sessionState, targetRoot);
         const fed = ws ? await callWorkspaceTool(targetRoot, dirOverride, name, args, seenSpans) : null;
         const res = fed ?? (await callSingleTool(targetRoot, name, args, dirOverride, seenSpans));
         return note ? { ...res, text: `${note}\n${res.text}` } : res;
@@ -792,7 +826,7 @@ export async function callTool(root, name, args, dirOverride, sessionState = nul
     }
 }
 
-function singleFindCode(root, args, dirOverride, seenSpans = null) {
+async function singleFindCode(root, args, dirOverride, seenSpans = null) {
     const queries = parseQueriesList(args.query ?? args.queries);
     if (queries.length === 0)
         return { text: 'plexer_find_code requires a query', isError: true };
@@ -800,6 +834,7 @@ function singleFindCode(root, args, dirOverride, seenSpans = null) {
     if (parsedLimit.error)
         return { text: parsedLimit.error, isError: true };
     const { limit } = parsedLimit;
+    const { ask, formatAsk } = await getAskMod();
     const seenPointers = queries.length > 1 ? new Set() : undefined;
     const blocks = queries.map((q) => {
         const maxHitsToInline = queries.length > 1 ? 1 : undefined;
@@ -816,12 +851,12 @@ function singleFindCode(root, args, dirOverride, seenSpans = null) {
             maxSourceBytes,
             maxHitsToInline,
         });
-        return formatAskWithSeenSpans(r, seenSpans, args.full === true);
+        return formatAskWithSeenSpans(r, seenSpans, args.full === true, formatAsk);
     });
-    return { text: `${blocks.join('\n\n')}\n`, isError: false };
+    return { text: capMcpText(`${blocks.join('\n\n')}\n`), isError: false };
 }
 
-function singleTraceCalls(root, args, dirOverride) {
+async function singleTraceCalls(root, args, dirOverride, seenSpans = null) {
     const queries = parseCommaOrArrayList(args.symbol ?? args.file);
     if (queries.length === 0)
         return { text: 'plexer_trace_calls requires a symbol', isError: true };
@@ -843,23 +878,26 @@ function singleTraceCalls(root, args, dirOverride) {
         }
     }
     if (matches.length === 0) {
+        const { suggestNearTargets } = await getTextHelpersMod();
         const suggestions = [...new Set(queries.flatMap((q) => suggestNearTargets(w, q, inPrefix, 3)))].slice(0, 3);
         return { text: unknownSymbolText(queries.join(', '), suggestions), isError: true };
     }
+    const { edgeWalk } = await getTraverseMod();
     const direction = args.direction === 'out' ? 'out' : 'in';
     const { depth } = parsedDepth;
     const useSource = args.full === true ? true : args.source !== false;
-    const text = renderMatches(root, direction, depth > 1, matches, (m) => edgeWalk(w, m, direction, depth), w, useSource, args.full === true);
+    const text = await renderMatches(root, direction, depth > 1, matches, (m) => edgeWalk(w, m, direction, depth), w, useSource, args.full === true, seenSpans);
     return { text, isError: false };
 }
 
-function singleFindAll(root, args, dirOverride) {
+async function singleFindAll(root, args, dirOverride) {
     const patterns = parsePatternList(args.pattern);
     if (patterns.length === 0)
         return { text: 'plexer_find_all requires a pattern', isError: true };
     const w = loadGraphCached(contextDirFor(root, dirOverride));
     if (!w)
         return { text: NO_GRAPH, isError: true };
+    const [{ grepGraph }, { formatGrepResult, zeroHitNote }] = await getGrepMods();
     const contextLines = typeof args.context === 'number' && Number.isFinite(args.context)
         ? Math.max(0, Math.min(50, Math.trunc(args.context)))
         : args.source === false
@@ -878,7 +916,7 @@ function singleFindAll(root, args, dirOverride) {
         });
         return result.totalHits === 0 ? zeroHitNote(result) : formatGrepResult(result, { maxBytes: perPatternBudget });
     });
-    return { text: chunks.join('\n\n'), isError: false };
+    return { text: capMcpText(chunks.join('\n\n')), isError: false };
 }
 
 const ALLOWED_MCP_HEALTH_ACTIONS = new Set([
@@ -963,7 +1001,11 @@ function formatMcpHealthMutationResult(rawAction, res, fmt) {
     };
 }
 
-function singleHealth(root, args, dirOverride) {
+async function singleHealth(root, rawArgs, dirOverride) {
+    const args = {
+        ...(rawArgs?.options && typeof rawArgs.options === 'object' ? rawArgs.options : {}),
+        ...(rawArgs ?? {}),
+    };
     const rawAction = typeof args.action === 'string' ? args.action.toLowerCase() : 'status';
     if (!ALLOWED_MCP_HEALTH_ACTIONS.has(rawAction)) {
         return {
@@ -980,7 +1022,7 @@ function singleHealth(root, args, dirOverride) {
             ? args.patterns.map(String)
             : typeof args.patterns === 'string'
                 ? [args.patterns]
-                : undefined;
+                : (typeof args.target === 'string' && args.target.trim() ? [args.target.trim()] : undefined);
 
     let engineAction = rawAction;
     let subAction;
@@ -998,6 +1040,7 @@ function singleHealth(root, args, dirOverride) {
         subAction = 'reopen';
     }
 
+    const [{ health }, { formatHealthMarkdown, formatHealthText }] = await getHealthMods();
     const res = health(root, {
         contextDir: dirOverride,
         action: engineAction,
@@ -1016,7 +1059,7 @@ function singleHealth(root, args, dirOverride) {
         confirm: args.confirm === true,
         permanent,
         falsePositive,
-        detector: typeof args.detector === 'string' ? args.detector : undefined,
+        detector: typeof args.detector === 'string' ? args.detector : (rawAction === 'detect' && typeof args.target === 'string' ? args.target : undefined),
         diff: args.diff === true ? (typeof args.base === 'string' ? args.base : true) : undefined,
         base: typeof args.base === 'string' ? args.base : undefined,
         in: optIn(args),
@@ -1024,6 +1067,9 @@ function singleHealth(root, args, dirOverride) {
         skip: typeof args.skip === 'string' ? args.skip : undefined,
         max: typeof args.max === 'number' ? args.max : 10,
     });
+    if (rawAction === 'resolve' || rawAction === 'skip' || rawAction === 'wontfix' || rawAction === 'reopen' || rawAction === 'scan') {
+        invalidateMcpFreshnessCache(root);
+    }
     if (rawAction === 'prompt') return { text: res.prompt, isError: false };
     if (rawAction === 'tree') return { text: res.tree_text, isError: false };
     const fmt = args.format === 'json' ? 'json' : args.format === 'markdown' ? 'markdown' : 'text';
@@ -1056,7 +1102,8 @@ async function callSingleTool(root, name, args, dirOverride, seenSpans = null) {
             const specs = parseCommaOrArrayList(args.spans ?? args.file);
             if (specs.length === 0)
                 return { text: 'plexer_read requires spans', isError: true };
-            const r = readSpans(root, specs, { contextDir: dirOverride, full: args.full === true });
+            const { readSpans, formatReadSpans } = await getReadSpansMod();
+            const r = readSpans(root, specs, { contextDir: dirOverride, full: args.full === true, callers: args.include_callers === true });
             applyReadSeenSpans(r, seenSpans, args.full === true);
             return {
                 text: formatReadSpans(r),
@@ -1067,26 +1114,32 @@ async function callSingleTool(root, name, args, dirOverride, seenSpans = null) {
             const files = parseCommaOrArrayList(args.file);
             if (files.length === 0)
                 return { text: 'plexer_file_api requires a file', isError: true };
+            const { skeleton, formatSkeleton } = await getSkeletonMod();
             const skelOpts = { contextDir: dirOverride, allMatches: Boolean(args.all_matches) };
             const results = files.map((f) => skeleton(root, f, skelOpts));
             const text = results.length === 1
                 ? formatSkeleton(results[0])
                 : `${results.map((r) => formatSkeleton(r).trimEnd()).join('\n\n')}\n`;
             const isError = results.every((r) => !r.entries?.length && Boolean(r.note || r.error));
-            return { text, isError };
+            return { text: capMcpText(text), isError };
         }
         case 'plexer_check_freshness': {
+            const { checkGraph, formatGraphCheckReport } = await getCheckMod();
             const g = await checkGraph(root, { contextDir: dirOverride });
             return { text: formatGraphCheckReport(g), isError: false };
         }
         case 'plexer_trace_calls':
-            return singleTraceCalls(root, args, dirOverride);
+            return singleTraceCalls(root, args, dirOverride, seenSpans);
         case 'plexer_find_all':
             return singleFindAll(root, args, dirOverride);
         case 'plexer_repo_map': {
             const w = loadGraphCached(contextDirFor(root, dirOverride));
             if (!w)
                 return { text: NO_GRAPH, isError: true };
+            const [{ buildRepoMap, formatRepoMap }, { analyzeGitHistory }] = await Promise.all([
+                getMapMod(),
+                args.churn === true ? getHistoryMod() : Promise.resolve({}),
+            ]);
             const map = buildRepoMap(w, {
                 maxDirs: parseMaxDirs(args),
                 gitHistory: args.churn === true ? analyzeGitHistory(root, contextDirFor(root, dirOverride)) : undefined,

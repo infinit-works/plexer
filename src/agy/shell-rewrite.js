@@ -3,19 +3,20 @@
  * deduplication, and Turn-6 pre-edit exploration gating shared across
  * Antigravity, Claude Code, Gemini CLI, and Codex PreToolUse hooks.
  */
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadGraphCached } from '../context/graph-store.js';
 import { hasPlexerIndex, nearestPlexerRoot } from '../graph/root.js';
 import { contextDirFor, isLexicallyWithin } from '../util/paths.js';
 import { unquoteArg } from '../util/span.js';
-import { normalizeRelFile } from './spans.js';
+import { normalizeRelFile, invalidateSpanIfModified } from './spans.js';
 
 export const PKG_BIN_PLEXER = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'plexer.js');
 const MAX_READ_STAT_BYTES = 256 * 1024;
 const DEFAULT_SHELL_CAT_MAX_LINES = 220;
 const SEEN_SEARCH_KEYS_CAP = 64;
+const BLOCKED_KEYS_CAP = 16;
 const PRE_EDIT_TURN_GAP_MS = 2500;
 const EXPLORATION_GATE_TURN_LIMIT = 6;
 
@@ -35,6 +36,9 @@ const BROAD_SEARCH_SUBCOMMANDS = new Set(['grep', 'ask', 'map', 'skeleton']);
 const DEDUP_SEARCH_SUBCOMMANDS = new Set(['grep', 'callers', 'callees', 'ask', 'map', 'skeleton']);
 const EDIT_TOOL_RE = /^(?:edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content|sed_file|Edit|MultiEdit|Write|apply_patch|replace)$/i;
 const NATIVE_BROAD_SEARCH_TOOL_RE = /^(?:grep_search|Grep|find_by_name|Glob)$/i;
+const SHELL_EDIT_TOOL_HINT_RE = /\b(?:sed|perl|python3?|node)\b/;
+const PY_INLINE_WRITE_RE = /(?:open\s*\([^)]*,\s*['"][wa+]|Path\s*\([^)]*\)\s*\.\s*write_(?:text|bytes)|\.write_(?:text|bytes)\s*\(|shutil\.(?:copy|move)|os\.replace\s*\()/;
+const NODE_INLINE_WRITE_RE = /(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|renameSync)\s*\(/;
 
 let cachedPathEnv = null;
 let cachedPlexerPathCheck = false;
@@ -77,7 +81,7 @@ export function readTextLinesSafe(absPath, maxStatBytes = MAX_READ_STAT_BYTES) {
     const lines = buf.toString('utf8').split(/\r\n|\n/);
     if (lines.length > 1 && lines[lines.length - 1] === '')
         lines.pop();
-    return { bytes: st.size, lines };
+    return { bytes: st.size, mtimeMs: st.mtimeMs, lines };
 }
 
 export function getSeenIntervalsForFile(seenSpans, relNorm) {
@@ -109,7 +113,7 @@ export function stepQuotedCommandChar(state, s, i) {
         state.cur += ch + s[i + 1];
         return i + 1;
     }
-    if (state.quote === '"' && (ch === '`' || (ch === '$' && next === '('))) {
+    if (state.quote === '"' && (ch === '`' || ch === '$')) {
         state.abort = true;
         return i;
     }
@@ -131,7 +135,12 @@ export function stepUnquotedCommandChar(state, s, i) {
         state.cur += ch + s[i + 1];
         return i + 1;
     }
-    if (ch === '|' || ch === '>' || ch === '<' || ch === '`' || (ch === '$' && next === '(')) {
+    if (
+        ch === '|' || ch === '>' || ch === '<' || ch === '`'
+        || ch === '\n' || ch === '\r' || ch === '$'
+        || ch === '(' || ch === ')' || ch === '{' || ch === '}'
+        || ch === '~' || ch === '#'
+    ) {
         state.abort = true;
         return i;
     }
@@ -330,8 +339,8 @@ export function parsePlexerCommandTokens(tokens, { allowAnySub = false, allowBat
         restStart = 2;
     }
     else if ((cmdTokens[0] === 'node' || cmdTokens[0].endsWith('/node')) && /plexer\.js$/i.test(cmdTokens[1]) && cmdTokens.length >= 3) {
-        const quotedBin = /\s/.test(cmdTokens[1]) ? JSON.stringify(cmdTokens[1]) : cmdTokens[1];
-        const quotedNode = /\s/.test(cmdTokens[0]) ? JSON.stringify(cmdTokens[0]) : cmdTokens[0];
+        const quotedBin = quoteShellToken(cmdTokens[1]);
+        const quotedNode = quoteShellToken(cmdTokens[0]);
         prefix = `${quotedNode} ${quotedBin}`;
         restStart = 2;
     }
@@ -422,11 +431,10 @@ function buildPlexerReadShellCmd(graphRepo, rel, startLine, endLine, cleanSid) {
 
 function tryRewriteFileSliceCommand(tokens, execRepo, graphRepo, cleanSid) {
     const prog = tokens[0];
-    let fileArg = null;
+    let files = [];
     let range = null;
 
     if (prog === 'cat') {
-        const files = [];
         for (let i = 1; i < tokens.length; i++) {
             const t = tokens[i];
             if (t === '--number' || t === '--number-nonblank') continue;
@@ -434,14 +442,31 @@ function tryRewriteFileSliceCommand(tokens, execRepo, graphRepo, cleanSid) {
             if (t.startsWith('-')) return null;
             files.push(t);
         }
+        if (files.length === 0 || files.length > 5) return null;
+        const capPerFile = files.length === 1 ? DEFAULT_SHELL_CAT_MAX_LINES : 120;
+        range = (total) => [1, Math.min(total, capPerFile)];
+    }
+    else if (prog === 'nl') {
+        for (let i = 1; i < tokens.length; i++) {
+            const t = tokens[i];
+            if ((t === '-b' || t === '-n' || t === '-v' || t === '-w') && i + 1 < tokens.length) {
+                const val = tokens[++i];
+                if (t === '-b' && !/^[atn]$/.test(val)) return null;
+                if (t === '-n' && !/^(?:ln|rn|rz)$/.test(val)) return null;
+                if ((t === '-v' || t === '-w') && !/^\d+$/.test(val)) return null;
+                continue;
+            }
+            if (/^-(?:ba|bt|bn|nln|nrn|nrz)$/.test(t)) continue;
+            if (t.startsWith('--body-numbering=') || t.startsWith('--number-format=')) continue;
+            if (t.startsWith('-')) return null;
+            files.push(t);
+        }
         if (files.length !== 1) return null;
-        fileArg = files[0];
         range = (total) => [1, Math.min(total, DEFAULT_SHELL_CAT_MAX_LINES)];
     }
     else if (prog === 'head' || prog === 'tail') {
         let nVal = 10;
         let plusStart = null;
-        const files = [];
         for (let i = 1; i < tokens.length; i++) {
             const t = tokens[i];
             if (t === '-n' && i + 1 < tokens.length) {
@@ -466,11 +491,11 @@ function tryRewriteFileSliceCommand(tokens, execRepo, graphRepo, cleanSid) {
             }
         }
         if (files.length !== 1 || nVal <= 0) return null;
-        fileArg = files[0];
         range = (total) => {
             if (prog === 'head') return [1, Math.min(total, nVal)];
             if (plusStart !== null) {
-                const s = Math.min(total, Math.max(1, plusStart));
+                if (plusStart > total) return null;
+                const s = Math.max(1, plusStart);
                 return [s, Math.min(total, s + DEFAULT_SHELL_CAT_MAX_LINES - 1)];
             }
             return [Math.max(1, total - nVal + 1), total];
@@ -479,7 +504,6 @@ function tryRewriteFileSliceCommand(tokens, execRepo, graphRepo, cleanSid) {
     else if (prog === 'sed') {
         let quiet = false;
         let script = null;
-        const files = [];
         for (let i = 1; i < tokens.length; i++) {
             const t = tokens[i];
             if (t === '-n' || t === '--quiet' || t === '--silent') quiet = true;
@@ -494,9 +518,9 @@ function tryRewriteFileSliceCommand(tokens, execRepo, graphRepo, cleanSid) {
         const reqA = Math.max(1, Number(m[1]));
         const reqB = m[2] === '$' ? Infinity : (m[2] ? Number(m[2]) : reqA);
         if (reqB < reqA) return null;
-        fileArg = files[0];
         range = (total) => {
-            const s = Math.min(total, reqA);
+            if (reqA > total) return null;
+            const s = reqA;
             const e = Number.isFinite(reqB) ? Math.min(total, reqB) : Math.min(total, s + DEFAULT_SHELL_CAT_MAX_LINES);
             return [s, Math.max(s, e)];
         };
@@ -505,11 +529,24 @@ function tryRewriteFileSliceCommand(tokens, execRepo, graphRepo, cleanSid) {
         return null;
     }
 
-    const target = resolveSafeTargetInGraphRepo(fileArg, execRepo, graphRepo);
-    if (!target)
-        return null;
-    const [s, e] = range(target.totalLines);
-    return buildPlexerReadShellCmd(graphRepo, target.rel, s, e, cleanSid);
+    if (files.length === 1) {
+        const target = resolveSafeTargetInGraphRepo(files[0], execRepo, graphRepo);
+        if (!target) return null;
+        const bounds = range(target.totalLines);
+        if (!bounds) return null;
+        return buildPlexerReadShellCmd(graphRepo, target.rel, bounds[0], bounds[1], cleanSid);
+    }
+    const spanArgs = [];
+    for (const f of files) {
+        const target = resolveSafeTargetInGraphRepo(f, execRepo, graphRepo);
+        if (!target) return null;
+        const bounds = range(target.totalLines);
+        if (!bounds) return null;
+        spanArgs.push(quoteShellToken(`${target.rel}:L${bounds[0]}-L${bounds[1]}`));
+    }
+    const bin = resolvePlexerBinPart();
+    const sessPart = cleanSid ? ` --session ${quoteShellToken(cleanSid)}` : '';
+    return `env -C ${quoteShellToken(graphRepo)} ${bin} read ${spanArgs.join(' ')}${sessPart}`;
 }
 
 const UNSAFE_GREP_FLAGS = new Set([
@@ -517,15 +554,65 @@ const UNSAFE_GREP_FLAGS = new Set([
 ]);
 const ALLOWED_SHORT_GREP_FLAGS = new Set(['r', 'R', 'n', 'H', 'h', 'I', 'i', 'F', 'E']);
 
+const UNINDEXED_SEARCH_EXTS = new Set([
+    '.json', '.jsonc', '.sh', '.bash', '.zsh', '.md', '.mdx', '.yaml', '.yml',
+    '.toml', '.ini', '.cfg', '.conf', '.txt', '.csv', '.tsv', '.lock', '.xml',
+    '.svg', '.html', '.htm', '.css', '.scss', '.less', '.sql', '.env', '.pbtxt',
+    '.proto', '.dockerfile',
+]);
+
+function pathHasIndexedMatches(graph, rel) {
+    if (graph._nodesByPath) {
+        if (graph._nodesByPath.has(rel)) return true;
+        const prefix = `${rel}/`;
+        for (const p of graph._nodesByPath.keys()) {
+            if (p.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+    return graph.nodes.some((n) => n.path === rel || n.path.startsWith(`${rel}/`));
+}
+
+const SKIP_UNINDEXED_SCAN_DIRS = new Set([
+    '.git', 'node_modules', 'plexer', '.plexer', 'dist', 'build', 'coverage',
+    '__pycache__', '.next', '.cache', '.venv', 'venv', 'target',
+]);
+
+function hasUnindexedEntriesInTarget(absP, graph) {
+    try {
+        const st = statSync(absP);
+        if (st.isFile()) {
+            return UNINDEXED_SEARCH_EXTS.has(extname(absP).toLowerCase());
+        }
+        if (st.isDirectory()) {
+            const stack = [absP];
+            let visited = 0;
+            while (stack.length > 0 && visited < 500) {
+                const dir = stack.pop();
+                for (const entry of readdirSync(dir, { withFileTypes: true })) {
+                    visited += 1;
+                    if (entry.isDirectory()) {
+                        if (!SKIP_UNINDEXED_SCAN_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+                            stack.push(join(dir, entry.name));
+                        }
+                    } else if (entry.isFile() && UNINDEXED_SEARCH_EXTS.has(extname(entry.name).toLowerCase())) {
+                        return true;
+                    }
+                    if (visited >= 500) break;
+                }
+            }
+        }
+    } catch { /* ignore */ }
+    return !graph;
+}
+
 function parseGrepLikeArgs(tokens) {
-    let isGitGrep = false;
     let startIdx = 1;
     let fixed = tokens[0] === 'fgrep';
     let ignoreCase = false;
-    let extended = tokens[0] === 'egrep' || tokens[0] === 'rg' || (tokens[0] === 'git' && tokens[1] === 'grep');
+    let extended = tokens[0] === 'egrep' || tokens[0] === 'rg';
     let ctxLines = null;
     if (tokens[0] === 'git' && tokens[1] === 'grep') {
-        isGitGrep = true;
         startIdx = 2;
     }
     else if (tokens[0] !== 'grep' && tokens[0] !== 'egrep' && tokens[0] !== 'fgrep' && tokens[0] !== 'rg') {
@@ -569,26 +656,55 @@ function parseGrepLikeArgs(tokens) {
     return { pattern: pat[0], paths: positionals, fixed, ignoreCase, ctxLines };
 }
 
-function tryRewriteSearchCommand(tokens, execRepo, graphRepo, cleanSid, getGraph) {
+function hasAlreadyRanPlexerGrep(agyState, absGraph, pattern) {
+    const seen = agyState?.seenSearchKeys;
+    if (!Array.isArray(seen) || seen.length === 0) return false;
+    const repoKey = normalizeRelFile(resolve(absGraph));
+    const prefix = `cmd:${repoKey}:grep\0`;
+    for (const key of seen) {
+        if (typeof key !== 'string' || !key.startsWith(prefix)) continue;
+        const parts = key.slice(prefix.length).split('\0');
+        if (parts.includes(pattern)) return true;
+    }
+    return false;
+}
+
+function tryRewriteSearchCommand(tokens, execRepo, graphRepo, cleanSid, getGraph, agyState = null) {
     const parsed = parseGrepLikeArgs(tokens);
     if (!parsed)
         return null;
     const absGraph = resolve(graphRepo);
+    if (hasAlreadyRanPlexerGrep(agyState, absGraph, parsed.pattern))
+        return null;
     const graph = typeof getGraph === 'function' ? getGraph(graphRepo) : loadGraphCached(contextDirFor(graphRepo));
     if (!graph?.nodes?.length)
         return null;
 
     const scopes = [];
+    if (parsed.paths.length === 0) {
+        const absExec = resolve(execRepo);
+        const relExec = normalizeRelFile(relative(absGraph, absExec));
+        if (relExec && relExec !== '.' && !relExec.startsWith('..')) {
+            if (isIgnoredRepoSubpath(relExec) || hasUnindexedEntriesInTarget(absExec, graph) || !pathHasIndexedMatches(graph, relExec))
+                return null;
+            scopes.push(relExec);
+        } else if (hasUnindexedEntriesInTarget(absGraph, graph)) {
+            return null;
+        }
+    }
     for (const rawPath of parsed.paths) {
         if (/[*?[\]]/.test(rawPath))
             return null;
         const absP = resolve(execRepo, unquoteArg(rawPath));
         const rel = normalizeRelFile(relative(absGraph, absP));
-        if (rel === '.' || rel === '') continue;
+        if (rel === '.' || rel === '') {
+            if (hasUnindexedEntriesInTarget(absP, graph)) return null;
+            continue;
+        }
         if (isIgnoredRepoSubpath(rel)) return null;
         if (!existsSync(absP)) return null;
-        const hasIndexed = graph.nodes.some((n) => n.path === rel || n.path.startsWith(`${rel}/`));
-        if (!hasIndexed)
+        if (hasUnindexedEntriesInTarget(absP, graph)) return null;
+        if (!pathHasIndexedMatches(graph, rel))
             return null;
         scopes.push(rel);
     }
@@ -603,11 +719,8 @@ function tryRewriteSearchCommand(tokens, execRepo, graphRepo, cleanSid, getGraph
     return parts.join(' ');
 }
 
-function tryRewriteGitLogCommand(tokens) {
+function tryRewriteGitLogCommand(tokens, execRepo = null, repoRoot = null) {
     if (tokens[0] !== 'git' || tokens[1] !== 'log')
-        return null;
-    const hasPatch = tokens.includes('-p') || tokens.includes('--patch');
-    if (!hasPatch)
         return null;
     const hasBound = tokens.some((t, idx) =>
         /^-\d+$/.test(t) || t === '-n' || t.startsWith('--max-count')
@@ -615,9 +728,37 @@ function tryRewriteGitLogCommand(tokens) {
     );
     if (hasBound)
         return null;
-    const mapped = tokens.map((t) => (t === '-p' || t === '--patch' ? '--stat' : t));
-    mapped.push('-n', '5');
-    return mapped.map(quoteShellToken).join(' ');
+    const envPrefix = execRepo && repoRoot && resolve(execRepo) !== resolve(repoRoot)
+        ? `env -C ${quoteShellToken(execRepo)} `
+        : '';
+    const hasPatch = tokens.includes('-p') || tokens.includes('--patch');
+    if (hasPatch) {
+        const dashDash = tokens.indexOf('--');
+        const out = dashDash >= 0
+            ? [...tokens.slice(0, dashDash), '-n', '3', ...tokens.slice(dashDash)]
+            : [...tokens, '-n', '3'];
+        return `${envPrefix}${out.map(quoteShellToken).join(' ')}`;
+    }
+    const skipUnbounded = tokens.some((t) =>
+        t === '-S' || t === '-G' || t.startsWith('-S') || t.startsWith('-G')
+        || t === '--grep' || t.startsWith('--grep=')
+        || t === '--since' || t.startsWith('--since=')
+        || t === '--after' || t.startsWith('--after=')
+        || t === '--all' || t === '--graph',
+    );
+    if (skipUnbounded)
+        return null;
+    const hasFmt = tokens.some((t) =>
+        t === '--oneline' || t === '--stat' || t === '--shortstat' || t === '--numstat'
+        || t === '--name-only' || t === '--name-status'
+        || t.startsWith('--format') || t.startsWith('--pretty'),
+    );
+    const extra = hasFmt ? ['-n', '15'] : ['--oneline', '-n', '15'];
+    const dashDash = tokens.indexOf('--');
+    const out = dashDash >= 0
+        ? [...tokens.slice(0, dashDash), ...extra, ...tokens.slice(dashDash)]
+        : [...tokens, ...extra];
+    return `${envPrefix}${out.map(quoteShellToken).join(' ')}`;
 }
 
 /**
@@ -625,7 +766,7 @@ function tryRewriteGitLogCommand(tokens) {
  * repo grep searches (`grep`/`rg`/`git grep`), and unbounded `git log -p`
  * into compact, `seenSpans`-aware `plexer` invocations when safe.
  */
-export function rewriteShellExplorationCommand(cmd, { repoRoot, sessionId = null, getGraph = null } = {}) {
+export function rewriteShellExplorationCommand(cmd, { repoRoot, sessionId = null, getGraph = null, agyState = null } = {}) {
     if (typeof cmd !== 'string' || !cmd.trim() || cmd.includes('\n'))
         return null;
     const resolved = resolveLeadingCdAndExecTokens(cmd, repoRoot);
@@ -635,8 +776,8 @@ export function rewriteShellExplorationCommand(cmd, { repoRoot, sessionId = null
     const { execRepo, graphRepo, tokens } = resolved;
     return (
         tryRewriteFileSliceCommand(tokens, execRepo, graphRepo, cleanSid)
-        ?? tryRewriteSearchCommand(tokens, execRepo, graphRepo, cleanSid, getGraph)
-        ?? tryRewriteGitLogCommand(tokens)
+        ?? tryRewriteSearchCommand(tokens, execRepo, graphRepo, cleanSid, getGraph, agyState)
+        ?? tryRewriteGitLogCommand(tokens, execRepo, repoRoot)
     );
 }
 
@@ -706,14 +847,52 @@ function classifyNativeSearch(toolName, toolArgs, repoRoot) {
     };
 }
 
-function areEditTargetsSeen(agyState, relPrefix = '') {
-    const targets = Array.isArray(agyState?.editTargetFiles) ? agyState.editTargetFiles.filter(Boolean) : [];
+function countCoveredLines(intervals) {
+    if (!intervals.length) return 0;
+    const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+    let total = 0;
+    let [curS, curE] = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+        const [s, e] = sorted[i];
+        if (s <= curE + 1) curE = Math.max(curE, e);
+        else { total += curE - curS + 1; curS = s; curE = e; }
+    }
+    return total + (curE - curS + 1);
+}
+
+function getExactOrPrefixedIntervals(seenSpans, rel, relPrefix = '') {
+    if (!seenSpans || typeof seenSpans !== 'object' || !rel) return [];
+    const key = relPrefix ? `${relPrefix}${rel}` : rel;
+    const direct = seenSpans[key] ?? seenSpans[rel];
+    if (Array.isArray(direct) && direct.length > 0) {
+        return direct.filter((p) => Array.isArray(p) && p.length >= 2 && Number(p[1]) >= Number(p[0]) && Number(p[0]) >= 1)
+            .map((p) => [Number(p[0]), Number(p[1])]);
+    }
+    return [];
+}
+
+function areEditTargetsSeen(agyState, relPrefix = '', repoRoot = '') {
+    const rawTargets = Array.isArray(agyState?.planTargetFiles) && agyState.planTargetFiles.length > 0
+        ? agyState.planTargetFiles
+        : (Array.isArray(agyState?.editTargetFiles) ? agyState.editTargetFiles : []);
+    const targets = rawTargets.filter(Boolean);
     if (targets.length === 0 || !agyState?.seenSpans)
         return false;
     return targets.every((t) => {
         const rel = normalizeRelFile(t);
-        return getSeenIntervalsForFile(agyState.seenSpans, rel).length > 0
-            || (relPrefix && getSeenIntervalsForFile(agyState.seenSpans, `${relPrefix}${rel}`).length > 0);
+        if (repoRoot) {
+            const absTarget = resolve(repoRoot, rel);
+            if (relPrefix) invalidateSpanIfModified(agyState, `${relPrefix}${rel}`, absTarget);
+            invalidateSpanIfModified(agyState, rel, absTarget);
+        }
+        const intervals = getExactOrPrefixedIntervals(agyState.seenSpans, rel, relPrefix);
+        const covered = countCoveredLines(intervals);
+        if (covered >= 15) return true;
+        if (covered > 0 && repoRoot) {
+            const loaded = readTextLinesSafe(resolve(repoRoot, rel));
+            if (loaded && loaded.lines.length > 0 && covered >= loaded.lines.length) return true;
+        }
+        return false;
     });
 }
 
@@ -733,24 +912,290 @@ export function trackPreEditTurn(agyState, toolName, nowMs) {
     agyState.lastPreEditToolAtMs = nowMs;
 }
 
+function hasBlockedSearchKey(agyState, key) {
+    if (!agyState || !key) return false;
+    if (Array.isArray(agyState.blockedSearchKeys) && agyState.blockedSearchKeys.includes(key)) return true;
+    return agyState.lastBlockedSearchKey === key;
+}
+
+function consumeBlockedSearchKey(agyState, key) {
+    if (!agyState) return;
+    if (Array.isArray(agyState.blockedSearchKeys)) {
+        agyState.blockedSearchKeys = agyState.blockedSearchKeys.filter((k) => k !== key);
+    }
+    if (agyState.lastBlockedSearchKey === key) agyState.lastBlockedSearchKey = null;
+}
+
+function recordBlockedSearchKey(agyState, key) {
+    if (!agyState || !key) return;
+    const list = Array.isArray(agyState.blockedSearchKeys)
+        ? agyState.blockedSearchKeys.filter((k) => k !== key)
+        : [];
+    list.push(key);
+    if (list.length > BLOCKED_KEYS_CAP) list.splice(0, list.length - BLOCKED_KEYS_CAP);
+    agyState.blockedSearchKeys = list;
+    agyState.lastBlockedSearchKey = key;
+}
+
 function checkDuplicateKey(agyState, key, reason) {
     if (!key || !agyState)
         return null;
     const seen = Array.isArray(agyState.seenSearchKeys) ? agyState.seenSearchKeys : [];
     if (seen.includes(key)) {
-        if (agyState.lastBlockedSearchKey === key) {
-            agyState.lastBlockedSearchKey = null;
+        if (hasBlockedSearchKey(agyState, key)) {
+            consumeBlockedSearchKey(agyState, key);
             return null;
         }
-        agyState.lastBlockedSearchKey = key;
+        recordBlockedSearchKey(agyState, key);
         return { decision: 'deny', reason };
     }
     seen.push(key);
     if (seen.length > SEEN_SEARCH_KEYS_CAP)
         seen.splice(0, seen.length - SEEN_SEARCH_KEYS_CAP);
     agyState.seenSearchKeys = seen;
-    agyState.lastBlockedSearchKey = null;
+    consumeBlockedSearchKey(agyState, key);
     return null;
+}
+
+function collectIndexedFileSet(graph) {
+    const out = new Set();
+    if (!graph) return out;
+    if (graph._nodesByPath) {
+        for (const p of graph._nodesByPath.keys()) {
+            const norm = normalizeRelFile(p);
+            if (norm) out.add(norm);
+        }
+        return out;
+    }
+    for (const n of graph.nodes ?? []) {
+        if (n?.path) {
+            const norm = normalizeRelFile(n.path);
+            if (norm) out.add(norm);
+        }
+    }
+    return out;
+}
+
+function resolveIndexedTargetArg(rawArg, execRepo, graphRepo, indexedSet) {
+    if (!rawArg || !execRepo || !graphRepo) return null;
+    const clean = unquoteArg(rawArg).trim();
+    if (!clean || clean === '-' || clean.startsWith('-') || /[*?[\]]/.test(clean)) return null;
+    if (/^(?:\/tmp\/|\\tmp\\)/.test(clean)) return null;
+    const absTarget = resolve(execRepo, clean);
+    const rel = normalizeRelFile(relative(resolve(graphRepo), absTarget));
+    if (!rel || rel.startsWith('..') || isIgnoredRepoSubpath(rel)) return null;
+    return indexedSet.has(rel) ? rel : null;
+}
+
+function extractInlineStringsAndPaths(code, extraArgs, execRepo, graphRepo, indexedSet) {
+    const found = new Set();
+    const candidates = [...extraArgs];
+    const strRe = /(['"])((?:\\.|(?!\1).){1,240})\1/g;
+    for (const m of code.matchAll(strRe)) {
+        candidates.push(m[2]);
+    }
+    for (const c of candidates) {
+        const hit = resolveIndexedTargetArg(c, execRepo, graphRepo, indexedSet);
+        if (hit) found.add(hit);
+    }
+    return [...found];
+}
+
+function splitLooseShellSegments(cmd) {
+    const safe = splitSafeChainedCommands(cmd);
+    if (safe) return safe;
+    const out = [];
+    let cur = '';
+    let quote = null;
+    for (let i = 0; i < cmd.length; i++) {
+        const ch = cmd[i];
+        const next = cmd[i + 1];
+        if (quote) {
+            if (quote === '"' && ch === '\\' && i + 1 < cmd.length) {
+                cur += ch + cmd[++i];
+                continue;
+            }
+            if (ch === quote) quote = null;
+            cur += ch;
+            continue;
+        }
+        if (ch === '\'' || ch === '"') {
+            quote = ch;
+            cur += ch;
+            continue;
+        }
+        if ((ch === '&' && next === '&') || ch === ';' || ch === '|' || ch === '\n') {
+            if (cur.trim()) out.push(cur.trim());
+            cur = '';
+            if (ch === '&' || next === '|') i++;
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+}
+
+function detectShellSourceEditInSegment(tokens, execRepo, graphRepo, indexedSet) {
+    if (!tokens?.length) return [];
+    const prog = tokens[0];
+    if (prog === 'sed') {
+        let inPlace = false;
+        let sawScript = false;
+        const posArgs = [];
+        for (let i = 1; i < tokens.length; i++) {
+            const t = tokens[i];
+            if (t === '--') {
+                posArgs.push(...tokens.slice(i + 1));
+                break;
+            }
+            if (t === '-n' || t === '--quiet' || t === '--silent') return [];
+            if (t === '--in-place' || t.startsWith('--in-place=') || t === '-i' || /^-(?:[A-Za-z]*i[A-Za-z]*|i.*)$/.test(t)) {
+                inPlace = true;
+                continue;
+            }
+            if ((t === '-e' || t === '-f') && i + 1 < tokens.length) {
+                sawScript = true;
+                i++;
+                continue;
+            }
+            if (t.startsWith('-')) continue;
+            if (!sawScript) {
+                sawScript = true;
+                continue;
+            }
+            posArgs.push(t);
+        }
+        if (!inPlace) return [];
+        return posArgs.map((a) => resolveIndexedTargetArg(a, execRepo, graphRepo, indexedSet)).filter(Boolean);
+    }
+    if (prog === 'perl') {
+        let inPlace = false;
+        let sawScript = false;
+        const posArgs = [];
+        for (let i = 1; i < tokens.length; i++) {
+            const t = tokens[i];
+            if (t === '--') {
+                posArgs.push(...tokens.slice(i + 1));
+                break;
+            }
+            if (t === '--in-place' || t.startsWith('--in-place=') || /^-[^-]*i/.test(t)) {
+                inPlace = true;
+                if (t.includes('e')) sawScript = true;
+                continue;
+            }
+            if ((t === '-e' || t === '-E') && i + 1 < tokens.length) {
+                sawScript = true;
+                i++;
+                continue;
+            }
+            if (t.startsWith('-')) continue;
+            if (!sawScript) {
+                sawScript = true;
+                continue;
+            }
+            posArgs.push(t);
+        }
+        if (!inPlace) return [];
+        return posArgs.map((a) => resolveIndexedTargetArg(a, execRepo, graphRepo, indexedSet)).filter(Boolean);
+    }
+    if (prog === 'python' || prog === 'python3' || /\/python3?$/.test(prog)) {
+        let code = null;
+        const extraArgs = [];
+        for (let i = 1; i < tokens.length; i++) {
+            const t = tokens[i];
+            if (code !== null) {
+                extraArgs.push(t);
+                continue;
+            }
+            if (t === '-m') return [];
+            if (t === '-c' && i + 1 < tokens.length) {
+                code = tokens[++i];
+                continue;
+            }
+            if (t.startsWith('-c') && t.length > 2) {
+                code = t.slice(2);
+                continue;
+            }
+            if (!t.startsWith('-')) return [];
+        }
+        if (!code || !PY_INLINE_WRITE_RE.test(code)) return [];
+        return extractInlineStringsAndPaths(code, extraArgs, execRepo, graphRepo, indexedSet);
+    }
+    if (prog === 'node' || /\/node$/.test(prog)) {
+        let code = null;
+        const extraArgs = [];
+        for (let i = 1; i < tokens.length; i++) {
+            const t = tokens[i];
+            if (code !== null) {
+                extraArgs.push(t);
+                continue;
+            }
+            if (t === '--test' || t === '--check' || t === '-c') return [];
+            if ((t === '-e' || t === '--eval') && i + 1 < tokens.length) {
+                code = tokens[++i];
+                continue;
+            }
+            if (t.startsWith('--eval=')) {
+                code = t.slice('--eval='.length);
+                continue;
+            }
+            if (!t.startsWith('-')) return [];
+        }
+        if (!code || !NODE_INLINE_WRITE_RE.test(code)) return [];
+        return extractInlineStringsAndPaths(code, extraArgs, execRepo, graphRepo, indexedSet);
+    }
+    return [];
+}
+
+/**
+ * Detect shell-based source edits (`sed -i`, `perl -i`, inline `python -c` /
+ * `node -e` file writes) targeting files indexed in the plexer graph.
+ */
+export function detectShellSourceEdit(cmd, repoRoot, getGraph = null) {
+    if (typeof cmd !== 'string' || !SHELL_EDIT_TOOL_HINT_RE.test(cmd) || !repoRoot)
+        return null;
+    const baseRoot = resolve(repoRoot);
+    const segments = splitLooseShellSegments(cmd);
+    if (!segments.length) return null;
+    const hits = new Set();
+    let curExec = baseRoot;
+    let activeGraphRepo = nearestPlexerRoot(curExec)?.root ?? curExec;
+    const graphCache = new Map();
+    const getIndexed = (gRepo) => {
+        const key = resolve(gRepo);
+        if (graphCache.has(key)) return graphCache.get(key);
+        if (!existsSync(contextDirFor(gRepo))) {
+            graphCache.set(key, null);
+            return null;
+        }
+        const graph = typeof getGraph === 'function' ? getGraph(gRepo) : loadGraphCached(contextDirFor(gRepo));
+        const set = graph ? collectIndexedFileSet(graph) : null;
+        graphCache.set(key, set);
+        return set;
+    };
+
+    for (const seg of segments) {
+        const rawTokens = tokenizeShellSegment(seg);
+        if (!rawTokens?.length) continue;
+        if (rawTokens[0] === 'cd' && rawTokens.length === 2) {
+            curExec = resolve(curExec, unquoteArg(rawTokens[1]));
+            activeGraphRepo = nearestPlexerRoot(curExec)?.root ?? curExec;
+            continue;
+        }
+        const unwrapped = unwrapEnvCommandTokens(rawTokens);
+        if (!unwrapped || !unwrapped.rest?.length) continue;
+        const segExec = unwrapped.envCwd ? resolve(curExec, unquoteArg(unwrapped.envCwd)) : curExec;
+        const segGraphRepo = unwrapped.envCwd ? (nearestPlexerRoot(segExec)?.root ?? segExec) : activeGraphRepo;
+        const indexedSet = getIndexed(segGraphRepo);
+        if (!indexedSet || indexedSet.size === 0) continue;
+        for (const rel of detectShellSourceEditInSegment(unwrapped.rest, segExec, segGraphRepo, indexedSet)) {
+            hits.add(rel);
+        }
+    }
+    if (hits.size === 0) return null;
+    const files = [...hits].sort();
+    return { repoKey: normalizeRelFile(resolve(activeGraphRepo)), files };
 }
 
 /**
@@ -764,39 +1209,69 @@ export function evaluateSearchAndGatePreTool({
     repoRoot = '',
     relPrefix = '',
     agyState = null,
+    geminiProfile = true,
+    getGraph = null,
     nowMs = Date.now(),
 }) {
     if (agyState)
         trackPreEditTurn(agyState, toolName, nowMs);
 
-    const isShell = /^(?:run_command|Bash|run_shell_command)$/i.test(toolName);
+    const isShell = /^(?:run_command|Bash|run_shell_command|shell)$/i.test(toolName);
+    const rawCmd = isShell ? (effectiveCmd ?? unquoteCommandLine(toolArgs?.CommandLine ?? toolArgs?.command)) : null;
+    if (geminiProfile && isShell && rawCmd) {
+        const shellEdit = detectShellSourceEdit(rawCmd, repoRoot, getGraph);
+        if (shellEdit) {
+            const targetList = shellEdit.files.join(', ');
+            const shellEditKey = `shell-edit:${shellEdit.repoKey}:${targetList}`;
+            if (agyState) {
+                if (hasBlockedSearchKey(agyState, shellEditKey)) {
+                    consumeBlockedSearchKey(agyState, shellEditKey);
+                }
+                else {
+                    recordBlockedSearchKey(agyState, shellEditKey);
+                    return {
+                        decision: 'deny',
+                        reason: `[plexer] Edit ${targetList} with your native edit tool instead of shell scripts (or retry once if intentional batch/codegen edit).`,
+                    };
+                }
+            }
+        }
+    }
     const searchInfo = isShell
-        ? classifyCommandSearch(effectiveCmd ?? unquoteCommandLine(toolArgs?.CommandLine ?? toolArgs?.command), repoRoot)
+        ? classifyCommandSearch(rawCmd, repoRoot)
         : classifyNativeSearch(toolName, toolArgs, repoRoot);
 
+    const turnLimit = agyState?.orchestratorPhase === 'execute' ? 3 : EXPLORATION_GATE_TURN_LIMIT;
     if (
         searchInfo.isBroadSearch
         && agyState?.isEditPrompt
         && !agyState?.editedInPrompt
         && agyState?.orchestratorPhase !== 'plan'
-        && (Number(agyState.preEditToolTurns) || 0) >= EXPLORATION_GATE_TURN_LIMIT
-        && areEditTargetsSeen(agyState, relPrefix)
+        && (Number(agyState.preEditToolTurns) || 0) >= turnLimit
+        && areEditTargetsSeen(agyState, relPrefix, repoRoot)
     ) {
-        const targets = agyState.editTargetFiles.join(', ');
-        return {
-            decision: 'deny',
-            reason: `[plexer] Exploration budget reached (${agyState.preEditToolTurns} pre-edit turns, 0 edits) and localized target files (${targets}) are already in context. Apply your edits now; targeted file reads on a specific unseen file/symbol and build/test commands remain allowed.`,
-        };
+        const targetPool = agyState.planTargetFiles?.length ? agyState.planTargetFiles : agyState.editTargetFiles;
+        const targets = targetPool.join(', ');
+        const isUnconfirmedHighOrXhigh = /(?:^|[-_\s(])(?:xhigh|extra|high)(?:$|[)\s_-])/i.test(String(agyState?.lastObservedModel ?? ''))
+            && agyState?.orchestratorPhase !== 'execute';
+        const nextAction = isUnconfirmedHighOrXhigh
+            ? 'Apply your edits (or call `exit_plan_mode` if in plan mode) now'
+            : 'Apply your edits now';
+        const reason = `[plexer] Exploration budget reached (${agyState.preEditToolTurns} pre-edit turns, 0 edits) and localized target files (${targets}) are already in context. ${nextAction}; targeted file reads on a specific unseen file/symbol and build/test commands remain allowed.`;
+        if (!geminiProfile || isUnconfirmedHighOrXhigh) {
+            return { decision: 'allow', additionalContext: reason };
+        }
+        return { decision: 'deny', reason };
     }
 
     if (searchInfo.diffKey && agyState) {
         const curEditSeq = Number(agyState.editSeq) || 0;
         if (agyState.lastGitDiffKey === searchInfo.diffKey && Number(agyState.lastGitDiffEditSeq) === curEditSeq) {
-            if (agyState.lastBlockedSearchKey === searchInfo.diffKey) {
-                agyState.lastBlockedSearchKey = null;
+            if (hasBlockedSearchKey(agyState, searchInfo.diffKey)) {
+                consumeBlockedSearchKey(agyState, searchInfo.diffKey);
                 return null;
             }
-            agyState.lastBlockedSearchKey = searchInfo.diffKey;
+            recordBlockedSearchKey(agyState, searchInfo.diffKey);
             return {
                 decision: 'deny',
                 reason: '[plexer] No files have been modified since your previous git diff — reuse the diff already in context (or retry once to force re-running).',
@@ -804,7 +1279,7 @@ export function evaluateSearchAndGatePreTool({
         }
         agyState.lastGitDiffKey = searchInfo.diffKey;
         agyState.lastGitDiffEditSeq = curEditSeq;
-        agyState.lastBlockedSearchKey = null;
+        consumeBlockedSearchKey(agyState, searchInfo.diffKey);
     }
 
     if (searchInfo.searchKey && agyState) {

@@ -1,6 +1,7 @@
 import { basename, relative, resolve } from 'node:path';
-import { isRedundantSnippet } from '../ask/ask.js';
+import { isRedundantSnippet } from '../ask/text-helpers.js';
 import { HIGH_FLOOR, STRONG_FLOOR } from '../ask/fuse.js';
+import { GENERIC_MEMBER_NAMES } from '../util/id.js';
 const C = {
     indigo: (s) => `\x1b[38;2;84;111;255m${s}\x1b[0m`,
     amber: (s) => `\x1b[38;2;224;165;68m${s}\x1b[0m`,
@@ -102,6 +103,23 @@ export function incomingEdges(w, filePath, dir) {
         return true;
     });
 }
+function getGraphBasenameCounts(w) {
+    const nodes = w?.nodes ?? [];
+    if (w?._basenameCounts && w._basenameCountsLen === nodes.length)
+        return w._basenameCounts;
+    const baseCounts = new Map();
+    for (const n of nodes) {
+        if (n.kind === 'file' && n.path) {
+            const b = basename(n.path);
+            baseCounts.set(b, (baseCounts.get(b) || 0) + 1);
+        }
+    }
+    if (w && typeof w === 'object') {
+        Object.defineProperty(w, '_basenameCounts', { value: baseCounts, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(w, '_basenameCountsLen', { value: nodes.length, enumerable: false, configurable: true, writable: true });
+    }
+    return baseCounts;
+}
 export function formatBlastRadius(w, filePath, cap = 8, dir, opts = {}) {
     const rawEdges = incomingEdges(w, filePath, dir);
     if (!rawEdges.length)
@@ -116,13 +134,7 @@ export function formatBlastRadius(w, filePath, cap = 8, dir, opts = {}) {
         : rawEdges;
     if (!edges.length)
         return null;
-    const baseCounts = new Map();
-    for (const n of w.nodes ?? []) {
-        if (n.kind === 'file' && n.path) {
-            const b = basename(n.path);
-            baseCounts.set(b, (baseCounts.get(b) || 0) + 1);
-        }
-    }
+    const baseCounts = getGraphBasenameCounts(w);
     const displayFile = (p) => {
         const b = basename(p);
         if ((baseCounts.get(b) || 0) <= 1)
@@ -259,7 +271,7 @@ function formatExploratoryPointerMap(candidates, isEditPrompt = false, coEditPoi
             .slice(0, 3)
             .map((h) => String(h.pointer ?? '').split(',')[0].trim())
             .filter(Boolean);
-        const header = '[plexer] exploratory candidate map (broad query — inspect before deep reads; never `&&`-chain `plexer` commands):';
+        const header = '[plexer] candidate map (broad query — inspect before reading):';
         const coEdit = isEditPrompt && Array.isArray(coEditPointers) && coEditPointers.length > 0
             ? `\nlikely co-edits / tests: ${coEditPointers.slice(0, 3).join(', ')}`
             : '';
@@ -275,6 +287,8 @@ function formatExploratoryPointerMap(candidates, isEditPrompt = false, coEditPoi
 }
 
 function fitHitCodeToBudget(h, n, fileKey, seenSymbolFiles, sourceCapBytes, budgetState) {
+    if (h.alreadySeen)
+        return undefined;
     let codeToRender = h.code;
     if (!codeToRender)
         return codeToRender;
@@ -301,7 +315,33 @@ function fitHitCodeToBudget(h, n, fileKey, seenSymbolFiles, sourceCapBytes, budg
     return codeToRender;
 }
 
+function packCompactGroupedCallSites(callSites, maxEntries = 26) {
+    const byFile = new Map();
+    const list = callSites.slice(0, maxEntries);
+    for (const cs of list) {
+        const m = /^([^(\n]+?)\s*\(([^():]+):(L\d+(?:-L\d+)?)\)(.*)$/.exec(cs);
+        if (!m) {
+            (byFile.get('_other') ?? byFile.set('_other', []).get('_other')).push(cs);
+            continue;
+        }
+        const [, caller, file, , rest] = m;
+        const lineM = /→\s*(L\d+):\s*(.+)$/.exec(rest);
+        const entry = lineM ? `${caller.trim()}@${lineM[1]}: ${lineM[2].trim().slice(0, 56)}` : caller.trim();
+        (byFile.get(file) ?? byFile.set(file, []).get(file)).push(entry);
+    }
+    const out = [];
+    for (const [file, items] of byFile) {
+        out.push(file === '_other' ? items.join(' | ') : `${file}: ${items.join('; ')}`);
+    }
+    return { lines: out, shownCount: list.length };
+}
+
 function formatSingleRetrievalBlock(h, num, i, ptr, fileKey, codeToRender, isEditPrompt, seenSymbolFiles, opts = {}) {
+    if (h.alreadySeen) {
+        const seenTag = /^\/\/\s*(\[(?:seen:|already in session context:)[^\]]+\])/.exec(String(h.code ?? '').trim())?.[1]
+            || '[seen]';
+        return ` ${num}. ${h.title}: ${ptr} — ${seenTag}`;
+    }
     const snip = (h.snippet ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
     const redundant = isRedundantSnippet(snip, codeToRender);
     let b = ` ${num}. ${h.title}: ${ptr}`;
@@ -312,16 +352,26 @@ function formatSingleRetrievalBlock(h, num, i, ptr, fileKey, codeToRender, isEdi
     const geminiProfile = Boolean(opts?.geminiProfile);
     const showCallSites = codeToRender && h.callSites?.length && (
         h.wantsCallSites ||
-        (isEditPrompt && (geminiProfile ? (i < 2 && h.callSites.length <= 3) : (i === 0 && h.callSites.length <= 2)))
+        (isEditPrompt && (geminiProfile ? (i < 2 && h.callSites.length <= 6) : (i === 0 && h.callSites.length <= 4)))
     );
     if (showCallSites) {
-        const selected = selectDiverseCallSites(h.callSites, geminiProfile ? (h.wantsCallSites ? 18 : 3) : (h.wantsCallSites ? 12 : 2));
         b += `\n    call sites (${h.callSites.length}):`;
-        for (const cs of selected)
-            b += `\n      ← ${cs}`;
-        if (h.callSites.length > selected.length) {
+        let shownCount = 0;
+        if (h.wantsCallSites && h.callSites.length > 12) {
+            const packed = packCompactGroupedCallSites(h.callSites, geminiProfile ? 34 : 18);
+            shownCount = packed.shownCount;
+            for (const line of packed.lines)
+                b += `\n      ← ${line}`;
+        }
+        else {
+            const selected = selectDiverseCallSites(h.callSites, geminiProfile ? (h.wantsCallSites ? 24 : 6) : (h.wantsCallSites ? 12 : 4));
+            shownCount = selected.length;
+            for (const cs of selected)
+                b += `\n      ← ${cs}`;
+        }
+        if (h.callSites.length > shownCount) {
             const symName = String(h.title ?? '').split(' · ')[0].replace(/\s*\(named in prompt\)\s*$/, '').trim() || '<sym>';
-            b += `\n      … +${h.callSites.length - selected.length} more — run \`plexer callers ${symName}\``;
+            b += `\n      … +${h.callSites.length - shownCount} more — run \`plexer callers ${symName}\``;
         }
     }
     if (h.otherSymbols && !codeToRender && i < 3 && (!fileKey || !seenSymbolFiles.has(fileKey))) {
@@ -334,36 +384,61 @@ function formatSingleRetrievalBlock(h, num, i, ptr, fileKey, codeToRender, isEdi
     return b;
 }
 
+function collectAllowedCallerFiles(hits, opts, isEditPrompt) {
+    const callerHit0 = opts?.geminiProfile && !isEditPrompt && hits[0]?.wantsCallSites && (hits[0]?.callSites?.length ?? 0) >= 6
+        ? hits[0]
+        : null;
+    if (!callerHit0) return null;
+    const allowed = new Set();
+    const primaryFile = String(callerHit0.pointer ?? '').split(':')[0];
+    if (primaryFile) allowed.add(primaryFile);
+    for (const cs of callerHit0.callSites ?? []) {
+        const m = /\(([^():]+):L?\d+/.exec(String(cs)) ?? /(?:^|\s)([^\s():]+):L?\d+/.exec(String(cs));
+        if (m?.[1]) allowed.add(m[1]);
+    }
+    return allowed;
+}
+
 function retrievalBody(hits, isEditPrompt = false, coEditPointers = undefined, sourceCapBytes = Infinity, opts = {}) {
+    if (!hits.length || hits.every((h) => h.alreadySeen))
+        return null;
     let ranked = 0;
     const budgetState = { inlinedCodeBytes: 0, hasAnyCode: false };
     const seenSymbolFiles = new Set();
+    const allowedCallerFiles = collectAllowedCallerFiles(hits, opts, isEditPrompt);
+    const promptText = String(opts?.prompt ?? '');
     const blocks = hits.map((h, n) => {
         // Pinned hits are numbered but don't consume the ranked hits' "top result" slots
         // (which earn the related / call-site lines below).
         const i = h.pinned ? Infinity : ranked++;
         const ptr = (h.pointer ?? '').split(',')[0].trim();
         const fileKey = ptr.split(':')[0];
-        const codeToRender = fitHitCodeToBudget(h, n, fileKey, seenSymbolFiles, sourceCapBytes, budgetState);
-        return formatSingleRetrievalBlock(h, n + 1, i, ptr, fileKey, codeToRender, isEditPrompt, seenSymbolFiles, opts);
+        const isPromptNamed = Boolean(
+            h.pinned
+            || String(h.title ?? '').includes('(named in prompt)')
+            || (promptText && fileKey && (promptText.includes(fileKey) || promptText.includes(basename(fileKey)))),
+        );
+        const effectiveHit = (allowedCallerFiles && n >= 1 && h.code && (!fileKey || (!allowedCallerFiles.has(fileKey) && !isPromptNamed)))
+            ? { ...h, code: undefined }
+            : h;
+        const codeToRender = fitHitCodeToBudget(effectiveHit, n, fileKey, seenSymbolFiles, sourceCapBytes, budgetState);
+        return formatSingleRetrievalBlock(effectiveHit, n + 1, i, ptr, fileKey, codeToRender, isEditPrompt, seenSymbolFiles, opts);
     });
     const header = budgetState.hasAnyCode
-        ? (opts?.planMode
-            ? '[plexer] plan targets localized (plan mode is read-only — use inlined `L<n>:` spans, callers, and co-edits to draft the plan without redundant reads; batch any missing spans in 1 `plexer read` call; never `&&`-chain `plexer` commands):'
+        ? (opts?.planMode && isEditPrompt
+            ? '[plexer] plan targets localized (plan mode is read-only — verify any unseen files, cite file:Lx-Ly concisely in exit_plan_mode without reprinting full code):'
             : (opts?.suppressNudge
                 ? (isEditPrompt
-                    ? '[plexer] edit targets localized (use the inlined `L<n>:` spans directly):'
-                    : '[plexer] retrieved context (use the inlined `L<n>:` spans directly):')
+                    ? '[plexer] localized targets (use inlined spans directly):'
+                    : '[plexer] retrieved context (use inlined spans directly):')
                 : (opts?.geminiProfile
                     ? (isEditPrompt
-                        ? '[plexer] edit targets localized (edit localized `L<n>:` spans directly without re-reading or auditing unrelated files; batch missing `<=200`-line spans in 1 `plexer read` or 1 parallel turn; never `&&`-chain `plexer` commands; if running checks, run one narrow check and stop once green without hunting missing toolchains or adding unrequested test files):'
-                        : '[plexer] retrieved context (if inlined `L<n>:` spans and `call sites` answer the prompt, reply directly with 0 tool calls citing `file:Lx-Ly`; otherwise batch missing `<=200`-line spans in 1 `plexer read` or 1 parallel turn — avoid whole-file reads on QA; never `&&`-chain `plexer` commands):')
+                        ? '[plexer] localized targets (edit inlined spans directly):'
+                        : '[plexer] retrieved context (reply citing `file:Lx-Ly` with 0 calls if spans answer):')
                     : (isEditPrompt
-                        ? '[plexer] edit targets localized (edit inlined `L<n>:` spans directly; batch missing `<=200`-line spans in 1 `plexer read` or read `>200`-line single files in parallel with native file read; never `&&`-chain `plexer` commands):'
-                        : '[plexer] retrieved context (use inlined `L<n>:` spans directly; batch missing `<=200`-line spans in 1 `plexer read` or 1 parallel turn; never `&&`-chain `plexer` commands):'))))
-        : (opts?.suppressNudge || opts?.planMode
-            ? '[plexer] starting points:'
-            : '[plexer] starting points (batch missing `<=200`-line spans in 1 `plexer read` or `plexer callers` call or 1 parallel turn; never `&&`-chain `plexer` commands):');
+                        ? '[plexer] localized targets:'
+                        : '[plexer] retrieved context:'))))
+        : '[plexer] starting points:';
     const footer = isEditPrompt && Array.isArray(coEditPointers) && coEditPointers.length > 0
         ? `\nlikely co-edits / tests: ${coEditPointers.join(', ')}`
         : '';
@@ -373,7 +448,8 @@ export function formatRetrieval(ask, cap = 5, opts = {}) {
     const allHits = ask.hits ?? [];
     const hasPinned = allHits.some((h) => h.pinned);
     const isEdit = Boolean(ask.isEditPrompt || ask.editEnvelope);
-    if (ask.confidenceTier === 'exploratory' && !hasPinned) {
+    const allowExploratoryCode = (ask.coverage ?? 0) >= 0.60 && (ask.coverageStrong ?? 0) >= 0.24;
+    if (ask.confidenceTier === 'exploratory' && !hasPinned && !allowExploratoryCode) {
         const candidates = (ask.candidateMap?.length ? ask.candidateMap : allHits).slice(0, 8);
         return formatExploratoryPointerMap(candidates, isEdit, ask.coEditPointers);
     }
@@ -382,9 +458,10 @@ export function formatRetrieval(ask, cap = 5, opts = {}) {
     const hits = allHits.slice(0, cap + pinned);
     if (!hits.length)
         return null;
-    const isMergedMultiQuery = !ask.confidenceTier && String(ask.query ?? '').includes(' ; ');
-    const highCap = opts?.geminiProfile ? 4200 : HIGH_CONFIDENCE_SOURCE_CAP_BYTES;
-    const sourceCapBytes = ask.confidenceTier === 'high' && !hasPinned && !isMergedMultiQuery
+    const highCap = opts?.geminiProfile
+        ? (opts?.narrowPrompt ? 2800 : (opts?.fastProfile ? 3400 : 4200))
+        : HIGH_CONFIDENCE_SOURCE_CAP_BYTES;
+    const sourceCapBytes = ask.confidenceTier === 'high' && !hasPinned
         ? highCap
         : Infinity;
     return retrievalBody(hits, isEdit, ask.coEditPointers, sourceCapBytes, opts);
@@ -450,13 +527,22 @@ export function relevantRetrieval(ask, s, cap = 4, opts = {}) {
     if (lexical && !hasPinned) {
         const strong = ask.coverageStrong ?? 0;
         const broad = ask.coverage ?? 0;
+        const topRawSym = String(ask.hits[0]?.title ?? '').split(' · ')[0] ?? '';
+        const topBareSym = (topRawSym.split(/[.:#]/).pop() ?? topRawSym).toLowerCase();
+        const rejectGenericCollision =
+            Boolean(topBareSym && GENERIC_MEMBER_NAMES.has(topBareSym)) &&
+            !hasExplicitPathHitMatch(ask) &&
+            strong < 0.25 &&
+            broad < 0.35;
         const hasSubstantialMatch =
-            strong >= 0.15 ||
-            (strong >= STRONG_FLOOR && broad >= 0.18) ||
-            hasExplicitPathHitMatch(ask) ||
-            (strong >= 0.06 && broad >= HIGH_FLOOR);
+            !rejectGenericCollision && (
+                strong >= 0.15 ||
+                (strong >= STRONG_FLOOR && broad >= 0.22) ||
+                hasExplicitPathHitMatch(ask) ||
+                (strong >= 0.08 && broad >= HIGH_FLOOR)
+            );
         if (!hasSubstantialMatch)
-            return (isFollowUp || opts.suppressNudge) ? null : weakMatchNudge(s, strong);
+            return null;
     }
     const seen = new Set(s.injectedPointers ?? []);
     if (isFollowUp) {
@@ -469,12 +555,15 @@ export function relevantRetrieval(ask, s, cap = 4, opts = {}) {
         const followUpHits = [...freshPins, ...freshTopRanked].slice(0, 2).map(trimFollowUpHitCode);
         return recordFreshRetrieval(ask, s, followUpHits, 2, false, opts);
     }
-    if (ask.confidenceTier === 'exploratory' && !hasPinned) {
+    const allowExploratoryCode = (ask.coverage ?? 0) >= 0.60 && (ask.coverageStrong ?? 0) >= 0.24;
+    if (ask.confidenceTier === 'exploratory' && !hasPinned && !allowExploratoryCode) {
         const pool = ask.candidateMap?.length ? ask.candidateMap : ask.hits;
         return recordFreshRetrieval(ask, s, pool.filter((h) => !seen.has(h.pointer)), 8, true, opts);
     }
     const isEdit = Boolean(ask.isEditPrompt || ask.editEnvelope);
-    const effectiveCap = (opts?.geminiProfile && isEdit) ? Math.max(cap, 5) : cap;
+    const effectiveCap = (opts?.geminiProfile && isEdit)
+        ? Math.min(cap, (opts?.fastProfile || opts?.narrowPrompt) ? 3 : 4)
+        : cap;
     return recordFreshRetrieval(ask, s, ask.hits.filter((h) => !seen.has(h.pointer)), effectiveCap, false, opts);
 }
 export function formatOrientation(indexMd, budgetBytes = 0, staleNote) {
@@ -482,7 +571,7 @@ export function formatOrientation(indexMd, budgetBytes = 0, staleNote) {
     if (budgetBytes <= 0) {
         return `${banner}[plexer] This repo is indexed by plexer.`;
     }
-    return `${banner}[plexer] This repo is indexed by plexer. Use \`plexer ask "<task>"\`, \`plexer callers <sym> [--depth 2|all]\`, \`plexer read <file:Lx-Ly|file:sym>\`, \`plexer skeleton <file>\`, or \`plexer grep "<pat>"\` to get exact spans and L<n>: source without redundant file reads.`;
+    return `${banner}[plexer] This repo is indexed by plexer. Commands: \`plexer ask\`, \`callers\`, \`read <file:Lx-Ly|sym>\`, \`skeleton\`, \`grep\` for exact <n>: spans.`;
 }
 export function renderSubagent(agentName, session) {
     const q = session?.perAgentQuery?.[agentName];

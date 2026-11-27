@@ -59,7 +59,7 @@ function createMcpRootsRequester(sessionState) {
         const timer = setTimeout(() => {
             pendingClientReqs.delete(reqId);
             done(sessionState.roots ?? []);
-        }, 200);
+        }, 1000);
         if (typeof timer.unref === 'function') timer.unref();
         pendingClientReqs.set(reqId, (msg) => {
             clearTimeout(timer);
@@ -107,6 +107,7 @@ function dispatchMcpMessage(msg, ctx) {
     try {
         switch (method) {
             case 'initialize': {
+                if (isNotification) return;
                 const hasTools = advertised().length > 0;
                 reply(id, {
                     protocolVersion: params?.protocolVersion ?? '2024-11-05',
@@ -169,6 +170,10 @@ export function startMcpServer(root = process.cwd(), dirOverride, version = read
             return;
         }
         dispatchMcpMessage(msg, ctx);
+    });
+    rl.on('close', () => {
+        lifecycle.stdinEnded = true;
+        maybeExit(lifecycle);
     });
     process.stdin.on('end', () => {
         lifecycle.stdinEnded = true;

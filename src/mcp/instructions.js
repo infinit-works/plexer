@@ -30,16 +30,16 @@ export function toolSearchQuery() {
 }
 export function mcpInstructions() {
     return [
-        'Repo indexed by plexer (file:line spans + call/import/type edges; auto-refreshes). Use plexer first; never re-read spans already shown.',
-        `**If deferred, load all in ONE lookup:** ToolSearch "${toolSearchQuery()}"`,
-        '- plexer_find_code — rank symbols with L<n>: source, helpers, constants.',
-        '- plexer_read — exact <file:symbol> or <file:Lx-Ly> spans.',
-        '- plexer_trace_calls — callers/callees (direction:"out", depth:2/"all").',
-        '- plexer_find_all — regex/literal search by symbol (fixed:true).',
-        '- plexer_file_api — file signatures (~200 tokens).',
-        '- plexer_repo_map — directory clusters, hubs, hotspots.',
-        '- plexer_blast — git diff blast radius (base, depth, format).',
-        '- plexer_health — health scan, queue (next/resolve), scores.',
-        '- plexer_check_freshness — check graph sync with working tree.',
+        'Repo indexed by plexer (spans + edges; auto-refreshes). Query first; skip [seen:].',
+        `Load all if deferred: ToolSearch "${toolSearchQuery()}"`,
+        '- plexer_find_code: rank symbols (<n>: source, `in`).',
+        '- plexer_read: exact <file:sym|Lx-Ly> (`include_callers`).',
+        '- plexer_trace_calls: callers/callees (direction, depth).',
+        '- plexer_find_all: regex/literal grep (fixed:true).',
+        '- plexer_file_api: file signatures (~200 tok).',
+        '- plexer_repo_map: dir hubs/hotspots.',
+        '- plexer_blast: git diff impact (base, depth, format).',
+        '- plexer_health: scan, queue, scores.',
+        '- plexer_check_freshness: graph sync status.',
     ].join('\n');
 }

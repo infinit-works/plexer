@@ -1,6 +1,7 @@
 // Generates the tiny `.cjs` shims installed into `.claude/helpers/` or `~/.codex/hooks/plexer/`.
 // Their job is to locate the installed `plexer` skill's `src/claude/<entry>.js` and call into it.
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const SKILL_MD_URL = new URL("../../SKILL.md", import.meta.url);
 let cachedSkill = null;
@@ -29,24 +30,32 @@ function hasLocalPlexerHook(startDir, relConfigPath, checkFile) {
   }
   return false;
 }
+const ev = process.argv[2] || '';
+const dedupOut = (ev === 'agy-pre-tool' || ev === 'agy-stop' || ev === 'agy-post-cascade-response')
+  ? '{"decision":"allow"}\\n'
+  : '{}\\n';
 const globalClaudeHelpers = path.join(homeResolved, '.claude', 'helpers') + path.sep;
 const globalGeminiHooks = path.join(homeResolved, '.gemini', 'hooks', 'plexer') + path.sep;
 const globalGeminiHelpers = path.join(homeResolved, '.gemini', 'config', 'helpers') + path.sep;
 const globalCodexHooks = path.join(homeResolved, '.codex', 'hooks', 'plexer') + path.sep;
 if (__filename.startsWith(globalClaudeHelpers)) {
   if (hasLocalPlexerHook(process.env.CLAUDE_PROJECT_DIR || process.cwd(), path.join('.claude', 'settings.json'), path.join('.claude', 'helpers', 'plexer-hooks.cjs'))) {
+    process.stdout.write(dedupOut);
     process.exit(0);
   }
 } else if (__filename.startsWith(globalGeminiHooks)) {
   if (hasLocalPlexerHook(process.env.GEMINI_PROJECT_DIR || process.cwd(), path.join('.gemini', 'settings.json'), path.join('.gemini', 'helpers', 'plexer-hooks.cjs'))) {
+    process.stdout.write(dedupOut);
     process.exit(0);
   }
 } else if (__filename.startsWith(globalGeminiHelpers)) {
   if (hasLocalPlexerHook(process.env.ANTIGRAVITY_PROJECT_DIR || process.cwd(), path.join('.agents', 'hooks.json'))) {
+    process.stdout.write(dedupOut);
     process.exit(0);
   }
 } else if (__filename.startsWith(globalCodexHooks)) {
   if (hasLocalPlexerHook(process.env.CODEX_PROJECT_DIR || process.cwd(), path.join('.codex', 'hooks.json'))) {
+    process.stdout.write(dedupOut);
     process.exit(0);
   }
 }
@@ -57,20 +66,31 @@ function buildShimInvokeBlock(entryFile, call, preferHookClient) {
     if (!preferHookClient) {
         return `import(pathToFileURL(entry(${JSON.stringify(entryFile)})).href).then((m) => ${call}).catch(() => { /* plexer unavailable — no-op */ });`;
     }
-    return `const claudeTarget = entry(${JSON.stringify(entryFile)});
-const clientTarget = path.resolve(path.dirname(claudeTarget), '..', '..', 'bin', 'plexer-hook-client.cjs');
-if (fs.existsSync(clientTarget)) {
-  const client = require(clientTarget);
+    return `if (BAKED_CLIENT && fs.existsSync(BAKED_CLIENT)) {
+  const client = require(BAKED_CLIENT);
   if (client && typeof client.main === 'function') {
     client.main().then(() => process.exit(0), () => process.exit(0));
   }
 } else {
-  import(pathToFileURL(claudeTarget).href).then((m) => ${call}).catch(() => { /* plexer unavailable — no-op */ });
+  const claudeTarget = entry(${JSON.stringify(entryFile)});
+  const clientTarget = path.resolve(path.dirname(claudeTarget), '..', '..', 'bin', 'plexer-hook-client.cjs');
+  if (fs.existsSync(clientTarget)) {
+    const client = require(clientTarget);
+    if (client && typeof client.main === 'function') {
+      client.main().then(() => process.exit(0), () => process.exit(0));
+    }
+  } else {
+    import(pathToFileURL(claudeTarget).href).then((m) => ${call}).catch(() => { /* plexer unavailable — no-op */ });
+  }
 }`;
 }
 
 function buildShimEntryBlock() {
     return `function entry(name) {
+  if (BAKED) {
+    const bakedFile = path.join(BAKED, name);
+    if (fs.existsSync(bakedFile)) return bakedFile;
+  }
   const home = os.homedir();
   let binClaudeDir = null;
   try {
@@ -102,12 +122,14 @@ function buildShimEntryBlock() {
 function shim(entryFile, call, bakedDir, dedupGlobalHooks = false, preferHookClient = false) {
     const dedupBlock = dedupGlobalHooks ? buildShimDedupBlock() : '';
     const invokeBlock = buildShimInvokeBlock(entryFile, call, preferHookClient);
+    const bakedClient = preferHookClient && bakedDir ? resolve(bakedDir, '..', '..', 'bin', 'plexer-hook-client.cjs') : '';
     return `#!/usr/bin/env node
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { pathToFileURL } = require('url');
 const BAKED = ${JSON.stringify(bakedDir)};
+const BAKED_CLIENT = ${JSON.stringify(bakedClient)};
 ${dedupBlock}
 ${buildShimEntryBlock()}
 

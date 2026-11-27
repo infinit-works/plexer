@@ -45,7 +45,7 @@ describe("pin: named-definition pinning", () => {
             writeFileSync(join(root, "src/a.js"), "// x\n\nfunction skeleton(dir) {\n  return 1;\n  // body\n}\n\nfunction helper() {\n}\n");
             const pins = pinnedHits(root, graph, "Update `skeleton(dir)`");
             assert.equal(pins.length, 1);
-            assert.match(pins[0].code, /^L3: function skeleton\(dir\) \{/);
+            assert.match(pins[0].code, /^3: function skeleton\(dir\) \{/);
             assert.equal(pins[0].pointer, "src/a.js:L3-L6");
             const ranked = [1, 2, 3, 4, 5].map((i) => ({ kind: "symbol", title: `h${i}`, pointer: `src/z${i}.js:L1-L2` }));
             const txt = relevantRetrieval({ hits: [...pins, ...ranked], isEditPrompt: true }, {});
@@ -165,7 +165,7 @@ describe("bench: replay + NeedCov parsing", () => {
             },
             session1,
         );
-        assert.match(weakShort, /^\[plexer\] no strong match/);
+        assert.equal(weakShort, null);
 
         // Turn 1 injects top hit; Turn 2 with the same top hit already seen must NOT promote tail hits[1..3]
         const session2 = { injectedPointers: ["src/a.js:L1-L10"] };

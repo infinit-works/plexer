@@ -1,9 +1,10 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { tryRealpath } from "./util/fs.js";
 import { parseJsonc } from "./util/jsonc.js";
 import { loadGraphCached } from "./context/graph-store.js";
-import { contextDirFor } from "./context/node-file.js";
+import { contextDirFor, wiringPath } from "./context/node-file.js";
+import { sqliteHasGraph } from "./storage/sqlite-store.js";
 import { resolveSymbol } from "./context/symbol-query.js";
 import { buildGraph } from "./graph/build.js";
 import { listSourceFiles } from "./graph/source-files.js";
@@ -383,7 +384,8 @@ function buildAcrossRepoResult(query, repos, missingLabels, survivors, gatedOut,
         result.coverage = survivors[0].res.coverage;
         result.coverageStrong = survivors[0].res.coverageStrong;
     } else if (hits.length > 0) {
-        result.confidenceTier = survivors[0]?.res?.confidenceTier;
+        const topRun = survivors.find((s) => s.label === hits[0].repoLabel) ?? survivors[0];
+        result.confidenceTier = topRun?.res?.confidenceTier;
     } else {
         result.confidenceTier = "exploratory";
     }
@@ -418,7 +420,7 @@ function askAcrossRepos(repos, missingLabels, query, opts, contextDir) {
             note: "no built graphs found for workspace — run `plexer build` in its folders",
         };
     }
-    const { onlyRepo, childIn } = resolveRepoFilter(federatedRepos, missingLabels, opts.in, true);
+    const { onlyRepo, childIn } = resolveRepoFilter(federatedRepos, missingLabels, opts.in, false);
     const runs = collectAcrossRepoRuns(repos, query, opts, contextDir, onlyRepo, childIn, limit);
     const { survivors, gatedOut } = splitEligibleRepoRuns(runs, onlyRepo);
     const { fused, hits } = fuseAcrossRepoHits(survivors, multiRoot, limit);
@@ -617,11 +619,15 @@ export class Plexer {
         }
         return { kind: "single", root: abs };
     }
+    #childContextDir() {
+        return this.cfg.contextDir && isAbsolute(this.cfg.contextDir) ? undefined : this.cfg.contextDir;
+    }
     #loadCodeWorkspaceRepos(target, requireBuilt = false) {
+        const childCtxDir = this.#childContextDir();
         const loaded = [];
         const missing = [];
         for (const repo of target.repos) {
-            const graph = loadGraphCached(contextDirFor(repo.dir, this.cfg.contextDir));
+            const graph = loadGraphCached(contextDirFor(repo.dir, childCtxDir));
             if (graph)
                 loaded.push({ label: repo.label, dir: repo.dir, graph });
             else
@@ -642,11 +648,85 @@ export class Plexer {
             missing: wg.missing,
         };
     }
+    async #checkCodeWorkspace(target, opts) {
+        const childCtxDir = this.#childContextDir();
+        const lines = [`workspace check — ${target.repos.length} repo(s)`, ""];
+        let ok = true;
+        const repos = {};
+        const missing = [];
+        for (const repo of target.repos) {
+            const outDir = contextDirFor(repo.dir, childCtxDir);
+            if (!sqliteHasGraph(outDir) && !existsSync(wiringPath(outDir))) {
+                ok = false;
+                missing.push(repo.label);
+                repos[repo.label] = null;
+                lines.push(`${repo.label}/: not built (run plexer build)`);
+                continue;
+            }
+            const g = await checkGraph(repo.dir, { extensions: opts.extensions, strict: opts.strict, contextDir: childCtxDir });
+            repos[repo.label] = g;
+            if (g.ok) {
+                lines.push(`${repo.label}/: OK`);
+            }
+            else {
+                ok = false;
+                const bits = [];
+                if (g.added.length)
+                    bits.push(`${g.added.length} added`);
+                if (g.removed.length)
+                    bits.push(`${g.removed.length} removed`);
+                if (g.changed.length)
+                    bits.push(`${g.changed.length} changed`);
+                if (g.stale.length)
+                    bits.push(`${g.stale.length} stale`);
+                lines.push(`${repo.label}/: STALE (${bits.join(", ")})`);
+            }
+        }
+        return { text: lines.join("\n") + "\n", ok, repos, missing };
+    }
+    #mapCodeWorkspace(target, opts) {
+        const childCtxDir = this.#childContextDir();
+        const { loaded, missing } = this.#loadCodeWorkspaceRepos(target, true);
+        const perChild = opts.maxDirs !== undefined && loaded.length > 0
+            ? Math.max(1, Math.floor(opts.maxDirs / loaded.length))
+            : undefined;
+        const repos = [];
+        const sections = loaded.map(({ label, dir: repoDir, graph }) => {
+            const gitHistory = opts.churn && !opts.gitHistory
+                ? analyzeGitHistory(repoDir, contextDirFor(repoDir, childCtxDir), opts.since ? { since: opts.since } : undefined)
+                : opts.gitHistory;
+            const map = buildRepoMap(graph, {
+                ...opts,
+                ...(perChild !== undefined ? { maxDirs: perChild } : {}),
+                ...(gitHistory ? { gitHistory } : {}),
+            });
+            repos.push({ repo: label, ...map });
+            return `## ${label}/\n${formatRepoMap(map).trimEnd()}`;
+        });
+        const cov = missing.length > 0
+            ? `${loaded.length} of ${loaded.length + missing.length} workspace repos have graphs; run plexer build to cover ${missing.join(", ")}`
+            : null;
+        if (opts.json) {
+            return { repos, missing, ...(cov ? { note: cov } : {}) };
+        }
+        const head = `workspace map — ${loaded.length} repo(s)`;
+        const parts = [head, "", sections.join("\n\n")];
+        if (cov)
+            parts.push("", cov);
+        return parts.join("\n") + "\n";
+    }
     check(dir, opts = {}) {
         return this.checkGraph(dir, opts);
     }
     checkGraph(dir, opts = {}) {
-        return checkGraph(dir, { ...opts, contextDir: this.cfg.contextDir });
+        const target = this.#resolveTarget(dir);
+        if (target.kind === "single") {
+            return checkGraph(target.root, { ...opts, contextDir: this.cfg.contextDir });
+        }
+        if (target.kind === "workspace") {
+            return federateCheck(target.root, this.cfg.contextDir, opts);
+        }
+        return this.#checkCodeWorkspace(target, opts);
     }
     graph(dir, opts = {}) {
         return buildGraph(dir, {
@@ -668,7 +748,7 @@ export class Plexer {
             return dedupeAskSeenPointers(res, opts.seenPointers, Boolean(opts.source));
         }
         const { loaded, missing } = this.#loadCodeWorkspaceRepos(target, false);
-        const res = askAcrossRepos(loaded, missing, query, opts, this.cfg.contextDir);
+        const res = askAcrossRepos(loaded, missing, query, opts, this.#childContextDir());
         return dedupeAskSeenPointers(res, opts.seenPointers, Boolean(opts.source));
     }
     ask(dir, query, opts = {}) {
@@ -688,7 +768,7 @@ export class Plexer {
             return federateSkeleton(target.root, this.cfg.contextDir, file, opts);
         }
         const { loaded, missing } = this.#loadCodeWorkspaceRepos(target, false);
-        return skeletonAcrossRepos(loaded, missing, file, opts, this.cfg.contextDir);
+        return skeletonAcrossRepos(loaded, missing, file, opts, this.#childContextDir());
     }
     skeleton(dir, file, opts = {}) {
         const target = this.#resolveTarget(dir);
@@ -706,7 +786,7 @@ export class Plexer {
             return federateRead(target.root, this.cfg.contextDir, spans, opts);
         }
         const { loaded, missing } = this.#loadCodeWorkspaceRepos(target, false);
-        return readAcrossRepos(loaded, missing, spans, opts, this.cfg.contextDir);
+        return readAcrossRepos(loaded, missing, spans, opts, this.#childContextDir());
     }
     blast(dir, opts = {}) {
         return blastRadius(dir, { ...opts, contextDir: this.cfg.contextDir });
@@ -751,11 +831,18 @@ export class Plexer {
         return callersAcrossRepos(loaded, missing, queries, direction, depth, opts);
     }
     map(dir, opts = {}) {
-        const { root, contextDir, graph } = this.#requireGraph(dir);
-        const mapOpts = opts.churn && !opts.gitHistory
-            ? { ...opts, gitHistory: analyzeGitHistory(root, contextDir, { since: opts.since }) }
-            : opts;
-        return buildRepoMap(graph, mapOpts);
+        const target = this.#resolveTarget(dir);
+        if (target.kind === "single") {
+            const { root, contextDir, graph } = this.#requireGraph(target.root);
+            const mapOpts = opts.churn && !opts.gitHistory
+                ? { ...opts, gitHistory: analyzeGitHistory(root, contextDir, { since: opts.since }) }
+                : opts;
+            return buildRepoMap(graph, mapOpts);
+        }
+        if (target.kind === "workspace") {
+            return federateMap(target.root, this.cfg.contextDir, { ...opts, analyzeGitHistory });
+        }
+        return this.#mapCodeWorkspace(target, opts);
     }
     health(dir, opts = {}) {
         return health(dir, { ...opts, contextDir: this.cfg.contextDir });

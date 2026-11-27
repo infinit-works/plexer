@@ -27,7 +27,17 @@ export function runHostsInit(repo, opts = {}) {
         selected = detectHosts(home, repo);
     }
     const written = [];
+    const writtenRelPaths = new Set();
+    const antigravityCoveredByPlugin = opts.global !== false && opts.hooks !== false;
+    const hasNonAgyAgentsConsumer = selected.some((h) => h.id !== 'antigravity' && h.relPath === 'AGENTS.md');
     for (const host of selected) {
+        if (host.id === 'antigravity' && host.relPath === 'AGENTS.md' && antigravityCoveredByPlugin && !hasNonAgyAgentsConsumer) {
+            continue;
+        }
+        if (writtenRelPaths.has(host.relPath)) {
+            continue;
+        }
+        writtenRelPaths.add(host.relPath);
         const path = join(repo, host.relPath);
         let action;
         if (host.kind === 'owned') {
@@ -62,6 +72,6 @@ export function runHostsInit(repo, opts = {}) {
     // Antigravity's plugin is a global write too, so --no-global suppresses it as well.
     const antigravitySkill = opts.global === false || !selected.some((h) => h.id === 'antigravity')
         ? []
-        : installAntigravitySkill(home, { hooks: opts.hooks, skills: opts.skills === true ? true : false });
+        : installAntigravitySkill(home, { hooks: opts.hooks, skills: opts.skills });
     return { written, skipped, unknown, mcp, hooks: [...codexHooks, ...geminiHooks, ...cursorHooks, ...antigravitySkill] };
 }

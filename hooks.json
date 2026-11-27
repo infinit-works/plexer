@@ -21,7 +21,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file|exit_plan_mode",
+        "matcher": "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|read_file|view_file|exit_plan_mode|enter_plan_mode",
         "hooks": [
           {
             "type": "command",

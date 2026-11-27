@@ -3,8 +3,8 @@
  *  - Inherits `seenSpans` + `orientedDirs` once when a `/swarm` worker forks from an existing member.
  *  - Emits a compact one-shot warning when another active `/swarm` worker already edited the target file.
  */
-import { statSync } from 'node:fs';
-import { relative, resolve } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { readAgySession } from './session.js';
 import { mergeSpan, normalizeRelFile } from './spans.js';
 import { discoverConversationSwarm, findAppDataDirs, locateSwarmRoster } from './context-graph.js';
@@ -21,13 +21,30 @@ function mtimeMsSafe(p) {
     }
 }
 
+function locateDirectSwarmRoster(conversationId, appDataDirs) {
+    for (const appData of appDataDirs) {
+        const directMembers = join(appData, 'brain', conversationId, '.system_generated', 'swarm', 'members.json');
+        if (!existsSync(directMembers))
+            continue;
+        try {
+            const roster = JSON.parse(readFileSync(directMembers, 'utf8'));
+            if (roster && typeof roster === 'object')
+                return { appData, coordinatorId: conversationId, membersPath: directMembers, roster };
+        }
+        catch { /* ignore unreadable roster */ }
+    }
+    return null;
+}
+
 function resolveSwarmLookup(conversationId, opts = {}) {
     if (!conversationId || conversationId === 'default')
         return null;
+    const skipBrainScan = Boolean(opts.skipBrainScan || opts.agyState?.isSwarmMember === false);
     const useCache = !Array.isArray(opts.appDataDirs);
     const now = Date.now();
+    const cacheKey = `${conversationId}\0${skipBrainScan ? '1' : '0'}`;
     if (useCache) {
-        const cached = rosterLookupCache.get(conversationId);
+        const cached = rosterLookupCache.get(cacheKey);
         if (cached) {
             if (!cached.found && (now - cached.checkedAt) < ROSTER_MISS_TTL_MS)
                 return null;
@@ -36,11 +53,21 @@ function resolveSwarmLookup(conversationId, opts = {}) {
         }
     }
     const appDataDirs = findAppDataDirs(opts);
-    const found = locateSwarmRoster(conversationId, appDataDirs);
+    let found = null;
+    try {
+        found = locateSwarmRoster(conversationId, { appDataDirs, skipBrainScan });
+    }
+    catch (err) {
+        if (!(err instanceof TypeError))
+            throw err;
+        found = skipBrainScan
+            ? locateDirectSwarmRoster(conversationId, appDataDirs)
+            : locateSwarmRoster(conversationId, appDataDirs);
+    }
     if (useCache) {
         if (rosterLookupCache.size >= 128)
             rosterLookupCache.delete(rosterLookupCache.keys().next().value);
-        rosterLookupCache.set(conversationId, {
+        rosterLookupCache.set(cacheKey, {
             found,
             mtimeMs: found ? mtimeMsSafe(found.membersPath) : 0,
             checkedAt: now,
@@ -82,8 +109,18 @@ export function seedForkedSwarmSession(conversationId, agyState, opts = {}) {
     if (!conversationId || !agyState || typeof agyState !== 'object' || agyState.swarmForkChecked)
         return false;
     agyState.swarmForkChecked = true;
-    const found = resolveSwarmLookup(conversationId, opts);
-    if (!found || found.coordinatorId === conversationId)
+    const skipBrainScan = Boolean(
+        opts.skipBrainScan
+        || agyState.isSwarmMember === false
+        || (!Array.isArray(opts.appDataDirs) && agyState.hasDirectUserInput && !agyState.subagentSenderId),
+    );
+    const found = resolveSwarmLookup(conversationId, { ...opts, agyState, skipBrainScan });
+    if (!found) {
+        agyState.isSwarmMember = false;
+        return false;
+    }
+    agyState.isSwarmMember = true;
+    if (found.coordinatorId === conversationId)
         return false;
 
     const entry = findSwarmMemberEntry(found.roster, conversationId);
@@ -124,9 +161,11 @@ export function seedForkedSwarmSession(conversationId, agyState, opts = {}) {
 export function checkSwarmEditCollision(conversationId, repoRoot, targetPath, agyState, opts = {}) {
     if (!conversationId || !repoRoot || !targetPath || !agyState)
         return null;
-    const found = resolveSwarmLookup(conversationId, opts);
+    const skipBrainScan = Boolean(opts.skipBrainScan || agyState.isSwarmMember === false);
+    const found = resolveSwarmLookup(conversationId, { ...opts, agyState, skipBrainScan });
     if (!found)
         return null;
+    agyState.isSwarmMember = true;
 
     const relTarget = normalizeRelFile(relative(resolve(repoRoot), resolve(repoRoot, targetPath)));
     if (!relTarget || relTarget.startsWith('..'))
@@ -161,8 +200,10 @@ export function checkSwarmEditCollision(conversationId, repoRoot, targetPath, ag
 
     agyState.emittedSwarmCollisions.push(relTarget);
     const msg = `[plexer] swarm collision warning: ${hitLabel} also edited ${relTarget} in this swarm — inspect recent changes before overwriting.`;
-    agyState.pendingBlastRadius = agyState.pendingBlastRadius
-        ? (agyState.pendingBlastRadius.includes(msg) ? agyState.pendingBlastRadius : `${agyState.pendingBlastRadius}\n${msg}`)
-        : msg;
+    if (!opts.preTool) {
+        agyState.pendingBlastRadius = agyState.pendingBlastRadius
+            ? (agyState.pendingBlastRadius.includes(msg) ? agyState.pendingBlastRadius : `${agyState.pendingBlastRadius}\n${msg}`)
+            : msg;
+    }
     return msg;
 }

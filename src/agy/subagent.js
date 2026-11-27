@@ -6,7 +6,7 @@ const BOILERPLATE_LINE_RE = /^(?:\s*[-*]?\s*(?:Output contract|Assigned paths?|D
 
 const INLINE_BOILERPLATE_RE = /\b(?:use|call)\s+`?(?:send_message|run_workflow)`?\b[^.\n]*(?:\.|$)/gi;
 
-const READ_ONLY_SANDBOX_RE = /\b(?:read-only sandbox|without `?(?:run_command|shell)`?|no (?:shell|command|terminal) tool|cannot run commands|you do not have `?(?:run_command)`?)\b/i;
+const READ_ONLY_SANDBOX_RE = /\b(?:read-only sandbox|without `?(?:run_command|shell)`?|no (?:shell|command|terminal) tool|cannot run commands|you do not have `?(?:run_command)`?|research subagent|read-only access|read-only mode|read-only agent)\b/i;
 
 /**
  * Strip delegation and swarm orchestration scaffolding from subagent prompts before

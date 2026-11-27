@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { incomingEdges } from '../../claude/format.js';
@@ -34,39 +34,49 @@ function realPosix(p) {
     return p && typeof p === 'string' ? tryRealpath(p).replace(/\\/g, '/') : null;
 }
 
-export function isIsolatedBenchDir(dir, envFlags = {}) {
+export function isIsolatedBenchDir(dir, envFlags = null) {
     if (!dir || typeof dir !== 'string') return false;
-    const disableHooks = envFlags?.disableHooks !== undefined ? Boolean(envFlags.disableHooks) : process.env.PLEXER_DISABLE_HOOKS === '1';
+    const useEnv = !envFlags || typeof envFlags !== 'object';
+    const disableHooks = envFlags?.disableHooks !== undefined ? Boolean(envFlags.disableHooks) : (useEnv && process.env.PLEXER_DISABLE_HOOKS === '1');
     if (disableHooks) return true;
-    const enableBench = envFlags?.enableBenchHooks !== undefined ? Boolean(envFlags.enableBenchHooks) : process.env.PLEXER_ENABLE_BENCH_HOOKS === '1';
+    const enableBench = envFlags?.enableBenchHooks !== undefined ? Boolean(envFlags.enableBenchHooks) : (useEnv && process.env.PLEXER_ENABLE_BENCH_HOOKS === '1');
     if (enableBench) return false;
     const norm = dir.replace(/\\/g, '/');
     return norm.includes('/plexer-ab-') || norm.includes('/plexer-bench-') || norm.includes('/plexer-swebench-') || norm.includes('/plexer-large-');
 }
 
-export function resolveHostProjectDir(input, envFlags = {}) {
+export function resolveHostProjectDir(input, envFlags = null) {
+    const useEnv = !envFlags || typeof envFlags !== 'object';
     const candidates = [
         input?.cwd, input?.projectDir,
         Array.isArray(input?.workspace_roots) ? input.workspace_roots[0] : null,
         Array.isArray(input?.workspacePaths) ? input.workspacePaths[0] : null,
         envFlags?.codexProjectDir, envFlags?.geminiProjectDir, envFlags?.claudeProjectDir,
         envFlags?.cursorProjectDir, envFlags?.antigravityProjectDir,
-        process.env.CODEX_PROJECT_DIR, process.env.GEMINI_PROJECT_DIR,
-        process.env.CLAUDE_PROJECT_DIR, process.env.CURSOR_PROJECT_DIR, process.env.ANTIGRAVITY_PROJECT_DIR,
+        ...(useEnv ? [
+            process.env.CODEX_PROJECT_DIR, process.env.GEMINI_PROJECT_DIR,
+            process.env.CLAUDE_PROJECT_DIR, process.env.CURSOR_PROJECT_DIR, process.env.ANTIGRAVITY_PROJECT_DIR,
+        ] : []),
     ];
     for (const c of candidates) {
         if (typeof c === 'string' && c.trim()) return c.trim();
     }
-    return projectDir();
+    return envFlags?.callerCwd || (useEnv ? projectDir() : process.cwd());
 }
 
-export function resolveHostSessionId(input, envFlags = {}) {
+export function resolveHostSessionId(input, envFlags = null) {
+    const useEnv = !envFlags || typeof envFlags !== 'object';
     const raw = input?.conversationId ?? input?.conversation_id ?? input?.session_id
-        ?? input?.sessionId ?? input?.trace_id ?? envFlags?.sessionId
+        ?? input?.sessionId ?? input?.trace_id
+        ?? envFlags?.plexerSessionId ?? envFlags?.sessionId
         ?? envFlags?.antigravityConversationId ?? envFlags?.claudeSessionId
-        ?? envFlags?.cursorTraceId ?? process.env.PLEXER_SESSION_ID
-        ?? process.env.ANTIGRAVITY_CONVERSATION_ID ?? process.env.CLAUDE_SESSION_ID
-        ?? process.env.CURSOR_TRACE_ID ?? 'default';
+        ?? envFlags?.cursorTraceId
+        ?? (useEnv ? (
+            process.env.PLEXER_SESSION_ID
+            ?? process.env.ANTIGRAVITY_CONVERSATION_ID ?? process.env.CLAUDE_SESSION_ID
+            ?? process.env.CURSOR_TRACE_ID
+        ) : null)
+        ?? 'default';
     return String(raw || 'default').replace(/[^A-Za-z0-9_.-]/g, '_');
 }
 
@@ -108,18 +118,23 @@ export function resolveAgyRepoDir(input, sessionState, opts = {}) {
     const wsRoot = input?.workspacePaths?.[0] || null;
     const rawTouched = sessionState?.lastTouchedPath;
     const touched = rawTouched && !isIgnoredTouchedPath(rawTouched, wsRoot) ? rawTouched : null;
-    const realPlugin = realPosix(opts.pluginRoot || process.env.PLUGIN_ROOT || DEFAULT_PLUGIN_ROOT);
+    const useEnvPlugin = !opts.envFlags || typeof opts.envFlags !== 'object';
+    const realPlugin = realPosix(opts.pluginRoot || opts.envFlags?.pluginRoot || (useEnvPlugin ? process.env.PLUGIN_ROOT : null) || DEFAULT_PLUGIN_ROOT);
     const realWs = realPosix(wsRoot);
-    const rawCallerCwd = opts.callerCwd ?? process.cwd();
+    const rawCallerCwd = opts.callerCwd ?? opts.envFlags?.callerCwd ?? process.cwd();
     const realCaller = realPosix(rawCallerCwd);
     const insidePlugin = (r) => Boolean(r && realPlugin && (r === realPlugin || r.startsWith(`${realPlugin}/`)));
     const callerCwd = insidePlugin(realCaller) && !insidePlugin(realWs) ? null : rawCallerCwd;
-    const candidates = [
-        touched, input?.cwd, wsRoot, callerCwd, ...(wsRoot && existsSync(wsRoot) ? [] : [readAgyLastRepo()]),
-    ].filter(Boolean);
+    const hasExplicitEmptyWs = Array.isArray(input?.workspacePaths) && input.workspacePaths.length === 0;
+    const candidates = hasExplicitEmptyWs
+        ? [touched, input?.cwd].filter(Boolean)
+        : [touched, input?.cwd, wsRoot, callerCwd, ...(wsRoot && existsSync(wsRoot) ? [] : [readAgyLastRepo()])].filter(Boolean);
     for (const c of candidates) {
         const hit = findNearestRepoAncestor(c);
         if (hit) return hit;
+    }
+    if (hasExplicitEmptyWs) {
+        return input?.cwd && !isBoundaryDir(input.cwd) ? input.cwd : null;
     }
     return wsRoot || input?.cwd || callerCwd || process.cwd();
 }
@@ -159,12 +174,37 @@ function pruneStaleAgySessions() {
     } catch {}
 }
 
+const sessionJsonByCache = new WeakMap();
+const MAX_CACHED_SESSION_JSON = 256;
+
+function serializeStateForDirtyCheck(state) {
+    if (!state || typeof state !== 'object') return JSON.stringify(state);
+    return JSON.stringify({ ...state, lastPreEditToolAtMs: 0 });
+}
+
+function recordSessionCacheJson(sessionCache, sid, state) {
+    if (!sessionCache) return null;
+    let bySid = sessionJsonByCache.get(sessionCache);
+    if (!bySid) {
+        bySid = new Map();
+        sessionJsonByCache.set(sessionCache, bySid);
+    } else if (bySid.size >= MAX_CACHED_SESSION_JSON && !bySid.has(sid)) {
+        bySid.clear();
+    }
+    const json = serializeStateForDirtyCheck(state);
+    bySid.set(sid, json);
+    return json;
+}
+
 export function readEngineSession(sid, opts = {}) {
     if (opts.sessionStore) return opts.sessionStore.get(sid) ?? emptyAgySession();
     const hit = opts.sessionCache?.get(sid);
     if (hit) return hit;
     const loaded = readAgySession(sid);
-    opts.sessionCache?.set(sid, loaded);
+    if (opts.sessionCache) {
+        opts.sessionCache.set(sid, loaded);
+        recordSessionCacheJson(opts.sessionCache, sid, loaded);
+    }
     return loaded;
 }
 
@@ -172,13 +212,36 @@ export function loadAgyContext(input, opts = {}) {
     const sid = resolveHostSessionId(input, opts.envFlags);
     if (!opts.sessionStore && Math.random() < 0.05) pruneStaleAgySessions();
     const agyState = readEngineSession(sid, opts);
-    if (input?.transcriptPath) parseAgyTranscript(input.transcriptPath, agyState);
+    const hasCachedTranscript = Boolean((agyState?.transcriptOffset ?? 0) > 0 && !input?.forceTranscriptParse);
+    if (input?.transcriptPath && !(opts.skipTranscriptParse && hasCachedTranscript)) {
+        parseAgyTranscript(input.transcriptPath, agyState);
+    }
     return { sid, agyState, dir: resolveAgyRepoDir(input, agyState, opts) };
 }
 
 export function saveAgyContext(sid, agyState, opts = {}) {
-    if (opts.sessionStore) opts.sessionStore.set(sid, agyState);
-    else { opts.sessionCache?.set(sid, agyState); writeAgySession(sid, agyState); }
+    if (agyState && typeof agyState === 'object' && '_dirtyTranscriptOffset' in agyState) {
+        agyState._dirtyTranscriptOffset = false;
+    }
+    if (opts.sessionStore) {
+        opts.sessionStore.set(sid, agyState);
+        return;
+    }
+    if (opts.sessionCache) {
+        opts.sessionCache.set(sid, agyState);
+        const bySid = sessionJsonByCache.get(opts.sessionCache);
+        const nextJson = serializeStateForDirtyCheck(agyState);
+        if (bySid && bySid.get(sid) === nextJson) return;
+        writeAgySession(sid, agyState);
+        if (bySid) {
+            if (bySid.size >= MAX_CACHED_SESSION_JSON && !bySid.has(sid)) bySid.clear();
+            bySid.set(sid, nextJson);
+        } else {
+            recordSessionCacheJson(opts.sessionCache, sid, agyState);
+        }
+        return;
+    }
+    writeAgySession(sid, agyState);
 }
 
 export function buildMidLoopHint(repoRoot, ctxDir, relFile, opts = {}) {
@@ -214,7 +277,7 @@ export function fitAgyEphemeral(text, maxChars = 12000) {
         return true;
     };
     while (out.length > maxChars && (
-        dropLast(/\n\n\/\/ [^\n]+\n(?:L\d+:[^\n]*\n?)+/g)
+        dropLast(/\n\n\/\/ [^\n]+\n(?:L?\d+:[^\n]*\n?)+/g)
         || dropLast(/\n\s*\d+\.\s[^\n]+(?:\n(?!\s*\d+\.\s|likely co-edits \/ tests:)[^\n]*)*/g)
         || dropLast(/\n\n## [^\n]+\n[\s\S]*?(?=\n\n## |$)/g)
     ));
@@ -244,4 +307,34 @@ export function formatAgyUserMarkdown(
     if (parts.length === 0) return '';
     const link = includeSidecarLink ? ' · [Graph](sidecar://plexer/viz/?tab=context)' : '';
     return `[plexer] ${parts.join(' · ')}${link}`;
+}
+
+export function resolveAgyAppDataDir(input) {
+    const art = typeof input?.artifactDirectoryPath === 'string' ? input.artifactDirectoryPath.trim() : '';
+    if (art) {
+        const brainDir = dirname(resolve(art));
+        if (basename(brainDir) === 'brain') return dirname(brainDir);
+    }
+    const tx = typeof input?.transcriptPath === 'string' ? input.transcriptPath.trim() : '';
+    if (tx) {
+        const candidate = resolve(tx, '..', '..', '..', '..', '..');
+        if (existsSync(join(candidate, 'brain'))) return candidate;
+    }
+    return null;
+}
+
+export function readAgyPlanExecuteFlag(input) {
+    const cid = String(input?.conversationId ?? input?.conversation_id ?? '').trim();
+    if (!cid || !/^[A-Za-z0-9_.-]+$/.test(cid)) return null;
+    const appDataDir = resolveAgyAppDataDir(input);
+    if (!appDataDir) return null;
+    const pbtxtPath = join(appDataDir, 'annotations', `${cid}.pbtxt`);
+    if (!existsSync(pbtxtPath)) return null;
+    try {
+        const st = statSync(pbtxtPath);
+        if (!st.isFile() || st.size > 16384) return null;
+        const raw = st.size > 0 ? readFileSync(pbtxtPath, 'utf8') : '';
+        return /\bplan_execute\s*:\s*true\b/i.test(raw);
+    } catch { /* ignore unreadable annotation */ }
+    return null;
 }

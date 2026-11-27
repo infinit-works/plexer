@@ -226,7 +226,7 @@ describe("MCP Stdio Server (`bin/plexer.js mcp`)", () => {
                 arguments: { spans: "src/ledger.ts:L1-L3" },
             });
             assert.equal(readDedup.isError, false);
-            assert.match(readDedup.content[0].text, /already in session context/i);
+            assert.match(readDedup.content[0].text, /\[seen:/i);
 
             const readFull = await client.request("tools/call", {
                 name: "plexer_read",

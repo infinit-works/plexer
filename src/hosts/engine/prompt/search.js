@@ -1,6 +1,9 @@
 import { join } from 'node:path';
 import { ask as runAsk } from '../../../ask/ask.js';
-import { loadGraphCached } from '../../../context/graph-store.js';
+import { loadFileCached, loadGraphCached, registerGraphCacheClearer } from '../../../context/graph-store.js';
+
+const gitHistoryCache = new Map();
+registerGraphCacheClearer(() => gitHistoryCache.clear());
 import { scopeOf, scopesOfGraph } from '../../../context/scopes.js';
 import { nearestPlexerRoot } from '../../../graph/root.js';
 import { linkTestsForGraph } from '../../../graph/test-links.js';
@@ -9,7 +12,7 @@ import { contextDirFor, isTestPath } from '../../../util/paths.js';
 import { readJson, readStats } from '../../../util/state.js';
 import { detectPromptIntent } from './intent.js';
 import { distillPromptQueries } from './distill.js';
-import { enforceMergedHitsBudget, mergeMultiQueryHits, resolveHookBudgets } from './budget.js';
+import { countHitSubsystemDirs, enforceMergedHitsBudget, mergeMultiQueryHits, resolveHookBudgets } from './budget.js';
 
 export function lastFileScopeHint(dir, lastFile) {
     if (!lastFile) return null;
@@ -102,7 +105,9 @@ export function computeCoEditPointers(ctxDir, graph, hits) {
     const pointers = [];
     const seenCandFiles = new Set(shownFiles);
     appendCallPeerPointers(graph, targetNodes, byId, seenCandFiles, pointers);
-    const hist = pointers.length < 3 && ctxDir ? readJson(join(ctxDir, '.cache', 'git-history.json')) : null;
+    const hist = pointers.length < 3 && ctxDir
+        ? loadFileCached(gitHistoryCache, join(ctxDir, '.cache', 'git-history.json'), () => readJson(join(ctxDir, '.cache', 'git-history.json')))
+        : null;
     if (hist?.coChanges && typeof hist.coChanges === 'object') {
         for (const pf of primaryFiles) {
             for (const c of hist.coChanges[pf] ?? []) {
@@ -126,10 +131,10 @@ function runScopedPromptQueries(root, contextDir, queries, intent, scope, opts =
     const geminiProfile = Boolean(opts?.geminiProfile);
     if (queries.length === 1) {
         const single = runAsk(root, queries[0], {
-            limit: (geminiProfile && intent.editEnvelope) ? 4 : 3, source: true, maxHitsToInline: budgets.singleQueryInline,
+            limit: (geminiProfile && !opts?.fastProfile && !opts?.narrowPrompt && intent.editEnvelope) ? 4 : 3, source: true, maxHitsToInline: budgets.singleQueryInline,
             maxSourceBytes: intent.editEnvelope ? budgets.editSingleHitBytes : budgets.qaSingleHitBytes,
             wantsCallSites: intent.wantsCallSites, editEnvelope: intent.editEnvelope, geminiProfile,
-            includeRankingMetadata: false, contextDir, in: scope ?? undefined,
+            suppressExploratorySource: true, includeRankingMetadata: false, contextDir, in: scope ?? undefined,
         });
         if (single) single.isEditPrompt = intent.editEnvelope;
         return single;
@@ -146,7 +151,7 @@ function runScopedPromptQueries(root, contextDir, queries, intent, scope, opts =
     }));
     const mergedHits = mergeMultiQueryHits(results, intent.editEnvelope, { geminiProfile });
     enforceMergedHitsBudget(mergedHits, intent, queries.length, budgets);
-    const topHits = mergedHits.slice(0, (geminiProfile && intent.editEnvelope) ? 5 : (queries.length >= 4 ? 5 : 4));
+    const topHits = mergedHits.slice(0, geminiProfile ? 4 : (queries.length >= 4 ? 5 : 4));
     const fileQueryCount = new Map();
     for (const r of results) {
         for (const f of new Set((r?.hits ?? []).map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean))) {
@@ -154,8 +159,15 @@ function runScopedPromptQueries(root, contextDir, queries, intent, scope, opts =
         }
     }
     const multiQueryFiles = [...fileQueryCount.entries()].filter(([, c]) => c >= 2).map(([f]) => f);
+    const highSubQueries = results.filter((r) => r?.confidenceTier === 'high').length;
+    const hasPinnedHits = topHits.some((h) => h.pinned);
+    const multiSubsystem = countHitSubsystemDirs(topHits) >= 3;
+    const confidenceTier = (multiSubsystem && !hasPinnedHits ? highSubQueries >= 2 : highSubQueries >= 1)
+        ? 'high'
+        : 'exploratory';
     return {
         query: queries.join(' ; '), mode: 'lexical', hits: topHits, isEditPrompt: intent.editEnvelope,
+        confidenceTier,
         allFiles: [...new Set([...topHits.filter((h) => h.code || !h.title?.includes(' · type')).map((h) => (h.pointer ?? '').split(':')[0]).filter(Boolean), ...multiQueryFiles])],
         coverage: Math.max(...results.map((r) => r?.coverage ?? 0)),
         coverageStrong: Math.max(...results.map((r) => r?.coverageStrong ?? 0)),

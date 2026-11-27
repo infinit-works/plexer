@@ -19,9 +19,9 @@ import { parseAgyTranscript } from "../src/hosts/engine/agy-transcript.js";
 import { buildPlanExecutionHandoff } from "../src/agy/plan-handoff.js";
 import { computeReadPreToolWidening, rewriteChainedPlexerCommand, rewriteSingleNpxPlexerCommand } from "../src/agy/pre-tool.js";
 import { queryPromptContext } from "../src/claude/hooks.js";
-import { relevantRetrieval } from "../src/claude/format.js";
+import { formatRetrieval, relevantRetrieval } from "../src/claude/format.js";
 import { handleAgyPreInvocation } from "../src/hosts/engine/turn0.js";
-import { handleAgyPreTool } from "../src/hosts/engine/dispatcher.js";
+import { dispatchHostEvent, handleAgyPreTool } from "../src/hosts/engine/dispatcher.js";
 import { handleAgyPostTool, isPlanToolCall, recordEditBlastForAgy } from "../src/hosts/engine/post-tool.js";
 import { GEMINI_HOOK_BUDGETS, HOOK_BUDGETS, isGeminiModelProfile, isOrchestratorInput } from "../src/hosts/engine/prompt/budget.js";
 import { backfillCompactPointerHits } from "../src/hosts/engine/prompt/pin.js";
@@ -224,7 +224,7 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
                 writeErr: () => {},
                 exit: () => {},
             });
-            assert.match(cliOut, /L51:/);
+            assert.match(cliOut, /^51:/m);
             const saved = readAgySession(sid);
             assert.deepEqual(saved.seenSpans?.["src/chunked.js"], [[51, 90]]);
         } finally {
@@ -297,7 +297,6 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
         assert.equal(isGeminiModelProfile({ modelName: "gemini-4-neon-medium" }, "agy"), true);
         assert.equal(isGeminiModelProfile({ modelName: "neon-medium" }, "agy"), true);
         assert.equal(isGeminiModelProfile({ modelName: "gemini-4-hydrogen-medium" }, "agy"), true);
-        assert.equal(isGeminiModelProfile({ modelName: "argon-medium" }, "agy"), true);
         assert.equal(isGeminiModelProfile({ modelName: "carbon-medium" }, "agy"), true);
         assert.equal(isGeminiModelProfile({}, "agy"), true);
         assert.equal(isGeminiModelProfile({ modelName: "claude-sonnet-5-5-medium" }, "agy"), false);
@@ -402,18 +401,18 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
         const repo = makeTempRepo("plexer-widen-ext-");
         const sid = `sess-widen-ext-${process.pid}-${Date.now()}`;
         try {
-            // 1. 440L file -> 2nd slice widens across uncovered remainder (<= 520L); 680L file -> does not widen (> 520L)
-            const lines440 = [];
-            for (let i = 1; i <= 440; i++) lines440.push(`// line ${i}`);
-            const medPath = join(repo, "src", "big440.js");
-            writeFileSync(medPath, `${lines440.join("\n")}\n`);
+            // 1. 280L file -> 2nd slice widens across uncovered remainder (<= 300L); 680L file -> widens bounded 260L window
+            const lines280 = [];
+            for (let i = 1; i <= 280; i++) lines280.push(`// line ${i}`);
+            const medPath = join(repo, "src", "big280.js");
+            writeFileSync(medPath, `${lines280.join("\n")}\n`);
 
             const lines680 = [];
             for (let i = 1; i <= 680; i++) lines680.push(`// line ${i}`);
             const bigPath = join(repo, "src", "big680.js");
             writeFileSync(bigPath, `${lines680.join("\n")}\n`);
 
-            // 2. Class > 320L containing a small inner method -> snaps to inner method bounds
+            // 2. Class > 220L containing a small inner method -> snaps to inner method bounds
             const clsLines = ["export class BigService {"];
             for (let i = 2; i <= 120; i++) clsLines.push(`    field_${i} = ${i};`);
             clsLines.push("    targetMethod(x) {");
@@ -428,21 +427,21 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             await buildGraph(repo, { force: true });
 
             const agyState = { seenSpans: {}, fileSliceCounts: {} };
-            // 1st slice on big440
+            // 1st slice on big280
             computeReadPreToolWidening({ Path: medPath, StartLine: 1, EndLine: 20 }, repo, agyState);
-            // 2nd slice widens to entire 440L uncovered remainder (<= 520L)
-            const widen440 = computeReadPreToolWidening({ Path: medPath, StartLine: 100, EndLine: 130 }, repo, agyState);
-            assert.ok(widen440);
-            assert.equal(widen440.startLine, 21);
-            assert.equal(widen440.endLine, 440);
+            // 2nd sequential slice widens to entire 280L uncovered remainder (<= 300L)
+            const widen280 = computeReadPreToolWidening({ Path: medPath, StartLine: 21, EndLine: 50 }, repo, agyState);
+            assert.ok(widen280);
+            assert.equal(widen280.startLine, 21);
+            assert.equal(widen280.endLine, 280);
 
-            // 1st and 2nd slices on big680 (> 520L) widen to a bounded <=400L window instead of dumping 21..680
+            // 1st and 2nd sequential slices on big680 (> 300L) widen to a bounded <=260L window instead of dumping 21..680
             computeReadPreToolWidening({ Path: bigPath, StartLine: 1, EndLine: 20 }, repo, agyState);
-            const widen680 = computeReadPreToolWidening({ Path: bigPath, StartLine: 100, EndLine: 130 }, repo, agyState);
-            assert.ok(widen680, "2nd slice >520L must widen to a bounded window");
+            const widen680 = computeReadPreToolWidening({ Path: bigPath, StartLine: 21, EndLine: 50 }, repo, agyState);
+            assert.ok(widen680, "2nd slice >300L must widen to a bounded window");
             assert.equal(widen680.startLine, 21);
-            assert.equal(widen680.endLine, 420);
-            assert.equal(widen680.limit, 400);
+            assert.equal(widen680.endLine, 280);
+            assert.equal(widen680.limit, 260);
 
             // Inner method snap inside BigService (> 320L class)
             const innerSnap = computeReadPreToolWidening({ Path: clsPath, StartLine: 124, EndLine: 130 }, repo, agyState);
@@ -465,7 +464,7 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             assert.equal(unboundedOut.overwrite, undefined);
             assert.deepEqual(readAgySession(sid).seenSpans?.["src/big680.js"], [[1, 680]]);
 
-            // PostToolUse edit invalidates seenSpans & resets fileSliceCounts
+            // PostToolUse same-line-count edit invalidates edited line 150 while preserving unedited lines above and below
             handleAgyPostTool(
                 {
                     conversationId: sid,
@@ -477,7 +476,7 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
                 },
                 { captureStdout: true },
             );
-            assert.deepEqual(readAgySession(sid).seenSpans?.["src/big680.js"], [[1, 149]]);
+            assert.deepEqual(readAgySession(sid).seenSpans?.["src/big680.js"], [[1, 149], [151, 680]]);
 
             // Coalesce echo dividers between >=2 plexer commands, leave bare echo untouched
             const echoBatch = rewriteChainedPlexerCommand('plexer skeleton src && echo "---" && plexer grep "targetMethod" src');
@@ -537,7 +536,7 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             await buildGraph(repo, { force: true });
 
             assert.equal(isGeminiModelProfile({ modelName: "gemini-pro-orchestrator" }, "agy"), true);
-            assert.equal(isOrchestratorInput({ modelName: "gemini-pro-orchestrator-argon" }, null), true);
+            assert.equal(isOrchestratorInput({ modelName: "gemini-pro-orchestrator-neon" }, null), true);
             assert.equal(isSyntheticOrMetaPrompt("/plan /grill-me Improve the performance of the gemini 4 models in antigravity 2"), true);
             assert.equal(isSyntheticOrMetaPrompt("[plan review due]"), true);
 
@@ -883,19 +882,19 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             await runCli(["node", "plexer", "read", "src/primary.js:L1-L40", "--session", sid], {
                 isCaptured: true, cwd: repo, sessionId: sid, writeOut: (s) => { out1 += s; }, writeErr: () => {}, exit: () => {},
             });
-            assert.match(out1, /L1: import/);
+            assert.match(out1, /1: import/);
 
             let outDup = "";
             await runCli(["node", "plexer", "read", "src/primary.js:L1-L40", "--session", sid], {
                 isCaptured: true, cwd: repo, sessionId: sid, writeOut: (s) => { outDup += s; }, writeErr: () => {}, exit: () => {},
             });
-            assert.match(outDup, /\[already in session context: src\/primary\.js:L1-L40/);
+            assert.match(outDup, /\[seen: src\/primary\.js:L1-L40/);
 
             let outFull = "";
             await runCli(["node", "plexer", "read", "src/primary.js:L1-L40", "--full", "--session", sid], {
                 isCaptured: true, cwd: repo, sessionId: sid, writeOut: (s) => { outFull += s; }, writeErr: () => {}, exit: () => {},
             });
-            assert.match(outFull, /L4:     return tinyCallee/);
+            assert.match(outFull, /4:     return tinyCallee/);
 
             // Request-order pool allocates primary span generously and scales default pool by span count (3 spans -> 12 KB)
             const pooled = readSpans(repo, [
@@ -1090,8 +1089,10 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             );
             assert.equal(preApprovalMid, "{}\n", "implementation_plan.md handoff must wait until user approval or exit_plan_mode");
 
-            const casualProseHandoff = buildPlanExecutionHandoff([repo], "Check `callFrom_c1` without naming any file path.", emptyAgySession());
-            assert.equal(casualProseHandoff, null, "casual prose backticks without matching repo file must not pull files");
+            const missingSymbolHandoff = buildPlanExecutionHandoff([repo], "Check `nonExistentSymbol` without naming any file path.", emptyAgySession());
+            assert.equal(missingSymbolHandoff, null, "unresolved backticks without matching repo file must not pull files");
+            const uniqueSymbolHandoff = buildPlanExecutionHandoff([repo], "Update `callFrom_c1` without naming any file path.", emptyAgySession());
+            assert.ok(uniqueSymbolHandoff && uniqueSymbolHandoff.targetFiles.includes("src/c1.js"), "unique symbol match must resolve when no file path is named");
 
             // 3. Exact diff-line seenSpans invalidation on { Path, Target, Replacement } edit_file & strict blastRadius gate
             const editLineSid = mkSid("r4-editline");
@@ -1112,7 +1113,7 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
                 },
                 { captureStdout: true },
             );
-            assert.deepEqual(readAgySession(editLineSid).seenSpans?.["src/editline.js"], [[1, 121]], "diff-line resolver must preserve lines above modified body line");
+            assert.deepEqual(readAgySession(editLineSid).seenSpans?.["src/editline.js"], [[1, 121], [123, 123]], "diff-line resolver must preserve unedited lines around modified body line");
 
             const blastStateNew = { injectedPointers: [], emittedBlastFiles: [], seenSpans: {} };
             recordEditBlastForAgy(
@@ -1135,7 +1136,8 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             // 4. Issue-style edit intent + 2-stage 4/8-turn escalation
             const swePrompt = `Working directory: ${repo}\n\n${"Line of context describing regression in hubRouter when mode is undefined. ".repeat(4)}\nFix \`hubRouter\` in \`src/hub.js\`.`;
             assert.equal(isLikelyEditSessionPrompt(swePrompt), true);
-            assert.equal(detectPromptIntent("Fix hubRouter bug", {}).editEnvelope, false, "Fix must stay excluded from detectPromptIntent EDIT_VERB_RE");
+            assert.equal(detectPromptIntent("Fix hubRouter bug", {}).editEnvelope, true, "Fix must be treated as an edit verb in detectPromptIntent");
+            assert.equal(detectPromptIntent("How does fix work?", {}).editEnvelope, false, "Read-only question about fix must stay excluded from editEnvelope");
             assert.equal(isLikelyEditSessionPrompt("Why does `hubRouter` return 1?"), false);
 
             const escSid = mkSid("r4-esc");
@@ -1158,8 +1160,10 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             }
 
             // 5. Gemini >3-caller inlining & <=28L backfill (Round 6 calibrated budgets)
-            assert.equal(HOOK_BUDGETS.editMergedBytes, 4000);
-            assert.equal(GEMINI_HOOK_BUDGETS.editMergedBytes, 5800);
+            assert.equal(HOOK_BUDGETS.editMergedBytes, 2000);
+            assert.ok(HOOK_BUDGETS.editTotalBytes <= 2200 && HOOK_BUDGETS.editTotalBytes >= 1800);
+            assert.ok(HOOK_BUDGETS.pinBytes <= HOOK_BUDGETS.editTotalBytes);
+            assert.equal(GEMINI_HOOK_BUDGETS.editMergedBytes, 4600);
             const gemPin = queryPromptContext(repo, "Update `hubRouter` in `src/hub.js`.", { geminiProfile: true });
             const gemTxt = relevantRetrieval(gemPin, {}, 5, { geminiProfile: true });
             assert.match(String(gemTxt || ""), /caller in src\/c[1-4]\.js:/, "Gemini must inline up to 3 callers even when >3 callers exist");
@@ -1203,14 +1207,20 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             );
             assert.equal(bypassOut.trim(), '{"decision":"allow"}');
 
-            // 7. --fixed pipe-separated identifiers natively match both symbols without regex errors
+            // 7. Regex alternation matches both symbols while --fixed treats `|` strictly literally
+            const regexPipeOut = execFileSync(
+                process.execPath,
+                [CLI_BIN, "grep", "hubRouter|surgicalCenterTarget", "src"],
+                { cwd: repo, encoding: "utf8", env: { ...process.env, PLEXER_NO_DAEMON: "1" } },
+            );
+            assert.match(regexPipeOut, /hubRouter/);
+            assert.match(regexPipeOut, /surgicalCenterTarget/);
             const fixedPipeOut = execFileSync(
                 process.execPath,
                 [CLI_BIN, "grep", "hubRouter|surgicalCenterTarget", "src", "--fixed"],
                 { cwd: repo, encoding: "utf8", env: { ...process.env, PLEXER_NO_DAEMON: "1" } },
             );
-            assert.match(fixedPipeOut, /hubRouter/);
-            assert.match(fixedPipeOut, /surgicalCenterTarget/);
+            assert.doesNotMatch(fixedPipeOut, /hubRouter|surgicalCenterTarget/);
         } finally {
             for (const s of sids) rmSync(agySessionPath(s), { force: true });
             rmSync(appData, { recursive: true, force: true });
@@ -1386,8 +1396,20 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
                 { pointer: "src/net/client.js:L1-L5", code: "L1: // keep\n" },
                 { pointer: "src/header.js:L1-L45" },
             ];
-            backfillCompactPointerHits(repo, backfillHits, 4000, pointerCovers, "pendingConfirmationToken pendingEmailConfirmToken");
-            assert.match(String(backfillHits[1].code || ""), /pendingEmailConfirmToken/, "backfill inlines query-matched window inside 29-140L span");
+            backfillCompactPointerHits(repo, backfillHits, 4000, pointerCovers, { narrowPrompt: false });
+            assert.equal(backfillHits[1].code, undefined, ">24L query-window partial backfill is disabled to avoid uncached bloat");
+            const compactHits = [
+                { pointer: "src/net/client.js:L1-L5", code: "L1: // keep\n" },
+                { pointer: "src/store.js:L1-L2" },
+            ];
+            backfillCompactPointerHits(repo, compactHits, 4000, pointerCovers, { narrowPrompt: false });
+            assert.ok(compactHits[1].code && compactHits[1].code.includes("updateStoreEntry"), "compact <=24L top-3 hit still backfills cleanly");
+            const narrowSkipHits = [
+                { pointer: "src/net/client.js:L1-L5", code: "L1: // keep\n" },
+                { pointer: "src/store.js:L1-L2" },
+            ];
+            backfillCompactPointerHits(repo, narrowSkipHits, 4000, pointerCovers, { narrowPrompt: true });
+            assert.equal(narrowSkipHits[1].code, undefined, "narrowPrompt skips backfill");
 
             const { loadGraphCached } = await import("../src/context/graph-store.js");
             const { contextDirFor } = await import("../src/util/paths.js");
@@ -1395,9 +1417,9 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             const storeTests = links.testsForFile("src/store.js");
             assert.equal(storeTests[0]?.testFile, "test/store.test.js", "exact stem companion test must outrank indirect barrel test");
 
-            // 6. Top-of-file page-1 widening, bare plexer off-PATH rewrite, repeatable --in & --!strict grep
-            const page1 = computeReadPreToolWidening({ Path: join(repo, "src", "large_suite.js"), StartLine: 1, EndLine: 130 }, repo, { seenSpans: {}, fileSliceCounts: {}, lastFileReadEnd: {} });
-            assert.ok(page1 && page1.startLine === 1 && page1.endLine >= 250 && page1.endLine <= 360, `expected page-1 widen, got ${JSON.stringify(page1)}`);
+            // 6. Top-of-file page-1 widening (on edit prompts), bare plexer off-PATH rewrite, repeatable --in & --!strict grep
+            const page1 = computeReadPreToolWidening({ Path: join(repo, "src", "large_suite.js"), StartLine: 1, EndLine: 130 }, repo, { seenSpans: {}, fileSliceCounts: {}, lastFileReadEnd: {}, isEditPrompt: true });
+            assert.ok(page1 && page1.startLine === 1 && page1.endLine >= 200 && page1.endLine <= 240, `expected page-1 widen, got ${JSON.stringify(page1)}`);
 
             process.env.PATH = "";
             const offPathCmd = rewriteSingleNpxPlexerCommand("plexer read src/store.js:L1-L2");
@@ -1453,6 +1475,145 @@ describe("Antigravity Gemini 4 Perf, Concurrency, PreTool/PostTool & CLI Contrac
             process.env.PATH = prevPath;
             for (const s of sids) rmSync(agySessionPath(s), { force: true });
             rmSync(appData, { recursive: true, force: true });
+            rmSync(repo, { recursive: true, force: true });
+        }
+    });
+
+    it("enforces surgical mid-file safety, Fast-Gemini widening limits, <=32 call sites + noise pruning, coalesced _batch grep, and Gemini CLI parity", async () => {
+        const repo = makeTempRepo("plexer-gem-opt-");
+        const sids = [];
+        const mkSid = (p) => {
+            const s = `${p}-${process.pid}-${Date.now()}-${sids.length}`;
+            sids.push(s);
+            return s;
+        };
+        try {
+            // 1. Surgical mid-file read (L55-L90 on 190L file) must NOT widen to whole file; Fast vs standard Gemini tiers
+            const lines190 = Array.from({ length: 190 }, (_, i) => `export const row_${i + 1} = ${i + 1};`).join("\n") + "\n";
+            const midFile = join(repo, "src", "mid190.js");
+            writeFileSync(midFile, lines190, "utf8");
+            await buildGraph(repo, { force: true });
+
+            const midWiden = computeReadPreToolWidening(
+                { Path: midFile, StartLine: 55, EndLine: 90 },
+                repo,
+                { seenSpans: {}, fileSliceCounts: {}, lastFileReadEnd: {} },
+                { geminiProfile: true, fastProfile: false },
+            );
+            assert.equal(midWiden, null, "surgical mid-file read L55-L90 on 190L file must not widen to full file");
+
+            const topFast = computeReadPreToolWidening(
+                { Path: midFile, StartLine: 1, EndLine: 60 },
+                repo,
+                { seenSpans: {}, fileSliceCounts: {}, lastFileReadEnd: {} },
+                { geminiProfile: true, fastProfile: true },
+            );
+            assert.equal(topFast, null, "Fast-Gemini skips whole-file widen at 190L (> FAST_FULL_WIDEN_MAX_LINES=180)");
+
+            const topStd = computeReadPreToolWidening(
+                { Path: midFile, StartLine: 1, EndLine: 60 },
+                repo,
+                { seenSpans: {}, fileSliceCounts: {}, lastFileReadEnd: {} },
+                { geminiProfile: true, fastProfile: false },
+            );
+            assert.ok(topStd && topStd.endLine === 190, "Standard Gemini still widens <=220L sequential top read");
+
+            // 2. <=32 call sites inline completely without `+1 more` & unrelated secondary hit code pruned
+            const callSites27 = Array.from({ length: 27 }, (_, i) => `caller_${i + 1} (src/callers/f${(i % 5) + 1}.js:L${i + 10})`);
+            const rendered = formatRetrieval(
+                {
+                    query: "hasPermission callers",
+                    isEditPrompt: false,
+                    confidenceTier: "high",
+                    hits: [
+                        {
+                            kind: "symbol",
+                            title: "hasPermission · function",
+                            pointer: "src/auth.js:L1-L20",
+                            code: "1: export function hasPermission() { return true; }",
+                            wantsCallSites: true,
+                            callSites: callSites27,
+                        },
+                        {
+                            kind: "symbol",
+                            title: "unrelatedHelper · function",
+                            pointer: "src/noise.js:L1-L30",
+                            code: "1: export function unrelatedHelper() { return 'NOISE_BODY'; }",
+                        },
+                        {
+                            kind: "symbol",
+                            title: "callerTarget · function",
+                            pointer: "src/callers/f1.js:L1-L15",
+                            code: "1: export function callerTarget() { return 'KEEP_CALLER'; }",
+                        },
+                    ],
+                },
+                5,
+                { geminiProfile: true, prompt: "Where is hasPermission checked?" },
+            );
+            assert.ok(rendered);
+            assert.doesNotMatch(rendered, /more — run `plexer callers/, "27 call sites must inline completely under 34 cap");
+            assert.doesNotMatch(rendered, /NOISE_BODY/, "unrelated secondary hit code must be pruned on saturated caller query");
+            assert.match(rendered, /KEEP_CALLER/, "caller file hit retains code");
+
+            // 3. _batch coalesces compatible grep subcommands without trailing-path ambiguity
+            writeFileSync(join(repo, "src", "alpha.js"), "export const uniqueAlphaNeedle = 1;\n");
+            writeFileSync(join(repo, "src", "package.json"), "{\"name\":\"pkg\"}\n");
+            await buildGraph(repo, { force: true });
+            const batchPayload = Buffer.from(
+                JSON.stringify([["grep", "uniqueAlphaNeedle"], ["grep", "package.json"]]),
+                "utf8",
+            ).toString("base64url");
+            let batchOut = "";
+            await runCli(["node", "plexer", "_batch", batchPayload], {
+                isCaptured: true,
+                cwd: repo,
+                writeOut: (s) => { batchOut += String(s ?? ""); },
+                writeErr: () => {},
+                exit: () => {},
+            });
+            assert.match(batchOut, /uniqueAlphaNeedle/);
+
+            // 4. Gemini CLI BeforeAgent / BeforeTool (0-based offset/limit surgical slice protection) / AfterTool parity
+            const gemCliSid = mkSid("gem-cli");
+            const beforeAgentOut = JSON.parse(
+                await dispatchHostEvent(
+                    "gemini-before-agent",
+                    {
+                        cwd: repo,
+                        session_id: gemCliSid,
+                        model: "gemini-4-hydrogen-medium",
+                        prompt: `Working directory: ${repo}\nCheck row_60 in src/mid190.js`,
+                    },
+                    { captureStdout: true },
+                ),
+            );
+            assert.equal(beforeAgentOut.hookSpecificOutput?.hookEventName, "BeforeAgent");
+            const gemPreSurg = await dispatchHostEvent(
+                "gemini-before-tool",
+                {
+                    cwd: repo,
+                    session_id: gemCliSid,
+                    model: "gemini-4-hydrogen-medium",
+                    tool_name: "read_file",
+                    tool_input: { file_path: midFile, offset: 54, limit: 36 },
+                },
+                { captureStdout: true },
+            );
+            assert.equal(gemPreSurg, "{}\n", "0-based offset=54 limit=36 (L55-L90) surgical read stays untouched in Gemini CLI BeforeTool");
+            await dispatchHostEvent(
+                "gemini-after-tool",
+                {
+                    cwd: repo,
+                    session_id: gemCliSid,
+                    tool_name: "read_file",
+                    tool_input: { file_path: midFile, offset: 54, limit: 36 },
+                },
+                { captureStdout: true },
+            );
+            assert.ok(readAgySession(gemCliSid).seenSpans["src/mid190.js"], "Gemini CLI AfterTool records seenSpans");
+        } finally {
+            for (const s of sids) rmSync(agySessionPath(s), { force: true });
             rmSync(repo, { recursive: true, force: true });
         }
     });

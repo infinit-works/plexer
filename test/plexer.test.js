@@ -405,11 +405,11 @@ describe("Luau / Roblox Graph Indexing, Querying, Viz & MCP", () => {
                 [...PLEXER_MCP_TOOL_CANONICAL].sort(),
             );
             for (const t of TOOLS) {
-                assert.equal(t.annotations?.readOnlyHint, true, `${t.name} must advertise readOnlyHint: true`);
+                assert.equal(t.annotations?.readOnlyHint, t.name !== "plexer_health", `${t.name} readOnlyHint mismatch`);
                 assert.equal(t.annotations?.destructiveHint, false, `${t.name} must advertise destructiveHint: false`);
             }
             const instr = mcpInstructions();
-            assert.ok(instr.length <= 1050, `mcpInstructions (${instr.length} chars) must stay concise`);
+            assert.ok(instr.length <= 1000, `mcpInstructions (${instr.length} chars) must stay concise`);
             for (const name of PLEXER_MCP_TOOL_CANONICAL) {
                 assert.ok(instr.includes(name), `mcpInstructions must document ${name}`);
                 assert.ok(toolSearchQuery().includes(`mcp__plexer__${name}`));
@@ -569,8 +569,8 @@ describe("Tokenization, Stemming, Doc Summaries, Crux Synthesis & Symbol Resolut
 
             // 1. Short function (<=35 lines) is inlined 100% contiguously
             const shortAsk = ask(tmp, "verifyShortToken", { source: true });
-            assert.ok(shortAsk.hits[0].code.includes("L1: export function verifyShortToken"));
-            assert.ok(shortAsk.hits[0].code.includes("L15: }"));
+            assert.ok(shortAsk.hits[0].code.includes("1: export function verifyShortToken"));
+            assert.ok(shortAsk.hits[0].code.includes("15: }"));
             assert.ok(!shortAsk.hits[0].code.includes("omitted"), "short <=35-line function must not omit interior lines");
 
             // 2. Long function (>35 lines) emits windowed excerpt with explicit omitted-line markers
@@ -805,12 +805,12 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
                 "updated .luaurc alias must resolve cross-file edge",
             );
 
-            // Same-size + same-mtime edit must still be caught by checkGraph (trustStat: false)
+            // Same-size + same-mtime edit must still be caught by checkGraph({ strict: true })
             const st = lstatSync(targetPath);
             writeFileSync(targetPath, "local M = {}\nfunction M.run()\n\treturn 2\nend\nreturn M\n");
             utimesSync(targetPath, st.atime, st.mtime);
-            const chk = await checkGraph(tmp);
-            assert.equal(chk.ok, false, "checkGraph must hash content and detect same-size/same-mtime edit");
+            const chk = await checkGraph(tmp, { strict: true });
+            assert.equal(chk.ok, false, "checkGraph({ strict: true }) must hash content and detect same-size/same-mtime edit");
 
             // Luau table field aliasing vs nested local shadowing
             const luauSrc = [
@@ -1249,7 +1249,7 @@ describe("Regressions: Cards, Build Config, Diff Parsing, Extensions, Programmat
                 { encoding: "utf8" },
             );
             assert.ok(readOut.includes("src/scheduler.ts:L7-L13"), "plexer read should resolve unique basename and span");
-            assert.ok(readOut.includes("L8:   if (count > MAX_RERUNS)"), "plexer read should output L<n>: prefixed lines");
+            assert.ok(readOut.includes("8:   if (count > MAX_RERUNS)"), "plexer read should output <n>: prefixed lines");
             assert.ok(readOut.includes("src/consumer.ts:L5-L8"), "plexer read should resolve file:symbol to exact symbol span");
 
             // MAX_CLOSURE_NODES cap on impactOfMany with maxDepth=Infinity
@@ -2039,7 +2039,7 @@ describe("Pooled Span Budgets, Untyped Member Resolution, & Turn-0 Hook Gates", 
             assert.ok(dBlock, "d.ts block present");
             assert.equal(dBlock.span, "L1-L120", "120-line span should not be chopped to 45 lines when siblings are small");
             assert.equal(dBlock.truncated, false);
-            assert.ok(formatReadSpans(res4).includes("L120:"), "formatted output includes L120");
+            assert.ok(formatReadSpans(res4).includes("120:"), "formatted output includes 120:");
 
             // 2. Overlapping / adjacent same-file spans coalesce into 1 contiguous block
             const coalesced = readSpans(tmp, ["src/d.ts:L46-L120", "src/d.ts:L1-L85"]);

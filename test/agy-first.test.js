@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildGraph } from "../src/index.js";
 import { startDaemon } from "../src/daemon/plexerd.js";
-import { agySessionPath, emptyAgySession } from "../src/agy/session.js";
+import { agyLastRepoPath, agySessionPath, emptyAgySession, writeAgyLastRepo } from "../src/agy/session.js";
 import { resolveAgyRepoDir } from "../src/hosts/engine/agy-context.js";
 import { handleAgyPreInvocation } from "../src/hosts/engine/turn0.js";
 import { handleAgyPreTool } from "../src/hosts/engine/dispatcher.js";
@@ -153,7 +153,7 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
                 ),
             );
             assert.equal(outSlice2.decision, "allow");
-            assert.deepEqual(outSlice2.overwrite, { StartLine: 1, EndLine: ledgerTotalLines });
+            assert.deepEqual(outSlice2.overwrite, { StartLine: 80, EndLine: 339 });
 
             const noOps = [
                 { Path: join(repo, ".system_generated", "steps", "5", "output.txt"), StartLine: 1, EndLine: 10 },
@@ -279,7 +279,7 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
                 [CLI_BIN, "ask", "settleCustomerBilling", "--session", sidMatched],
                 { cwd: repo, encoding: "utf8", env: { ...process.env, PLEXER_NO_DAEMON: "1" } },
             );
-            assert.match(cliAskSeen, /\[already in session context: src\/small\.js:/);
+            assert.match(cliAskSeen, /\[seen: src\/small\.js:/);
 
             // Simulate agent reading src/small.js:1-80, then asking about formatCurrencyAmount (not yet in injectedPointers)
             handleAgyPostTool(
@@ -302,7 +302,7 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
                 ),
             );
             const t2Text = turn2.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-            assert.match(t2Text, /\[already in session context: src\/small\.js:/);
+            assert.equal(t2Text, "", "all-seen Turn-0 hits must return null without redundant injection");
 
             // Simulate /compact resetting step count from 20 -> 4 and clearing seenSpans
             const turnCompacted = JSON.parse(
@@ -317,8 +317,8 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
                 ),
             );
             const tCompText = turnCompacted.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-            assert.doesNotMatch(tCompText, /\[already in session context:/);
-            assert.match(tCompText, /L\d+:/);
+            assert.doesNotMatch(tCompText, /\[(?:seen|already in session context):/);
+            assert.match(tCompText, /^\d+:/m);
 
             // Turn 0 miss -> read_file PostToolUse -> at most one <=600B mid-loop graph hint -> silent afterward
             await handleAgyPreInvocation(
@@ -411,6 +411,22 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
                 { pluginRoot: PKG_ROOT, callerCwd: PKG_ROOT },
             );
             assert.equal(resolved, emptyNonGitDir);
+
+            // Empty workspacePaths must never bleed back to plexer-agy-last-repo.json or plugin CWD
+            const lastRepoFile = agyLastRepoPath();
+            const prevLastRepo = existsSync(lastRepoFile) ? readFileSync(lastRepoFile, "utf8") : null;
+            try {
+                writeAgyLastRepo(PKG_ROOT);
+                const resolvedEmptyWs = resolveAgyRepoDir(
+                    { workspacePaths: [] },
+                    emptyAgySession(),
+                    { pluginRoot: PKG_ROOT, callerCwd: PKG_ROOT },
+                );
+                assert.equal(resolvedEmptyWs, null, "empty workspacePaths must return null instead of lastRepo/plugin CWD");
+            } finally {
+                if (prevLastRepo === null) rmSync(lastRepoFile, { force: true });
+                else writeFileSync(lastRepoFile, prevLastRepo, "utf8");
+            }
 
             const geminiSkills = join(home, ".gemini", "skills");
             mkdirSync(geminiSkills, { recursive: true });
@@ -557,7 +573,7 @@ describe("Antigravity-First Plugin, PreToolUse Overwrite, Session State & Daemon
         const filtered = applySeenSpansFilter(askResult, spansFromHits);
         assert.equal(filtered.dedupedCount, 1);
         assert.equal(filtered.ask.hits[0].alreadySeen, true);
-        assert.equal(filtered.ask.hits[0].code, "// [already in session context: src/a.js:L10-L12]");
+        assert.equal(filtered.ask.hits[0].code, "// [seen: src/a.js:L10-L12]");
         assert.equal(filtered.ask.hits[1].alreadySeen, undefined);
         assert.equal(filtered.ask.hits[1].code, "L1: export const x = 1;");
 

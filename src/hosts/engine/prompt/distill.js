@@ -1,5 +1,5 @@
 import { basename } from 'node:path';
-import { stemToken, tokenize } from '../../../ask/index-file.js';
+import { stemToken, tokenize } from '../../../ask/tokenize.js';
 import { loadGraphCached } from '../../../context/graph-store.js';
 import { contextDirFor } from '../../../util/paths.js';
 import { cleanPromptBoilerplate } from './intent.js';

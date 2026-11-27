@@ -7,13 +7,11 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
-const { execFileSync, spawn } = require('node:child_process');
-const {
-    computeCodeStamp,
-    resolveSocketPath,
-    sendRpc,
-    waitForSocketTeardown,
-} = require('../src/daemon/ipc.cjs');
+
+let childProcMod = null;
+let ipcMod = null;
+const getChildProc = () => (childProcMod ??= require('node:child_process'));
+const getIpc = () => (ipcMod ??= require('../src/daemon/ipc.cjs'));
 
 const TURN0_EVENTS = new Set([
     'agy-pre-invocation',
@@ -71,7 +69,7 @@ function runDirectFallback({ event, rawStdin, pkgRoot, fallbackOut, timeoutMs })
         return;
     }
     try {
-        const out = execFileSync(process.execPath, [path.join(__dirname, 'plexer.js'), '_hook', event], {
+        const out = getChildProc().execFileSync(process.execPath, [path.join(__dirname, 'plexer.js'), '_hook', event], {
             input: rawStdin,
             encoding: 'utf8',
             timeout: timeoutMs,
@@ -87,30 +85,65 @@ function runDirectFallback({ event, rawStdin, pkgRoot, fallbackOut, timeoutMs })
     }
 }
 
+const DAEMON_STRIP_EXACT = new Set([
+    'PLEXER_SESSION_ID',
+    'ANTIGRAVITY_CONVERSATION_ID',
+    'ANTIGRAVITY_SIDECAR_WEB_PORT',
+    'ANTIGRAVITY_AGENT',
+    'ANTIGRAVITY_PROJECT_DIR',
+    'PLEXER_DIR',
+    'PLEXER_ENABLE_BENCH_HOOKS',
+    'PLEXER_DISABLE_HOOKS',
+    'PLEXER_AGY_USER_MARKDOWN',
+    'PLEXER_TEST_STDIN',
+]);
+const DAEMON_STRIP_PREFIXES = ['CLAUDE_', 'CODEX_', 'GEMINI_', 'CURSOR_'];
+
+function buildCleanDaemonEnv(pkgRoot, sockPath) {
+    const env = {};
+    for (const [k, v] of Object.entries(process.env)) {
+        if (DAEMON_STRIP_EXACT.has(k)) continue;
+        if (DAEMON_STRIP_PREFIXES.some((p) => k.startsWith(p))) continue;
+        env[k] = v;
+    }
+    env.PLUGIN_ROOT = process.env.PLUGIN_ROOT || pkgRoot;
+    env.PLEXER_DAEMON_SOCK = sockPath;
+    return env;
+}
+
+function readPkgVersion(pkgRoot) {
+    try {
+        return JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf8')).version || '';
+    }
+    catch {
+        return '';
+    }
+}
+
 function spawnDaemonProcess(pkgRoot, sockPath) {
-    const child = spawn(process.execPath, [path.join(__dirname, 'plexer.js'), '_daemon'], {
+    const child = getChildProc().spawn(process.execPath, [path.join(__dirname, 'plexer.js'), '_daemon'], {
         detached: true,
         stdio: 'ignore',
-        env: {
-            ...process.env,
-            PLUGIN_ROOT: process.env.PLUGIN_ROOT || pkgRoot,
-            PLEXER_DAEMON_SOCK: sockPath,
-        },
+        env: buildCleanDaemonEnv(pkgRoot, sockPath),
     });
     child.unref();
 }
 
-function buildHookRequest({ event, parsedInput, version, codeStamp, pkgRoot }) {
+function buildHookRequest({ event, parsedInput, version, pkgRoot }) {
     return {
         id: 1,
         type: 'hook',
         event,
         version,
-        codeStamp,
         input: parsedInput,
         envFlags: {
             disableHooks: process.env.PLEXER_DISABLE_HOOKS === '1' ? true : undefined,
-            enableBenchHooks: process.env.PLEXER_ENABLE_BENCH_HOOKS === '1' ? true : undefined,
+            enableBenchHooks: process.env.PLEXER_ENABLE_BENCH_HOOKS === '1'
+                ? true
+                : (process.env.PLEXER_ENABLE_BENCH_HOOKS === '0' ? false : undefined),
+            antigravityAgent: process.env.ANTIGRAVITY_AGENT === '1'
+                ? true
+                : (process.env.ANTIGRAVITY_AGENT === '0' ? false : undefined),
             enableUserMarkdown: process.env.PLEXER_AGY_USER_MARKDOWN === '1'
                 ? true
                 : (process.env.PLEXER_AGY_USER_MARKDOWN === '0' ? false : undefined),
@@ -143,14 +176,16 @@ function parseStdinJson(rawStdin) {
 }
 
 async function tryExistingDaemon(ctx) {
-    const { sockPath, req, codeStamp, connectTimeoutMs, rpcTimeoutMs, startedAt, totalBudgetMs, fallbackOut, event, rawStdin, pkgRoot } = ctx;
+    const { sockPath, req, version, connectTimeoutMs, rpcTimeoutMs, startedAt, totalBudgetMs, fallbackOut, event, rawStdin, pkgRoot } = ctx;
+    const { sendRpc, waitForSocketTeardown } = getIpc();
     try {
         const res = await sendRpc(sockPath, req, { connectTimeoutMs, rpcTimeoutMs });
-        if (res && !res.restartRequired && res.codeStamp === codeStamp && res.ok) {
+        const versionOk = !version || !res?.version || res.version === version;
+        if (res && !res.restartRequired && versionOk && res.ok) {
             writeAll(res.stdout || fallbackOut);
             return { handled: true, shouldSpawn: false };
         }
-        if (res && (res.restartRequired || res.codeStamp !== codeStamp)) {
+        if (res && (res.restartRequired || !versionOk)) {
             if (!res.restartRequired) {
                 await sendRpc(sockPath, { id: 99, type: 'shutdown' }, { connectTimeoutMs: 60, rpcTimeoutMs: 200 }).catch(() => null);
             }
@@ -174,7 +209,8 @@ async function tryExistingDaemon(ctx) {
 }
 
 async function spawnAndRetryDaemon(ctx) {
-    const { pkgRoot, sockPath, req, codeStamp, connectTimeoutMs, rpcTimeoutMs, startedAt, totalBudgetMs, fallbackOut } = ctx;
+    const { pkgRoot, sockPath, req, version, connectTimeoutMs, rpcTimeoutMs, startedAt, totalBudgetMs, fallbackOut } = ctx;
+    const { sendRpc } = getIpc();
     spawnDaemonProcess(pkgRoot, sockPath);
     const readyDeadline = Date.now() + 450;
     while (Date.now() < readyDeadline) {
@@ -185,7 +221,8 @@ async function spawnAndRetryDaemon(ctx) {
                 connectTimeoutMs,
                 rpcTimeoutMs: Math.min(rpcTimeoutMs, remainingRpcMs),
             });
-            if (res && !res.restartRequired && res.codeStamp === codeStamp && res.ok) {
+            const versionOk = !version || !res?.version || res.version === version;
+            if (res && !res.restartRequired && versionOk && res.ok) {
                 writeAll(res.stdout || fallbackOut);
                 return true;
             }
@@ -209,6 +246,7 @@ function canFastBypassPreTool(event, parsedInput) {
         event !== 'agy-pre-tool'
         && event !== 'pre-tool-use'
         && event !== 'claude-pre-tool'
+        && event !== 'codex-pre-tool'
         && event !== 'gemini-before-tool'
     ) {
         return false;
@@ -219,11 +257,33 @@ function canFastBypassPreTool(event, parsedInput) {
         ?? parsedInput?.toolName
         ?? '',
     ).trim();
-    if (!/^(?:run_command|Bash|run_shell_command)$/i.test(toolName))
+    if (!toolName)
+        return false;
+    if (!/^(?:read_file|view_file|Read|read|run_command|Bash|run_shell_command|shell|grep_search|Grep|find_by_name|Glob)$/i.test(toolName))
+        return true;
+    if (!/^(?:run_command|Bash|run_shell_command|shell)$/i.test(toolName))
         return false;
     const args = parsedInput?.toolCall?.args ?? parsedInput?.tool_input ?? parsedInput?.args ?? {};
     const cmd = String(args?.CommandLine ?? args?.command ?? '');
-    return !/(?:^|[\s;/\\"'`])(?:plexer|cat|head|tail|sed|e?grep|fgrep|rg|find)\b|\bgit\s+(?:grep|diff|log)\b/.test(cmd);
+    return !/(?:^|[\s;/\\"'`])(?:plexer|cat|head|tail|sed|nl|e?grep|fgrep|rg|find)\b|\bgit\s+(?:grep|diff|log)\b/.test(cmd);
+}
+
+function hasRepoAgentsHooksJson(startDir) {
+    if (!startDir) return false;
+    try {
+        const homeResolved = path.resolve(require('node:os').homedir());
+        let cur = path.resolve(startDir);
+        for (let i = 0; i < 25 && cur && cur !== homeResolved; i++) {
+            const cfg = path.join(cur, '.agents', 'hooks.json');
+            if (fs.existsSync(cfg) && fs.readFileSync(cfg, 'utf8').includes('plexer')) {
+                return true;
+            }
+            const parent = path.dirname(cur);
+            if (parent === cur) break;
+            cur = parent;
+        }
+    } catch { /* ignore */ }
+    return false;
 }
 
 async function main() {
@@ -237,6 +297,14 @@ async function main() {
 
     const rawStdin = readRawStdin();
     const parsedInput = parseStdinJson(rawStdin);
+    const pluginNeedle = `${path.sep}.gemini${path.sep}config${path.sep}plugins${path.sep}`;
+    if (event.startsWith('agy-') && process.env.PLEXER_TEST_STDIN === undefined && __dirname.includes(pluginNeedle)) {
+        const projectHint = process.env.ANTIGRAVITY_PROJECT_DIR || parsedInput?.workspacePaths?.[0] || process.cwd();
+        if (hasRepoAgentsHooksJson(projectHint)) {
+            writeAll(fallbackOut);
+            return;
+        }
+    }
     if (canFastBypassPreTool(event, parsedInput)) {
         writeAll(fallbackOut);
         return;
@@ -251,11 +319,12 @@ async function main() {
         return;
     }
 
-    const codeStamp = computeCodeStamp(pkgRoot);
+    const { resolveSocketPath } = getIpc();
+    const version = readPkgVersion(pkgRoot);
     const ctx = {
-        startedAt, event, fallbackOut, rawStdin, pkgRoot, codeStamp,
+        startedAt, event, fallbackOut, rawStdin, pkgRoot, version,
         sockPath: resolveSocketPath(),
-        req: buildHookRequest({ event, parsedInput, version: codeStamp.split(':')[0] || '', codeStamp, pkgRoot }),
+        req: buildHookRequest({ event, parsedInput, version, pkgRoot }),
         connectTimeoutMs, rpcTimeoutMs, totalBudgetMs,
     };
 
@@ -286,9 +355,9 @@ if (require.main === module) {
 
 module.exports = {
     TURN0_EVENTS,
-    computeCodeStamp,
+    computeCodeStamp: (...a) => getIpc().computeCodeStamp(...a),
     main,
-    resolveSocketPath,
-    sendRpc,
-    waitForSocketTeardown,
+    resolveSocketPath: (...a) => getIpc().resolveSocketPath(...a),
+    sendRpc: (...a) => getIpc().sendRpc(...a),
+    waitForSocketTeardown: (...a) => getIpc().waitForSocketTeardown(...a),
 };

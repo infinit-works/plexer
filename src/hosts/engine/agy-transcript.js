@@ -81,6 +81,17 @@ export function extractPathsFromEntry(obj, sessionState) {
     }
 }
 
+function modelTokens(raw) {
+    return String(raw ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/).filter(Boolean);
+}
+
+function modelDisplayMatchesId(displayLabel, modelId) {
+    if (!displayLabel || !modelId) return false;
+    const setA = new Set(modelTokens(displayLabel));
+    const toksB = modelTokens(modelId);
+    return setA.size > 0 && toksB.length > 0 && toksB.every((t) => setA.has(t));
+}
+
 export function extractMetadataContext(raw, sessionState) {
     if (!raw || typeof raw !== 'string' || !sessionState || typeof sessionState !== 'object')
         return;
@@ -90,17 +101,28 @@ export function extractMetadataContext(raw, sessionState) {
     }
     const settingsMatch = /<USER_SETTINGS_CHANGE>([\s\S]*?)(?:<\/USER_SETTINGS_CHANGE>|$)/i.exec(raw);
     if (settingsMatch?.[1]) {
-        const ms = /`Model Selection`\s+from\s+[^\n]+?\s+to\s+([^\n.]+)/i.exec(settingsMatch[1]);
-        if (ms?.[1]) {
-            const targetModel = ms[1].trim();
+        const ms = /`Model Selection`\s+from\s+([^\n]+?)\s+to\s+([^\n.]+)/i.exec(settingsMatch[1]);
+        if (ms?.[2]) {
+            const fromModel = ms[1].trim();
+            const targetModel = ms[2].trim();
             if (/orchestrator/i.test(targetModel)) {
                 sessionState.isOrchestratorModel = true;
+                sessionState.orchestratorExplicitlyDisabled = false;
                 if (!sessionState.orchestratorPhase)
                     sessionState.orchestratorPhase = 'plan';
             }
-            else if (/claude|gemini|neon|carbon|argon|hydrogen|flash|gpt/i.test(targetModel)) {
-                sessionState.isOrchestratorModel = false;
-                sessionState.orchestratorPhase = null;
+            else if (/claude|gemini|neon|carbon|hydrogen|flash|gpt/i.test(targetModel)) {
+                const isFromNone = /^none$/i.test(fromModel);
+                const isFromOrch = /orchestrator/i.test(fromModel);
+                const matchesKnownRole = modelDisplayMatchesId(targetModel, sessionState.plannerModel)
+                    || modelDisplayMatchesId(targetModel, sessionState.executorModel);
+                if (!isFromNone && (isFromOrch || (sessionState.isOrchestratorModel && !matchesKnownRole))) {
+                    sessionState.isOrchestratorModel = false;
+                    sessionState.orchestratorExplicitlyDisabled = true;
+                    sessionState.orchestratorPhase = null;
+                    sessionState.plannerModel = null;
+                    sessionState.executorModel = null;
+                }
             }
         }
     }
@@ -111,18 +133,70 @@ export function stripUserRequestTags(text) {
     return (m ? m[1] : text).trim();
 }
 
-function loadFullTranscriptMap(transcriptPath) {
-    if (basename(transcriptPath) !== 'transcript.jsonl') return null;
+const FULL_HYDRATE_CHUNK_BYTES = 65536;
+const FULL_HYDRATE_MAX_SCAN_BYTES = 4 * 1024 * 1024;
+
+function hydrateFromFullTranscriptTail(transcriptPath, neededKeys) {
+    if (!neededKeys || neededKeys.size === 0 || basename(transcriptPath) !== 'transcript.jsonl')
+        return new Map();
     const fullPath = join(dirname(transcriptPath), 'transcript_full.jsonl');
-    if (!existsSync(fullPath)) return null;
+    if (!existsSync(fullPath))
+        return new Map();
+    let fd = null;
     try {
-        const byKey = new Map();
-        for (const raw of readFileSync(fullPath, 'utf8').split('\n')) {
-            if (!raw.trim()) continue;
-            try { const o = JSON.parse(raw); if (o?.step_index !== undefined) byKey.set(`${o.step_index}:${o.type ?? ''}`, o); } catch {}
+        const size = statSync(fullPath).size;
+        if (size <= 0) return new Map();
+        const found = new Map();
+        const remaining = new Set(neededKeys);
+        const minPos = Math.max(0, size - FULL_HYDRATE_MAX_SCAN_BYTES);
+        fd = openSync(fullPath, 'r');
+        let endPos = size;
+        let carry = '';
+        while (endPos > minPos && remaining.size > 0) {
+            const readPos = Math.max(minPos, endPos - FULL_HYDRATE_CHUNK_BYTES);
+            const len = endPos - readPos;
+            const buf = Buffer.allocUnsafe(len);
+            let total = 0;
+            while (total < len) {
+                const n = readSync(fd, buf, total, len - total, readPos + total);
+                if (n <= 0) break;
+                total += n;
+            }
+            if (total <= 0) break;
+            const text = buf.subarray(0, total).toString('utf8') + carry;
+            const lines = text.split('\n');
+            carry = readPos > 0 ? (lines.shift() ?? '') : '';
+            for (let i = lines.length - 1; i >= 0 && remaining.size > 0; i--) {
+                const raw = lines[i];
+                if (!raw || !raw.trim() || !raw.includes('"step_index"')) continue;
+                try {
+                    const o = JSON.parse(raw);
+                    if (o?.step_index !== undefined) {
+                        const key = `${o.step_index}:${o.type ?? ''}`;
+                        if (remaining.has(key)) {
+                            found.set(key, o);
+                            remaining.delete(key);
+                        }
+                    }
+                } catch { /* ignore malformed line */ }
+            }
+            endPos = readPos;
         }
-        return byKey;
-    } catch { return null; }
+        if (remaining.size > 0 && endPos === 0 && carry.trim() && carry.includes('"step_index"')) {
+            try {
+                const o = JSON.parse(carry);
+                if (o?.step_index !== undefined) {
+                    const key = `${o.step_index}:${o.type ?? ''}`;
+                    if (remaining.has(key)) found.set(key, o);
+                }
+            } catch { /* ignore */ }
+        }
+        return found;
+    } catch {
+        return new Map();
+    } finally {
+        if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
+    }
 }
 
 function readTranscriptSlice(transcriptPath, sessionState) {
@@ -173,7 +247,30 @@ function extractSubagentSystemMessage(parsed, sessionState = null) {
     return cleaned;
 }
 
+export function capturePreCompactionTargets(sessionState) {
+    if (!sessionState || typeof sessionState !== 'object') return [];
+    const raw = [
+        ...(Array.isArray(sessionState.postCompactAnchorFiles) ? sessionState.postCompactAnchorFiles : []),
+        ...(Array.isArray(sessionState.planTargetFiles) ? sessionState.planTargetFiles : []),
+        ...(Array.isArray(sessionState.editTargetFiles) ? sessionState.editTargetFiles : []),
+        sessionState.lastEditedFile,
+        sessionState.lastReadRelFile,
+    ];
+    const out = [];
+    const seen = new Set();
+    for (const item of raw) {
+        const p = typeof item === 'string' ? item.trim() : '';
+        if (!p || (isAbsolute(p) && isIgnoredTouchedPath(p)) || seen.has(p)) continue;
+        seen.add(p);
+        out.push(p);
+        if (out.length >= 3) break;
+    }
+    sessionState.postCompactAnchorFiles = out;
+    return out;
+}
+
 function resetTranscriptCompactionState(sessionState) {
+    capturePreCompactionTargets(sessionState);
     sessionState.seenSpans = {};
     sessionState.fileSliceCounts = {};
     sessionState.lastFileReadEnd = {};
@@ -183,27 +280,76 @@ function resetTranscriptCompactionState(sessionState) {
     sessionState.turn0Matched = false;
     sessionState.midLoopHintEmitted = false;
     sessionState.lastBlockedReadKey = null;
+    sessionState.blockedReadKeys = [];
+    sessionState.lastBlockedSearchKey = null;
+    sessionState.blockedSearchKeys = [];
     sessionState.isEditPrompt = false;
     sessionState.editTargetFiles = [];
+    sessionState.planTargetFiles = [];
+    sessionState.pendingPlanText = null;
+    sessionState.pendingPlanWorkspaceDirs = [];
     sessionState.preEditInvocations = 0;
     sessionState.editedInPrompt = false;
     sessionState.exploreGuardEmitted = false;
     sessionState.exploreGuardStage = 0;
+    sessionState.orchestratorPhase = sessionState.isOrchestratorModel ? 'plan' : null;
 }
 
 function applyTranscriptEntry(parsed, stepFallback, sessionState) {
     extractPathsFromEntry(parsed, sessionState);
     const stepType = String(parsed?.type ?? '').toUpperCase();
     const stepSrc = String(parsed?.source ?? '').toUpperCase();
-    const stepIdx = parsed?.step_index ?? parsed?.step ?? parsed?.index ?? stepFallback;
+    const explicitStep = parsed?.step_index ?? parsed?.step ?? parsed?.index;
+    const hasExplicitStep = typeof explicitStep === 'number' && Number.isFinite(explicitStep);
+    const stepIdx = hasExplicitStep ? explicitStep : stepFallback;
     if (stepType === 'CHECKPOINT') {
-        if (typeof sessionState.lastCheckpointStep !== 'number' || (typeof stepIdx === 'number' && stepIdx > sessionState.lastCheckpointStep)) {
+        if (!hasExplicitStep || typeof sessionState.lastCheckpointStep !== 'number' || explicitStep > sessionState.lastCheckpointStep) {
             resetTranscriptCompactionState(sessionState);
-            if (typeof stepIdx === 'number') sessionState.lastCheckpointStep = stepIdx;
+            if (hasExplicitStep) sessionState.lastCheckpointStep = explicitStep;
+        }
+        return;
+    }
+    if (stepType === 'PLANNER_RESPONSE') {
+        const calls = [...(parsed?.tool_calls ?? []), ...(parsed?.toolCalls ?? [])];
+        const stepModel = typeof parsed?.model === 'string' ? parsed.model.trim() : '';
+        const hasExitPlan = calls.some((c) => c?.name === 'exit_plan_mode' || c?.name === 'ExitPlanMode');
+        const hasEnterPlan = calls.some((c) => c?.name === 'enter_plan_mode' || c?.name === 'EnterPlanMode');
+        if (hasExitPlan) {
+            sessionState.isOrchestratorModel = true;
+            sessionState.orchestratorExplicitlyDisabled = false;
+            if (stepModel) sessionState.plannerModel = stepModel;
+            sessionState.orchestratorPhase = 'execute';
+        }
+        else if (hasEnterPlan) {
+            sessionState.isOrchestratorModel = true;
+            sessionState.orchestratorExplicitlyDisabled = false;
+            if (stepModel) sessionState.executorModel = stepModel;
+            sessionState.orchestratorPhase = 'plan';
+        }
+        if (stepModel) {
+            sessionState.lastObservedModel = stepModel;
+            if (sessionState.isOrchestratorModel && sessionState.orchestratorPhase === 'execute'
+                && sessionState.plannerModel && stepModel !== sessionState.plannerModel && !hasExitPlan && !hasEnterPlan) {
+                sessionState.executorModel = stepModel;
+            }
+            else if (sessionState.isOrchestratorModel && sessionState.plannerModel && sessionState.executorModel
+                && stepModel === sessionState.plannerModel && stepModel !== sessionState.executorModel
+                && sessionState.orchestratorPhase === 'execute' && !hasExitPlan) {
+                sessionState.orchestratorPhase = 'plan';
+            }
         }
         return;
     }
     if (stepSrc === 'SYSTEM_SDK') return;
+    if (stepType === 'SYSTEM_MESSAGE' || stepSrc === 'SYSTEM') {
+        const rawSysText = extractRawTextContent(parsed);
+        if (/\[plan review(?:\s+due)?\]/i.test(rawSysText)) {
+            sessionState.isOrchestratorModel = true;
+            sessionState.orchestratorExplicitlyDisabled = false;
+            sessionState.orchestratorPhase = 'plan';
+            return;
+        }
+    }
     const subagentMsg = extractSubagentSystemMessage(parsed, sessionState);
     if (stepType === 'SYSTEM_MESSAGE' || stepSrc === 'SYSTEM') {
         if (!subagentMsg) return;
@@ -232,8 +378,6 @@ function applyTranscriptEntry(parsed, stepFallback, sessionState) {
 function entryNeedsFullTranscriptHydration(parsed, sessionState = null) {
     if (!parsed || parsed.step_index === undefined || !Array.isArray(parsed.truncated_fields))
         return false;
-    if (parsed.truncated_fields.includes('tool_calls'))
-        return true;
     if (!parsed.truncated_fields.includes('content'))
         return false;
     const stepType = String(parsed?.type ?? '').toUpperCase();
@@ -259,18 +403,47 @@ export function parseAgyTranscript(transcriptPath, sessionState) {
     try {
         const slice = readTranscriptSlice(transcriptPath, sessionState);
         if (!slice) return sessionState;
-        sessionState.transcriptOffset = slice.offset + slice.consumed;
+        const nextOffset = slice.offset + slice.consumed;
+        if (nextOffset !== sessionState.transcriptOffset) {
+            Object.defineProperty(sessionState, '_dirtyTranscriptOffset', {
+                value: true,
+                configurable: true,
+                enumerable: false,
+                writable: true,
+            });
+        }
+        sessionState.transcriptOffset = nextOffset;
         sessionState.transcriptSize = slice.size;
         const lines = slice.processable.split('\n').filter((l) => l.trim().length > 0);
-        let fullMap;
+        const parsedEntries = [];
+        const neededKeys = new Set();
+        const hydrationState = {
+            hasDirectUserInput: Boolean(sessionState?.hasDirectUserInput),
+            lastUserPrompt: sessionState?.lastUserPrompt,
+            subagentSenderId: sessionState?.subagentSenderId,
+        };
         for (let i = 0; i < lines.length; i++) {
             let parsed = null;
             try { parsed = JSON.parse(lines[i]); } catch { continue; }
-            if (entryNeedsFullTranscriptHydration(parsed, sessionState)) {
-                parsed = (fullMap ??= loadFullTranscriptMap(transcriptPath))?.get(`${parsed.step_index}:${parsed.type ?? ''}`) ?? parsed;
+            if (entryNeedsFullTranscriptHydration(parsed, hydrationState)) {
+                neededKeys.add(`${parsed.step_index}:${parsed.type ?? ''}`);
             }
-            applyTranscriptEntry(parsed, slice.offset + i, sessionState);
+            const stepRole = parsed?.role ?? parsed?.type ?? parsed?.author ?? parsed?.message?.role;
+            if (stepRole === 'user' || stepRole === 'human' || stepRole === 'USER_INPUT' || parsed?.user_input || parsed?.userPrompt) {
+                hydrationState.hasDirectUserInput = true;
+            }
+            parsedEntries.push(parsed);
         }
+        const fullMap = neededKeys.size > 0 ? hydrateFromFullTranscriptTail(transcriptPath, neededKeys) : null;
+        const baseStep = typeof sessionState.transcriptStepSeq === 'number' ? sessionState.transcriptStepSeq : 0;
+        for (let i = 0; i < parsedEntries.length; i++) {
+            let parsed = parsedEntries[i];
+            if (fullMap && parsed?.step_index !== undefined) {
+                parsed = fullMap.get(`${parsed.step_index}:${parsed.type ?? ''}`) ?? parsed;
+            }
+            applyTranscriptEntry(parsed, baseStep + i, sessionState);
+        }
+        sessionState.transcriptStepSeq = baseStep + parsedEntries.length;
     } catch { /* ignore read errors */ }
     return sessionState;
 }

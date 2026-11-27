@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const { StringDecoder } = require('node:string_decoder');
 
 function walkStampTree(dir, acc) {
     let entries;
@@ -80,6 +81,7 @@ function sendRpc(sockPath, reqObj, opts = {}) {
     const rpcTimeoutMs = Math.max(50, Number(opts.rpcTimeoutMs) || 7500);
     return new Promise((resolve, reject) => {
         const sock = net.createConnection(sockPath);
+        const decoder = new StringDecoder('utf8');
         let settled = false;
         let connected = false;
         let buf = '';
@@ -120,20 +122,23 @@ function sendRpc(sockPath, reqObj, opts = {}) {
         });
 
         sock.on('data', (chunk) => {
-            buf += chunk.toString('utf8');
+            buf += Buffer.isBuffer(chunk) ? decoder.write(chunk) : String(chunk);
             const nl = buf.indexOf('\n');
             if (nl !== -1 && !settled) {
+                let parsed;
+                try {
+                    parsed = JSON.parse(buf.slice(0, nl));
+                }
+                catch (err) {
+                    finishErr(err, 'rpc');
+                    return;
+                }
                 settled = true;
                 clearTimeout(connectTimer);
                 if (rpcTimer)
                     clearTimeout(rpcTimer);
                 sock.end();
-                try {
-                    resolve(JSON.parse(buf.slice(0, nl)));
-                }
-                catch (err) {
-                    finishErr(err, 'rpc');
-                }
+                resolve(parsed);
             }
         });
 
@@ -174,13 +179,16 @@ async function waitForSocketTeardown(sockPath, maxWaitMs = 500) {
     const isPipe = process.platform === 'win32' || sockPath.startsWith('\\\\.\\pipe\\');
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
-        if (!isPipe && !fs.existsSync(sockPath))
+        if (isPipe) {
+            if (!(await isSocketReachable(sockPath, 30)))
+                return true;
+        }
+        else if (!fs.existsSync(sockPath)) {
             return true;
-        if (!(await isSocketReachable(sockPath, 30)))
-            return !isPipe ? !fs.existsSync(sockPath) : true;
+        }
         await new Promise((r) => setTimeout(r, 20));
     }
-    return isPipe ? true : !fs.existsSync(sockPath);
+    return isPipe ? !(await isSocketReachable(sockPath, 30)) : !fs.existsSync(sockPath);
 }
 
 module.exports = {

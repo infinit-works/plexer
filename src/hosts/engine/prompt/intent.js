@@ -14,7 +14,9 @@ const META_PROJECT_STATUS_RE = /^(?:what(?:'s|\s+is|\s+are)\s+(?:the\s+)?(?:curr
 const META_PHILOSOPHY_RE = /^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:explain|describe|summarize|tell\s+me(?:\s+about)?|walk\s+me\s+through|what\s+is)\s+(?:the\s+)?(?:high[- ]level\s+|overall\s+|core\s+|general\s+)?(?:philosophy|vision|motivation|purpose|goals?|rationale|design\s+philosophy|guiding\s+principles?)\s+(?:behind|of|for)\s+(?:this|the|our)\s+(?:project|repo|repository|tool|library|system)\b/i;
 const META_EVALUATION_RE = /\b(?:why\s+is\s+[a-z0-9_-]+\s+performing\b|performing\s+(?:worse|better|poorly)|tokens?\s+(?:usage\s+)?saved|wall[- ]?time\s+saved|high[- ]leverage\s+changes|benchmark(?:s|ing)?\s+(?:regress(?:ion|ed)?|suite|numbers)|(?:improve|optimi[sz]e)\s+(?:the\s+)?performance\s+of\b[\s\S]{0,60}\bmodels?\b|best\s+token\s+usage\s+and\s+time\s+reduction)\b/i;
 const SYNTHETIC_PREFIX_RE = /^(?:<task-notification>|<system-reminder>|<local-command-|<SYSTEM_MESSAGE>\b|The following is a <SYSTEM_MESSAGE>|\[plan review(?:\s+due)?\]|Another Claude session sent a message:|\[Request interrupted by user\]$)/i;
-const EDIT_VERB_RE = /\b(implement|add|extend|replace|update|rewrite|centralize|expose|forward|support)\b/i;
+const EDIT_VERB_LIST = 'implement|add|extend|replace|update|rewrite|centralize|expose|forward|support|fix|resolve|patch|repair|modify|change|refactor|migrate|remove|delete|rename|convert|extract|handle|prevent|avoid|normalize|validate|align|enforce|preserve|propagate';
+const EDIT_VERB_RE = new RegExp(`\\b(?:${EDIT_VERB_LIST})\\b`, 'i');
+const NEGATED_EDIT_RE = new RegExp(`\\b(?:do\\s+not|don't|dont|never|without|not\\s+to)\\s+(?:[a-z]+\\s+){0,2}(?:${EDIT_VERB_LIST})\\b`, 'gi');
 
 /** True when a prompt is a synthetic harness notification, interrupt, or meta-only prompt. */
 export function isSyntheticOrMetaPrompt(raw) {
@@ -48,14 +50,29 @@ export function cleanPromptBoilerplate(raw) {
     return stripLeadingSlashCommands(body);
 }
 
+const LEADING_READ_ONLY_IMPERATIVES = 'explain|describe|trace|list|summarize|audit|review|diagnose|investigate|analyze|inspect|show|check|find|locate|identify|compare';
+const LEADING_READ_ONLY_RE = new RegExp(`^(?:(?:can|could|would)\\s+you\\s+(?:please\\s+)?|please\\s+)?(?:${LEADING_READ_ONLY_IMPERATIVES})\\b`, 'i');
+
 function hasActionableEditIntent(raw, optsOrForce = false) {
     const forceReadOnly = typeof optsOrForce === 'boolean' ? optsOrForce : Boolean(optsOrForce?.forceReadOnly);
     const planMode = typeof optsOrForce === 'object' && Boolean(optsOrForce?.planMode);
     if (forceReadOnly || (!planMode && READ_ONLY_SLASH_RE.test(raw.trim())) || /\bAnswer concisely with exact\b/i.test(raw)) return false;
     const cleaned = stripLeadingSlashCommands(raw)
-        .replace(/\b(?:do\s+not|don't|dont|never|without|not\s+to)\s+(?:[a-z]+\s+){0,2}(?:implement|add|extend|replace|update|rewrite|centralize|expose|forward|support)\b/gi, '')
+        .replace(NEGATED_EDIT_RE, '')
         .trim();
     if (!EDIT_VERB_RE.test(cleaned)) return false;
+    const isLeadingReadOnly = LEADING_READ_ONLY_RE.test(cleaned);
+    if (isLeadingReadOnly) {
+        const roClauses = cleaned
+            .split(/[?;\n]+|,\s*(?:(?:and|then)\s+)?|\b(?:and\s+(?:then\s+)?|then\s+)\b/i)
+            .map((c) => c.trim()).filter(Boolean);
+        const hasPromptCode = CODE_SIGNAL_RE.test(cleaned);
+        const hasFollowUpEdit = roClauses.slice(1).some((c) => EDIT_VERB_RE.test(c)
+            && !LEADING_READ_ONLY_RE.test(c)
+            && !/^(?:how|why|what|where|when|which|who|whether|if|should|could|would|might|can|that)\b/i.test(c)
+            && (CODE_SIGNAL_RE.test(c) || hasPromptCode));
+        if (!hasFollowUpEdit) return false;
+    }
     const isInterrogative = /^(?:how|why|what|where|when|which|who|is|are|does|do|can\s+you\s+(?:explain|tell|show|walk))\b/i.test(cleaned);
     if (!isInterrogative && !cleaned.endsWith('?')) return true;
     if (isInterrogative && cleaned.endsWith('?') && !CODE_SIGNAL_RE.test(cleaned)) return false;
@@ -90,8 +107,18 @@ export function isLikelyEditSessionPrompt(prompt, opts = {}) {
         .replace(/^Working directory:[^\n]*\n*/i, '')
         .trim();
     if (!cleaned || cleaned.endsWith('?')) return false;
-    if (/^(?:how|why|what|where|when|which|who|is|are|does|do|can\s+you\s+(?:explain|tell|show|walk)|diagnose|explain|describe|trace|list|summarize|audit|review)\b/i.test(cleaned)) {
+    if (/^(?:how|why|what|where|when|which|who|is|are|does|do|can\s+you\s+(?:explain|tell|show|walk))\b/i.test(cleaned)) {
         return false;
+    }
+    if (LEADING_READ_ONLY_RE.test(cleaned)) {
+        const roClauses = cleaned
+            .split(/[?;\n]+|,\s*(?:(?:and|then)\s+)?|\b(?:and\s+(?:then\s+)?|then\s+)\b/i)
+            .map((c) => c.trim()).filter(Boolean);
+        const hasEditClause = CODE_SIGNAL_RE.test(cleaned) && roClauses.slice(1).some((c) =>
+            (EDIT_VERB_RE.test(c) || /\b(?:fix|resolve|patch|repair|prevent|handle)\b/i.test(c))
+            && !LEADING_READ_ONLY_RE.test(c)
+            && !/^(?:how|why|what|where|when|which|who|whether|if|should|could|would|might|can|that)\b/i.test(c));
+        if (!hasEditClause) return false;
     }
     if (/<pr_description>/i.test(raw)) return true;
     if (/^Working directory:/i.test(raw) && cleaned.length >= 120 && /\n/.test(cleaned)) return true;

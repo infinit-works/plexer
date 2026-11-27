@@ -110,7 +110,7 @@ describe("Round 6 compaction, shell routing, dedup, exploration gate, & grep com
             );
             assert.equal(
                 rewriteShellExplorationCommand("git log -p src/api/auth.ts", { repoRoot: repo }),
-                "git log --stat src/api/auth.ts -n 5",
+                "git log -p src/api/auth.ts -n 3",
             );
             assert.equal(rewriteShellExplorationCommand("git log -n 2 -p src/api/auth.ts", { repoRoot: repo }), null);
 
@@ -214,8 +214,8 @@ describe("Round 6 compaction, shell routing, dedup, exploration gate, & grep com
                 tool_name: "Grep",
                 tool_input: { pattern: "serviceStep", path: repo },
             }, { captureStdout: true }));
-            assert.equal(gateGrep.hookSpecificOutput?.permissionDecision, "deny");
-            assert.match(gateGrep.hookSpecificOutput?.permissionDecisionReason, /Exploration budget reached/);
+            assert.equal(gateGrep.hookSpecificOutput?.permissionDecision, "allow");
+            assert.match(gateGrep.hookSpecificOutput?.additionalContext, /Exploration budget reached/);
 
             const gateAgyNative = evaluateAgyPreTool(
                 { conversationId: sid, toolCall: { name: "grep_search", args: { Query: "other", SearchPath: repo } } },

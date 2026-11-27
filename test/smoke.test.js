@@ -93,8 +93,8 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             mkdirSync(join(repo, "src"), { recursive: true });
             const utilFile = join(repo, "src", "util.ts");
             const appFile = join(repo, "src", "app.ts");
-            writeFileSync(utilFile, "export function helper(x: number): number { return x + 1; }\n");
-            writeFileSync(appFile, "import { helper } from './util';\nexport function run(): number { return helper(41); }\n");
+            writeFileSync(utilFile, "export function computeAnswer(x: number): number { return x + 1; }\n");
+            writeFileSync(appFile, "import { computeAnswer } from './util';\nexport function run(): number { return computeAnswer(41); }\n");
 
             await buildGraph(repo);
             const builtStats = readStats(repo);
@@ -105,10 +105,24 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             const transcriptPath = join(repo, "transcript.jsonl");
             writeFileSync(
                 transcriptPath,
-                JSON.stringify({ role: "user", step: 1, content: "<USER_REQUEST>Where is helper called in app?</USER_REQUEST>" }) + "\n",
+                JSON.stringify({ role: "user", step: 1, content: "<USER_REQUEST>Summarize the history of ancient Rome.</USER_REQUEST>" }) + "\n",
             );
 
-            // 1. Pre-invocation: emits orientation + retrieval
+            // 1a. OOB Pre-invocation stays completely silent (0 B, no orientation dump)
+            const oobOut = JSON.parse(
+                runHookEvent("agy-pre-invocation", {
+                    sessionId,
+                    workspacePaths: [repo],
+                    transcriptPath,
+                }),
+            );
+            assert.deepEqual(oobOut, {});
+
+            // 1b. Repo-relevant Pre-invocation emits retrieved context for matched symbol
+            writeFileSync(
+                transcriptPath,
+                JSON.stringify({ role: "user", step: 2, content: "<USER_REQUEST>Where is computeAnswer called in app?</USER_REQUEST>" }) + "\n",
+            );
             const preOut1 = JSON.parse(
                 runHookEvent("agy-pre-invocation", {
                     sessionId,
@@ -118,13 +132,19 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             );
             assert.ok(Array.isArray(preOut1.injectSteps));
             const preMsg1 = preOut1.injectSteps[0].systemMessage?.systemMessage ?? preOut1.injectSteps[0].ephemeralMessage;
-            assert.ok(preMsg1.includes("[plexer] This repo is indexed by plexer."));
+            assert.ok(preMsg1.includes("computeAnswer") && preMsg1.includes("util.ts"));
 
-            // 2. Modify util.ts and trigger agy-post-edit (via both replace_file_content and edit_file)
-            writeFileSync(utilFile, "export function helper(x: number): number { return x + 2; }\n");
+            // 2. Modify util.ts in an editing session without pre-injected util.ts spans and trigger agy-post-edit
+            const editSessionId = `${sessionId}-edit`;
+            const editTranscriptPath = join(repo, "transcript-edit.jsonl");
+            writeFileSync(
+                editTranscriptPath,
+                JSON.stringify({ role: "user", step: 1, content: "<USER_REQUEST>Check blast behavior</USER_REQUEST>" }) + "\n",
+            );
+            writeFileSync(utilFile, "export function computeAnswer(x: number): number { return x + 2; }\n");
             const postOut = JSON.parse(
                 runHookEvent("agy-post-edit", {
-                    sessionId,
+                    sessionId: editSessionId,
                     workspacePaths: [repo],
                     toolCall: { name: "edit_file", args: { Path: JSON.stringify(utilFile) } },
                 }),
@@ -138,9 +158,9 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             // 3. Next agy-pre-invocation flushes pendingBlastRadius
             const preOut2 = JSON.parse(
                 runHookEvent("agy-pre-invocation", {
-                    sessionId,
+                    sessionId: editSessionId,
                     workspacePaths: [repo],
-                    transcriptPath,
+                    transcriptPath: editTranscriptPath,
                 }),
             );
             assert.ok(Array.isArray(preOut2.injectSteps));
@@ -163,6 +183,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
         } finally {
             rmSync(repo, { recursive: true, force: true });
             rmSync(agySessionPath(sessionId), { force: true });
+            rmSync(agySessionPath(`${sessionId}-edit`), { force: true });
         }
     });
 
@@ -369,12 +390,21 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
         const tmp = mkdtempSync(join(tmpdir(), "plexer-hook-run-"));
         const home = mkdtempSync(join(tmpdir(), "plexer-hook-home-"));
         try {
-            const fakeNode = join(tmp, "fake-node.sh");
+            const fakeBinDir = join(tmp, "fake-bin");
+            mkdirSync(fakeBinDir, { recursive: true });
+            const fakeNode = join(fakeBinDir, "node");
             writeFileSync(
                 fakeNode,
                 "#!/bin/sh\necho 'node: error while loading shared libraries: libsimdjson.so.36: cannot open shared object file' >&2\nexit 127\n",
             );
             chmodSync(fakeNode, 0o755);
+
+            const failOpenEnv = {
+                ...process.env,
+                PATH: `${fakeBinDir}:${process.env.PATH || "/usr/bin:/bin"}`,
+                XDG_DATA_HOME: tmp,
+            };
+            delete failOpenEnv.AGENT_HOOK_NODE;
 
             const exit2Script = join(tmp, "exit2.js");
             writeFileSync(exit2Script, "process.exit(2);\n");
@@ -392,7 +422,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
                 const res = spawnSync("sh", [runnerPath, clientPath, ev], {
                     cwd: pkgRoot,
                     encoding: "utf8",
-                    env: { ...process.env, AGENT_HOOK_NODE: fakeNode },
+                    env: failOpenEnv,
                 });
                 assert.equal(res.status, 0, `${ev}: expected fail-open exit 0, stderr=${res.stderr}`);
                 assert.deepEqual(JSON.parse(res.stdout), expected, `${ev}: expected valid fallback JSON`);
@@ -409,7 +439,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             const claudeCmd = mergePlexerHooks({}, join(tmp, "helpers")).merged.hooks.PreToolUse[0].hooks[0].command;
             const claudeRes = spawnSync("sh", ["-c", claudeCmd], {
                 encoding: "utf8",
-                env: { ...process.env, AGENT_HOOK_NODE: fakeNode },
+                env: failOpenEnv,
             });
             assert.equal(claudeRes.status, 0, `Claude command failed: ${claudeRes.stderr}`);
             assert.deepEqual(JSON.parse(claudeRes.stdout), {});
@@ -421,7 +451,7 @@ describe("Antigravity Hooks, Retraction & Global Setup", () => {
             const codexCmd = codexHooks.SessionStart[0].hooks[0].command;
             const codexRes = spawnSync("sh", ["-c", codexCmd], {
                 encoding: "utf8",
-                env: { ...process.env, AGENT_HOOK_NODE: fakeNode },
+                env: failOpenEnv,
             });
             assert.equal(codexRes.status, 0, `Codex command failed: ${codexRes.stderr}`);
             assert.deepEqual(JSON.parse(codexRes.stdout), {});

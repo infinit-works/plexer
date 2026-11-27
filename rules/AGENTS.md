@@ -1,8 +1,9 @@
 # Plexer Code Graph Rules
 
-Start repo tasks from Turn-0 `[plexer]` context instead of shell searches or file paging. This rule covers daily `plexer` usage: skip `plexer/SKILL.md`, and load `plexer-health` only for `plexer health` tasks.
+Start from Turn-0 `[plexer]` context instead of shell searches or file paging. Skip `plexer/SKILL.md` daily; load `plexer-health` only for `plexer health`.
 
-- **Zero-tool answers:** If Turn-0 `L<n>:` spans and `call sites` answer the prompt, reply directly citing `file:Lx-Ly` without running `plexer ask` or file reads.
-- **Edit-first, stop once green:** Edit localized `(named in prompt)` and `L<n>:` spans in Turn 1 without re-reading them or auditing unrelated files; skip `[already in session context: ...]`. When checks apply, run one narrow check after editing and stop once green (never hunt missing toolchains, repeat linters, or add unrequested test files).
-- **Batch & parallel turns:** Check `likely co-edits / tests` and `// other symbols in <file>` footers first. Pass 1–5 targeted spans (`<=200`L/file, without `--full`) in **1** `plexer read` call, issue separate tools (`plexer read` + `plexer grep`/`callers`) as parallel tool calls in 1 turn, and never `&&`-chain or add `echo` dividers. Use `read_file` on a `>200`-line file only when editing multiple regions of that file (never dump whole files on QA tasks).
-- **CLI:** `plexer read <file:sym|file:Lx-Ly ...>`, `plexer ask "<queries...>" [--in <dir>]`, `plexer callers|callees <syms...> [--depth 2|all]`, `plexer impact <files...>`, `plexer skeleton <files|dirs...>`, `plexer grep "<pat...>" [dir] [--fixed]`, `plexer map`.
+- **Zero-tool answers:** Cite Turn-0 `<n>:` spans and `call sites` (`file:Lx-Ly`) with 0 tool calls when sufficient.
+- **Edit-first, stop once green:** Edit localized `(named in prompt)` and `<n>:` spans directly without re-reading; skip `[seen: ...]`. Run one narrow check and stop.
+- **Batch & parallel:** Check `likely co-edits / tests` and `// other symbols`. Parallelize native file reads for medium/multi-file spans; use `plexer read` for compact targeted spans or symbol lookups, and parallelize edits/calls.
+- **Orchestrator / plan mode:** Answer Q&A in 0 calls; in plan mode never call `write_file`—localize once, keep `exit_plan_mode` concise (`file:Lx-Ly` spans and exact edit bullets, no full code reprints), then apply planned edits in 1 parallel turn.
+- **CLI:** `plexer read <file:sym|file:Lx-Ly ...>`, `ask "<q>" [--in dir]`, `callers|callees <syms...> [-d 2|all]`, `impact <syms...>`, `blast [--base ref]`, `skeleton <files...>`, `grep "<pat>" [--in dir] [-F] [-i]`, `map`.

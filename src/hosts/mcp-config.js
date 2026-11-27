@@ -33,15 +33,30 @@ const TOML_HEADER = '[mcp_servers.plexer]';
  * is exactly the shape {@link upsertCodexToml} appends. Exported so the writer and
  * `retract.js` can never disagree about what "plexer's section" means.
  */
+const isPlexerTomlHeader = (line) => {
+    const t = line.trim();
+    return t === TOML_HEADER || (t.startsWith('[mcp_servers.plexer.') && t.endsWith(']'));
+};
+
 export function stripTomlSection(text) {
     const lines = text.split('\n');
-    const start = lines.findIndex((l) => l.trim() === TOML_HEADER);
-    if (start === -1)
+    const kept = [];
+    let found = false;
+    let i = 0;
+    while (i < lines.length) {
+        if (isPlexerTomlHeader(lines[i])) {
+            found = true;
+            i += 1;
+            while (i < lines.length && !lines[i].trimStart().startsWith('['))
+                i += 1;
+            continue;
+        }
+        kept.push(lines[i]);
+        i += 1;
+    }
+    if (!found)
         return { rest: text, found: false };
-    let end = start + 1;
-    while (end < lines.length && !lines[end].trimStart().startsWith('['))
-        end++;
-    const rest = [...lines.slice(0, start), ...lines.slice(end)]
+    const rest = kept
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .replace(/^\n+/, '');
@@ -58,7 +73,7 @@ function upsertCodexToml(id, path) {
     const text = existed ? readFileSync(path, 'utf8') : '';
     const { command, args } = BIN_LAUNCH;
     const argList = args.map((a) => JSON.stringify(a)).join(", ");
-    const section = `${TOML_HEADER}\ncommand = \"${command}\"\nargs = [${argList}]\n`;
+    const section = `${TOML_HEADER}\ncommand = ${JSON.stringify(command)}\nargs = [${argList}]\n`;
     const { rest, found } = stripTomlSection(text);
     // Byte-identical already: don't rewrite the file just to reorder it.
     if (found && text === appendSection(rest, section))

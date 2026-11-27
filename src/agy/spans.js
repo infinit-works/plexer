@@ -1,3 +1,7 @@
+import { statSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { LINE_PREFIX_RE } from '../util/span.js';
+
 /**
  * Session-level line-span tracking and compaction reset detection for Antigravity hooks.
  */
@@ -139,7 +143,7 @@ export function extractInlinedSpansByFile(code, primaryFile = '') {
             currentFile = hdrFile;
             continue;
         }
-        const lm = /^L(\d+):/.exec(line);
+        const lm = LINE_PREFIX_RE.exec(line);
         if (lm) {
             const ln = Number(lm[1]);
             if (activeRun && activeRun.file === currentFile && ln >= activeRun.start && ln <= activeRun.end + 1) {
@@ -195,7 +199,8 @@ export function recordRetrievalSpans(seenSpans, askResult, relPrefix = '') {
  */
 export function recordEmittedRetrievalTextSpans(seenSpans, renderedText, relPrefix = '') {
     if (!seenSpans || !renderedText || typeof renderedText !== 'string')
-        return;
+        return [];
+    const touched = new Set();
     let currentHitFile = '';
     let inFence = false;
     let codeBuf = [];
@@ -206,7 +211,9 @@ export function recordEmittedRetrievalTextSpans(seenSpans, renderedText, relPref
         }
         const runs = extractInlinedSpansByFile(codeBuf.join('\n'), currentHitFile);
         for (const r of runs) {
-            mergeSpan(seenSpans, prefixSpanKey(r.file, relPrefix), r.start, r.end);
+            const k = prefixSpanKey(r.file, relPrefix);
+            mergeSpan(seenSpans, k, r.start, r.end);
+            touched.add(k);
         }
         codeBuf = [];
     };
@@ -236,6 +243,67 @@ export function recordEmittedRetrievalTextSpans(seenSpans, renderedText, relPref
     }
     if (inFence)
         flushFence();
+    return [...touched];
+}
+
+function resolveSpanKeyPath(spanKey, workspaceDirs = []) {
+    const norm = normalizeRelFile(spanKey);
+    if (!norm) return null;
+    const dirs = (Array.isArray(workspaceDirs) ? workspaceDirs : [workspaceDirs]).filter(Boolean);
+    if (dirs.length === 0) return null;
+    for (const d of dirs) {
+        const direct = resolve(d, norm);
+        try { if (statSync(direct).isFile()) return direct; } catch { /* try stripped */ }
+    }
+    const slash = norm.indexOf('/');
+    if (slash > 0) {
+        const stripped = norm.slice(slash + 1);
+        for (const d of dirs) {
+            const candidate = resolve(d, stripped);
+            try { if (statSync(candidate).isFile()) return candidate; } catch { /* ignore */ }
+        }
+    }
+    return null;
+}
+
+export function stampSeenMtime(agyState, spanKey, absPathOrDirs) {
+    if (!agyState || typeof agyState !== 'object' || !spanKey) return;
+    const key = normalizeRelFile(spanKey);
+    if (!key) return;
+    const absPath = typeof absPathOrDirs === 'string'
+        ? absPathOrDirs
+        : resolveSpanKeyPath(key, absPathOrDirs);
+    if (!absPath) return;
+    try {
+        const st = statSync(absPath);
+        if (st.isFile()) {
+            if (!agyState.seenMtimes || typeof agyState.seenMtimes !== 'object')
+                agyState.seenMtimes = {};
+            agyState.seenMtimes[key] = st.mtimeMs;
+        }
+    } catch { /* ignore */ }
+}
+
+export function invalidateSpanIfModified(agyState, spanKey, absPathOrDirs) {
+    if (!agyState || typeof agyState !== 'object' || !spanKey) return false;
+    const key = normalizeRelFile(spanKey);
+    const recorded = agyState.seenMtimes?.[key];
+    if (typeof recorded !== 'number' || !Number.isFinite(recorded)) return false;
+    const absPath = typeof absPathOrDirs === 'string'
+        ? absPathOrDirs
+        : resolveSpanKeyPath(key, absPathOrDirs);
+    if (!absPath) return false;
+    try {
+        const st = statSync(absPath);
+        if (st.isFile() && Math.abs(recorded - st.mtimeMs) > 1) {
+            if (agyState.seenSpans) delete agyState.seenSpans[key];
+            if (agyState.fileSliceCounts) delete agyState.fileSliceCounts[key];
+            if (agyState.lastFileReadEnd) delete agyState.lastFileReadEnd[key];
+            delete agyState.seenMtimes[key];
+            return true;
+        }
+    } catch { /* ignore */ }
+    return false;
 }
 
 function isIntervalsCoveringLineSet(intervals, lineSet) {
@@ -303,7 +371,7 @@ export function applySeenSpansFilter(askResult, seenSpans, relPrefix = '') {
         const ptr = `${parsed.file}:L${spanStart}-L${spanEnd}`;
         return {
             ...h,
-            code: `// [already in session context: ${ptr}]`,
+            code: `// [seen: ${ptr}]`,
             alreadySeen: true,
         };
     });
@@ -317,13 +385,16 @@ export function applySeenSpansFilter(askResult, seenSpans, relPrefix = '') {
  * Invalidate or truncate `seenSpans` entries for `relFile` at or after `firstChangedLine`
  * after an edit so post-edit reads and `[plan review]` handoffs are never marked seen.
  */
-export function invalidateEditedSpans(seenSpans, relFile, firstChangedLine = 1) {
+export function invalidateEditedSpans(seenSpans, relFile, firstChangedLine = 1, lastChangedLine = null) {
     if (!seenSpans || typeof seenSpans !== 'object' || !relFile)
         return false;
     const normTarget = normalizeRelFile(relFile);
     if (!normTarget)
         return false;
     const cutoff = Number.isFinite(Number(firstChangedLine)) ? Math.floor(Number(firstChangedLine)) : 1;
+    const hasEndCutoff = lastChangedLine !== null && lastChangedLine !== undefined
+        && Number.isFinite(Number(lastChangedLine)) && Math.floor(Number(lastChangedLine)) >= cutoff;
+    const endCutoff = hasEndCutoff ? Math.floor(Number(lastChangedLine)) : null;
     let changed = false;
     for (const key of Object.keys(seenSpans)) {
         const normKey = normalizeRelFile(key);
@@ -333,7 +404,7 @@ export function invalidateEditedSpans(seenSpans, relFile, firstChangedLine = 1) 
         if (!matches)
             continue;
         changed = true;
-        if (cutoff <= 1) {
+        if (cutoff <= 1 && !hasEndCutoff) {
             delete seenSpans[key];
             continue;
         }
@@ -344,8 +415,19 @@ export function invalidateEditedSpans(seenSpans, relFile, firstChangedLine = 1) 
                 continue;
             const s = Number(pair[0]);
             const e = Number(pair[1]);
-            if (s < cutoff)
+            if (hasEndCutoff) {
+                if (e < cutoff || s > endCutoff) {
+                    kept.push([s, e]);
+                    continue;
+                }
+                if (s < cutoff)
+                    kept.push([s, cutoff - 1]);
+                if (e > endCutoff)
+                    kept.push([endCutoff + 1, e]);
+            }
+            else if (s < cutoff) {
                 kept.push([s, Math.min(e, cutoff - 1)]);
+            }
         }
         if (kept.length > 0)
             seenSpans[key] = kept;
@@ -368,6 +450,7 @@ export function detectCompactionReset(agyState, input) {
     const compacted = typeof prev === 'number' && Number.isFinite(prev) && cur < prev;
     if (compacted) {
         agyState.seenSpans = {};
+        agyState.seenMtimes = {};
         agyState.injectedPointers = [];
         agyState.midLoopHintEmitted = false;
         agyState.pendingMidLoopFile = null;
