@@ -115,6 +115,11 @@ export function globToRegExp(globPat) {
     return new RegExp(rx);
 }
 
+/** True when `path` resides inside a dependency/vendored tree. */
+export function isDependencyPath(path) {
+    return /(?:^|\/)(?:vendor|third_party|third-party|external|submodules|Packages|ServerPackages|DevPackages|RobloxPackages|roblox_packages|luau_packages|_Index)\//i.test(path || "");
+}
+
 /** True when `path` is a test, spec, benchmark, fixture, or mock file across supported languages. */
 export function isTestPath(path) {
     return /(?:^|\/)(?:__tests__|tests?|testdata|specs?|bench|benchmarks?|fixtures?|__mocks__|mocks?)\/|\.(?:test|spec|bench|mock)\.[a-z0-9]+$|_(?:test|spec|bench|mock)\.(?:go|py|rb|rs|luau|lua|ts|js|tsx|jsx|mjs|cjs)$|(?:^|\/)(?:test_[^/]+|mock_[^/]+|conftest)\.(?:py|go|rb|rs|luau|lua|ts|js)$/i.test(path || "");

@@ -17,9 +17,13 @@
 (library_declaration
   name: (identifier) @name) @definition.interface
 
-(struct_declaration name: (identifier) @name) @definition.class
-(enum_declaration name: (identifier) @name) @definition.class
-(event_definition name: (identifier) @name) @definition.class
+(struct_declaration name: (identifier) @name) @definition.struct
+(enum_declaration name: (identifier) @name) @definition.enum
+(event_definition name: (identifier) @name) @definition.type
+(modifier_definition name: (identifier) @name) @definition.method
+(error_declaration name: (identifier) @name) @definition.type
+(constructor_definition) @definition.method
+(state_variable_declaration name: (identifier) @name) @definition.variable
 
 ;; Function calls
 (call_expression (expression (identifier)) @name ) @reference.call

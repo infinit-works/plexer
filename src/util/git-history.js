@@ -8,9 +8,10 @@
  * Results are cached in `<contextDir>/.cache/git-history.json` keyed by `HEAD`
  * commit SHA so repeated `blast`, `map`, and `health` invocations cost 0ms.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { git } from "./git.js";
+import { writeJsonAtomic } from "./state.js";
 
 const HISTORY_CACHE_VERSION = 1;
 const HALF_LIFE_MS = 120 * 24 * 60 * 60 * 1000;
@@ -48,8 +49,7 @@ function readHistoryCache(cacheFile, head, maxCommits, minCoCommits, minRatio, s
 function writeHistoryCache(cacheFile, payload) {
     if (!cacheFile) return;
     try {
-        mkdirSync(dirname(cacheFile), { recursive: true });
-        writeFileSync(cacheFile, JSON.stringify(payload), "utf8");
+        writeJsonAtomic(cacheFile, payload, true);
     } catch {
         /* cache write is best-effort */
     }

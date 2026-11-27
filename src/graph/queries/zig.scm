@@ -19,6 +19,10 @@
   (identifier) @name
   (opaque_declaration)) @definition.type
 
+; Tests
+(test_declaration
+  (string (string_content) @name)) @definition.function
+
 ; Calls & References
 (call_expression
   function: (identifier) @name) @reference.call

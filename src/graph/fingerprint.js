@@ -19,19 +19,25 @@
  * rebuild is just cold.
  */
 import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { collectMarkdownDocFiles } from "../ask/index-file.js";
-import { CACHE_DIR } from "../context/node-file.js";
+import { loadFileCached, registerGraphCacheClearer, statOf } from "../context/graph-store.js";
+import { CACHE_DIR, envTruthy } from "../context/node-file.js";
 import { openSqliteStore, prepareStmt } from "../storage/sqlite-store.js";
-import { shouldSkipDir } from "../util/fs.js";
+import { dirVisitMode, shouldSkipDir, walkDir } from "../util/fs.js";
+import { discoverManifestMounts } from "./manifest-mounts.js";
 import { contentHash } from "../util/id.js";
-import { relPosix, toPosixPath } from "../util/paths.js";
+import { parseJsonc } from "../util/jsonc.js";
+import { pathUnderPrefix, relPosix, toPosixPath } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
-import { readJson, readWalkConfig, resolveGitExcludePath, writeJsonAtomic } from "../util/state.js";
-import { extractorStamp, pruneSidecars } from "./extract-cache.js";
+import { acquireLockIn, buildConfigPath, readJson, readWalkConfig, releaseLockIn, resolveGitExcludePath, writeJsonAtomic } from "../util/state.js";
+import { extractorStamp, pruneSidecars } from "./extractor-stamp.js";
+import { containerLangOf, genericLangOf, languageOf } from "./languages.js";
 import { listSourceStats } from "./source-files.js";
 export const FINGERPRINT_PREFIX = "fingerprint";
 const FINGERPRINT_VERSION = 1;
+const fingerprintCache = new Map();
+registerGraphCacheClearer(() => fingerprintCache.clear());
 /** The identity this plexer's prints are filed under. Unlike the extract memo, a
  * missing extractor identity is *not* disqualifying here: freshness is a claim about
  * source bytes, and a build with no memo is merely cold, never wrong. So stamp what
@@ -47,7 +53,8 @@ function fingerprintPath(outDir) {
     return join(outDir, CACHE_DIR, `${FINGERPRINT_PREFIX}.${stamp()}.json`);
 }
 export function readFingerprint(outDir) {
-    const f = readJson(fingerprintPath(outDir));
+    const fpPath = fingerprintPath(outDir);
+    const f = loadFileCached(fingerprintCache, fpPath, () => readJson(fpPath));
     if (!f || f.version !== FINGERPRINT_VERSION || typeof f.files !== "object" || !f.files)
         return null;
     if (f.extractor !== stamp())
@@ -57,54 +64,177 @@ export function readFingerprint(outDir) {
 const ROOT_DOT_RESOLVER_CONFIGS = [
     ".luaurc",
     ".jsconfig",
+    ".gitignore",
     "tsconfig.json",
     "tsconfig.base.json",
     "tsconfig.app.json",
     "jsconfig.json",
     "package.json",
+    "pnpm-workspace.yaml",
     "go.mod",
+    "go.work",
+    "pyproject.toml",
+    "setup.py",
     "Cargo.toml",
+    "composer.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Package.swift",
+    "pubspec.yaml",
+    "foundry.toml",
+    "remappings.txt",
+    "build.zig",
     "wally.toml",
     "pesde.toml",
     "default.project.json",
 ];
 
+const SCOPE_MARKER_FILENAMES = new Set([
+    "package.json",
+    "pnpm-workspace.yaml",
+    "go.mod",
+    "go.work",
+    "pyproject.toml",
+    "setup.py",
+    "Cargo.toml",
+    "composer.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Package.swift",
+    "pubspec.yaml",
+    "foundry.toml",
+    "remappings.txt",
+    "build.zig",
+]);
+
 export function isResolverConfigFilename(b) {
     return (
         b === ".luaurc" ||
         b === ".jsconfig" ||
+        b === ".gitignore" ||
         b.endsWith(".project.json") ||
         /^(?:ts|js)config(?:\..+)?\.json$/i.test(b) ||
-        b === "package.json" ||
-        b === "go.mod" ||
-        b === "Cargo.toml" ||
+        SCOPE_MARKER_FILENAMES.has(b) ||
         b === "wally.toml" ||
         b === "pesde.toml"
     );
 }
 
+function resolveExtendedTsConfigTarget(configFile, extRaw) {
+    if (typeof extRaw !== "string" || (!extRaw.startsWith(".") && !extRaw.startsWith("/")))
+        return null;
+    const candidate = resolve(dirname(configFile), extRaw);
+    try {
+        if (existsSync(candidate) && statSync(candidate).isFile())
+            return candidate;
+    }
+    catch {
+        /* ignore */
+    }
+    if (existsSync(`${candidate}.json`))
+        return `${candidate}.json`;
+    const nested = join(candidate, "tsconfig.json");
+    return existsSync(nested) ? nested : null;
+}
+
+function collectTsConfigExtendsTargets(absSet) {
+    const queue = [...absSet].filter((p) => {
+        const b = basename(p);
+        return b === ".jsconfig" || /^(?:ts|js)config(?:\..+)?\.json$/i.test(b);
+    });
+    const visited = new Set();
+    while (queue.length > 0) {
+        const cfgPath = queue.pop();
+        const abs = resolve(cfgPath);
+        if (visited.has(abs))
+            continue;
+        visited.add(abs);
+        let parsed;
+        try {
+            parsed = parseJsonc(readFileSync(abs, "utf8"));
+        }
+        catch {
+            continue;
+        }
+        if (!parsed || typeof parsed !== "object")
+            continue;
+        const exts = typeof parsed.extends === "string"
+            ? [parsed.extends]
+            : Array.isArray(parsed.extends)
+                ? parsed.extends.filter((x) => typeof x === "string")
+                : [];
+        for (const extRaw of exts) {
+            const target = resolveExtendedTsConfigTarget(abs, extRaw);
+            if (!target)
+                continue;
+            const absTarget = resolve(target);
+            if (!absSet.has(absTarget)) {
+                absSet.add(absTarget);
+                queue.push(absTarget);
+            }
+        }
+    }
+}
+
 /** Collect absolute paths to all resolver configs (including root/scope dotfiles & manifests). */
-export function collectResolverConfigPaths(root, walkedFiles = [], scopes = []) {
+export function collectResolverConfigPaths(root, walkedFiles = [], scopes = [], outDir = null) {
+    const absRoot = resolve(root);
     const absSet = new Set();
     for (const name of ROOT_DOT_RESOLVER_CONFIGS) {
-        const p = join(root, name);
+        const p = join(absRoot, name);
         if (existsSync(p))
             absSet.add(resolve(p));
+    }
+    const excludePath = resolveGitExcludePath(absRoot);
+    if (excludePath && existsSync(excludePath)) {
+        absSet.add(resolve(excludePath));
+    }
+    const buildCfgCandidates = [join(absRoot, "plexer", CACHE_DIR, "config.json")];
+    if (outDir) {
+        buildCfgCandidates.push(buildConfigPath(absRoot, outDir));
+    }
+    for (const cfgP of buildCfgCandidates) {
+        if (existsSync(cfgP))
+            absSet.add(resolve(cfgP));
     }
     for (const s of scopes) {
         if (!s?.prefix)
             continue;
         for (const name of [".luaurc", ".jsconfig"]) {
-            const p = join(root, s.prefix, name);
+            const p = join(absRoot, s.prefix, name);
             if (existsSync(p))
                 absSet.add(resolve(p));
         }
     }
+    const manifestMounts = discoverManifestMounts(absRoot);
+    for (const mf of manifestMounts.manifestFiles) {
+        if (existsSync(mf))
+            absSet.add(resolve(mf));
+    }
+    const checkedLuauDirs = new Set();
     for (const f of walkedFiles) {
         if (isResolverConfigFilename(basename(f))) {
             absSet.add(resolve(f));
         }
+        if (f.endsWith(".luau") || (manifestMounts.hasRojoProject && f.endsWith(".lua"))) {
+            let dir = dirname(resolve(f));
+            while (dir && dir.length >= absRoot.length && !checkedLuauDirs.has(dir)) {
+                checkedLuauDirs.add(dir);
+                const luaurc = join(dir, ".luaurc");
+                if (existsSync(luaurc))
+                    absSet.add(resolve(luaurc));
+                if (dir === absRoot)
+                    break;
+                const parent = dirname(dir);
+                if (parent === dir)
+                    break;
+                dir = parent;
+            }
+        }
     }
+    collectTsConfigExtendsTargets(absSet);
     return [...absSet].sort();
 }
 
@@ -258,7 +388,7 @@ export function collectWalkedDirs(rootDir, outDir) {
         }
     }
 
-    const walk = (absDir, relDir, inheritedRules) => {
+    const walk = (absDir, relDir, inheritedRules, parentMode = "include") => {
         const localRules = readGitignoreRulesForDir(absDir, relDir);
         const rules = localRules.length > 0 ? [...inheritedRules, ...localRules] : inheritedRules;
         let items;
@@ -271,21 +401,23 @@ export function collectWalkedDirs(rootDir, outDir) {
         for (const item of items) {
             if (!item.isDirectory())
                 continue;
-            if (shouldSkipDir(item.name, includeDirs))
-                continue;
             const full = join(absDir, item.name);
             if (absOut && full === absOut)
                 continue;
             const rel = relPosix(absRoot, full);
             if (!rel || rel === "." || rel.startsWith(".."))
                 continue;
-            if (rules.length > 0 && isDirIgnoredByRules(toPosixPath(rel), item.name, rules))
+            const relPosixStr = toPosixPath(rel);
+            const mode = dirVisitMode(relPosixStr, item.name, includeDirs, parentMode);
+            if (mode === "skip")
+                continue;
+            if (rules.length > 0 && isDirIgnoredByRules(relPosixStr, item.name, rules))
                 continue;
             dirSet.add(rel);
-            walk(full, toPosixPath(rel), rules);
+            walk(full, relPosixStr, rules, mode);
         }
     };
-    walk(absRoot, "", rootRules);
+    walk(absRoot, "", rootRules, "include");
     return dirSet;
 }
 export function snapshotDirMtimes(rootDir, outDir) {
@@ -311,17 +443,20 @@ export function snapshotDirMtimes(rootDir, outDir) {
     return dirs;
 }
 
-function collectResolverConfigSnapshots(absRoot, configPaths) {
+function collectResolverConfigSnapshots(absRoot, configPaths, preReadMap = null) {
     const configs = {};
+    const excludeRaw = resolveGitExcludePath(absRoot);
+    const excludeAbs = excludeRaw ? resolve(excludeRaw) : null;
     for (const absPath of configPaths) {
-        const rel = relPosix(absRoot, absPath);
-        if (!rel || rel.startsWith(".."))
+        const resolvedAbs = resolve(absPath);
+        const rel = excludeAbs && resolvedAbs === excludeAbs ? ".git/info/exclude" : relPosix(absRoot, resolvedAbs);
+        if (!rel || (rel !== ".git/info/exclude" && rel.startsWith("..")))
             continue;
         try {
-            const st = statSync(absPath);
+            const st = statSync(resolvedAbs);
             if (!st.isFile())
                 continue;
-            const raw = readFileSync(absPath, "utf8");
+            const raw = preReadMap?.get(resolvedAbs) ?? readFileSync(resolvedAbs, "utf8");
             configs[rel] = [st.size, st.mtimeMs, contentHash(raw)];
         }
         catch {
@@ -331,9 +466,11 @@ function collectResolverConfigSnapshots(absRoot, configPaths) {
     return configs;
 }
 
-function findResolverConfigsInDirs(absRoot, walkedDirs) {
-    const absPaths = new Set(collectResolverConfigPaths(absRoot));
+function findResolverConfigsInDirs(absRoot, walkedDirs, outDir = null) {
+    const absPaths = new Set(collectResolverConfigPaths(absRoot, [], [], outDir));
     for (const relDir of walkedDirs) {
+        if (relDir === ".git/index")
+            continue;
         const absDir = relDir === "." ? absRoot : join(absRoot, relDir);
         let items;
         try {
@@ -350,11 +487,12 @@ function findResolverConfigsInDirs(absRoot, walkedDirs) {
             }
         }
     }
+    collectTsConfigExtendsTargets(absPaths);
     return [...absPaths].sort();
 }
 
 function loadEntriesFromSqlite(outDir) {
-    const store = openSqliteStore(outDir, { create: false });
+    const store = openSqliteStore(outDir, { create: false, readOnly: true });
     if (!store)
         return {};
     const out = {};
@@ -408,7 +546,7 @@ export function writeFingerprint(outDir, entries, onlyDirs, rootDir, extensions,
     const files = {};
     const dirSet = new Set(["."]);
     for (const [rel, e] of Object.entries(sourceEntries)) {
-        files[rel] = [e.size, e.mtimeMs, e.hash];
+        files[rel] = Array.isArray(e) ? e : [e.size, e.mtimeMs, e.hash];
         let d = dirname(rel);
         while (d && d !== "." && !dirSet.has(d)) {
             dirSet.add(d);
@@ -418,17 +556,30 @@ export function writeFingerprint(outDir, entries, onlyDirs, rootDir, extensions,
     const dirs = collectFingerprintDirMtimes(dirSet, rootDir, outDir, preWalkDirMtimes);
     let configs = {};
     let docs;
+    let gitIndexPath = null;
     if (rootDir) {
         const absRoot = resolve(rootDir);
-        const cfgPaths = Array.isArray(configOpts?.configFiles)
-            ? configOpts.configFiles
-            : findResolverConfigsInDirs(absRoot, Object.keys(dirs).length ? Object.keys(dirs) : dirSet);
-        configs = collectResolverConfigSnapshots(absRoot, cfgPaths);
-        docs = collectResolverConfigSnapshots(absRoot, collectMarkdownDocFiles(absRoot).map((d) => d.absPath));
+        gitIndexPath = resolveGitIndexPath(absRoot);
+        if (configOpts?.configSnapshots && typeof configOpts.configSnapshots === "object") {
+            configs = configOpts.configSnapshots;
+        }
+        else {
+            const cfgPaths = Array.isArray(configOpts?.configFiles)
+                ? configOpts.configFiles
+                : findResolverConfigsInDirs(absRoot, Object.keys(dirs).length ? Object.keys(dirs) : dirSet, outDir);
+            configs = collectResolverConfigSnapshots(absRoot, cfgPaths, configOpts?.configContents);
+        }
+        if (configOpts?.docSnapshots && typeof configOpts.docSnapshots === "object") {
+            docs = configOpts.docSnapshots;
+        }
+        else {
+            docs = collectResolverConfigSnapshots(absRoot, collectMarkdownDocFiles(absRoot).map((d) => d.absPath));
+        }
     }
     try {
         const record = { version: FINGERPRINT_VERSION, extractor: stamp(), files };
         if (Object.keys(dirs).length > 0) record.dirs = dirs;
+        if (gitIndexPath) record.gitIndexPath = gitIndexPath;
         if (onlyDirs?.length > 0) record.onlyDirs = onlyDirs;
         if (extensions?.length > 0) record.extensions = extensions;
         if (Object.keys(configs).length > 0) record.configs = configs;
@@ -481,20 +632,23 @@ export function driftCount(d) {
  * `PLEXER_REFRESH=hash` skips the stat fast path and hashes every file, for the
  * rare tooling that rewrites content while preserving size and mtime.
  */
-function checkConfigSnapshots(absRoot, fpConfigs, drift, seenDrift) {
+function checkConfigSnapshots(absRoot, fpConfigs, drift, seenDrift, healedSnapshots = null) {
     if (!fpConfigs || typeof fpConfigs !== "object")
         return true;
     let allClean = true;
     for (const [rel, print] of Object.entries(fpConfigs)) {
         const [size, mtimeMs, hash] = print;
-        const abs = join(absRoot, rel);
+        const abs = rel === ".git/info/exclude" ? (resolveGitExcludePath(absRoot) ?? join(absRoot, rel)) : join(absRoot, rel);
         try {
             const st = statSync(abs);
             if (!alwaysHash() && st.size === size && st.mtimeMs === mtimeMs)
                 continue;
             const now = contentHash(readFileSync(abs, "utf8"));
-            if (now === hash)
+            if (now === hash) {
+                if (healedSnapshots)
+                    healedSnapshots[rel] = [st.size, st.mtimeMs, hash];
                 continue;
+            }
             allClean = false;
             if (drift && !seenDrift.has(`c:${rel}`)) {
                 seenDrift.add(`c:${rel}`);
@@ -512,10 +666,14 @@ function checkConfigSnapshots(absRoot, fpConfigs, drift, seenDrift) {
     return allClean;
 }
 
-function probeFastDirsClean(absRoot, dirs) {
+function probeFastDirsClean(absRoot, dirs, cachedGitIndexPath = null) {
     for (const [relDir, expectedMtime] of Object.entries(dirs)) {
         try {
-            const target = relDir === "." ? absRoot : relDir === ".git/index" ? resolveGitIndexPath(absRoot) : join(absRoot, relDir);
+            const target = relDir === "."
+                ? absRoot
+                : relDir === ".git/index"
+                    ? (cachedGitIndexPath ?? resolveGitIndexPath(absRoot))
+                    : join(absRoot, relDir);
             if (!target || statSync(target).mtimeMs !== expectedMtime) return false;
         } catch {
             return false;
@@ -537,7 +695,7 @@ function probeFastFilesClean(absRoot, files) {
     return true;
 }
 
-function recordEntryDrift(f, fp, drift, seenDrift) {
+function recordEntryDrift(f, fp, drift, seenDrift, healedFiles = null) {
     const print = fp.files[f.rel];
     if (!print) {
         seenDrift.add(`a:${f.rel}`);
@@ -564,16 +722,23 @@ function recordEntryDrift(f, fp, drift, seenDrift) {
     if (now !== hash) {
         seenDrift.add(`c:${f.rel}`);
         drift.changed.push(f.rel);
+    } else if (healedFiles) {
+        healedFiles[f.rel] = [f.size, f.mtimeMs, hash];
     }
 }
 
-function appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seenDrift) {
+function appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seenDrift, healedConfigs = null, healedDocs = null, walked = null) {
     if (fp.configs && typeof fp.configs === "object") {
-        checkConfigSnapshots(absRoot, fp.configs, drift, seenDrift);
-        const walkedDirs = collectWalkedDirs(absRoot, outDir);
-        for (const absCfg of findResolverConfigsInDirs(absRoot, walkedDirs)) {
-            const relCfg = relPosix(absRoot, absCfg);
-            if (!relCfg || relCfg.startsWith("..") || relCfg in fp.configs) continue;
+        checkConfigSnapshots(absRoot, fp.configs, drift, seenDrift, healedConfigs);
+        const cfgPaths = Array.isArray(walked)
+            ? collectResolverConfigPaths(absRoot, walked, [], outDir)
+            : findResolverConfigsInDirs(absRoot, collectWalkedDirs(absRoot, outDir), outDir);
+        const excludeRaw = resolveGitExcludePath(absRoot);
+        const excludeAbs = excludeRaw ? resolve(excludeRaw) : null;
+        for (const absCfg of cfgPaths) {
+            const resolvedAbs = resolve(absCfg);
+            const relCfg = excludeAbs && resolvedAbs === excludeAbs ? ".git/info/exclude" : relPosix(absRoot, resolvedAbs);
+            if (!relCfg || (relCfg !== ".git/info/exclude" && relCfg.startsWith("..")) || relCfg in fp.configs) continue;
             if (!seen.has(relCfg) && !seenDrift.has(`a:${relCfg}`)) {
                 seenDrift.add(`a:${relCfg}`);
                 drift.added.push(relCfg);
@@ -581,7 +746,7 @@ function appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seen
         }
     }
     if (fp.docs && typeof fp.docs === "object") {
-        checkConfigSnapshots(absRoot, fp.docs, drift, seenDrift);
+        checkConfigSnapshots(absRoot, fp.docs, drift, seenDrift, healedDocs);
         for (const { relPath } of collectMarkdownDocFiles(absRoot)) {
             if (relPath in fp.docs) continue;
             if (!seen.has(relPath) && !seenDrift.has(`a:${relPath}`)) {
@@ -592,38 +757,419 @@ function appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seen
     }
 }
 
+function isIndexedSourceName(fileName, extSet) {
+    if (extSet && !extSet.has(extname(fileName).toLowerCase()))
+        return false;
+    return languageOf(fileName) !== null || genericLangOf(fileName) !== null || containerLangOf(fileName) !== null;
+}
+
+const FAST_POSIX_SEP = process.platform === "win32" ? null : "/";
+
+function tryFastDeltaProbe(absRoot, outDir, fp, canHeal) {
+    if (alwaysHash() || !fp.dirs || typeof fp.dirs !== "object" || !fp.files || envTruthy("PLEXER_NO_DELTA_PROBE"))
+        return null;
+    const onlyDirs = fp.onlyDirs && fp.onlyDirs.length > 0 ? fp.onlyDirs : null;
+    const rawExts = Array.isArray(fp.extensions) && fp.extensions.length > 0 ? fp.extensions : null;
+    const extSet = rawExts
+        ? new Set(rawExts.map((e) => {
+            const t = String(e).trim().toLowerCase();
+            return t.startsWith(".") ? t : `.${t}`;
+        }))
+        : null;
+
+    const changedDirs = [];
+    let gitIndexChanged = false;
+    const nextDirs = { ...fp.dirs };
+
+    for (const [relDir, expectedMtime] of Object.entries(fp.dirs)) {
+        try {
+            if (relDir === ".git/index") {
+                const target = fp.gitIndexPath ?? resolveGitIndexPath(absRoot);
+                if (!target) {
+                    gitIndexChanged = true;
+                    break;
+                }
+                const st = statSync(target);
+                if (st.mtimeMs !== expectedMtime) {
+                    gitIndexChanged = true;
+                    break;
+                }
+                continue;
+            }
+            const target = relDir === "." ? absRoot : join(absRoot, relDir);
+            const st = statSync(target);
+            if (!st.isDirectory())
+                return null;
+            if (st.mtimeMs !== expectedMtime) {
+                changedDirs.push({ relDir, absDir: target, mtimeMs: st.mtimeMs });
+                nextDirs[relDir] = st.mtimeMs;
+                if (changedDirs.length > 16)
+                    return null;
+            }
+        }
+        catch {
+            return null;
+        }
+    }
+    if (gitIndexChanged)
+        return null;
+
+    const absOut = resolve(outDir);
+    const changedDirNames = new Set();
+    const scannedByDir = new Map();
+    let docsDirTouched = false;
+
+    for (const cd of changedDirs) {
+        changedDirNames.add(cd.relDir);
+        if (cd.relDir === "." || cd.relDir === "docs" || cd.relDir.startsWith("docs/"))
+            docsDirTouched = true;
+        let entries;
+        try {
+            entries = readdirSync(cd.absDir, { withFileTypes: true });
+        }
+        catch {
+            return null;
+        }
+        const filesInDir = new Map();
+        for (const item of entries) {
+            if (item.isDirectory()) {
+                const subRel = cd.relDir === "." ? item.name : `${cd.relDir}/${item.name}`;
+                if (!(subRel in fp.dirs)) {
+                    if (join(cd.absDir, item.name) === absOut)
+                        continue;
+                    if (shouldSkipDir(item.name))
+                        continue;
+                    return null;
+                }
+                continue;
+            }
+            if (!item.isFile())
+                continue;
+            if (item.name === ".gitignore" || isResolverConfigFilename(item.name))
+                return null;
+            if (!isIndexedSourceName(item.name, extSet))
+                continue;
+            const relPath = cd.relDir === "." ? item.name : `${cd.relDir}/${item.name}`;
+            if (onlyDirs && !onlyDirs.some((d) => pathUnderPrefix(relPath, d)))
+                continue;
+            filesInDir.set(relPath, join(cd.absDir, item.name));
+        }
+        scannedByDir.set(cd.relDir, filesInDir);
+    }
+
+    const drift = { changed: [], added: [], removed: [] };
+    const rootPrefix = FAST_POSIX_SEP ? (absRoot.endsWith(FAST_POSIX_SEP) ? absRoot : `${absRoot}${FAST_POSIX_SEP}`) : null;
+    const hasChangedDirs = changedDirNames.size > 0;
+    const fpEntries = Object.entries(fp.files);
+
+    // Zero-allocation clean scan until the first modified/removed/added entry appears.
+    if (!hasChangedDirs) {
+        let firstDirtyIdx = -1;
+        for (let i = 0; i < fpEntries.length; i++) {
+            const [rel, print] = fpEntries[i];
+            const [size, mtimeMs, hash] = print;
+            if (!hash) {
+                firstDirtyIdx = i;
+                break;
+            }
+            const abs = rootPrefix ? `${rootPrefix}${rel}` : join(absRoot, rel);
+            try {
+                const st = statSync(abs);
+                if (st.size !== size || st.mtimeMs !== mtimeMs) {
+                    firstDirtyIdx = i;
+                    break;
+                }
+            }
+            catch {
+                firstDirtyIdx = i;
+                break;
+            }
+        }
+        if (firstDirtyIdx === -1) {
+            const cfgClean = !fp.configs || typeof fp.configs !== "object" || checkConfigSnapshots(absRoot, fp.configs, null, null);
+            const docsClean = !fp.docs || typeof fp.docs !== "object" || checkConfigSnapshots(absRoot, fp.docs, null, null);
+            if (cfgClean && docsClean) {
+                return { clean: true, drift };
+            }
+            firstDirtyIdx = fpEntries.length;
+        }
+        // Replay clean prefix [0 .. firstDirtyIdx) without re-stating any file.
+        const healedFiles = canHeal ? {} : null;
+        const healedConfigs = canHeal && fp.configs && typeof fp.configs === "object" ? {} : null;
+        const healedDocs = canHeal && fp.docs && typeof fp.docs === "object" ? {} : null;
+        const sourceStats = new Array(firstDirtyIdx);
+        const walkedSet = new Set();
+        const seen = new Set();
+        const seenDrift = new Set();
+        for (let i = 0; i < firstDirtyIdx; i++) {
+            const [rel, print] = fpEntries[i];
+            const abs = rootPrefix ? `${rootPrefix}${rel}` : join(absRoot, rel);
+            seen.add(rel);
+            walkedSet.add(abs);
+            sourceStats[i] = { abs, rel, size: print[0], mtimeMs: print[1] };
+        }
+        for (let i = firstDirtyIdx; i < fpEntries.length; i++) {
+            const [rel, print] = fpEntries[i];
+            const [size, mtimeMs, hash] = print;
+            const abs = rootPrefix ? `${rootPrefix}${rel}` : join(absRoot, rel);
+            let st;
+            try {
+                st = statSync(abs);
+            }
+            catch {
+                seenDrift.add(`r:${rel}`);
+                drift.removed.push(rel);
+                continue;
+            }
+            seen.add(rel);
+            walkedSet.add(abs);
+            sourceStats.push({ abs, rel, size: st.size, mtimeMs: st.mtimeMs });
+            if (hash && st.size === size && st.mtimeMs === mtimeMs)
+                continue;
+            const source = readSourceFile(abs);
+            if (source === null) {
+                if (hash) {
+                    seenDrift.add(`c:${rel}`);
+                    drift.changed.push(rel);
+                }
+                continue;
+            }
+            const now = contentHash(source);
+            if (now !== hash) {
+                seenDrift.add(`c:${rel}`);
+                drift.changed.push(rel);
+            }
+            else if (healedFiles) {
+                healedFiles[rel] = [st.size, st.mtimeMs, hash];
+            }
+        }
+        let configsUnchanged = true;
+        if (fp.configs && typeof fp.configs === "object") {
+            configsUnchanged = checkConfigSnapshots(absRoot, fp.configs, drift, seenDrift, healedConfigs);
+            for (const relCfg of Object.keys(fp.configs)) {
+                if (relCfg !== ".git/info/exclude" && !relCfg.startsWith(".."))
+                    walkedSet.add(join(absRoot, relCfg));
+            }
+        }
+        let docsUnchanged = true;
+        if (fp.docs && typeof fp.docs === "object") {
+            docsUnchanged = checkConfigSnapshots(absRoot, fp.docs, drift, seenDrift, healedDocs);
+        }
+        drift.changed.sort();
+        const walked = [...walkedSet];
+        Object.defineProperties(drift, {
+            _walked: { value: walked, enumerable: false, configurable: true },
+            _dirMtimes: { value: nextDirs, enumerable: false, configurable: true },
+            _sourceStats: { value: sourceStats, enumerable: false, configurable: true },
+            _configsUnchanged: { value: configsUnchanged, enumerable: false, configurable: true },
+            _docsUnchanged: { value: docsUnchanged, enumerable: false, configurable: true },
+            _noFileAddRemove: { value: drift.removed.length === 0, enumerable: false, configurable: true },
+        });
+        return { drift, dirMtimes: nextDirs, healedFiles, healedConfigs, healedDocs };
+    }
+
+    const seen = new Set();
+    const seenDrift = new Set();
+    const healedFiles = canHeal ? {} : null;
+    const healedConfigs = canHeal && fp.configs && typeof fp.configs === "object" ? {} : null;
+    const healedDocs = canHeal && fp.docs && typeof fp.docs === "object" ? {} : null;
+    const sourceStats = [];
+    const walkedSet = new Set();
+
+    for (let i = 0; i < fpEntries.length; i++) {
+        const [rel, print] = fpEntries[i];
+        const [size, mtimeMs, hash] = print;
+        const slash = rel.lastIndexOf("/");
+        const parentRel = slash < 0 ? "." : rel.slice(0, slash);
+        if (changedDirNames.has(parentRel) && !scannedByDir.get(parentRel)?.has(rel)) {
+            seenDrift.add(`r:${rel}`);
+            drift.removed.push(rel);
+            continue;
+        }
+        const abs = rootPrefix ? `${rootPrefix}${rel}` : join(absRoot, rel);
+        let st;
+        try {
+            st = statSync(abs);
+        }
+        catch {
+            seenDrift.add(`r:${rel}`);
+            drift.removed.push(rel);
+            continue;
+        }
+        seen.add(rel);
+        walkedSet.add(abs);
+        sourceStats.push({ abs, rel, size: st.size, mtimeMs: st.mtimeMs });
+        if (hash && st.size === size && st.mtimeMs === mtimeMs)
+            continue;
+        const source = readSourceFile(abs);
+        if (source === null) {
+            if (hash) {
+                seenDrift.add(`c:${rel}`);
+                drift.changed.push(rel);
+            }
+            continue;
+        }
+        const now = contentHash(source);
+        if (now !== hash) {
+            seenDrift.add(`c:${rel}`);
+            drift.changed.push(rel);
+        }
+        else if (healedFiles) {
+            healedFiles[rel] = [st.size, st.mtimeMs, hash];
+        }
+    }
+
+    for (const filesInDir of scannedByDir.values()) {
+        for (const [relPath, absPath] of filesInDir) {
+            if (seen.has(relPath))
+                continue;
+            try {
+                const st = statSync(absPath);
+                seen.add(relPath);
+                walkedSet.add(absPath);
+                sourceStats.push({ abs: absPath, rel: relPath, size: st.size, mtimeMs: st.mtimeMs });
+                seenDrift.add(`a:${relPath}`);
+                drift.added.push(relPath);
+            }
+            catch {
+                /* ignore vanished file */
+            }
+        }
+    }
+
+    let configsUnchanged = true;
+    if (fp.configs && typeof fp.configs === "object") {
+        configsUnchanged = checkConfigSnapshots(absRoot, fp.configs, drift, seenDrift, healedConfigs);
+        for (const relCfg of Object.keys(fp.configs)) {
+            if (relCfg !== ".git/info/exclude" && !relCfg.startsWith(".."))
+                walkedSet.add(join(absRoot, relCfg));
+        }
+    }
+    let docsUnchanged = true;
+    if (fp.docs && typeof fp.docs === "object") {
+        docsUnchanged = checkConfigSnapshots(absRoot, fp.docs, drift, seenDrift, healedDocs);
+        if (docsDirTouched) {
+            for (const { relPath } of collectMarkdownDocFiles(absRoot)) {
+                if (!(relPath in fp.docs) && !seen.has(relPath) && !seenDrift.has(`a:${relPath}`)) {
+                    docsUnchanged = false;
+                    seenDrift.add(`a:${relPath}`);
+                    drift.added.push(relPath);
+                }
+            }
+        }
+    }
+
+    drift.changed.sort();
+    drift.added.sort();
+    drift.removed.sort();
+    const walked = [...walkedSet];
+    Object.defineProperties(drift, {
+        _walked: { value: walked, enumerable: false, configurable: true },
+        _dirMtimes: { value: nextDirs, enumerable: false, configurable: true },
+        _sourceStats: { value: sourceStats, enumerable: false, configurable: true },
+        _configsUnchanged: { value: configsUnchanged, enumerable: false, configurable: true },
+        _docsUnchanged: { value: docsUnchanged, enumerable: false, configurable: true },
+        _noFileAddRemove: { value: drift.added.length === 0 && drift.removed.length === 0, enumerable: false, configurable: true },
+    });
+    return { drift, dirMtimes: nextDirs, healedFiles, healedConfigs, healedDocs };
+}
+
 export function probeDrift(root, outDir) {
     const fp = readFingerprint(outDir);
     if (!fp) return null;
     const absRoot = resolve(root);
-    const fastClean =
-        !alwaysHash() &&
-        fp.dirs &&
-        typeof fp.dirs === "object" &&
-        probeFastDirsClean(absRoot, fp.dirs) &&
-        probeFastFilesClean(absRoot, fp.files) &&
-        checkConfigSnapshots(absRoot, fp.configs, null, null) &&
-        checkConfigSnapshots(absRoot, fp.docs, null, null);
-    if (fastClean) return { changed: [], added: [], removed: [] };
+    const fpPath = fingerprintPath(outDir);
+    const fpStatBefore = statOf(fpPath);
+    const canHeal = !alwaysHash() && !envTruthy("PLEXER_NO_REFRESH");
+    const deltaAttempt = tryFastDeltaProbe(absRoot, outDir, fp, canHeal);
+    if (deltaAttempt?.clean)
+        return deltaAttempt.drift;
+    let drift;
+    let dirMtimes;
+    let healedFiles;
+    let healedConfigs;
+    let healedDocs;
 
-    const drift = { changed: [], added: [], removed: [] };
-    const seen = new Set();
-    const seenDrift = new Set();
-    const onlyDirs = fp.onlyDirs && fp.onlyDirs.length > 0 ? new Set(fp.onlyDirs) : undefined;
-    const extensions = Array.isArray(fp.extensions) && fp.extensions.length > 0 ? fp.extensions : undefined;
-    for (const f of listSourceStats(root, outDir, undefined, onlyDirs, extensions)) {
-        seen.add(f.rel);
-        recordEntryDrift(f, fp, drift, seenDrift);
+    if (deltaAttempt) {
+        drift = deltaAttempt.drift;
+        dirMtimes = deltaAttempt.dirMtimes;
+        healedFiles = deltaAttempt.healedFiles;
+        healedConfigs = deltaAttempt.healedConfigs;
+        healedDocs = deltaAttempt.healedDocs;
     }
-    for (const rel of Object.keys(fp.files)) {
-        if (!seen.has(rel)) {
-            seenDrift.add(`r:${rel}`);
-            drift.removed.push(rel);
+    else {
+        drift = { changed: [], added: [], removed: [] };
+        const seen = new Set();
+        const seenDrift = new Set();
+        healedFiles = canHeal ? {} : null;
+        healedConfigs = canHeal && fp.configs && typeof fp.configs === "object" ? {} : null;
+        healedDocs = canHeal && fp.docs && typeof fp.docs === "object" ? {} : null;
+        const onlyDirs = fp.onlyDirs && fp.onlyDirs.length > 0 ? new Set(fp.onlyDirs) : undefined;
+        const extensions = Array.isArray(fp.extensions) && fp.extensions.length > 0 ? fp.extensions : undefined;
+        const walkCfg = readWalkConfig(absRoot, outDir);
+        const walked = walkDir(absRoot, walkCfg.includeDirs, {
+            followSubmodules: walkCfg.followSubmodules,
+            followNestedRepos: walkCfg.followNestedRepos,
+        });
+        dirMtimes = snapshotDirMtimes(absRoot, outDir);
+        const sourceStats = listSourceStats(root, outDir, walked, onlyDirs, extensions);
+        for (const f of sourceStats) {
+            seen.add(f.rel);
+            recordEntryDrift(f, fp, drift, seenDrift, healedFiles);
+        }
+        for (const rel of Object.keys(fp.files)) {
+            if (!seen.has(rel)) {
+                seenDrift.add(`r:${rel}`);
+                drift.removed.push(rel);
+            }
+        }
+        appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seenDrift, healedConfigs, healedDocs, walked);
+        drift.changed.sort();
+        drift.added.sort();
+        drift.removed.sort();
+        Object.defineProperties(drift, {
+            _walked: { value: walked, enumerable: false, configurable: true },
+            _dirMtimes: { value: dirMtimes, enumerable: false, configurable: true },
+            _sourceStats: { value: sourceStats, enumerable: false, configurable: true },
+        });
+    }
+    if (canHeal && isClean(drift)) {
+        const lockCache = join(outDir, CACHE_DIR);
+        try {
+            if (acquireLockIn(lockCache)) {
+                try {
+                    const fpStatNow = statOf(fpPath);
+                    const unchangedFp = Boolean(
+                        fpStatBefore &&
+                        fpStatNow &&
+                        fpStatBefore.dev === fpStatNow.dev &&
+                        fpStatBefore.ino === fpStatNow.ino &&
+                        fpStatBefore.mtimeMs === fpStatNow.mtimeMs
+                    );
+                    if (unchangedFp) {
+                        const nextFiles = healedFiles && Object.keys(healedFiles).length > 0 ? { ...fp.files, ...healedFiles } : fp.files;
+                        const nextConfigs = healedConfigs && Object.keys(healedConfigs).length > 0 ? { ...fp.configs, ...healedConfigs } : fp.configs;
+                        const nextDocs = healedDocs && Object.keys(healedDocs).length > 0 ? { ...fp.docs, ...healedDocs } : fp.docs;
+                        const healedFp = {
+                            ...fp,
+                            dirs: dirMtimes,
+                            ...(fp.gitIndexPath ? { gitIndexPath: fp.gitIndexPath } : {}),
+                            files: nextFiles,
+                            ...(nextConfigs ? { configs: nextConfigs } : {}),
+                            ...(nextDocs ? { docs: nextDocs } : {}),
+                        };
+                        writeJsonAtomic(fpPath, healedFp, true);
+                        fingerprintCache.delete(fpPath);
+                    }
+                }
+                finally {
+                    releaseLockIn(lockCache);
+                }
+            }
+        }
+        catch {
+            /* best-effort heal when cache dir is read-only */
         }
     }
-    appendUntrackedConfigAndDocDrift(absRoot, outDir, fp, drift, seen, seenDrift);
-    drift.changed.sort();
-    drift.added.sort();
-    drift.removed.sort();
     return drift;
 }

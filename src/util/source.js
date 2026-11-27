@@ -7,5 +7,6 @@ export function readSourceFile(path) {
         return null;
     if (bytes[0] === 0xff && bytes[1] === 0xfe)
         return bytes.subarray(2).toString("utf16le");
-    return bytes.toString("utf8");
+    const text = bytes.toString("utf8");
+    return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }

@@ -154,7 +154,7 @@ export function writeIndex(outDir, files, graph) {
         }
     }
     if (files.length) {
-        const withSymbols = files.filter((f) => f.symbols > 0).length;
+        const withSymbols = files.filter((f) => typeof f === "object" && f !== null && f.symbols > 0).length;
         lines.push(`## Files (${files.length} cards, ${withSymbols} with symbols)`, "");
     }
     writeFileSync(join(outDir, INDEX_FILE), lines.join("\n"));

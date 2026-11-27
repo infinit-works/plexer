@@ -33,7 +33,7 @@ export function computeInDegree(graph) {
 }
 
 export function moduleStem(rel) {
-    const parts = rel.replace(/\.luau$/i, "").split("/");
+    const parts = rel.replace(/\.(?:luau|lua)$/i, "").split("/");
     const last = parts[parts.length - 1] ?? rel;
     if ((last === "init" || last.startsWith("init.")) && parts.length >= 2) {
         return parts[parts.length - 2];
@@ -57,17 +57,30 @@ function buildLuauCandidates(nodes, lowerQuery) {
     return candidates;
 }
 
-function unwrapLuauReexportHits(list, nodes, edges) {
-    if (!edges || list.length === 0) return list;
-    let byId = null;
+function unwrapLuauReexportHits(list, nodes, edges, graph) {
+    if ((!edges && !graph?._outEdges) || list.length === 0) return list;
+    let byId = graph?._byId ?? null;
+    const outEdgesMap = graph?._outEdges ?? null;
     return list.map((h) => {
         const range = spanRange(h.span);
         if (range && range.start === range.end) {
-            const outCalls = edges.filter((e) => e.source === h.id && e.relation === "calls");
+            const sourceEdges = outEdgesMap ? (outEdgesMap.get(h.id) ?? []) : edges.filter((e) => e.source === h.id);
+            const outCalls = sourceEdges.filter((e) => e.relation === "calls");
             if (outCalls.length === 1) {
                 byId ??= new Map(nodes.map((n) => [n.id, n]));
                 const target = byId.get(outCalls[0].target);
-                if (target && target.name.toLowerCase() === h.name.toLowerCase()) return target;
+                if (target) {
+                    if (target.name.toLowerCase() === h.name.toLowerCase())
+                        return target;
+                    const inEdges = graph?._inEdges?.get(h.id) ?? [];
+                    const isSimpleMemberReexport = Boolean(
+                        h.signature &&
+                        /^\s*[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\s*,?\s*$/.test(h.signature) &&
+                        inEdges.length === 0,
+                    );
+                    if (isSimpleMemberReexport)
+                        return target;
+                }
             }
         }
         return h;
@@ -82,7 +95,7 @@ function filterLuauNodesBySuffixes(nodes, suffixes) {
     });
 }
 
-function matchLuauDottedSymbol(nodes, norm, edges) {
+function matchLuauDottedSymbol(nodes, norm, edges, graph) {
     const dot = norm.lastIndexOf(".");
     const modPart = norm.slice(0, dot).replace(/\./g, "/");
     const symPart = norm.slice(dot + 1);
@@ -90,45 +103,63 @@ function matchLuauDottedSymbol(nodes, norm, edges) {
     const modSuffixes = [
         `${modPart}.luau#${symPart}`,
         `${modPart}/init.luau#${symPart}`,
+        `${modPart}/src/init.luau#${symPart}`,
         `${modPart}/init.client.luau#${symPart}`,
         `${modPart}/init.server.luau#${symPart}`,
+        `${modPart}.lua#${symPart}`,
+        `${modPart}/init.lua#${symPart}`,
+        `${modPart}/src/init.lua#${symPart}`,
+        `${modPart}/init.client.lua#${symPart}`,
+        `${modPart}/init.server.lua#${symPart}`,
     ];
+    const slashIdx = modPart.indexOf("/");
+    if (slashIdx > 0) {
+        const head = modPart.slice(0, slashIdx);
+        const tail = modPart.slice(slashIdx + 1);
+        modSuffixes.push(
+            `${head}/src/${tail}.luau#${symPart}`,
+            `${head}/src/${tail}/init.luau#${symPart}`,
+            `${head}/src/${tail}.lua#${symPart}`,
+            `${head}/src/${tail}/init.lua#${symPart}`,
+        );
+    }
     let hits = filterLuauNodesBySuffixes(nodes, modSuffixes);
     if (hits.length === 0) hits = filterLuauNodesBySuffixes(nodes, [`#${norm}`]);
     if (hits.length > 1) {
         const exp = hits.filter((n) => n.exported);
         if (exp.length > 0) hits = exp;
     }
-    return hits.length > 0 ? unwrapLuauReexportHits(hits, nodes, edges) : [];
+    return hits.length > 0 ? unwrapLuauReexportHits(hits, nodes, edges, graph) : [];
 }
 
-function matchSingleLuauCandidate(nodes, norm, edges) {
+function matchSingleLuauCandidate(nodes, norm, edges, graph) {
     if (norm.includes("#")) {
         const hits = unwrapLuauReexportHits(
             nodes.filter((n) => n.kind !== "file" && (stripNodeOrdinals(n) === norm || stripNodeOrdinals(n).endsWith("/" + norm))),
             nodes,
             edges,
+            graph,
         );
         return hits.length > 0 ? hits : null;
     }
-    if (norm.endsWith(".luau")) {
+    if (norm.endsWith(".luau") || norm.endsWith(".lua")) {
         const hits = nodes.filter(
             (n) => n.kind === "file" && (n.name.toLowerCase() === norm || n.path.toLowerCase() === norm || n.path.toLowerCase().endsWith("/" + norm)),
         );
         return hits.length > 0 ? hits : null;
     }
     if (norm.includes(".")) {
-        const hits = matchLuauDottedSymbol(nodes, norm, edges);
+        const hits = matchLuauDottedSymbol(nodes, norm, edges, graph);
         if (hits.length > 0) return hits;
     }
-    const fileStemHits = nodes.filter((n) => n.kind === "file" && n.path.endsWith(".luau") && moduleStem(n.path).toLowerCase() === norm);
+    const fileStemHits = nodes.filter((n) => n.kind === "file" && (n.path.endsWith(".luau") || n.path.endsWith(".lua")) && moduleStem(n.path).toLowerCase() === norm);
     if (fileStemHits.length > 0 && !nodes.some((n) => n.kind !== "file" && n.name.toLowerCase() === norm)) return fileStemHits;
     return null;
 }
 
-export function matchLuauSymbol(nodes, lowerQuery, edges) {
+export function matchLuauSymbol(nodes, lowerQuery, edges, graph) {
     for (const norm of buildLuauCandidates(nodes, lowerQuery)) {
-        const matched = matchSingleLuauCandidate(nodes, norm, edges);
+        const matched = matchSingleLuauCandidate(nodes, norm, edges, graph);
         if (matched) return matched;
     }
     return [];
@@ -227,11 +258,25 @@ export function resolveSymbol(graph, query, opts = {}) {
     let matches = symbolMatches(graph.nodes, lowerQuery, graph);
     if (matches.length === 0 && (trimmed.includes(":") || trimmed.includes("#")))
         matches = matchColonOrHashSymbol(graph.nodes, lowerQuery, graph);
-    const hasLuau = !graph.meta?.languages || graph.meta.languages.includes("luau");
+    const hasLuau = !graph.meta?.languages || graph.meta.languages.includes("luau") || graph.meta.languages.includes("lua");
     if (hasLuau && (matches.length === 0 || lowerQuery.includes(".") || lowerQuery.includes(":"))) {
-        const luauMatches = matchLuauSymbol(graph.nodes, lowerQuery, graph.edges);
-        if (luauMatches.length > 0 && (matches.length === 0 || luauMatches.some((m) => m.exported)))
-            matches = luauMatches;
+        const luauMatches = matchLuauSymbol(graph.nodes, lowerQuery, graph.edges, graph);
+        if (luauMatches.length > 0 && (matches.length === 0 || luauMatches.some((m) => m.exported))) {
+            if (matches.length === 0) {
+                matches = luauMatches;
+            }
+            else {
+                const seenIds = new Set(matches.map((m) => m.id));
+                const merged = [...matches];
+                for (const m of luauMatches) {
+                    if (!seenIds.has(m.id)) {
+                        seenIds.add(m.id);
+                        merged.push(m);
+                    }
+                }
+                matches = merged;
+            }
+        }
     }
     if (matches.length === 0 && looksLikeFilename)
         matches = matchFileNodeFallback(graph, trimmed, lowerQuery);

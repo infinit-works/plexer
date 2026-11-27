@@ -1,10 +1,19 @@
 ; Definitions
 
-; * modules and protocols
+; * modules, protocols, and protocol implementations
 (call
   target: (identifier) @ignore
   (arguments (alias) @name)
   (#any-of? @ignore "defmodule" "defprotocol")) @definition.module
+
+(call
+  target: (identifier) @ignore
+  (arguments (alias) @name)
+  (#eq? @ignore "defimpl")) @definition.class
+
+(call
+  target: (identifier) @ignore
+  (#any-of? @ignore "defstruct" "defexception")) @definition.struct
 
 ; * functions/macros
 (call

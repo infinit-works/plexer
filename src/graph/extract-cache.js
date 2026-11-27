@@ -23,27 +23,33 @@
  * extraction code itself, caught by content-hashing it — see
  * {@link extractorStamp}. Neither asks anyone to remember to bump anything.
  */
-import { readFileSync, readdirSync, rmSync, statSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { fork } from "node:child_process";
+import { readdirSync, rmSync, statSync } from "node:fs";
+import { availableParallelism } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { dirname, extname, join } from "node:path";
-import { readPackageVersion } from "../util/cli-meta.js";
+import { registerGraphCacheClearer } from "../context/graph-store.js";
 import { CACHE_DIR } from "../context/node-file.js";
 import {
     checkpointSqliteStore,
     getSqliteMeta,
     openSqliteStore,
     prepareStmt,
+    sameWalRevision,
     setSqliteMeta,
+    sqliteWalRevision,
     stripNodeBodyText,
     withSqliteTransaction,
 } from "../storage/sqlite-store.js";
 import { contentHash } from "../util/id.js";
+import { pathUnderPrefix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
 import { readJson } from "../util/state.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
 import { extractFile, languageLabelOf, languageOf, warmDepthGrammars } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
+import { extractorStamp, pruneSidecars } from "./extractor-stamp.js";
+export { extractorStamp, pruneSidecars };
 /** Bump when the on-disk shape below changes. */
 const CACHE_VERSION = 2;
 export const EXTRACT_CACHE_PREFIX = "extract";
@@ -60,152 +66,7 @@ function extractCachePath(outDir) {
     const stamp = extractorStamp();
     return stamp === null ? null : join(outDir, CACHE_DIR, `${EXTRACT_CACHE_PREFIX}.${stamp}.json`);
 }
-/** Keep `.cache/` from growing a file per version forever: after writing, drop all
- * but the newest `keep` files sharing a prefix. Best-effort and never fatal — this
- * is a cache directory, and a failure here costs disk, not correctness. */
-export function pruneSidecars(cacheDir, prefix, keep = 2) {
-    try {
-        const mine = readdirSync(cacheDir)
-            .filter((f) => f.startsWith(`${prefix}.`) && f.endsWith(".json"))
-            .map((f) => {
-            const full = join(cacheDir, f);
-            return { full, mtimeMs: statSync(full).mtimeMs };
-        })
-            .sort((a, b) => b.mtimeMs - a.mtimeMs);
-        for (const f of mine.slice(keep))
-            rmSync(f.full, { force: true });
-    }
-    catch {
-        /* nothing here is load-bearing */
-    }
-}
-/** Computed once per process — this can't change under a running process without
- * the module graph itself being swapped, and a long-lived MCP server holding the
- * identity of the code it actually loaded is the correct answer anyway.
- * `undefined` = not computed yet; `null` = computed, and there is no identity. */
-let memoizedStamp;
-/**
- * Identity of the code that produces the cached parses. Both sidecars key on it,
- * so *anything* that can change extraction output has to change this string.
- *
- * Content-hashed over every sibling module in this directory, plus the package
- * version. Two earlier instincts are deliberately rejected:
- *
- * - **Not a timestamp.** This was `mtime:size` of `extract.js` alone, which is
- *   wrong in both directions. Too loose: the parse of `db.count()` depends on
- *   `bindings.js` deciding that `db` is a `UserRepo` (that answer is stored *in*
- *   the cached entry, as an edge's `recvType`), and fixing a binding bug leaves
- *   `extract.js`'s emitted bytes untouched — so any build that skips rewriting
- *   unchanged output keeps the old stamp and silently replays pre-fix edges. Too
- *   tight: a rebuild that rewrites identical content moves the mtime and throws
- *   away the whole memo for nothing.
- * - **Not a hand-kept list of modules.** A list is correct exactly until someone
- *   moves parse logic into a module nobody added to it, and the failure is silent.
- *
- * Hashing the directory over-invalidates a little — editing any `graph/` module
- * costs one cold rebuild — which is no more often than a version bump already
- * costs, and always in the safe direction. The package version is folded in so a
- * tree-sitter grammar upgrade (which changes parse output without changing any of
- * plexer's own files) invalidates too.
- *
- * Measured at ~0.5ms for 21 files / 556KB, paid once per process.
- *
- * **Null when no identity can be established at all**, and that is deliberately not
- * a string. It used to return `"unknown"` on failure — but `"unknown"` was then
- * *written into the sidecars as a real identity*, and every later run compared equal
- * to it, so any environment where stamping fails (a `pkg`/`bun-compile` single-file
- * build, an asar-style read, a directory that can't be listed) permanently lost the
- * ability to notice an extractor change. A sentinel that doubles as a valid value
- * silently disables the whole mechanism. Null forces callers to decide instead, and
- * {@link extractCachePath} decides not to have a memo.
- */
-export function extractorStamp() {
-    if (memoizedStamp === undefined)
-        memoizedStamp = computeStamp();
-    return memoizedStamp;
-}
-function computeStamp() {
-    try {
-        const self = fileURLToPath(import.meta.url);
-        // `.js` when running from `dist/`, `.ts` under tsx — take the extension from
-        // our own filename rather than guessing which layout we're in.
-        const dir = dirname(self);
-        const v = readPackageVersion(import.meta.url);
-        const hashed = stampDir(dir, extname(self), v ?? "");
-        if (hashed)
-            return hashed;
-        // Couldn't read the modules (bundled into one file, say). The version alone is
-        // a weaker identity — it can't see a local edit — but it still turns over on
-        // every upgrade, which is the case that ships broken parses to users.
-        return v ? `v${v}` : null;
-    }
-    catch (err) {
-        const fallback = null;
-        void err;
-        return fallback;
-    }
-}
-/**
- * Hash every `ext` file in `dir`, plus `version`. Null when the directory holds no
- * such file. Separated from {@link extractorStamp} so a test can prove the property
- * that matters: a change to *any* module in the directory moves the stamp, not just
- * the one the old implementation happened to watch.
- */
-function stampDir(dir, ext, version = "") {
-    const files = readdirSync(dir).filter((f) => f.endsWith(ext)).sort();
-    if (!files.length)
-        return null;
-    const h = createHash("sha256");
-    h.update(version);
-    for (const f of files) {
-        h.update(f); // a rename is a change, even at identical content
-        h.update(readFileSync(join(dir, f)));
-    }
-    try {
-        const queriesDir = join(dir, "queries");
-        const scmFiles = readdirSync(queriesDir).filter((f) => f.endsWith(".scm")).sort();
-        for (const qf of scmFiles) {
-            h.update(`queries/${qf}`);
-            h.update(readFileSync(join(queriesDir, qf)));
-        }
-    }
-    catch {
-        /* no queries/ subdir */
-    }
-    try {
-        const extractDir = join(dir, "extract");
-        const extractFiles = readdirSync(extractDir)
-            .filter((f) => f.endsWith(".js") || (ext && f.endsWith(ext)))
-            .sort();
-        for (const ef of extractFiles) {
-            h.update(`extract/${ef}`);
-            h.update(readFileSync(join(extractDir, ef)));
-        }
-    }
-    catch {
-        /* no extract/ subdir */
-    }
-    try {
-        const grammarsDir = join(dir, "..", "..", "grammars");
-        const wasmFiles = readdirSync(grammarsDir).filter((f) => f.endsWith(".wasm")).sort();
-        for (const wf of wasmFiles) {
-            h.update(`grammars/${wf}`);
-            h.update(readFileSync(join(grammarsDir, wf)));
-        }
-    }
-    catch {
-        /* no grammars/ subdir */
-    }
-    try {
-        const idPath = join(dir, "..", "util", ext && ext !== ".js" ? `id${ext}` : "id.js");
-        h.update("util/id.js");
-        h.update(readFileSync(idPath));
-    }
-    catch {
-        /* id.js missing in bundled build */
-    }
-    return h.digest("hex").slice(0, 16);
-}
+/** `pruneSidecars` and `extractorStamp` moved to `./extractor-stamp.js` (re-exported above). */
 export function emptyExtractCache() {
     return { version: CACHE_VERSION, extractor: extractorStamp() ?? "", files: {} };
 }
@@ -224,6 +85,42 @@ function unlinkLegacyExtractFiles(outDir) {
     }
 }
 
+const MAX_EXTRACT_STATS_CACHE = 2;
+const extractStatsCache = new Map();
+
+function setCachedExtractStats(absOut, stamp, rev, stats) {
+    if (!extractStatsCache.has(absOut) && extractStatsCache.size >= MAX_EXTRACT_STATS_CACHE) {
+        const oldest = extractStatsCache.keys().next().value;
+        if (oldest !== undefined)
+            extractStatsCache.delete(oldest);
+    }
+    extractStatsCache.delete(absOut);
+    extractStatsCache.set(absOut, { stamp, rev, stats });
+}
+
+export function syncExtractStatsRevision(outDir) {
+    if (!outDir)
+        return;
+    const absOut = resolve(outDir);
+    const cached = extractStatsCache.get(absOut);
+    if (!cached)
+        return;
+    const rev = sqliteWalRevision(absOut);
+    if (rev)
+        cached.rev = rev;
+    else
+        extractStatsCache.delete(absOut);
+}
+
+registerGraphCacheClearer((outDir, opts) => {
+    if (opts?.keepPriorNodes)
+        return;
+    if (outDir !== undefined && outDir !== null)
+        extractStatsCache.delete(resolve(outDir));
+    else
+        extractStatsCache.clear();
+});
+
 /**
  * Lightweight SQLite stat/hash index reader (`files` metadata only, zero `nodes_json` parsing).
  * Falls back to legacy `.cache/extract.<stamp>.json` when `index.sqlite` isn't populated yet.
@@ -232,6 +129,12 @@ export function readExtractCacheStats(outDir) {
     const stamp = extractorStamp();
     if (stamp === null) {
         return { source: "none", extractor: "", stats: new Map(), cache: emptyExtractCache() };
+    }
+    const absOut = resolve(outDir);
+    const rev = sqliteWalRevision(absOut);
+    const cached = extractStatsCache.get(absOut);
+    if (cached && cached.stamp === stamp && rev && sameWalRevision(cached.rev, rev)) {
+        return { source: "sqlite", extractor: stamp, stats: cached.stats, cache: null };
     }
     const store = openSqliteStore(outDir, { create: false });
     if (store) {
@@ -251,6 +154,7 @@ export function readExtractCacheStats(outDir) {
                     });
                 }
                 if (stats.size > 0 || extractCachePath(outDir) === null || !readdirLegacyExtractExists(outDir)) {
+                    setCachedExtractStats(absOut, stamp, rev ?? sqliteWalRevision(absOut), stats);
                     return { source: "sqlite", extractor: stamp, stats, cache: null };
                 }
             }
@@ -381,51 +285,60 @@ export function writeExtractCacheIncremental(outDir, delta = {}) {
     const stamp = extractorStamp();
     if (stamp === null)
         return false;
-    try {
-        const store = openSqliteStore(outDir, { create: true });
-        withSqliteTransaction(store, () => {
-            setSqliteMeta(store, "extractor_stamp", stamp);
-            const delStmt = prepareStmt(store, "DELETE FROM files WHERE path = ?");
-            for (const rel of delta.deletePaths ?? []) {
-                delStmt.run(rel);
-            }
-            const statStmt = prepareStmt(
-                store,
-                "UPDATE files SET mtime_ms = ?, size = ?, content_hash = ? WHERE path = ?"
-            );
-            for (const u of delta.updateStats ?? []) {
-                statStmt.run(u.mtimeMs ?? 0, u.size ?? 0, u.hash ?? "", u.rel);
-            }
-            const upsertStmt = prepareStmt(
-                store,
-                `INSERT OR REPLACE INTO files(
-                    path, mtime_ms, size, content_hash, nodes_json, raw_edges_json
-                ) VALUES (?, ?, ?, ?, ?, ?)`
-            );
-            const entries = delta.upsertEntries ?? {};
-            for (const [rel, entry] of Object.entries(entries)) {
-                if (!entry)
-                    continue;
-                const compactNodes = (entry.nodes ?? []).map(stripNodeBodyText);
-                upsertStmt.run(
-                    rel,
-                    entry.mtimeMs ?? 0,
-                    entry.size ?? 0,
-                    entry.hash ?? "",
-                    JSON.stringify(compactNodes),
-                    JSON.stringify(entry.rawEdges ?? [])
-                );
-            }
-        });
-        if (store.txDepth === 0) {
-            checkpointSqliteStore(outDir, "PASSIVE");
+    const store = openSqliteStore(outDir, { create: true });
+    withSqliteTransaction(store, () => {
+        setSqliteMeta(store, "extractor_stamp", stamp);
+        const delStmt = prepareStmt(store, "DELETE FROM files WHERE path = ?");
+        for (const rel of delta.deletePaths ?? []) {
+            delStmt.run(rel);
         }
-        unlinkLegacyExtractFiles(outDir);
-        return true;
+        const statStmt = prepareStmt(
+            store,
+            "UPDATE files SET mtime_ms = ?, size = ?, content_hash = ? WHERE path = ?"
+        );
+        for (const u of delta.updateStats ?? []) {
+            statStmt.run(u.mtimeMs ?? 0, u.size ?? 0, u.hash ?? "", u.rel);
+        }
+        const upsertStmt = prepareStmt(
+            store,
+            `INSERT OR REPLACE INTO files(
+                path, mtime_ms, size, content_hash, nodes_json, raw_edges_json
+            ) VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        const entries = delta.upsertEntries ?? {};
+        for (const [rel, entry] of Object.entries(entries)) {
+            if (!entry)
+                continue;
+            const compactNodes = (entry.nodes ?? []).map(stripNodeBodyText);
+            upsertStmt.run(
+                rel,
+                entry.mtimeMs ?? 0,
+                entry.size ?? 0,
+                entry.hash ?? "",
+                JSON.stringify(compactNodes),
+                JSON.stringify(entry.rawEdges ?? [])
+            );
+        }
+    });
+    if (store.txDepth === 0) {
+        checkpointSqliteStore(outDir, "PASSIVE");
     }
-    catch {
-        return false;
+    const absOut = resolve(outDir);
+    const cached = extractStatsCache.get(absOut);
+    if (cached && cached.stamp === stamp) {
+        for (const rel of delta.deletePaths ?? [])
+            cached.stats.delete(rel);
+        for (const u of delta.updateStats ?? [])
+            cached.stats.set(u.rel, { mtimeMs: u.mtimeMs ?? 0, size: u.size ?? 0, hash: u.hash ?? "" });
+        for (const [rel, entry] of Object.entries(delta.upsertEntries ?? {})) {
+            if (entry)
+                cached.stats.set(rel, { mtimeMs: entry.mtimeMs ?? 0, size: entry.size ?? 0, hash: entry.hash ?? "" });
+        }
+        if (store.txDepth === 0)
+            cached.rev = sqliteWalRevision(absOut);
     }
+    unlinkLegacyExtractFiles(outDir);
+    return true;
 }
 
 /**
@@ -437,62 +350,80 @@ export function writeExtractCache(outDir, cache) {
     const stamp = extractorStamp();
     if (stamp === null)
         return false;
-    try {
-        const store = openSqliteStore(outDir, { create: true });
-        const entries = cache?.files ?? {};
-        withSqliteTransaction(store, () => {
-            setSqliteMeta(store, "extractor_stamp", stamp);
-            store.db.exec("DELETE FROM files");
-            const upsertStmt = prepareStmt(
-                store,
-                `INSERT INTO files(
-                    path, mtime_ms, size, content_hash, nodes_json, raw_edges_json
-                ) VALUES (?, ?, ?, ?, ?, ?)`
+    const store = openSqliteStore(outDir, { create: true });
+    const entries = cache?.files ?? {};
+    const nextStats = new Map();
+    withSqliteTransaction(store, () => {
+        setSqliteMeta(store, "extractor_stamp", stamp);
+        store.db.exec("DELETE FROM files");
+        const upsertStmt = prepareStmt(
+            store,
+            `INSERT INTO files(
+                path, mtime_ms, size, content_hash, nodes_json, raw_edges_json
+            ) VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        for (const [rel, entry] of Object.entries(entries)) {
+            if (!entry)
+                continue;
+            const compactNodes = (entry.nodes ?? []).map(stripNodeBodyText);
+            const mtimeMs = entry.mtimeMs ?? 0;
+            const size = entry.size ?? 0;
+            const hash = entry.hash ?? "";
+            nextStats.set(rel, { mtimeMs, size, hash });
+            upsertStmt.run(
+                rel,
+                mtimeMs,
+                size,
+                hash,
+                JSON.stringify(compactNodes),
+                JSON.stringify(entry.rawEdges ?? [])
             );
-            for (const [rel, entry] of Object.entries(entries)) {
-                if (!entry)
-                    continue;
-                const compactNodes = (entry.nodes ?? []).map(stripNodeBodyText);
-                upsertStmt.run(
-                    rel,
-                    entry.mtimeMs ?? 0,
-                    entry.size ?? 0,
-                    entry.hash ?? "",
-                    JSON.stringify(compactNodes),
-                    JSON.stringify(entry.rawEdges ?? [])
-                );
-            }
-        });
-        if (store.txDepth === 0) {
-            checkpointSqliteStore(outDir, "PASSIVE");
         }
-        unlinkLegacyExtractFiles(outDir);
-        return true;
+    });
+    if (store.txDepth === 0) {
+        checkpointSqliteStore(outDir, "PASSIVE");
     }
-    catch {
-        return false;
-    }
+    const absOut = resolve(outDir);
+    setCachedExtractStats(absOut, stamp, sqliteWalRevision(absOut), nextStats);
+    unlinkLegacyExtractFiles(outDir);
+    return true;
 }
-function classifySourceFile(rel) {
+function isRojoLuauFile(rel, opts) {
+    if (!rel || !rel.endsWith(".lua"))
+        return false;
+    if (opts?.hasRojoProject)
+        return true;
+    return Boolean(opts?.rojoMountPrefixes?.some((p) => pathUnderPrefix(rel, p)));
+}
+
+function classifySourceFile(rel, opts = null) {
     const lang = languageOf(rel);
     const container = lang ? null : containerLangOf(rel);
     const generic = lang || container ? null : genericLangOf(rel);
     const label = languageLabelOf(rel) ?? container?.name ?? generic?.name ?? "unknown";
-    return { lang, container, generic, label };
+    const luauMode = generic?.name === "lua" && isRojoLuauFile(rel, opts);
+    return { lang, container, generic, label, luauMode };
 }
 
-function isValidCachedNodes(cached, rel) {
-    return Boolean(cached && Array.isArray(cached.nodes) && cached.nodes.every((n) => n && n.path === rel));
+function isValidCachedNodes(cached, rel, classified = null) {
+    if (!cached || !Array.isArray(cached.nodes) || !cached.nodes.every((n) => n && n.path === rel))
+        return false;
+    if (classified?.generic?.name === "lua") {
+        const cachedLuau = Boolean(cached.nodes[0]?.luauMode);
+        if (cachedLuau !== Boolean(classified.luauMode))
+            return false;
+    }
+    return true;
 }
 
-function canReuseByStat(cached, f, rel, trustStat) {
+function canReuseByStat(cached, f, rel, trustStat, classified = null) {
     return Boolean(
         trustStat &&
             cached?.hash &&
             !cached.error &&
             cached.size === f.size &&
             cached.mtimeMs === f.mtimeMs &&
-            isValidCachedNodes(cached, rel),
+            isValidCachedNodes(cached, rel, classified),
     );
 }
 
@@ -502,14 +433,140 @@ function appendCachedResult(cached, label, state) {
     state.langs.add(label);
 }
 
-function inspectOrQueueSourceFile(f, prevCache, trustStat, state) {
+function compareUtf16Local(a, b) {
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+const EXTRACT_WORKER_PATH = fileURLToPath(new URL("./extract-worker.js", import.meta.url));
+const WORKER_PARALLEL_THRESHOLD = 64;
+
+function buildCleanWorkerEnv() {
+    if (!("NODE_TEST_CONTEXT" in process.env))
+        return process.env;
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    return env;
+}
+
+async function parseQueuedWithWorkers(toParse, state) {
+    const sorted = [...toParse].sort((a, b) => compareUtf16Local(a.label, b.label) || compareUtf16Local(a.rel, b.rel));
+    const envWorkers = Number.parseInt(process.env.PLEXER_WORKERS ?? "", 10);
+    const maxWorkers = Number.isInteger(envWorkers) && envWorkers >= 1
+        ? Math.min(4, envWorkers)
+        : Math.min(4, Math.max(1, availableParallelism() - 1));
+    const workerCount = Math.min(maxWorkers, Math.floor(sorted.length / 32));
+    if (workerCount <= 1)
+        return false;
+
+    const chunkSize = Math.ceil(sorted.length / workerCount);
+    const workerEnv = buildCleanWorkerEnv();
+    const children = [];
+    const promises = [];
+    try {
+        for (let off = 0; off < sorted.length; off += chunkSize) {
+            const slice = sorted.slice(off, off + chunkSize).map((it) => ({
+                abs: it.f.abs,
+                rel: it.rel,
+                size: it.f.size,
+                mtimeMs: it.f.mtimeMs,
+                lang: it.lang ?? null,
+                genericName: it.generic?.name ?? null,
+                containerName: it.container?.name ?? null,
+                label: it.label,
+                luauMode: Boolean(it.luauMode),
+            }));
+            promises.push(new Promise((resolveDone, rejectDone) => {
+                const child = fork(EXTRACT_WORKER_PATH, [], {
+                    execArgv: [],
+                    serialization: "advanced",
+                    stdio: ["ignore", "ignore", "pipe", "ipc"],
+                    env: workerEnv,
+                });
+                children.push(child);
+                let stderrText = "";
+                child.stderr?.on("data", (d) => {
+                    stderrText += String(d);
+                });
+                let settled = false;
+                child.once("message", (msg) => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    if (msg?.fatal) {
+                        rejectDone(new Error(msg.fatal));
+                        return;
+                    }
+                    resolveDone(Array.isArray(msg?.results) ? msg.results : []);
+                });
+                child.once("error", (err) => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    rejectDone(err);
+                });
+                child.once("exit", (code) => {
+                    if (!settled) {
+                        settled = true;
+                        rejectDone(new Error(`extract-worker exited with code ${code}${stderrText ? `: ${stderrText.trim()}` : ""}`));
+                    }
+                });
+                child.send({ items: slice });
+            }));
+        }
+
+        const batchLists = await Promise.all(promises);
+        const merged = [];
+        for (const list of batchLists) {
+            for (const r of list)
+                merged.push(r);
+        }
+        merged.sort((a, b) => compareUtf16Local(a.rel, b.rel));
+        for (const r of merged) {
+            if (!r.hash && r.error) {
+                state.errors.push(r.error);
+                state.entries[r.rel] = { size: r.size, mtimeMs: r.mtimeMs, hash: "", nodes: [], rawEdges: [], error: r.error };
+                state.mtimeDirty = true;
+                continue;
+            }
+            if (!r.hash) {
+                state.entries[r.rel] = { size: r.size, mtimeMs: r.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+                state.mtimeDirty = true;
+                continue;
+            }
+            state.parsed++;
+            if (r.error) {
+                state.errors.push(r.error);
+                state.entries[r.rel] = { size: r.size, mtimeMs: r.mtimeMs, hash: r.hash, nodes: [], rawEdges: [], error: r.error };
+                continue;
+            }
+            state.nodes.push(...r.nodes);
+            state.rawEdges.push(...r.rawEdges);
+            state.langs.add(r.label);
+            state.entries[r.rel] = { size: r.size, mtimeMs: r.mtimeMs, hash: r.hash, nodes: r.nodes, rawEdges: r.rawEdges };
+        }
+        return true;
+    }
+    finally {
+        for (const child of children) {
+            if (child.exitCode === null && !child.killed) {
+                try { child.kill(); } catch { /* ignore */ }
+            }
+        }
+    }
+}
+
+function inspectOrQueueSourceFile(f, prevCache, trustStat, state, opts = null, deferColdRead = false) {
     const rel = f.rel;
-    const classified = classifySourceFile(rel);
+    const classified = classifySourceFile(rel, opts);
     const cached = prevCache.files[rel];
-    if (canReuseByStat(cached, f, rel, trustStat)) {
+    if (canReuseByStat(cached, f, rel, trustStat, classified)) {
         state.entries[rel] = cached;
         state.reused++;
         appendCachedResult(cached, classified.label, state);
+        return;
+    }
+    if (deferColdRead && !cached?.hash) {
+        state.toParse.push({ f, rel, source: null, hash: null, ...classified });
         return;
     }
     let source;
@@ -529,7 +586,7 @@ function inspectOrQueueSourceFile(f, prevCache, trustStat, state) {
         return;
     }
     const hash = contentHash(source);
-    if (hash === cached?.hash && isValidCachedNodes(cached, rel)) {
+    if (hash === cached?.hash && isValidCachedNodes(cached, rel, classified)) {
         state.entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
         state.mtimeDirty = true;
         state.reused++;
@@ -542,13 +599,13 @@ function inspectOrQueueSourceFile(f, prevCache, trustStat, state) {
     state.toParse.push({ f, rel, source, hash, ...classified });
 }
 
-function runSingleFileExtractor(item) {
+function runSingleFileExtractor(item, source) {
     if (item.lang)
-        return extractFile(item.rel, item.source, item.lang);
+        return extractFile(item.rel, source, item.lang);
     if (item.container)
-        return extractContainer(item.rel, item.source, item.container);
+        return extractContainer(item.rel, source, item.container);
     if (item.generic)
-        return extractGeneric(item.rel, item.source, item.generic.name);
+        return extractGeneric(item.rel, source, item.generic.name, item.luauMode ? { luauMode: true } : null);
     return null;
 }
 
@@ -556,16 +613,47 @@ async function parseQueuedSourceFiles(state) {
     const { toParse } = state;
     if (toParse.length === 0)
         return;
+    if (toParse.length >= WORKER_PARALLEL_THRESHOLD && process.env.PLEXER_NO_WORKERS !== "1") {
+        const handled = await parseQueuedWithWorkers(toParse, state);
+        if (handled) {
+            toParse.length = 0;
+            return;
+        }
+    }
+    const genericLangs = new Set(toParse.map((p) => p.generic?.name).filter(Boolean));
+    if (toParse.some((p) => p.luauMode))
+        genericLangs.add("luau");
     await Promise.all([
         warmDepthGrammars(new Set(toParse.map((p) => p.lang).filter(Boolean))),
-        warmGenericGrammars(new Set(toParse.map((p) => p.generic?.name).filter(Boolean))),
+        warmGenericGrammars(genericLangs),
         warmContainerGrammars(new Set(toParse.map((p) => p.container?.name).filter(Boolean))),
     ]);
     for (const item of toParse) {
-        const { f, rel, hash, label } = item;
+        const { f, rel, label } = item;
+        let source = item.source;
+        let hash = item.hash;
+        item.source = null;
+        if (source === null) {
+            try {
+                source = readSourceFile(f.abs);
+            }
+            catch (err) {
+                const message = `${rel}: ${err instanceof Error ? err.message : String(err)}`;
+                state.errors.push(message);
+                state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
+                state.mtimeDirty = true;
+                continue;
+            }
+            if (source === null) {
+                state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+                state.mtimeDirty = true;
+                continue;
+            }
+            hash = contentHash(source);
+        }
         state.parsed++;
         try {
-            const extracted = runSingleFileExtractor(item);
+            const extracted = runSingleFileExtractor(item, source);
             if (!extracted)
                 continue;
             appendCachedResult(extracted, label, state);
@@ -577,6 +665,7 @@ async function parseQueuedSourceFiles(state) {
             state.entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
         }
     }
+    toParse.length = 0;
 }
 
 /**
@@ -585,6 +674,7 @@ async function parseQueuedSourceFiles(state) {
  */
 export async function extractSourceFiles(files, prevCache, opts = {}) {
     const trustStat = (opts.trustStat ?? true) && process.env.PLEXER_REFRESH !== "hash";
+    const deferColdRead = files.length >= WORKER_PARALLEL_THRESHOLD && process.env.PLEXER_NO_WORKERS !== "1";
     const state = {
         nodes: [],
         rawEdges: [],
@@ -598,7 +688,7 @@ export async function extractSourceFiles(files, prevCache, opts = {}) {
     };
     for (let i = 0; i < files.length; i++) {
         opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: files[i].rel });
-        inspectOrQueueSourceFile(files[i], prevCache, trustStat, state);
+        inspectOrQueueSourceFile(files[i], prevCache, trustStat, state, opts, deferColdRead);
     }
     await parseQueuedSourceFiles(state);
     const { nodes, rawEdges, langs, errors, entries, parsed, reused, mtimeDirty } = state;
@@ -613,6 +703,20 @@ export async function extractSourceFiles(files, prevCache, opts = {}) {
 export async function extractSourceFilesIncremental(files, outDir, opts = {}) {
     const useCache = opts.reuse !== false;
     const statsInfo = useCache ? readExtractCacheStats(outDir) : { source: "none", stats: new Map(), cache: emptyExtractCache() };
+    let priorRojoMode = null;
+    if (statsInfo.source === "sqlite") {
+        const store = openSqliteStore(outDir, { create: false });
+        if (store) {
+            try {
+                priorRojoMode = getSqliteMeta(store, "rojo_lua_mode") === "1";
+            }
+            catch {
+                priorRojoMode = null;
+            }
+        }
+    }
+    const wantRojoMode = Boolean(opts.hasRojoProject);
+    const luaModeMismatch = priorRojoMode !== null && priorRojoMode !== wantRojoMode;
     if (statsInfo.source !== "sqlite") {
         const prevCache = statsInfo.source === "legacy" ? statsInfo.cache : emptyExtractCache();
         const full = await extractSourceFiles(files, prevCache, opts);
@@ -645,18 +749,25 @@ export async function extractSourceFilesIncremental(files, outDir, opts = {}) {
         mtimeDirty: false,
     };
 
+    const deferColdRead = files.length >= WORKER_PARALLEL_THRESHOLD && process.env.PLEXER_NO_WORKERS !== "1";
     for (let i = 0; i < files.length; i++) {
         const f = files[i];
         const rel = f.rel;
         seenPaths.add(rel);
         opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
-        const classified = classifySourceFile(rel);
+        const classified = classifySourceFile(rel, opts);
         const st = statsMap.get(rel);
+        const canTrustFileStat = trustStat && !(luaModeMismatch && rel.endsWith(".lua"));
 
-        if (trustStat && st && st.hash && st.size === f.size && st.mtimeMs === f.mtimeMs) {
+        if (canTrustFileStat && st && st.hash && st.size === f.size && st.mtimeMs === f.mtimeMs) {
             state.reused++;
             cleanPaths.add(rel);
             state.langs.add(classified.label);
+            continue;
+        }
+        if (deferColdRead && (!st?.hash || (luaModeMismatch && rel.endsWith(".lua")))) {
+            dirtyPaths.add(rel);
+            state.toParse.push({ f, rel, source: null, hash: null, ...classified });
             continue;
         }
 
@@ -680,7 +791,7 @@ export async function extractSourceFilesIncremental(files, outDir, opts = {}) {
         }
 
         const hash = contentHash(source);
-        if (st && st.hash && hash === st.hash) {
+        if (st && st.hash && hash === st.hash && !(luaModeMismatch && rel.endsWith(".lua"))) {
             mtimeUpdates.push({ rel, size: f.size, mtimeMs: f.mtimeMs, hash });
             state.mtimeDirty = true;
             state.reused++;

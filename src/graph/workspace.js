@@ -21,8 +21,8 @@
  * CLI print/exit wrappers and the per-child build orchestration live in
  * `workspace-cli.js`; `mcp/tools.js` calls the federate* functions directly.
  */
-import { existsSync, lstatSync, realpathSync, rmSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
 import { checkGraph } from "./check.js";
 import { loadGraphCached } from "../context/graph-store.js";
@@ -38,47 +38,15 @@ import { fuseScopes, STRONG_FLOOR, HIGH_FLOOR } from "../ask/fuse.js";
 import { grepGraph } from "../search/grep.js";
 import { fileReader } from "../util/span.js";
 import { normalizePathPrefix } from "../util/paths.js";
-import { readBuildConfig, readJson, writeBuildConfig, writeJsonAtomic } from "../util/state.js";
-const WORKSPACE_FILE = "workspace.json";
-/** Absolute path to the workspace index for a parent root (`<dir>/plexer/workspace.json`). */
-export function workspacePath(root, override) {
-    return join(contextDirFor(root, override), WORKSPACE_FILE);
-}
-function isSafeWorkspaceChild(root, child) {
-    if (typeof child !== "string")
-        return false;
-    const c = child.trim();
-    if (!c || c === "." || c === ".." || c.startsWith(".") || /[/\\:]/.test(c))
-        return false;
-    const absRoot = resolve(root);
-    const absChild = resolve(absRoot, c);
-    const rel = relative(absRoot, absChild);
-    if (!rel || rel.startsWith("..") || isAbsolute(rel))
-        return false;
-    if (!existsSync(absChild))
-        return true;
-    try {
-        if (lstatSync(absChild).isSymbolicLink())
-            return false;
-        const realRoot = realpathSync(absRoot);
-        const realChild = realpathSync(absChild);
-        const realRel = relative(realRoot, realChild);
-        return Boolean(realRel && !realRel.startsWith("..") && !isAbsolute(realRel));
-    }
-    catch {
-        return false;
-    }
-}
+import { readBuildConfig, writeBuildConfig, writeJsonAtomic } from "../util/state.js";
+import { readWorkspaceMeta, workspacePath } from "./workspace-path.js";
+
+export { workspacePath };
+
 /** Read the workspace index, or null when the parent has none (not a workspace,
  * or unparseable/foreign json — treated the same as absent). */
 export function readWorkspace(root, override) {
-    const parsed = readJson(workspacePath(root, override));
-    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.children))
-        return null;
-    const children = parsed.children.map(String).filter((c) => isSafeWorkspaceChild(root, c));
-    if (children.length === 0 && parsed.children.length > 0)
-        return null;
-    return { version: 1, children };
+    return readWorkspaceMeta(root, override);
 }
 /** Write the workspace index, sorting children for a stable, minimal git diff. */
 export function writeWorkspace(root, ws, override) {
@@ -339,7 +307,7 @@ function federateAskWithFileTopLock(query, wg, limit, survivors, baselineSurvivo
 export function federateAsk(root, override, query, opts = {}) {
     const wg = loadWorkspaceGraphs(root, override);
     const limit = opts.limit ?? 8;
-    const { onlyChild, childIn } = resolveWorkspaceIn(wg, opts.in, true);
+    const { onlyChild, childIn } = resolveWorkspaceIn(wg, opts.in, false);
     const { gatedOut, survivors, baselineSurvivors } = collectChildAskRuns(root, wg, query, opts, limit, onlyChild, childIn);
     return federateAskWithFileTopLock(query, wg, limit, survivors, baselineSurvivors, gatedOut);
 }
@@ -651,8 +619,16 @@ function renderFederatedCallersChild(root, child, graph, matches, direction, dep
     const testLinks = linkTestsForGraph(graph);
     const lines = [`## ${child}/`];
     const entries = [];
+    const childSpans = !opts.full && opts.shownTargetSpans ? [] : null;
     for (const { symbol: sym, hits } of results) {
-        lines.push(renderMatchBlock(sym, hits, direction, showDepth, matches.length, read, { source: Boolean(opts.source), graph, testLinks }));
+        lines.push(renderMatchBlock(sym, hits, direction, showDepth, matches.length, read, {
+            source: Boolean(opts.source),
+            full: Boolean(opts.full),
+            seenSpans: !opts.full ? (opts.seenSpans ?? null) : null,
+            shownTargetSpans: childSpans,
+            graph,
+            testLinks,
+        }));
         const entry = {
             repo: child,
             symbol: symbolJson({ ...sym, path: `${child}/${sym.path}` }),
@@ -661,6 +637,11 @@ function renderFederatedCallersChild(root, child, graph, matches, direction, dep
         if (hits.length === 0)
             entry.note = looseNoteFor(direction, sym.name, matches.length);
         entries.push(entry);
+    }
+    if (childSpans && opts.shownTargetSpans) {
+        for (const sp of childSpans) {
+            opts.shownTargetSpans.push({ ...sp, file: `${child}/${sp.file}` });
+        }
     }
     return { block: lines.join("\n"), entries };
 }

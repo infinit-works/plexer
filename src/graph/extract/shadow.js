@@ -145,22 +145,82 @@ function collectRustPatternIds(pat, shadowed) {
     }
 }
 
-function collectPythonOrGoShadowed(node, lang, shadowed) {
+function addBothTargets(target, shadowed, nonCallableShadowed) {
+    if (!target)
+        return;
+    if (target.type === "identifier") {
+        shadowed.add(target.text);
+        nonCallableShadowed.add(target.text);
+        return;
+    }
+    if (
+        target.type === "pattern_list" ||
+        target.type === "tuple_pattern" ||
+        target.type === "list_pattern" ||
+        target.type === "parenthesized_expression" ||
+        target.type === "list_splat_pattern" ||
+        target.type === "dictionary_splat_pattern"
+    ) {
+        for (const child of target.namedChildren)
+            addBothTargets(child, shadowed, nonCallableShadowed);
+    }
+}
+
+function collectPythonOrGoShadowed(node, lang, shadowed, nonCallableShadowed = shadowed) {
     if (lang === "python") {
         if (node.type === "parameters") {
-            for (const p of node.namedChildren)
-                collectPythonParameterNode(p, shadowed);
+            for (const p of node.namedChildren) {
+                if (p.type === "default_parameter" || p.type === "typed_default_parameter") {
+                    addBothTargets(p.childForFieldName("name"), shadowed, nonCallableShadowed);
+                }
+                else if (p.type === "typed_parameter") {
+                    const typeNode = p.childForFieldName("type");
+                    for (const child of p.namedChildren) {
+                        if (!sameSyntaxNode(child, typeNode) && child.type !== "type")
+                            addBothTargets(child, shadowed, nonCallableShadowed);
+                    }
+                }
+                else {
+                    addBothTargets(p, shadowed, nonCallableShadowed);
+                }
+            }
         }
         else if (node.type === "assignment" || node.type === "for_statement") {
-            collectPythonTargetIds(node.childForFieldName("left"), shadowed);
+            addBothTargets(node.childForFieldName("left"), shadowed, nonCallableShadowed);
         }
         return;
     }
     if (node.type === "parameter_declaration" || node.type === "variadic_parameter_declaration" || node.type === "var_spec") {
-        collectGoDeclIdentifiers(node, shadowed);
+        const typeNode = node.childForFieldName("type");
+        const valueNode = node.childForFieldName("value");
+        for (const child of node.namedChildren) {
+            if (sameSyntaxNode(child, typeNode) || sameSyntaxNode(child, valueNode))
+                continue;
+            if (child.type === "identifier" && child.text !== "_") {
+                shadowed.add(child.text);
+                nonCallableShadowed.add(child.text);
+            }
+        }
     }
     else if (node.type === "short_var_declaration" || node.type === "range_clause") {
-        collectGoLhsIdentifiers(node.childForFieldName("left"), shadowed);
+        const lhs = node.childForFieldName("left");
+        if (!lhs)
+            return;
+        if (lhs.type === "identifier") {
+            if (lhs.text !== "_") {
+                shadowed.add(lhs.text);
+                nonCallableShadowed.add(lhs.text);
+            }
+            return;
+        }
+        if (lhs.type === "expression_list") {
+            for (const child of lhs.namedChildren) {
+                if (child.type === "identifier" && child.text !== "_") {
+                    shadowed.add(child.text);
+                    nonCallableShadowed.add(child.text);
+                }
+            }
+        }
     }
 }
 
@@ -234,8 +294,7 @@ export function collectShadowedLocals(definition, langOrIsRequire, maybeIsRequir
             return;
         }
         if (lang === "python" || lang === "go") {
-            collectPythonOrGoShadowed(node, lang, shadowed);
-            collectPythonOrGoShadowed(node, lang, nonCallableShadowed);
+            collectPythonOrGoShadowed(node, lang, shadowed, nonCallableShadowed);
         }
         else {
             collectJsOrRustShadowed(node, lang, shadowed, nonCallableShadowed, isRequireDeclarator);

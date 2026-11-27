@@ -209,10 +209,30 @@ function applyWorkspaceGlobs(dirs, globs) {
     return { matches, excluded };
 }
 
-function collectScopeCandidates(absRoot, dirs) {
+function collectScopeCandidates(absRoot, dirs, repoFiles = null) {
+    const filesByDir = new Map();
+    if (Array.isArray(repoFiles)) {
+        for (const abs of repoFiles) {
+            const rel = toPosixPath(relPosix(absRoot, abs));
+            const slash = rel.lastIndexOf("/");
+            const relDir = slash === -1 ? "" : rel.slice(0, slash);
+            const name = slash === -1 ? rel : rel.slice(slash + 1);
+            let set = filesByDir.get(relDir);
+            if (!set) {
+                set = new Set();
+                filesByDir.set(relDir, set);
+            }
+            set.add(name);
+        }
+    }
     const markerMap = new Map();
     for (const dir of dirs) {
-        const found = MARKERS.filter((m) => existsSync(join(absRoot, dir, m)));
+        const dirFiles = filesByDir.get(dir);
+        const found = dirFiles
+            ? MARKERS.filter((m) => dirFiles.has(m))
+            : !Array.isArray(repoFiles) || (dir === "" && filesByDir.size > 0)
+                ? MARKERS.filter((m) => existsSync(join(absRoot, dir, m)))
+                : [];
         if (found.length)
             markerMap.set(dir, found);
     }
@@ -306,7 +326,7 @@ export function discoverScopes(root, repoFiles, contextDir) {
         });
     }
     const dirs = collectDirs(absRoot, repoFiles);
-    const candidates = collectScopeCandidates(absRoot, dirs);
+    const candidates = collectScopeCandidates(absRoot, dirs, repoFiles);
     collapseNestedScopeCandidates(candidates);
     const survivors = [...candidates.entries()].map(([prefix, c]) => ({ prefix, ...c }));
     // Rule 6: canonical single-scope form when only root survives, or nothing does.

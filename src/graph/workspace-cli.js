@@ -8,6 +8,7 @@
 import { buildGraph } from "./build.js";
 import { contextDirFor, ensureGitignored } from "../context/node-file.js";
 import { patchBuildConfig } from "../util/state.js";
+import { applySeenSpansFilter, mergeSpan, recordRetrievalSpans } from "../agy/spans.js";
 import { formatAsk } from "../ask/ask.js";
 import { formatGrepResult, runGrepWithRegexFallback, zeroHitNote } from "../search/grep-cli.js";
 import { federateAsk, federateCallers, federateCheck, federateGrep, federateMap, splitWorkspace, } from "./workspace.js";
@@ -56,10 +57,17 @@ export function runWorkspaceAsk(root, override, query, opts) {
         process.exit(1);
         return;
     }
-    if (opts.json)
+    if (opts.json) {
         console.log(JSON.stringify(r, null, 2));
-    else
-        process.stdout.write(formatAsk(r));
+        return;
+    }
+    let toRender = r;
+    if (opts.seenSpans && !opts.full) {
+        toRender = applySeenSpansFilter(r, opts.seenSpans)?.ask ?? r;
+    }
+    if (opts.seenSpans)
+        recordRetrievalSpans(opts.seenSpans, toRender);
+    process.stdout.write(formatAsk(toRender));
 }
 export function runWorkspaceGrep(root, override, pattern, opts) {
     let result;
@@ -90,7 +98,10 @@ export function runWorkspaceGrep(root, override, pattern, opts) {
         console.error(coverage ? `${zeroHitNote(result)}\n${coverage}` : zeroHitNote(result));
         return;
     }
-    process.stdout.write(formatGrepResult(result, { explicitContext: Boolean(opts.explicitContext) }));
+    process.stdout.write(formatGrepResult(result, {
+        explicitContext: Boolean(opts.explicitContext),
+        seenSpans: !opts.explicitContext ? (opts.seenSpans ?? null) : null,
+    }));
     if (coverage)
         console.log(coverage);
 }
@@ -124,8 +135,12 @@ export function runWorkspaceCallers(root, override, symbol, opts) {
     let found;
     let matches;
     let coverage;
+    const shownTargetSpans = !opts.full && !opts.json && opts.seenSpans ? [] : null;
     try {
-        ({ text, found, matches, coverage } = federateCallers(root, override, symbol, opts));
+        ({ text, found, matches, coverage } = federateCallers(root, override, symbol, {
+            ...opts,
+            shownTargetSpans,
+        }));
     }
     catch (err) {
         console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
@@ -140,5 +155,10 @@ export function runWorkspaceCallers(root, override, symbol, opts) {
         console.log(JSON.stringify({ query: symbol, matches, ...(coverage ? { note: coverage } : {}) }, null, 2));
         return;
     }
-    process.stdout.write(text + "\n");
+    const outText = `${text}\n`;
+    if (opts.seenSpans && shownTargetSpans && Buffer.byteLength(outText, "utf8") <= 9500) {
+        for (const sp of shownTargetSpans)
+            mergeSpan(opts.seenSpans, sp.file, sp.start, sp.end);
+    }
+    process.stdout.write(outText);
 }

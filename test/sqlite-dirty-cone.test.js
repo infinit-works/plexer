@@ -71,14 +71,16 @@ describe("SQLite WAL Persistence, Postings, Dirty-Cone Parity, & Drift/Seed Edge
         const extractJsonFiles = readdirSync(cacheDir).filter((f) => f.startsWith("extract.") && f.endsWith(".json"));
         assert.equal(extractJsonFiles.length, 0, "legacy extract.*.json files must not exist when index.sqlite is active");
 
-        // Verify O(|Q|) queryAskPostings direct lookup across exact_ident and stem channels
+        // Verify O(|Q|) queryAskPostings direct lookup across name, exact_ident and stem channels
         const postings = queryAskPostings(join(incRepo, "plexer"), {
-            exact_ident: ["compute", "discount", "charge", "order"],
+            name: ["compute", "discount", "charge", "order"],
+            exact_ident: ["from"],
             stem: ["discount", "order"],
         });
         assert.ok(postings && postings.docCount > 0, "queryAskPostings should return active corpus docCount");
         assert.ok(postings.docs instanceof Map && postings.docs.size >= 2, "queryAskPostings.docs must return matched documents");
-        assert.ok(postings.postings.exact_ident.get("compute")?.length >= 1, "exact_ident postings must index identifier split compute");
+        assert.ok(postings.postings.name.get("compute")?.length >= 1, "name postings must index identifier split compute");
+        assert.ok(postings.postings.exact_ident.get("from")?.length >= 1, "exact_ident postings must index stopword token from");
         assert.ok(postings.postings.stem.get("discount")?.length >= 1, "stem postings must index discount");
 
         // .md-only doc update refreshes docs index WITHOUT touching wiring.json

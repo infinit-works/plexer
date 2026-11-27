@@ -1,5 +1,5 @@
 import { plural } from "../util/span.js";
-import { languageLabelOf } from "./extract.js";
+import { languageLabelOf } from "./languages.js";
 import { scopeLabel, scopeOf, scopesOfGraph } from "../context/scopes.js";
 import { computeInDegree } from "../context/symbol-query.js";
 const DEFAULT_MAX_DIRS = 16;
@@ -293,7 +293,6 @@ export function buildRepoMap(graph, opts = {}) {
     }
     return result;
 }
-const DIR_COL_WIDTH = 20;
 function basenameOf(path) {
     const i = path.lastIndexOf("/");
     return i >= 0 ? path.slice(i + 1) : path;
@@ -302,10 +301,10 @@ function formatDirHub(h) {
     return `${h.name} (${basenameOf(h.path)}, ${h.inDegree}←)`;
 }
 function formatDirLine(d) {
-    const label = (d.isFile ? d.path : `${d.path}/`).padEnd(DIR_COL_WIDTH);
+    const rawLabel = d.isFile ? d.path : `${d.path}/`;
     const counts = `${d.files} files · ${d.symbols} symbols`;
-    const hubs = d.hubs.length ? `   hubs: ${d.hubs.map(formatDirHub).join(", ")}` : "";
-    return `${label}${counts}${hubs}`;
+    const hubs = d.hubs.length ? ` hubs: ${d.hubs.map(formatDirHub).join(", ")}` : "";
+    return `${rawLabel} ${counts}${hubs}`;
 }
 function formatHotspot(h) {
     return `${h.name} · ${h.kind} · ${h.path}:${h.span} · ${h.inDegree}←`;
@@ -357,10 +356,26 @@ export function formatRepoMap(map) {
         return lines.join("\n") + "\n";
     };
     let out = render(Infinity);
-    for (const cap of [12, 8, 5, 3]) {
+    for (const cap of [12, 8, 5, 3, 2, 1]) {
         if (Buffer.byteLength(out, "utf8") <= 8800)
             break;
         out = render(cap);
+    }
+    if (Buffer.byteLength(out, "utf8") > 8800) {
+        const lines = out.trimEnd().split("\n");
+        const kept = [];
+        let bytes = 0;
+        for (const ln of lines) {
+            const lb = Buffer.byteLength(ln, "utf8") + 1;
+            if (kept.length > 0 && bytes + lb > 8680)
+                break;
+            kept.push(ln);
+            bytes += lb;
+        }
+        const omitted = lines.length - kept.length;
+        if (omitted > 0)
+            kept.push(`… (+${omitted} more lines omitted — narrow with --in)`);
+        out = `${kept.join("\n")}\n`;
     }
     return out;
 }

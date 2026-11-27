@@ -24,6 +24,9 @@
 (function_definition
   name: (identifier) @name) @definition.function
 
+(function_declaration
+  name: (identifier) @name) @definition.function
+
 (val_definition
   pattern: (identifier) @name) @definition.variable
 
@@ -46,6 +49,12 @@
   name: (identifier) @name) @definition.property
 
 ; References 
+
+(call_expression
+  function: [
+    (identifier) @name
+    (field_expression field: (identifier) @name)
+  ]) @reference.call
 
 (call_expression
   (identifier) @name) @reference.call

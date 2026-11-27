@@ -7,6 +7,10 @@ export const MAX_SOURCE_READ_BYTES = 10 * 1024 * 1024;
 
 export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
+export const LINE_PREFIX_RE = /^L?(\d+):/;
+export const fmtLine = (n, text) => `${n}: ${text}`;
+export const hasInlinedLine = (code, ln) => new RegExp(`(?:^|\\n)L?${ln}:`).test(String(code ?? ""));
+
 /** Parse a graph node's `startLine`/`endLine` or `L<start>-L<end>` span into `{ start, end }`. */
 export function parseNodeSpan(node) {
     const start = Number(node?.startLine);
@@ -246,7 +250,14 @@ export function fileReader(root, opts = {}) {
                 return null;
             }
             const raw = readSourceFile(safe.realFile);
-            lines = raw !== null ? raw.split(/\r?\n/) : null;
+            if (raw !== null) {
+                lines = raw.split(/\r?\n/);
+                if (lines.length > 1 && lines[lines.length - 1] === "")
+                    lines.pop();
+            }
+            else {
+                lines = null;
+            }
         }
         catch {
             lines = null;

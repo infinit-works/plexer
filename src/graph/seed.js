@@ -38,7 +38,7 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSy
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CACHE_DIR, GRAPH_DIR, contextDirFor, envTruthy, wiringPath } from "../context/node-file.js";
-import { DatabaseSync, SQLITE_FILE, closeSqliteStores } from "../storage/sqlite-store.js";
+import { DatabaseSync, SQLITE_FILE, closeSqliteStores, sqliteHasGraph } from "../storage/sqlite-store.js";
 import { FINGERPRINT_PREFIX } from "./fingerprint.js";
 /** The one line a linked worktree's `.git` file carries. */
 const GITDIR_KEY = "gitdir:";
@@ -136,7 +136,8 @@ function resolveCandidateCheckout(rawPath, baseDir, cloneRoot) {
     }
     if (!existsSync(join(absCheckout, ".git")))
         return null;
-    if (!existsSync(wiringPath(contextDirFor(absCheckout))))
+    const absCtx = contextDirFor(absCheckout);
+    if (!sqliteHasGraph(absCtx) && !existsSync(wiringPath(absCtx)))
         return null;
     return absCheckout;
 }
@@ -385,6 +386,21 @@ function copySqliteFileSafe(srcSqlite, destSqlite) {
         else {
             copyFileSync(srcSqlite, tmp);
         }
+        let checkDb = null;
+        try {
+            checkDb = new DatabaseSync(tmp, { readOnly: true });
+            const row = checkDb.prepare("PRAGMA quick_check").get();
+            const status = row ? Object.values(row)[0] : null;
+            if (status !== "ok") {
+                throw new Error(`sqlite quick_check failed: ${String(status)}`);
+            }
+        }
+        finally {
+            try {
+                checkDb?.close();
+            }
+            catch { /* ignore close */ }
+        }
         renameSync(tmp, destSqlite);
     }
     catch (err) {
@@ -466,12 +482,13 @@ export function canSeedGraph(root, opts = {}) {
     try {
         const dir = resolve(root);
         const outDir = contextDirFor(dir);
-        if (existsSync(wiringPath(outDir)))
+        if (sqliteHasGraph(outDir) || existsSync(wiringPath(outDir)))
             return false;
         const main = seedSourceRoot(dir);
         if (!main)
             return false;
-        return existsSync(wiringPath(contextDirFor(main)));
+        const mainCtx = contextDirFor(main);
+        return sqliteHasGraph(mainCtx) || existsSync(wiringPath(mainCtx));
     }
     catch {
         return false;
@@ -493,10 +510,12 @@ export function seedGraph(root, opts = {}) {
             return NOT_SEEDED;
         const srcDir = contextDirFor(main);
         const srcGraph = wiringPath(srcDir);
-        if (!existsSync(srcGraph))
+        const hasSql = sqliteHasGraph(srcDir);
+        if (!hasSql && !existsSync(srcGraph))
             return NOT_SEEDED; // parent never built either
         copyTree(srcDir, outDir);
-        installGraph(srcGraph, wiringPath(outDir));
+        if (existsSync(srcGraph))
+            installGraph(srcGraph, wiringPath(outDir));
         return { seeded: true, from: main };
     }
     catch {

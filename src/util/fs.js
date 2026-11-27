@@ -60,32 +60,118 @@ export const SKIP_DIRS = new Set([
 ]);
 /** Files above this size are generated/vendored in practice, not hand-written code. */
 export const MAX_FILE_BYTES = 1_000_000;
+/** Normalize bare names, relative directory prefixes, and exact files into a shared walk filter. */
+export function normalizeWalkIncludes(includes, extraExactFiles = null) {
+    if (includes && includes._normalized === true && !extraExactFiles)
+        return includes;
+    const bareNames = new Set(includes?._normalized ? includes.bareNames : []);
+    const pathPrefixes = new Set(includes?._normalized ? includes.pathPrefixes : []);
+    const exactFiles = new Set(includes?._normalized ? includes.exactFiles : []);
+    const ancestorDirs = new Set(includes?._normalized ? includes.ancestorDirs : []);
+
+    const addEntry = (raw, isExact = false) => {
+        if (typeof raw !== "string")
+            return;
+        const norm = toPosixPath(raw).trim().replace(/^\.\//, "").replace(/\/+$/, "");
+        if (!norm || norm === "." || norm.startsWith("..") || isAbsolute(norm))
+            return;
+        if (isExact) {
+            exactFiles.add(norm);
+        }
+        else if (norm.includes("/")) {
+            pathPrefixes.add(norm);
+        }
+        else {
+            bareNames.add(norm);
+            return;
+        }
+        const parts = norm.split("/").filter(Boolean);
+        for (let i = 1; i < parts.length; i++) {
+            ancestorDirs.add(parts.slice(0, i).join("/"));
+        }
+    };
+
+    if (includes && !includes._normalized) {
+        if (includes instanceof Set || Array.isArray(includes)) {
+            for (const entry of includes)
+                addEntry(entry, false);
+        }
+        else if (typeof includes === "object") {
+            for (const entry of includes.bareNames ?? [])
+                addEntry(entry, false);
+            for (const entry of includes.pathPrefixes ?? includes.includePrefixes ?? [])
+                addEntry(entry, false);
+            for (const entry of includes.exactFiles ?? [])
+                addEntry(entry, true);
+        }
+    }
+    for (const f of extraExactFiles ?? [])
+        addEntry(f, true);
+
+    const sortedPrefixes = [...pathPrefixes].sort((a, b) => b.length - a.length || a.localeCompare(b));
+    return {
+        _normalized: true,
+        bareNames,
+        pathPrefixes: sortedPrefixes,
+        exactFiles,
+        ancestorDirs,
+    };
+}
+
+function findMatchingIncludePrefix(relPosixPath, normIncludes) {
+    if (!normIncludes || normIncludes.pathPrefixes.length === 0)
+        return null;
+    for (const prefix of normIncludes.pathPrefixes) {
+        if (relPosixPath === prefix || relPosixPath.startsWith(`${prefix}/`))
+            return prefix;
+    }
+    return null;
+}
+
+/**
+ * Determine how a directory `relDirPosix` should be visited during traversal:
+ *   - `"include"`: walk normally (dir itself and non-skipped descendants)
+ *   - `"traverse"`: descend only toward deeper mounted children or `exactFiles`
+ *   - `"skip"`: prune directory completely
+ */
+export function dirVisitMode(relDirPosix, dirName, includes, parentMode = "include") {
+    const norm = normalizeWalkIncludes(includes);
+    const cleanRel = toPosixPath(relDirPosix || "").replace(/^\.\//, "").replace(/\/+$/, "");
+    const matchedPrefix = cleanRel ? findMatchingIncludePrefix(cleanRel, norm) : null;
+    if (matchedPrefix) {
+        if (cleanRel === matchedPrefix)
+            return "include";
+        const tail = cleanRel.slice(matchedPrefix.length + 1);
+        const hasSkippedTail = tail.split("/").some((seg) => shouldSkipDirSegment(seg, norm.bareNames));
+        return hasSkippedTail ? "skip" : "include";
+    }
+    if (cleanRel && norm.ancestorDirs.has(cleanRel))
+        return "traverse";
+    if (parentMode === "traverse")
+        return "skip";
+    return shouldSkipDirSegment(dirName, norm.bareNames) ? "skip" : "include";
+}
+
+function shouldSkipDirSegment(name, bareNames) {
+    if (name.startsWith("."))
+        return true;
+    if (bareNames?.has(name))
+        return false;
+    return SKIP_DIRS.has(name);
+}
+
 /**
  * Whether a directory named `name` should be skipped when walking a repo tree:
  * any dot-prefixed directory (`.git`, `.github`, `.vscode`, ...) or one of
- * {@link SKIP_DIRS} not named in `includes`. The single source of truth for
- * "is this dir source" — `skippedPath` and `walkFilesystem` below and the
- * git-child discovery in `graph/scope-discovery.js` share it, so they can never
- * independently drift on what counts as skippable.
- *
- * `includes` is the explicit, per-repo `plexer build --include-dir` override
- * (persisted via `util/state.js`'s `readIncludeDirs`, threaded in by each
- * caller) — a name in it is removed from the effective skip set for THIS
- * repo's walks. Absent/empty ≡ today's default behavior. It lifts only
- * plexer's own skip list: in a Git repo, Git's ignore rules stay authoritative
- * (see {@link walkDir}).
- *
- * KNOWN LIMITATION: a dot-directory is skipped WHOLESALE and is NEVER
- * overridable, even via `includes` — unlike `SKIP_DIRS`, there is no path to
- * un-skip one. A repo that keeps real, hand-written source under a
- * dot-prefixed directory is out of scope.
+ * {@link SKIP_DIRS} not named in `includes`. When `relPath` is passed, relative
+ * path-prefix includes (e.g. `vendor/flux/src`) are honored alongside bare names.
  */
-export function shouldSkipDir(name, includes) {
-    if (name.startsWith("."))
-        return true;
-    if (includes?.has(name))
-        return false;
-    return SKIP_DIRS.has(name);
+export function shouldSkipDir(name, includes, relPath = null) {
+    const norm = normalizeWalkIncludes(includes);
+    if (relPath) {
+        return dirVisitMode(relPath, name, norm) === "skip";
+    }
+    return shouldSkipDirSegment(name, norm.bareNames);
 }
 /**
  * Directory `walkDir` actually enumerates.
@@ -212,14 +298,17 @@ function parseGitStageEntries(stdout) {
 }
 
 function collectGitStageFiles(entries, root, includes, opts, state) {
+    const normIncludes = normalizeWalkIncludes(includes);
     const out = new Set();
     for (const [rel, entry] of entries) {
         const abs = resolve(root, rel);
-        if (skippedPath(relative(state.topRoot, abs), includes)) continue;
+        const relFromTop = relative(state.topRoot, abs);
+        const isDirEntry = Boolean(entry.gitlink || entry.nested);
+        if (skippedPath(relFromTop, normIncludes, isDirEntry)) continue;
         const followChild = (entry.gitlink && opts.followSubmodules === true) || (entry.nested && opts.followNestedRepos === true);
         if (followChild) {
             if (!existsSync(join(abs, ".git"))) continue;
-            const childFiles = gitVisibleFiles(abs, includes, opts, state) ?? walkFilesystem(abs, includes);
+            const childFiles = gitVisibleFiles(abs, normIncludes, opts, state) ?? walkFilesystem(abs, normIncludes, state.topRoot, toPosixPath(relFromTop));
             for (const file of childFiles) out.add(file);
         } else if (isIndexableFile(abs)) {
             out.add(abs);
@@ -230,8 +319,9 @@ function collectGitStageFiles(entries, root, includes, opts, state) {
 
 function gitVisibleFiles(dir, includes, opts = {}, traversal) {
     const root = resolve(dir);
+    const normIncludes = normalizeWalkIncludes(includes);
     if (opts.followSubmodules !== true && opts.followNestedRepos !== true) {
-        return gitVisibleFilesShallow(root, includes);
+        return gitVisibleFilesShallow(root, normIncludes);
     }
     const state = traversal ?? { topRoot: root, activeRoots: new Set() };
     const rootKey = process.platform === "win32" ? root.toLowerCase() : root;
@@ -243,7 +333,7 @@ function gitVisibleFiles(dir, includes, opts = {}, traversal) {
         return null;
     }
     const entries = parseGitStageEntries(stdout);
-    const files = collectGitStageFiles(entries, root, includes, opts, state);
+    const files = collectGitStageFiles(entries, root, normIncludes, opts, state);
     state.activeRoots.delete(rootKey);
     return files;
 }
@@ -266,12 +356,13 @@ function isIndexableFile(abs) {
  * exactly the same command, filtering, ordering, and duplicate handling as it
  * did before submodule support existed. */
 function gitVisibleFilesShallow(root, includes) {
+    const normIncludes = normalizeWalkIncludes(includes);
     const stdout = git(root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"]);
     if (stdout === null)
         return null;
     const out = [];
     for (const rel of stdout.split("\0")) {
-        if (!rel || skippedPath(rel, includes))
+        if (!rel || skippedPath(rel, normIncludes, false))
             continue;
         const abs = resolve(root, rel);
         if (isIndexableFile(abs))
@@ -283,13 +374,33 @@ function gitVisibleFilesShallow(root, includes) {
  * segments is a skippable directory name — the final segment doubles as the
  * dot-FILE check (`.eslintrc.js` and friends are not source either). */
 const MINIFIED_BUNDLE_RE = /\.(?:min|bundle)\.(?:js|mjs|cjs|css)$/i;
-function skippedPath(path, includes) {
-    const posix = toPosixPath(path);
+function skippedPath(path, includes, isDir = false) {
+    const posix = toPosixPath(path).replace(/^\.\//, "");
+    if (!posix)
+        return false;
     if (MINIFIED_BUNDLE_RE.test(posix))
         return true;
-    return posix.split("/").some((segment) => shouldSkipDir(segment, includes));
+    const norm = normalizeWalkIncludes(includes);
+    const segments = posix.split("/").filter(Boolean);
+    const lastSeg = segments[segments.length - 1] || "";
+    if (!isDir && lastSeg.startsWith("."))
+        return true;
+    if (!isDir && norm.exactFiles.has(posix))
+        return false;
+    const matchedPrefix = findMatchingIncludePrefix(posix, norm);
+    if (matchedPrefix) {
+        if (posix === matchedPrefix)
+            return false;
+        const tail = posix.slice(matchedPrefix.length + 1);
+        const tailSegs = tail.split("/").filter(Boolean);
+        return tailSegs.some((seg) => shouldSkipDirSegment(seg, norm.bareNames));
+    }
+    if (isDir && norm.ancestorDirs.has(posix))
+        return false;
+    return segments.some((segment) => shouldSkipDirSegment(segment, norm.bareNames));
 }
-function walkFilesystem(dir, includes) {
+function walkFilesystem(dir, includes, rootDir = dir, relDir = "", parentMode = "include") {
+    const normIncludes = normalizeWalkIncludes(includes);
     const out = [];
     let entries;
     try {
@@ -300,14 +411,18 @@ function walkFilesystem(dir, includes) {
     }
     for (const entry of entries) {
         const full = join(dir, entry.name);
+        const childRel = relDir ? `${relDir}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
-            if (shouldSkipDir(entry.name, includes))
+            const mode = dirVisitMode(childRel, entry.name, normIncludes, parentMode);
+            if (mode === "skip")
                 continue;
-            out.push(...walkFilesystem(full, includes));
+            out.push(...walkFilesystem(full, normIncludes, rootDir, childRel, mode));
         }
         else if (entry.isFile()) {
             if (entry.name.startsWith(".") || MINIFIED_BUNDLE_RE.test(entry.name))
                 continue; // dot-files and minified vendor bundles are not source either
+            if (parentMode === "traverse" && !normIncludes.exactFiles.has(childRel))
+                continue;
             try {
                 const st = statSync(full);
                 if (st.size > MAX_FILE_BYTES)

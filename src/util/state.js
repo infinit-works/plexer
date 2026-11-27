@@ -2,15 +2,20 @@
  * The `plexer/.cache/` sidecar state: statusline stats snapshot, per-session state,
  * persisted repository walk settings (`config.json`), and the build lock that serializes rebuilds.
  */
-import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, readdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, dirname, isAbsolute, relative, resolve } from "node:path";
+import { discoverManifestMounts } from "../graph/manifest-mounts.js";
+import { readGraphFromSqlite, sqliteHasGraph } from "../storage/sqlite-store.js";
+import { normalizeWalkIncludes } from "./fs.js";
 import { contextDirFor } from "./paths.js";
 
 const LOCK_STALE_MS = 300000;
 const SESSION_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_PRUNE_INTERVAL_MS = 60_000;
 const LOCK_FILE = ".sync.lock";
 let atomicSeq = 0;
+const lastSessionPruneByDir = new Map();
 
 export function emptyStats() {
     return {
@@ -80,7 +85,13 @@ export function patchStats(d, patch) {
 }
 
 export function readWiring(projectDir) {
-    return readJson(join(contextDirFor(projectDir), ".graph", "wiring.json"));
+    const ctxDir = contextDirFor(projectDir);
+    if (sqliteHasGraph(ctxDir)) {
+        const loaded = readGraphFromSqlite(ctxDir);
+        if (loaded?.graph)
+            return loaded.graph;
+    }
+    return readJson(join(ctxDir, ".graph", "wiring.json"));
 }
 
 export function computeStats(w) {
@@ -114,20 +125,24 @@ export function readSession(d, id) {
 
 export function writeSession(d, id, s) {
     const dir = sessionDir(d);
-    try {
-        const now = Date.now();
-        for (const name of readdirSync(dir)) {
-            if (!name.endsWith(".json"))
-                continue;
-            const full = join(dir, name);
-            try {
-                if (now - statSync(full).mtimeMs > SESSION_STALE_MS)
-                    rmSync(full, { force: true });
+    const now = Date.now();
+    const lastPruned = lastSessionPruneByDir.get(dir) ?? 0;
+    if (now - lastPruned >= SESSION_PRUNE_INTERVAL_MS) {
+        lastSessionPruneByDir.set(dir, now);
+        try {
+            for (const name of readdirSync(dir)) {
+                if (!name.endsWith(".json"))
+                    continue;
+                const full = join(dir, name);
+                try {
+                    if (now - statSync(full).mtimeMs > SESSION_STALE_MS)
+                        rmSync(full, { force: true });
+                }
+                catch { /* ignore */ }
             }
-            catch { /* ignore */ }
         }
+        catch { /* session dir may not exist yet */ }
     }
-    catch { /* session dir may not exist yet */ }
     writeJsonAtomic(sessionPath(d, id), s);
 }
 
@@ -271,28 +286,54 @@ export function readIncludeDirs(d, cfg = readBuildConfig(d)) {
     return dirs && dirs.length ? new Set(dirs) : undefined;
 }
 
-function readFollowSubmodules(d, cfg = readBuildConfig(d)) {
+function readFollowSubmodules(d, cfg = readBuildConfig(d), manifestMounts = null) {
     if (typeof cfg?.followSubmodules === "boolean")
         return cfg.followSubmodules;
     try {
-        return readFileSync(join(d, "default.project.json"), "utf8").includes("submodules/");
+        if (readFileSync(join(d, "default.project.json"), "utf8").includes("submodules/"))
+            return true;
     }
     catch {
-        return false;
+        /* no default.project.json */
     }
+    if (existsSync(join(d, ".gitmodules")) && manifestMounts) {
+        const mountedTargets = [...(manifestMounts.includePrefixes ?? []), ...(manifestMounts.rojoMountPrefixes ?? [])];
+        for (const rel of mountedTargets) {
+            const abs = resolve(d, rel);
+            if (existsSync(join(abs, ".git")))
+                return true;
+            const topRel = rel.split("/")[0];
+            if (topRel && existsSync(join(d, topRel, ".git")))
+                return true;
+        }
+    }
+    return false;
 }
 
 function readFollowNestedRepos(d, cfg = readBuildConfig(d)) {
     return cfg?.followNestedRepos === true;
 }
 
-/** Read `plexer/.cache/config.json` once and derive all walk options for `walkDir`. */
+/** Read `plexer/.cache/config.json` once and derive all walk options (merged with manifest mounts) for `walkDir`. */
 export function readWalkConfig(d, override) {
-    const cfg = readBuildConfig(d, override);
+    const absRoot = resolve(d);
+    const cfg = readBuildConfig(absRoot, override);
+    const manualIncludes = readIncludeDirs(absRoot, cfg);
+    const manifestMounts = discoverManifestMounts(absRoot);
+    const mergedRaw = [
+        ...(manualIncludes ? [...manualIncludes] : []),
+        ...(manifestMounts.includePrefixes ?? []),
+    ];
+    const hasExact = (manifestMounts.exactFiles?.length ?? 0) > 0;
+    const includeDirs = mergedRaw.length > 0 || hasExact
+        ? normalizeWalkIncludes(mergedRaw, manifestMounts.exactFiles)
+        : undefined;
     return {
-        includeDirs: readIncludeDirs(d, cfg),
-        followSubmodules: readFollowSubmodules(d, cfg),
-        followNestedRepos: readFollowNestedRepos(d, cfg),
+        includeDirs,
+        manualIncludeDirs: manualIncludes,
+        manifestMounts,
+        followSubmodules: readFollowSubmodules(absRoot, cfg, manifestMounts),
+        followNestedRepos: readFollowNestedRepos(absRoot, cfg),
     };
 }
 
@@ -324,44 +365,49 @@ export function acquireLockIn(cache) {
     const p = join(cache, LOCK_FILE);
     mkdirSync(cache, { recursive: true });
     const payload = JSON.stringify({ pid: process.pid, at: new Date().toISOString() });
-    try {
-        writeFileSync(p, payload, { flag: "wx" });
-        return true;
-    }
-    catch (e) {
-        if (e?.code !== "EEXIST")
-            throw e;
-        let stale = false;
+    for (let attempt = 0; attempt < 8; attempt++) {
         try {
-            const st = statSync(p);
+            writeFileSync(p, payload, { flag: "wx" });
+            return true;
+        }
+        catch (e) {
+            if (e?.code !== "EEXIST")
+                throw e;
+            let st;
+            try {
+                st = statSync(p);
+            }
+            catch (statErr) {
+                if (statErr?.code === "ENOENT")
+                    continue;
+                throw statErr;
+            }
             const age = Date.now() - st.mtimeMs;
             const holder = readJson(p);
+            let stale = false;
             if (holder && typeof holder.pid === "number") {
                 stale = !pidAlive(holder.pid);
             }
             else {
                 stale = age >= LOCK_STALE_MS;
             }
-        }
-        catch {
-            stale = true;
-        }
-        if (!stale)
-            return false;
-        const tmp = `${p}.${process.pid}.${++atomicSeq}.tmp`;
-        try {
-            writeFileSync(tmp, payload);
-            renameSync(tmp, p);
-            return true;
-        }
-        catch {
+            if (!stale)
+                return false;
             try {
-                rmSync(tmp, { force: true });
+                const st2 = statSync(p);
+                if (st2.dev !== st.dev || st2.ino !== st.ino) {
+                    continue;
+                }
+                unlinkSync(p);
             }
-            catch { /* ignore */ }
-            return false;
+            catch (unlinkErr) {
+                if (unlinkErr?.code === "ENOENT")
+                    continue;
+                return false;
+            }
         }
     }
+    return false;
 }
 
 function updateLockPidIn(cache, pid = process.pid) {

@@ -25,30 +25,8 @@ import { spanRange } from "../util/span.js";
 import { extractFile, mintId, warmDepthGrammars } from "./extract.js";
 import { loadWasmLanguage, parseWasm } from "./generic.js";
 import { contentHash } from "../util/id.js";
-/** The container registry. Svelte and Astro are the same shape and would be a
- * row each, but they are left out until someone has a repo to verify them
- * against — a wrong `body` node type would produce silently misplaced spans. */
-export const CONTAINER_LANGS = [
-    { name: "vue", exts: [".vue"], wasm: "vue", block: "script_element", body: "raw_text", inner: "typescript", warmInner: ["typescript", "tsx"] },
-    { name: "svelte", exts: [".svelte"], wasm: "svelte", block: "script_element", body: "raw_text", inner: "typescript", warmInner: ["typescript", "tsx"] },
-    { name: "astro", exts: [".astro"], wasm: "astro", block: "script_element", body: "raw_text", frontmatterBlock: "frontmatter", frontmatterBody: "frontmatter_js_block", inner: "typescript", warmInner: ["typescript", "tsx"] },
-];
-const byExt = new Map();
-for (const l of CONTAINER_LANGS)
-    for (const e of l.exts)
-        byExt.set(e, l);
-/** The container language for a path, or null if none claims it. */
-export function containerLangOf(path) {
-    const lower = path.toLowerCase();
-    for (const [ext, l] of byExt)
-        if (lower.endsWith(ext))
-            return l;
-    return null;
-}
-/** Every file extension the container tier claims. */
-export function containerExtensions() {
-    return CONTAINER_LANGS.flatMap((l) => l.exts);
-}
+import { CONTAINER_LANGS, containerExtensions, containerLangOf } from "./languages.js";
+export { CONTAINER_LANGS, containerExtensions, containerLangOf };
 const loaded = new Map();
 /** Warm the container grammars this repo needs. Same contract as
  * `warmGenericGrammars`: await once before the synchronous parse loop, and an
@@ -153,6 +131,115 @@ function blocks(root, lang) {
     }
     return out;
 }
+function kebabToPascal(tag) {
+    return tag
+        .split("-")
+        .filter(Boolean)
+        .map((part) => part[0].toUpperCase() + part.slice(1))
+        .join("");
+}
+
+const TEMPLATE_KEYWORDS = new Set([
+    "true", "false", "null", "undefined", "this", "event", "arguments", "typeof", "instanceof", "return", "new",
+    "if", "else", "for", "of", "in", "let", "const", "var", "await", "async", "slot", "component", "template",
+]);
+
+function collectTemplateMarkupEdges(root, rel, scriptSyms, rawEdges, importedByName = null) {
+    const symByName = new Map();
+    const impByName = new Map();
+    for (const s of scriptSyms) {
+        if (s.kind && s.name && !symByName.has(s.name))
+            symByName.set(s.name, s);
+    }
+    if (importedByName instanceof Map) {
+        for (const [localName, info] of importedByName) {
+            if (info?.specifier && !impByName.has(localName)) {
+                impByName.set(localName, {
+                    name: info.isDefault ? localName : (info.name || localName),
+                    specifier: info.specifier,
+                    isDefault: info.isDefault,
+                    typeOnly: info.typeOnly,
+                });
+            }
+        }
+    }
+    for (const e of rawEdges) {
+        if ((e.relation === "references" || e.relation === "calls") && e.name && e.specifier && !impByName.has(e.name)) {
+            impByName.set(e.name, { name: e.name, specifier: e.specifier, isDefault: e.isDefault, typeOnly: e.typeOnly });
+        }
+    }
+    const seenEdgeKeys = new Set();
+    const pushRef = (name, relation = "references", viaImport = null) => {
+        const imp = viaImport ?? impByName.get(name);
+        const key = `${relation}\0${name}\0${imp?.specifier ?? ""}`;
+        if (seenEdgeKeys.has(key))
+            return;
+        seenEdgeKeys.add(key);
+        if (imp?.specifier) {
+            rawEdges.push({
+                source: rel,
+                relation,
+                name: imp.name || name,
+                specifier: imp.specifier,
+                file: rel,
+                ...(imp.isDefault ? { isDefault: true } : {}),
+                ...(imp.typeOnly ? { typeOnly: true } : {}),
+            });
+            return;
+        }
+        const localSym = symByName.get(name);
+        if (localSym) {
+            rawEdges.push({ source: rel, relation, name, file: rel, sameFileOnly: true });
+        }
+    };
+    const inspectExpressionText = (exprText) => {
+        if (!exprText)
+            return;
+        for (const m of exprText.matchAll(/\b([A-Za-z_$][\w$]*)(?:\s*\()?/g)) {
+            const ident = m[1];
+            if (!ident || TEMPLATE_KEYWORDS.has(ident))
+                continue;
+            const isCall = m[0].endsWith("(") || /^\s*[A-Za-z_$][\w$.]*\s*$/.test(exprText.trim());
+            if (symByName.has(ident) || impByName.has(ident)) {
+                pushRef(ident, isCall ? "calls" : "references");
+            }
+        }
+    };
+    const visitTemplateNode = (node, insideScriptOrStyle = false) => {
+        if (!node)
+            return;
+        if (node.type === "script_element" || node.type === "style_element" || node.type === "frontmatter")
+            return;
+        if ((node.type === "start_tag" || node.type === "self_closing_tag") && !insideScriptOrStyle) {
+            const tagNode = node.namedChildren?.find((c) => c.type === "tag_name");
+            const rawTag = tagNode?.text?.trim();
+            if (rawTag) {
+                const candidate = rawTag.includes("-")
+                    ? kebabToPascal(rawTag)
+                    : rawTag.includes(".")
+                        ? rawTag.split(".")[0]
+                        : (/^[A-Z]/.test(rawTag) ? rawTag : null);
+                if (candidate) {
+                    pushRef(candidate, "references");
+                }
+            }
+        }
+        if (
+            node.type === "attribute_value" &&
+            (node.parent?.parent?.type === "directive_attribute" || node.parent?.parent?.parent?.type === "directive_attribute")
+        ) {
+            inspectExpressionText(node.text);
+        }
+        else if (node.type === "raw_text_expr" || node.type === "attribute_js_expr" || node.type === "interpolation") {
+            inspectExpressionText(node.text);
+        }
+        for (let i = 0; i < (node.namedChildCount ?? 0); i++) {
+            visitTemplateNode(node.namedChild(i), insideScriptOrStyle);
+        }
+    };
+    visitTemplateNode(root, false);
+}
+
 /**
  * Extract one container file. Synchronous; needs the grammar pre-warmed.
  *
@@ -161,23 +248,21 @@ function blocks(root, lang) {
  * not fail over one component.
  */
 export function extractContainer(rel, source, lang = containerLangOf(rel)) {
+    const langSpec = typeof lang === "string" ? CONTAINER_LANGS.find((l) => l.name === lang) : lang;
     const nodes = [];
     const rawEdges = [];
     const residuals = [];
-    const language = lang ? loaded.get(lang.name) : null;
+    const language = langSpec ? loaded.get(langSpec.name) : null;
     const root = language ? parseWasm(language, source) : null;
     if (root) {
         try {
-            // Ids are minted per file by the inner extractor, so two script blocks that
-            // both define `setup` would collide. Threading one set across the blocks
-            // makes the second one `path#setup~2`, and the rename is applied to that
-            // block's edges too so nothing points at an id that no longer exists.
             const minted = new Set([rel]);
-            for (const { body, innerLang } of blocks(root, lang)) {
+            const importedByName = new Map();
+            for (const { body, innerLang } of blocks(root, langSpec)) {
                 const script = source.slice(body.startIndex, body.endIndex);
                 let inner;
                 try {
-                    inner = extractFile(rel, script, innerLang);
+                    inner = extractFile(rel, script, innerLang, { includeImportedSymbols: importedByName });
                 }
                 catch {
                     continue; // one bad block, not a bad build
@@ -207,6 +292,7 @@ export function extractContainer(rel, source, lang = containerLangOf(rel)) {
                     rawEdges.push({ ...edge, source: source_, ...(targetId === undefined ? {} : { targetId }) });
                 }
             }
+            collectTemplateMarkupEdges(root, rel, nodes, rawEdges, importedByName);
         }
         finally {
             root._tree?.delete?.();

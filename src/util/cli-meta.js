@@ -17,8 +17,15 @@ function resolvePackageJsonPath(moduleUrl = import.meta.url) {
 	return candidates[0];
 }
 
+const PKG_VERSION_CACHE = new Map();
+
 export function readPackageVersion(moduleUrl = import.meta.url) {
-	return readJson(resolvePackageJsonPath(moduleUrl))?.version ?? null;
+	const key = String(moduleUrl || "");
+	if (PKG_VERSION_CACHE.has(key))
+		return PKG_VERSION_CACHE.get(key);
+	const version = readJson(resolvePackageJsonPath(moduleUrl))?.version ?? null;
+	PKG_VERSION_CACHE.set(key, version);
+	return version;
 }
 
 export function readCurrentVersion(moduleUrl = import.meta.url) {

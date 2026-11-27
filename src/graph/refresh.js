@@ -34,12 +34,20 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { plural } from "../util/span.js";
 import { CACHE_DIR, contextDirFor, envTruthy, wiringPath } from "../context/node-file.js";
+import { sqliteHasGraph } from "../storage/sqlite-store.js";
 import { acquireLockIn, releaseLockIn } from "../util/state.js";
-import { buildGraph } from "./build.js";
+
+function hasBuiltGraph(outDir) {
+    return sqliteHasGraph(outDir) || existsSync(wiringPath(outDir));
+}
 import { driftCount, isClean, probeDrift, readFingerprint } from "./fingerprint.js";
 import { invalidateGraphCaches } from "../context/graph-store.js";
 import { isAutoBuildableRepo } from "./root.js";
-import { canSeedGraph, seedGraph } from "./seed.js";
+
+let buildModPromise;
+let seedModPromise;
+const loadBuildMod = () => (buildModPromise ??= import("./build.js"));
+const loadSeedMod = () => (seedModPromise ??= import("./seed.js"));
 /** How long to wait for another process's in-flight rebuild before giving up and
  * answering from the current graph. Long enough to ride out a small repo's build,
  * short enough that a tool call never feels hung. */
@@ -83,15 +91,17 @@ function releaseOnSignal(cache) {
             process.removeListener(s, onSignal);
     };
 }
-/** Wait out someone else's rebuild, then take the lock. False when we couldn't. */
+/** Wait out someone else's rebuild, then take the lock. Returns `{ acquired, waited }`. */
 async function waitForLock(cache) {
+    if (acquireLockIn(cache))
+        return { acquired: true, waited: false };
     const deadline = Date.now() + LOCK_WAIT_MS;
     for (;;) {
-        if (acquireLockIn(cache))
-            return true;
         if (Date.now() >= deadline)
-            return false;
+            return { acquired: false, waited: true };
         await sleep(LOCK_POLL_MS);
+        if (acquireLockIn(cache))
+            return { acquired: true, waited: true };
     }
 }
 /**
@@ -103,13 +113,15 @@ async function waitForLock(cache) {
  * rather than trusting this return value.
  */
 async function seedUnderLock(dir, outDir, contextDir) {
+    const { canSeedGraph, seedGraph } = await loadSeedMod();
     if (!canSeedGraph(dir, { contextDir }))
         return { seeded: false };
     const lockCache = join(outDir, CACHE_DIR);
     // `busy` matters: with no graph on disk there is nothing to fall back to, so a
     // caller that stayed silent here would emit the bare "no matching nodes" this whole
     // mechanism exists to remove. Say what happened instead.
-    if (!(await waitForLock(lockCache)))
+    const lock = await waitForLock(lockCache);
+    if (!lock.acquired)
         return { seeded: false, busy: true };
     const unhook = releaseOnSignal(lockCache);
     try {
@@ -130,10 +142,12 @@ async function seedUnderLock(dir, outDir, contextDir) {
 async function autoBuildMissingGraph(dir, outDir, opts, seed) {
     if (opts.autoBuild !== false && isAutoBuildableRepo(dir)) {
         const lockCache = join(outDir, CACHE_DIR);
-        if (await waitForLock(lockCache)) {
+        const lock = await waitForLock(lockCache);
+        if (lock.acquired) {
             const unhook = releaseOnSignal(lockCache);
             try {
-                if (!existsSync(wiringPath(outDir))) {
+                if (!hasBuiltGraph(outDir)) {
+                    const { buildGraph } = await loadBuildMod();
                     await buildGraph(dir, { contextDir: opts.contextDir, _lockHeld: true });
                 }
                 invalidateGraphCaches(outDir);
@@ -152,7 +166,8 @@ async function autoBuildMissingGraph(dir, outDir, opts, seed) {
 
 async function rebuildExistingGraphUnderLock(dir, outDir, drift, seedNote, opts) {
     const lockCache = join(outDir, CACHE_DIR);
-    if (!(await waitForLock(lockCache))) {
+    const lock = await waitForLock(lockCache);
+    if (!lock.acquired) {
         const busy = "a graph rebuild is already in flight — answering from the current graph";
         return {
             refreshed: false,
@@ -162,21 +177,33 @@ async function rebuildExistingGraphUnderLock(dir, outDir, drift, seedNote, opts)
     }
     const unhook = releaseOnSignal(lockCache);
     try {
-        const now = drift ? probeDrift(dir, outDir) : null;
-        if (now && isClean(now)) {
-            invalidateGraphCaches(outDir);
-            return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
+        let activeDrift = drift;
+        if (lock.waited && drift) {
+            const now = probeDrift(dir, outDir);
+            if (now && isClean(now)) {
+                invalidateGraphCaches(outDir);
+                return seedNote ? { refreshed: false, note: seedNote } : CLEAN;
+            }
+            activeDrift = now ?? drift;
         }
         const fp = readFingerprint(outDir);
+        const { buildGraph } = await loadBuildMod();
         await buildGraph(dir, {
             contextDir: opts.contextDir,
             graphOnly: true,
+            skipAggregateCounts: true,
             onlyDirs: fp?.onlyDirs,
             extensions: fp?.extensions,
+            walked: activeDrift?._walked,
+            sourceStats: activeDrift?._sourceStats,
+            dirMtimes: activeDrift?._dirMtimes,
+            configsUnchanged: activeDrift?._configsUnchanged,
+            docsUnchanged: activeDrift?._docsUnchanged,
+            noFileAddRemove: activeDrift?._noFileAddRemove,
             _lockHeld: true,
         });
-        invalidateGraphCaches(outDir);
-        return { refreshed: true, drift: drift ?? undefined, note: seedNote };
+        invalidateGraphCaches(outDir, { keepSqlite: true, keepPriorNodes: true });
+        return { refreshed: true, drift: activeDrift ?? undefined, note: seedNote };
     }
     finally {
         unhook();
@@ -191,13 +218,13 @@ export async function ensureFreshGraph(root, opts = {}) {
         const dir = resolve(root);
         const outDir = contextDirFor(dir, opts.contextDir);
         let seededFrom;
-        if (!existsSync(wiringPath(outDir))) {
+        if (!hasBuiltGraph(outDir)) {
             const seed = await seedUnderLock(dir, outDir, opts.contextDir);
             seededFrom = seed.from;
             if (seed.seeded) {
                 invalidateGraphCaches(outDir);
             }
-            if (!existsSync(wiringPath(outDir))) {
+            if (!hasBuiltGraph(outDir)) {
                 return await autoBuildMissingGraph(dir, outDir, opts, seed);
             }
         }

@@ -21,22 +21,54 @@
   (function_signature
     name: (identifier) @name) @definition.function)
 
-; Methods
+; Methods, getters, setters, constructors
 (method_signature
   (function_signature
     name: (identifier) @name)) @definition.method
 
+(method_signature
+  (getter_signature
+    name: (identifier) @name)) @definition.method
+
+(method_signature
+  (setter_signature
+    name: (identifier) @name)) @definition.method
+
+(constructor_signature
+  name: (identifier) @name) @definition.method
+
 (class_definition
   name: (identifier) @name) @definition.class
+
+(mixin_declaration
+  (identifier) @name) @definition.interface
+
+(extension_declaration
+  name: (identifier) @name) @definition.module
+
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
+(type_alias
+  (type_identifier) @name) @definition.type
 
 ; Top-level / static `const`/`final` (`const int kThreshold = 3`)
 (static_final_declaration
   .
   (identifier) @name) @definition.constant
 
-; identifier(args) — `isReady(count)`, `Counter.ready → isReady(value)`
+; identifier(args) — `isReady(count)`
 (
   (identifier) @name
+  .
+  (selector
+    (argument_part))) @reference.call
+
+; member.method(args) and chained a.b().c()
+(
+  (selector
+    (unconditional_assignable_selector
+      (identifier) @name))
   .
   (selector
     (argument_part))) @reference.call

@@ -94,9 +94,64 @@ function phpDefName(node) {
         return phpClosureName(node);
     return node.type === "anonymous_class" ? "{anonymous}" : null;
 }
+function tsSpecialDefName(node) {
+    if (node.type === "variable_declarator") {
+        const value = node.childForFieldName("value");
+        if (value && FN_VALUE_TYPES.has(value.type))
+            return node.childForFieldName("name")?.text ?? null;
+    }
+    if (node.type === "public_field_definition") {
+        const value = node.childForFieldName("value");
+        if (value && FN_VALUE_TYPES.has(value.type))
+            return node.childForFieldName("name")?.text ?? null;
+    }
+    if (node.type === "assignment_expression") {
+        const left = node.childForFieldName("left");
+        const right = node.childForFieldName("right");
+        if (left?.type === "member_expression" && right) {
+            if (left.text === "module.exports" && (FN_VALUE_TYPES.has(right.type) || right.type === "class" || right.type === "class_declaration" || right.type === "function_declaration" || right.type === "generator_function_declaration")) {
+                return right.childForFieldName("name")?.text ?? "default";
+            }
+            if (FN_VALUE_TYPES.has(right.type)) {
+                const prop = left.childForFieldName("property")?.text;
+                if (prop && prop !== "exports" && /^[A-Za-z_$][\w$]*$/.test(prop)) {
+                    const objText = left.childForFieldName("object")?.text;
+                    const rawOwner = objText && objText !== "exports" && objText !== "module.exports" && objText !== "this"
+                        ? objText.replace(/^(?:module\.)?exports\./, "").replace(/\.prototype$/, "")
+                        : null;
+                    const owner = rawOwner && rawOwner !== "exports" && rawOwner !== "module" ? rawOwner : null;
+                    return owner && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(owner) ? `${owner}.${prop}` : prop;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+const KOTLIN_DEF_TYPES = new Set([
+    "class_declaration",
+    "object_declaration",
+    "companion_object",
+    "function_declaration",
+    "type_alias",
+]);
+function kotlinDefName(node) {
+    if (node.type === "class_declaration" || node.type === "object_declaration" || node.type === "type_alias") {
+        return node.namedChildren.find((c) => c.type === "type_identifier")?.text ?? null;
+    }
+    if (node.type === "companion_object") {
+        return node.namedChildren.find((c) => c.type === "type_identifier")?.text ?? "Companion";
+    }
+    if (node.type === "function_declaration") {
+        return node.namedChildren.find((c) => c.type === "simple_identifier")?.text ?? null;
+    }
+    return null;
+}
 function defName(node, lang) {
     if (lang === "java")
         return JAVA_DEF_TYPES.has(node.type) ? (node.childForFieldName("name")?.text ?? null) : null;
+    if (lang === "kotlin")
+        return KOTLIN_DEF_TYPES.has(node.type) ? kotlinDefName(node) : null;
     if (lang === "go")
         return goDefName(node);
     if (lang === "r")
@@ -108,11 +163,8 @@ function defName(node, lang) {
     const defTypes = lang === "python" ? PY_DEF_TYPES : TS_DEF_TYPES;
     if (defTypes.has(node.type))
         return node.childForFieldName("name")?.text ?? null;
-    if ((lang === "typescript" || lang === "tsx") && node.type === "variable_declarator") {
-        const value = node.childForFieldName("value");
-        if (value && FN_VALUE_TYPES.has(value.type))
-            return node.childForFieldName("name")?.text ?? null;
-    }
+    if (lang === "typescript" || lang === "tsx")
+        return tsSpecialDefName(node);
     return null;
 }
 /** The scope segment a Swift definition pushes, mirroring extract.js's
@@ -188,8 +240,12 @@ export function goReceiverTypeOf(node) {
     const recv = node.childForFieldName("receiver");
     const param = recv?.namedChildren.find((c) => c.type === "parameter_declaration");
     let type = param?.childForFieldName("type");
-    if (type?.type === "pointer_type")
-        type = type.namedChildren.at(-1) ?? null;
+    while (type && (type.type === "pointer_type" || type.type === "generic_type" || type.type === "parenthesized_type")) {
+        if (type.type === "generic_type")
+            type = type.childForFieldName("type") ?? type.namedChildren[0] ?? null;
+        else
+            type = type.namedChildren.at(-1) ?? null;
+    }
     return type?.type === "type_identifier" ? type.text : null;
 }
 /** Resolves a call site's receiver text (from `calleeName`) to a bound type
@@ -200,29 +256,55 @@ export function goReceiverTypeOf(node) {
  * the current class's own same-named override, not find it); anything else is
  * a bindings-map lookup, normalizing `this.` to `self.` since both are stored
  * the same way. */
+function resolveSingleRecvSegment(head, ctx) {
+    if (!head)
+        return undefined;
+    if (head === "self" || head === "cls" || head === "this")
+        return ctx.enclosingClass ?? undefined;
+    if (head === "super")
+        return ctx.rSuperClass ?? undefined;
+    if (ctx.lang === "php" && !head.startsWith("$"))
+        return head;
+    return ((ctx.lang === "go" && head === ctx.goReceiverVar ? ctx.enclosingClass : undefined) ??
+        ctx.bindings.lookup(ctx.scope, head) ??
+        (ctx.lang === "swift" && /^[A-Z]/.test(head) ? head : undefined) ??
+        (ctx.lang === "kotlin" && /^[A-Z]/.test(head) ? head : undefined) ??
+        undefined);
+}
 export function resolveRecvType(receiver, ctx) {
     if (!receiver)
         return undefined;
-    if (receiver === "self" || receiver === "cls" || receiver === "this")
-        return ctx.enclosingClass ?? undefined;
-    if (receiver === "super")
-        return ctx.rSuperClass ?? undefined;
+    if (!receiver.includes("."))
+        return resolveSingleRecvSegment(receiver, ctx);
     if (receiver.startsWith("self.") || receiver.startsWith("this.")) {
-        return (ctx.bindings.lookup(ctx.scope, receiver) ??
-            ctx.bindings.lookup(ctx.scope, receiver.replace(/^this\./, "self.")) ??
-            undefined);
+        const twoPart = receiver.split(".", 2).join(".");
+        const direct = ctx.bindings.lookup(ctx.scope, twoPart) ??
+            ctx.bindings.lookup(ctx.scope, twoPart.replace(/^this\./, "self."));
+        const parts = receiver.split(".");
+        if (direct && parts.length === 2)
+            return direct;
     }
-    // PHP static call `Foo::bar()`: the scope operand is a class name, so it *is*
-    // the receiver type. (Member calls pass a `$var` receiver, filtered by the `$`.)
-    if (ctx.lang === "php" && !receiver.startsWith("$"))
-        return receiver;
-    return ((ctx.lang === "go" && receiver === ctx.goReceiverVar ? ctx.enclosingClass : undefined) ??
-        ctx.bindings.lookup(ctx.scope, receiver) ??
-        // Swift type-member call `Animal.staticThing()`: an uppercase receiver with no
-        // local binding is the type itself (Swift naming: types are UpperCamelCase,
-        // values lowerCamelCase — and a shadowing binding was already tried above).
-        (ctx.lang === "swift" && /^[A-Z]/.test(receiver) ? receiver : undefined) ??
-        undefined);
+    const parts = receiver.split(".");
+    let curType = resolveSingleRecvSegment(parts[0], ctx);
+    let idx = 1;
+    if ((parts[0] === "self" || parts[0] === "this") && parts.length >= 2) {
+        const direct = ctx.bindings.lookup(ctx.scope, `self.${parts[1]}`) ??
+            ctx.bindings.lookup(ctx.scope, `this.${parts[1]}`);
+        if (direct) {
+            curType = direct;
+            idx = 2;
+        }
+    }
+    if (!curType && ctx.bindings.lookup(ctx.scope, receiver))
+        return ctx.bindings.lookup(ctx.scope, receiver);
+    for (; idx < parts.length && curType; idx++) {
+        const seg = parts[idx];
+        const next = ctx.bindings.lookup([], `${curType}.${seg}`) ?? ctx.bindings.lookup(ctx.scope, `${curType}.${seg}`);
+        if (!next)
+            return undefined;
+        curType = next;
+    }
+    return curType;
 }
 
 /** Looks up the 1-hop factory call binding that initialized `receiver`, if any. */
@@ -244,6 +326,10 @@ function isClassNode(node, lang) {
         return node.type === "class_definition";
     if (lang === "java")
         return JAVA_TYPE_DECLS.has(node.type);
+    if (lang === "kotlin")
+        return node.type === "class_declaration" || node.type === "object_declaration" || node.type === "companion_object";
+    if (lang === "php")
+        return node.type === "class_declaration" || node.type === "interface_declaration" || node.type === "trait_declaration" || node.type === "enum_declaration";
     if (lang === "typescript" || lang === "tsx") {
         return node.type === "class_declaration" || node.type === "abstract_class_declaration";
     }
@@ -286,6 +372,14 @@ export function collectBindings(root, lang) {
 /** Import aliases (`... as F`) can be declared anywhere relative to their use
  * textually, so this scans the whole tree once, ahead of the scope-aware walk. */
 function collectAliases(node, lang, aliases) {
+    if ((lang === "typescript" || lang === "tsx") && (
+        node.type === "function_declaration" ||
+        node.type === "generator_function_declaration" ||
+        node.type === "method_definition" ||
+        FN_VALUE_TYPES.has(node.type)
+    )) {
+        return;
+    }
     if (lang === "python" && node.type === "aliased_import") {
         const nameNode = node.childForFieldName("name");
         const aliasNode = node.childForFieldName("alias");
@@ -299,6 +393,20 @@ function collectAliases(node, lang, aliases) {
         const aliasNode = node.childForFieldName("alias");
         if (nameNode && aliasNode)
             aliases.set(aliasNode.text, nameNode.text);
+    }
+    else if (lang === "php" && node.type === "namespace_use_clause") {
+        const names = node.namedChildren.filter((c) => c.type === "name");
+        const q = node.namedChildren.find((c) => c.type === "qualified_name");
+        const orig = q ? q.text.replace(/^.*\\/, "") : names[0]?.text;
+        const alias = q && names.length >= 1 ? names.at(-1)?.text : names.length >= 2 ? names[1]?.text : null;
+        if (orig && alias)
+            aliases.set(alias, orig);
+    }
+    else if (lang === "kotlin" && node.type === "import_header") {
+        const id = node.namedChildren.find((c) => c.type === "identifier")?.text;
+        const alias = node.namedChildren.find((c) => c.type === "import_alias")?.namedChildren.find((c) => c.type === "type_identifier")?.text;
+        if (id && alias)
+            aliases.set(alias, id.split(".").pop());
     }
     for (const child of node.namedChildren)
         collectAliases(child, lang, aliases);
@@ -346,16 +454,81 @@ function collectGoReturnTypes(node, classScope, returnTypes, bindings) {
 function collectTsReturnTypes(node, classScope, aliases, returnTypes, bindings) {
     if (node.type === "class_declaration" || node.type === "abstract_class_declaration")
         return node.childForFieldName("name")?.text ?? classScope;
-    if (node.type === "function_declaration" || node.type === "generator_function_declaration" || node.type === "method_definition") {
+    if (node.type === "function_declaration" || node.type === "generator_function_declaration" || node.type === "method_definition" ||
+        node.type === "function_signature" || node.type === "method_signature") {
         const name = node.childForFieldName("name")?.text;
         const ret = tsAnnotationTypeName(node.childForFieldName("return_type"), aliases);
         if (name && ret)
             recordReturnTypeEntry(name, [ret], node, classScope, returnTypes, bindings);
     }
-    else if (node.type === "variable_declarator") {
+    else if (node.type === "variable_declarator" || node.type === "public_field_definition") {
         const value = node.childForFieldName("value");
         const name = value && FN_VALUE_TYPES.has(value.type) ? node.childForFieldName("name")?.text : null;
         const ret = name ? tsAnnotationTypeName(value.childForFieldName("return_type"), aliases) : null;
+        if (name && ret)
+            recordReturnTypeEntry(name, [ret], node, classScope, returnTypes, bindings);
+    }
+    return classScope;
+}
+function kotlinTypeName(node, aliases = null) {
+    if (!node)
+        return null;
+    if (node.type === "nullable_type") {
+        const inner = node.namedChildren.find((c) => c.type === "user_type" || c.type === "nullable_type");
+        return kotlinTypeName(inner, aliases);
+    }
+    if (node.type === "user_type") {
+        const st = node.namedChildren.filter((c) => c.type === "simple_user_type");
+        const raw = st.at(-1)?.namedChildren.find((c) => c.type === "type_identifier")?.text
+            ?? node.namedChildren.filter((c) => c.type === "type_identifier").at(-1)?.text
+            ?? null;
+        return raw ? (aliases?.get(raw) ?? raw) : null;
+    }
+    return null;
+}
+function collectJavaReturnTypes(node, classScope, returnTypes, bindings) {
+    if (JAVA_TYPE_DECLS.has(node.type))
+        return node.childForFieldName("name")?.text ?? classScope;
+    if (node.type === "method_declaration") {
+        const name = node.childForFieldName("name")?.text;
+        const ret = javaTypeName(node.childForFieldName("type"));
+        if (name && ret)
+            recordReturnTypeEntry(name, [ret], node, classScope, returnTypes, bindings);
+    }
+    return classScope;
+}
+function collectKotlinReturnTypes(node, classScope, aliases, returnTypes, bindings) {
+    if (node.type === "class_declaration" || node.type === "object_declaration")
+        return kotlinDefName(node) ?? classScope;
+    if (node.type === "function_declaration") {
+        const name = kotlinDefName(node);
+        const typeNode = node.namedChildren.find((c) => c.type === "user_type" || c.type === "nullable_type");
+        const ret = kotlinTypeName(typeNode, aliases);
+        if (name && ret)
+            recordReturnTypeEntry(name, [ret], node, classScope, returnTypes, bindings);
+    }
+    return classScope;
+}
+function collectSwiftReturnTypes(node, classScope, returnTypes, bindings) {
+    if (node.type === "class_declaration" || node.type === "protocol_declaration")
+        return swiftDefName(node) ?? classScope;
+    if (node.type === "function_declaration" || node.type === "protocol_function_declaration") {
+        const name = swiftDefName(node);
+        const retNode = node.namedChildren.find((c) => c.type === "function_result")
+            ?.namedChildren.find((c) => c.type === "user_type" || c.type === "optional_type");
+        const ret = swiftTypeName(retNode);
+        if (name && ret)
+            recordReturnTypeEntry(name, [ret], node, classScope, returnTypes, bindings);
+    }
+    return classScope;
+}
+function collectPhpReturnTypes(node, classScope, aliases, returnTypes, bindings) {
+    if (node.type === "class_declaration" || node.type === "interface_declaration" || node.type === "trait_declaration" || node.type === "enum_declaration")
+        return node.childForFieldName("name")?.text ?? classScope;
+    if (node.type === "method_declaration" || node.type === "function_definition") {
+        const name = node.childForFieldName("name")?.text;
+        const rawRet = phpTypeName(node.childForFieldName("return_type"));
+        const ret = rawRet ? (aliases.get(rawRet) ?? rawRet) : null;
         if (name && ret)
             recordReturnTypeEntry(name, [ret], node, classScope, returnTypes, bindings);
     }
@@ -369,6 +542,14 @@ function collectReturnTypes(node, lang, classScope, aliases, returnTypes, bindin
         collectGoReturnTypes(node, classScope, returnTypes, bindings);
     else if (lang === "typescript" || lang === "tsx")
         nextClassScope = collectTsReturnTypes(node, classScope, aliases, returnTypes, bindings);
+    else if (lang === "java")
+        nextClassScope = collectJavaReturnTypes(node, classScope, returnTypes, bindings);
+    else if (lang === "kotlin")
+        nextClassScope = collectKotlinReturnTypes(node, classScope, aliases, returnTypes, bindings);
+    else if (lang === "swift")
+        nextClassScope = collectSwiftReturnTypes(node, classScope, returnTypes, bindings);
+    else if (lang === "php")
+        nextClassScope = collectPhpReturnTypes(node, classScope, aliases, returnTypes, bindings);
     for (const child of node.namedChildren)
         collectReturnTypes(child, lang, nextClassScope, aliases, returnTypes, bindings);
 }
@@ -381,19 +562,19 @@ function visit(node, lang, scope, scopePath, classScope, bindings, aliases, retu
     if (lang === "python")
         handlePy(node, scope, scopePath, classScope, bindings, aliases, returnTypes);
     else if (lang === "go")
-        handleGo(node, scopePath, bindings, returnTypes);
-    // R Phase 1 has no classes, so there's no member/receiver-type binding to
-    // collect yet (see extract.js's calleeName R branch) — no handleR needed.
+        handleGo(node, scopePath, classScope, bindings, returnTypes);
     else if (lang === "r")
-        void 0;
+        handleR(node, scopePath, bindings);
     else if (lang === "java")
-        handleJava(node, scopePath, classScope, bindings);
+        handleJava(node, scopePath, classScope, bindings, returnTypes);
+    else if (lang === "kotlin")
+        handleKotlin(node, scopePath, classScope, bindings, aliases, returnTypes);
     else if (lang === "swift")
-        handleSwift(node, scopePath, classScope, bindings);
+        handleSwift(node, scopePath, classScope, bindings, returnTypes);
     else if (lang === "php")
-        handlePhp(node, scopePath, bindings);
+        handlePhp(node, scopePath, classScope, bindings, aliases, returnTypes);
     else
-        handleTs(node, scopePath, classScope, bindings, aliases, returnTypes);
+        handleTs(node, scope, scopePath, classScope, bindings, aliases, returnTypes);
     const name = defName(node, lang);
     let childScope = scope;
     let childScopePath = scopePath;
@@ -427,12 +608,72 @@ const CALL_TARGET_SPECS = {
     go: { callType: "call_expression", fnField: "function", memberType: "selector_expression", objField: "operand", memberField: "field" },
     typescript: { callType: "call_expression", fnField: "function", memberType: "member_expression", objField: "object", memberField: "property" },
     tsx: { callType: "call_expression", fnField: "function", memberType: "member_expression", objField: "object", memberField: "property" },
+    java: { callType: "method_invocation", fnField: "name", memberType: "field_access", objField: "object", memberField: "field" },
+    php: { callType: "member_call_expression", fnField: "name", memberType: "member_access_expression", objField: "object", memberField: "name" },
 };
 
+function unwindMemberChain(obj, spec, depth = 0) {
+    if (!obj || depth > 4)
+        return null;
+    if (obj.type === "identifier" || obj.type === "this" || obj.type === "self" || obj.type === "variable_name" || obj.type === "simple_identifier") {
+        return obj.text === "$this" ? "this" : obj.text;
+    }
+    if (obj.type === spec.memberType) {
+        const inner = unwindMemberChain(obj.childForFieldName(spec.objField), spec, depth + 1);
+        const prop = obj.childForFieldName(spec.memberField)?.text;
+        return inner && prop ? `${inner}.${prop}` : (prop ?? inner);
+    }
+    return null;
+}
+
 function extractCallTarget(expr, lang) {
+    const cur = unwrapAwaitExpr(expr);
+    if (!cur)
+        return null;
+    if (lang === "kotlin" || lang === "swift") {
+        if (cur.type !== "call_expression")
+            return null;
+        const target = cur.namedChildren[0];
+        if (target?.type === "simple_identifier")
+            return { callee: target.text };
+        if (target?.type === "navigation_expression") {
+            const member = target.namedChildren.find((c) => c.type === "navigation_suffix")
+                ?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+            const recv = target.namedChildren[0]?.text?.replace(/^self$/, "self");
+            return member && recv ? { callee: member, viaMember: true, receiver: recv } : null;
+        }
+        return null;
+    }
+    if (lang === "java" && cur.type === "method_invocation") {
+        const nameNode = cur.childForFieldName("name");
+        const obj = cur.childForFieldName("object");
+        if (!nameNode)
+            return null;
+        if (!obj)
+            return { callee: nameNode.text };
+        const recv = unwindMemberChain(obj, CALL_TARGET_SPECS.java) ?? obj.text;
+        return { callee: nameNode.text, viaMember: true, receiver: recv };
+    }
+    if (lang === "php") {
+        if (cur.type === "function_call_expression") {
+            const fn = cur.childForFieldName("function");
+            return fn?.type === "name" ? { callee: fn.text } : null;
+        }
+        if (cur.type === "member_call_expression" || cur.type === "nullsafe_member_call_expression") {
+            const nameNode = cur.childForFieldName("name");
+            const obj = cur.childForFieldName("object");
+            const recv = obj?.type === "variable_name" ? (obj.text === "$this" ? "this" : obj.text) : obj?.text;
+            return nameNode && recv ? { callee: nameNode.text, viaMember: true, receiver: recv } : null;
+        }
+        if (cur.type === "scoped_call_expression") {
+            const nameNode = cur.childForFieldName("name");
+            const sc = cur.childForFieldName("scope")?.text?.replace(/^.*\\/, "");
+            return nameNode && sc ? { callee: nameNode.text, viaMember: true, receiver: sc } : null;
+        }
+        return null;
+    }
     const spec = CALL_TARGET_SPECS[lang];
-    const cur = spec ? unwrapAwaitExpr(expr) : null;
-    if (!cur || cur.type !== spec.callType)
+    if (!spec || cur.type !== spec.callType)
         return null;
     const fn = cur.childForFieldName(spec.fnField);
     if (fn?.type === "identifier")
@@ -441,7 +682,10 @@ function extractCallTarget(expr, lang) {
         return null;
     const obj = fn.childForFieldName(spec.objField);
     const member = fn.childForFieldName(spec.memberField);
-    return obj && member ? { callee: member.text, viaMember: true, receiver: obj.text } : null;
+    if (!obj || !member)
+        return null;
+    const recv = unwindMemberChain(obj, spec) ?? obj.text;
+    return recv ? { callee: member.text, viaMember: true, receiver: recv } : null;
 }
 
 function lookupIntraReturnTypes(callTarget, classScope, returnTypes) {
@@ -512,9 +756,17 @@ function callTypeName(node, aliases) {
     if (rhs?.type !== "call")
         return null;
     const fn = rhs.childForFieldName("function");
-    if (fn?.type !== "identifier" || !/^[A-Z]/.test(fn.text))
+    let name = null;
+    if (fn?.type === "identifier") {
+        name = fn.text;
+    } else if (fn?.type === "attribute") {
+        const attr = fn.childForFieldName("attribute") ?? fn.namedChildren.at(-1);
+        if (attr?.type === "identifier")
+            name = attr.text;
+    }
+    if (!name || !/^[A-Z]/.test(name))
         return null;
-    return aliases.get(fn.text) ?? fn.text;
+    return aliases.get(name) ?? name;
 }
 /** Swift variable->type bindings from the confident, syntax-local clues:
  * a typed parameter (`func feed(animal: Animal)`, `init(keeper k: Keeper)` —
@@ -526,13 +778,26 @@ function callTypeName(node, aliases) {
  * convention is trusted in handleGo). A property directly inside a type body is
  * a field: bound at the type's scope, both bare (`repo.save()`) and
  * `self.`-prefixed (`self.repo.save()`), like Java's fields. */
-function handleSwift(node, scopePath, classScope, bindings) {
+function handleSwift(node, scopePath, classScope, bindings, returnTypes) {
     if (node.type === "parameter") {
         const ids = node.namedChildren.filter((c) => c.type === "simple_identifier");
         const name = ids.at(-1)?.text;
         const type = swiftTypeName(node.namedChildren.find((c) => c.type === "user_type" || c.type === "optional_type"));
         if (name && type)
             bindings.set(scopePath, name, type);
+        return;
+    }
+    if (node.type === "optional_binding_condition" || node.type === "implicitly_unwrapped_optional") {
+        const name = node.namedChildren.find((c) => c.type === "pattern")?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+        const val = node.namedChildren.find((c) => c.type === "call_expression" || c.type === "simple_identifier");
+        if (name && val) {
+            const ct = val.type === "call_expression" ? extractCallTarget(val, "swift") : null;
+            const t = swiftCtorTypeName(val) ?? lookupIntraReturnTypes(ct, classScope, returnTypes)?.[0] ?? null;
+            if (t)
+                bindings.set(scopePath, name, t);
+            else if (ct)
+                bindings.setFactory(scopePath, name, ct);
+        }
         return;
     }
     if (node.type !== "property_declaration")
@@ -545,15 +810,24 @@ function handleSwift(node, scopePath, classScope, bindings) {
     const annotated = node.namedChildren
         .find((c) => c.type === "type_annotation")
         ?.namedChildren.find((c) => c.type === "user_type" || c.type === "optional_type");
+    const initCall = node.namedChildren.find((c) => c.type === "call_expression");
+    const callTarget = initCall ? extractCallTarget(initCall, "swift") : null;
     const type = swiftTypeName(annotated) ??
-        swiftCtorTypeName(node.namedChildren.find((c) => c.type === "call_expression"));
-    if (!type)
-        return;
+        swiftCtorTypeName(initCall) ??
+        lookupIntraReturnTypes(callTarget, classScope, returnTypes)?.[0] ?? null;
     const isField = node.parent?.type === "class_body" || node.parent?.type === "protocol_body";
     const target = isField ? (classScope ?? scopePath) : scopePath;
-    bindings.set(target, name, type);
-    if (isField)
-        bindings.set(target, `self.${name}`, type);
+    if (type) {
+        bindings.set(target, name, type);
+        if (isField) {
+            bindings.set(target, `self.${name}`, type);
+            if (classScope)
+                bindings.set(target, `${classScope}.${name}`, type);
+        }
+    }
+    else if (callTarget) {
+        bindings.setFactory(target, isField ? `self.${name}` : name, callTarget);
+    }
 }
 /** A Swift type node's bare name: a `user_type`'s LAST type_identifier (so a
  * module-qualified `Foundation.Date` binds as `Date`, generic arguments live in
@@ -582,26 +856,128 @@ function swiftCtorTypeName(call) {
         return null;
     return /^[A-Z]/.test(fn.text) ? fn.text : null;
 }
-/** PHP variable->type bindings from the two confident, syntax-local clues:
- * a type-hinted parameter (`function f(Foo $x)`) and a `new` assignment
- * (`$x = new Foo()`). Keyed by the `$var` text (with the `$`) so a
- * `$var->method()` call site resolves through resolveRecvType's bindings
- * lookup, exactly like Python's annotated params and Go's receiver. */
-function handlePhp(node, scopePath, bindings) {
-    if (node.type === "simple_parameter") {
-        const type = phpTypeName(node.childForFieldName("type"));
+function handleKotlin(node, scopePath, classScope, bindings, aliases, returnTypes) {
+    if (node.type === "parameter" || node.type === "class_parameter") {
+        const name = node.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+        const type = kotlinTypeName(node.namedChildren.find((c) => c.type === "user_type" || c.type === "nullable_type"), aliases);
+        if (!name || !type)
+            return;
+        bindings.set(scopePath, name, type);
+        if (node.type === "class_parameter" && classScope) {
+            bindings.set(classScope, name, type);
+            bindings.set(classScope, `this.${name}`, type);
+            bindings.set(classScope, `self.${name}`, type);
+            bindings.set(classScope, `${classScope}.${name}`, type);
+        }
+        return;
+    }
+    if (node.type !== "property_declaration")
+        return;
+    const vd = node.namedChildren.find((c) => c.type === "variable_declaration");
+    const name = vd?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+    if (!name)
+        return;
+    const annotated = kotlinTypeName(vd?.namedChildren.find((c) => c.type === "user_type" || c.type === "nullable_type"), aliases);
+    const initCall = node.namedChildren.find((c) => c.type === "call_expression");
+    const callTarget = initCall ? extractCallTarget(initCall, "kotlin") : null;
+    const ctorName = initCall?.namedChildren[0]?.type === "simple_identifier" && /^[A-Z]/.test(initCall.namedChildren[0].text)
+        ? (aliases.get(initCall.namedChildren[0].text) ?? initCall.namedChildren[0].text)
+        : null;
+    const type = annotated ?? ctorName ?? lookupIntraReturnTypes(callTarget, classScope, returnTypes)?.[0] ?? null;
+    const isField = node.parent?.type === "class_body";
+    const target = isField ? (classScope ?? scopePath) : scopePath;
+    if (type) {
+        bindings.set(target, name, type);
+        if (isField) {
+            bindings.set(target, `this.${name}`, type);
+            bindings.set(target, `self.${name}`, type);
+            if (classScope)
+                bindings.set(target, `${classScope}.${name}`, type);
+        }
+    }
+    else if (callTarget) {
+        bindings.setFactory(target, isField ? `self.${name}` : name, callTarget);
+    }
+}
+function handleR(node, scopePath, bindings) {
+    if (node.type !== "binary_operator")
+        return;
+    const op = node.childForFieldName("operator")?.text;
+    if (!op || !R_ASSIGN_OPS.has(op))
+        return;
+    const lhs = node.childForFieldName("lhs");
+    const rhs = node.childForFieldName("rhs");
+    if (lhs?.type !== "identifier" || rhs?.type !== "call")
+        return;
+    const fn = rhs.childForFieldName("function");
+    if (fn?.type === "extract_operator" && fn.childForFieldName("rhs")?.text === "new") {
+        const cls = fn.childForFieldName("lhs")?.text;
+        if (cls)
+            bindings.set(scopePath, lhs.text, cls);
+    }
+}
+/** PHP variable->type bindings from typed parameters, ctor property promotion,
+ * typed class properties, `new Foo()`, and `$this->prop` assignments. */
+function handlePhp(node, scopePath, classScope, bindings, aliases, returnTypes) {
+    if (node.type === "simple_parameter" || node.type === "property_promotion_parameter") {
+        const rawType = phpTypeName(node.childForFieldName("type"));
+        const type = rawType ? (aliases.get(rawType) ?? rawType) : null;
         const name = node.childForFieldName("name");
-        if (type && name?.type === "variable_name")
+        if (type && name?.type === "variable_name") {
             bindings.set(scopePath, name.text, type);
+            if (node.type === "property_promotion_parameter" && classScope) {
+                const prop = name.text.replace(/^\$/, "");
+                bindings.set(classScope, `this.${prop}`, type);
+                bindings.set(classScope, `self.${prop}`, type);
+                bindings.set(classScope, `${classScope}.${prop}`, type);
+            }
+        }
+        return;
+    }
+    if (node.type === "property_declaration" && classScope) {
+        const rawType = phpTypeName(node.childForFieldName("type"));
+        const type = rawType ? (aliases.get(rawType) ?? rawType) : null;
+        if (!type)
+            return;
+        for (const el of node.namedChildren) {
+            if (el.type === "property_element") {
+                const v = el.namedChildren.find((c) => c.type === "variable_name")?.text?.replace(/^\$/, "");
+                if (v) {
+                    bindings.set(classScope, `this.${v}`, type);
+                    bindings.set(classScope, `self.${v}`, type);
+                    bindings.set(classScope, `${classScope}.${v}`, type);
+                }
+            }
+        }
         return;
     }
     if (node.type === "assignment_expression") {
         const left = node.childForFieldName("left");
         const right = node.childForFieldName("right");
-        if (left?.type === "variable_name" && right?.type === "object_creation_expression") {
-            const type = phpNewType(right);
+        let type = right?.type === "object_creation_expression" ? phpNewType(right) : null;
+        if (type)
+            type = aliases.get(type) ?? type;
+        const callTarget = !type ? extractCallTarget(right, "php") : null;
+        if (!type && callTarget)
+            type = lookupIntraReturnTypes(callTarget, classScope, returnTypes)?.[0] ?? null;
+        if (left?.type === "variable_name") {
             if (type)
                 bindings.set(scopePath, left.text, type);
+            else if (callTarget)
+                bindings.setFactory(scopePath, left.text, callTarget);
+        }
+        else if (left?.type === "member_access_expression" && left.childForFieldName("object")?.text === "$this" && classScope) {
+            const prop = left.childForFieldName("name")?.text;
+            const rhsVarType = !type && right?.type === "variable_name" ? bindings.lookup(scopePath ? scopePath.split(".") : [], right.text) : null;
+            const resolved = type ?? rhsVarType;
+            if (prop && resolved) {
+                bindings.set(classScope, `this.${prop}`, resolved);
+                bindings.set(classScope, `self.${prop}`, resolved);
+                bindings.set(classScope, `${classScope}.${prop}`, resolved);
+            }
+            else if (prop && callTarget) {
+                bindings.setFactory(classScope, `this.${prop}`, callTarget);
+            }
         }
     }
 }
@@ -786,18 +1162,61 @@ function handleTsParameter(node, scopePath, classScope, bindings, aliases) {
     if (isParamProperty)
         bindings.set(classScope ?? scopePath, `this.${pattern.text}`, typeName);
 }
-function handleTs(node, scopePath, classScope, bindings, aliases, returnTypes) {
+function handleTs(node, scope, scopePath, classScope, bindings, aliases, returnTypes) {
     if (node.type === "variable_declarator") {
         const value = node.childForFieldName("value");
         const name = value && FN_VALUE_TYPES.has(value.type) ? null : node.childForFieldName("name");
-        if (name?.type === "identifier")
+        if (name?.type === "identifier") {
             bindTsValueOrField(scopePath, name.text, value, node.childForFieldName("type"), classScope, bindings, aliases, returnTypes, false);
+        }
+        else if (name?.type === "object_pattern" && value) {
+            const rhsType = value.type === "identifier"
+                ? bindings.lookup(scope, value.text)
+                : (value.type === "member_expression" && value.childForFieldName("object")?.text === "this"
+                    ? bindings.lookup(scope, `this.${value.childForFieldName("property")?.text}`)
+                    : null);
+            if (rhsType) {
+                for (const prop of name.namedChildren) {
+                    const key = prop.type === "shorthand_property_identifier_pattern"
+                        ? prop.text
+                        : prop.type === "pair_pattern" ? prop.childForFieldName("key")?.text : null;
+                    const local = prop.type === "pair_pattern" ? prop.childForFieldName("value")?.text : key;
+                    const fType = key ? bindings.lookup([], `${rhsType}.${key}`) : null;
+                    if (local && fType)
+                        bindings.set(scopePath, local, fType);
+                }
+            }
+        }
         return;
     }
     if (node.type === "public_field_definition") {
+        const value = node.childForFieldName("value");
+        if (value && FN_VALUE_TYPES.has(value.type))
+            return;
         const name = node.childForFieldName("name");
-        if (name)
-            bindTsValueOrField(classScope ?? scopePath, `this.${name.text}`, node.childForFieldName("value"), node.childForFieldName("type"), classScope, bindings, aliases, returnTypes, true);
+        if (name) {
+            const target = classScope ?? scopePath;
+            bindTsValueOrField(target, `this.${name.text}`, value, node.childForFieldName("type"), classScope, bindings, aliases, returnTypes, true);
+            if (classScope)
+                bindTsValueOrField(target, `${classScope}.${name.text}`, value, node.childForFieldName("type"), classScope, bindings, aliases, returnTypes, true);
+        }
+        return;
+    }
+    if (node.type === "assignment_expression" && classScope) {
+        const left = node.childForFieldName("left");
+        const right = node.childForFieldName("right");
+        if (left?.type === "member_expression" && left.childForFieldName("object")?.text === "this" && right) {
+            const prop = left.childForFieldName("property")?.text;
+            const rhsVarType = right.type === "identifier" ? bindings.lookup(scope, right.text) : null;
+            if (prop && rhsVarType) {
+                bindings.set(classScope, `this.${prop}`, rhsVarType);
+                bindings.set(classScope, `${classScope}.${prop}`, rhsVarType);
+            }
+            else if (prop) {
+                bindTsValueOrField(classScope, `this.${prop}`, right, null, classScope, bindings, aliases, returnTypes, false);
+                bindTsValueOrField(classScope, `${classScope}.${prop}`, right, null, classScope, bindings, aliases, returnTypes, false);
+            }
+        }
         return;
     }
     if (node.type === "required_parameter" || node.type === "optional_parameter")
@@ -820,7 +1239,7 @@ function handleJavaSpreadOrCatchParam(node, scopePath, bindings) {
     if (type && name?.type === "identifier")
         bindings.set(scopePath, name.text, type);
 }
-function handleJavaDeclBindings(node, scopePath, classScope, bindings) {
+function handleJavaDeclBindings(node, scopePath, classScope, bindings, returnTypes) {
     const isField = node.type === "field_declaration";
     const target = isField ? (classScope ?? scopePath) : scopePath;
     for (const d of node.namedChildren) {
@@ -829,15 +1248,25 @@ function handleJavaDeclBindings(node, scopePath, classScope, bindings) {
         const name = d.childForFieldName("name");
         if (name?.type !== "identifier")
             continue;
-        const type = javaTypeName(node.childForFieldName("type")) ?? javaNewTypeName(d.childForFieldName("value"));
-        if (!type)
+        const val = d.childForFieldName("value");
+        const ct = val ? extractCallTarget(val, "java") : null;
+        const type = javaTypeName(node.childForFieldName("type")) ??
+            javaNewTypeName(val) ??
+            lookupIntraReturnTypes(ct, classScope, returnTypes)?.[0] ?? null;
+        if (!type) {
+            if (ct)
+                bindings.setFactory(target, name.text, ct);
             continue;
+        }
         bindings.set(target, name.text, type);
-        if (isField)
+        if (isField) {
             bindings.set(target, `self.${name.text}`, type);
+            if (classScope)
+                bindings.set(target, `${classScope}.${name.text}`, type);
+        }
     }
 }
-function handleJava(node, scopePath, classScope, bindings) {
+function handleJava(node, scopePath, classScope, bindings, returnTypes) {
     if (node.type === "formal_parameter" || node.type === "enhanced_for_statement") {
         const type = javaTypeName(node.childForFieldName("type"));
         const name = node.childForFieldName("name");
@@ -847,7 +1276,11 @@ function handleJava(node, scopePath, classScope, bindings) {
     }
     if (node.type === "resource") {
         const name = node.childForFieldName("name");
-        const type = javaTypeName(node.childForFieldName("type")) ?? javaNewTypeName(node.childForFieldName("value"));
+        const val = node.childForFieldName("value");
+        const ct = val ? extractCallTarget(val, "java") : null;
+        const type = javaTypeName(node.childForFieldName("type")) ??
+            javaNewTypeName(val) ??
+            lookupIntraReturnTypes(ct, classScope, returnTypes)?.[0] ?? null;
         if (type && name?.type === "identifier")
             bindings.set(scopePath, name.text, type);
         return;
@@ -857,7 +1290,7 @@ function handleJava(node, scopePath, classScope, bindings) {
         return;
     }
     if (node.type === "local_variable_declaration" || node.type === "field_declaration")
-        handleJavaDeclBindings(node, scopePath, classScope, bindings);
+        handleJavaDeclBindings(node, scopePath, classScope, bindings, returnTypes);
 }
 /** A Java type node's bare name. `var` is the inferred-local keyword and states no
  * type, so it binds nothing. A generic binds to its erasure (`List<Order>` → `List`),
@@ -897,6 +1330,8 @@ function goTypeName(typeNode) {
         return null;
     if (typeNode.type === "pointer_type")
         return goTypeName(typeNode.namedChildren.at(-1) ?? null);
+    if (typeNode.type === "generic_type")
+        return goTypeName(typeNode.childForFieldName("type") ?? typeNode.namedChildren[0] ?? null);
     if (typeNode.type === "parenthesized_type")
         return goTypeName(typeNode.namedChildren[0] ?? null);
     if (typeNode.type === "type_identifier")
@@ -956,6 +1391,9 @@ function bindGoShortVarExpr(nameNode, rawExpr, scopePath, bindings, returnTypes)
     if (expr.type === "composite_literal") {
         typeName = goTypeName(expr.childForFieldName("type"));
     }
+    else if (expr.type === "type_assertion_expression") {
+        typeName = goTypeName(expr.childForFieldName("type"));
+    }
     else if (expr.type === "call_expression") {
         const callTarget = extractCallTarget(expr, "go");
         typeName = lookupIntraReturnTypes(callTarget, null, returnTypes)?.[0] ?? null;
@@ -972,7 +1410,21 @@ function bindGoShortVarExpr(nameNode, rawExpr, scopePath, bindings, returnTypes)
     if (typeName)
         bindings.set(scopePath, nameNode.text, typeName);
 }
-function handleGo(node, scopePath, bindings, returnTypes) {
+function handleGo(node, scopePath, classScope, bindings, returnTypes) {
+    if (node.type === "field_declaration") {
+        let cur = node.parent;
+        while (cur && cur.type !== "type_spec" && cur.type !== "source_file")
+            cur = cur.parent;
+        const structName = cur?.type === "type_spec" ? cur.childForFieldName("name")?.text : null;
+        const fieldType = goTypeName(node.childForFieldName("type"));
+        if (structName && fieldType) {
+            for (const f of node.childrenForFieldName("name")) {
+                if (f.type === "field_identifier" || f.type === "identifier")
+                    bindings.set("", `${structName}.${f.text}`, fieldType);
+            }
+        }
+        return;
+    }
     if (node.type === "parameter_declaration" || node.type === "variadic_parameter_declaration") {
         const typeNode = node.childForFieldName("type") ?? node.namedChildren.find((c) => c.type !== "identifier");
         const typeName = goTypeName(typeNode);
@@ -982,8 +1434,14 @@ function handleGo(node, scopePath, bindings, returnTypes) {
     }
     if (node.type === "var_spec") {
         const typeName = goTypeName(node.childForFieldName("type"));
-        if (typeName)
+        if (typeName) {
             bindGoNamedIds(node, scopePath, typeName, bindings);
+            return;
+        }
+        const names = node.childrenForFieldName("name");
+        const vals = node.childForFieldName("value")?.namedChildren ?? [];
+        for (let i = 0; i < names.length && i < vals.length; i++)
+            bindGoShortVarExpr(names[i], vals[i], scopePath, bindings, returnTypes);
         return;
     }
     if (node.type !== "short_var_declaration")

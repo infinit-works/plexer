@@ -2,12 +2,13 @@
  * Luau depth-equivalent extractor & module-aware edge resolver for plexer.
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, posix, resolve } from "node:path";
+import { basename, join, posix, resolve } from "node:path";
 import { moduleStem } from "../context/symbol-query.js";
 import { contentHash, fileResidual, GENERIC_MEMBER_NAMES, isCompoundIdentifierName, mintId, searchBody } from "../util/id.js";
-import { pushMap } from "../util/paths.js";
+import { isDependencyPath, pathUnderPrefix, pushMap, relPosix } from "../util/paths.js";
 import { readJson } from "../util/state.js";
 import { KIND, defScope, enclosingDef, extractLeadingSummary } from "./extract/ast.js";
+import { discoverManifestMounts } from "./manifest-mounts.js";
 
 const PARSE_CHUNK = 16384;
 const LUAU_PARSERS = new WeakMap();
@@ -77,7 +78,9 @@ function maskLuauProtectedSpans(src) {
     while (i < src.length) {
         const ch = src[i];
         if (ch === '"' || ch === "'" || ch === "`") {
-            i = skipLuauQuotedString(src, i);
+            const end = skipLuauQuotedString(src, i);
+            stash(i, end);
+            i = end;
             continue;
         }
         if (ch === "-" && src[i + 1] === "-") {
@@ -87,8 +90,10 @@ function maskLuauProtectedSpans(src) {
                 i = blkEnd;
                 continue;
             }
+            const lineStart = i;
             while (i < src.length && src[i] !== "\n")
                 i++;
+            stash(lineStart, i);
             continue;
         }
         if (ch === "[") {
@@ -197,17 +202,23 @@ function isRawTypeofTypeContext(rawSource, matchIndex, hasFieldColon) {
     return /:\s*[^=\n]*$/.test(before);
 }
 
+function unmaskLuauText(text, saved) {
+    if (!saved || saved.length === 0)
+        return text;
+    return text.replace(/\uE8F0(\d+)\n*\uE8F1/g, (_, idx) => saved[Number(idx)] ?? "");
+}
+
 /**
  * Extract `require(...)` inside `typeof(...)` before `stripBalancedTypeof` replaces them with `any`.
  */
-function extractTypeofRequires(rawSource) {
+function extractTypeofRequires(maskedSource, saved = null) {
     const results = [];
     const re = /(?:([A-Za-z_]\w*)\s*:\s*)?typeof\s*\(\s*require\s*\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)\s*\)/g;
     let m;
-    while ((m = re.exec(rawSource)) !== null) {
-        const rawArg = m[2].trim();
+    while ((m = re.exec(maskedSource)) !== null) {
+        const rawArg = unmaskLuauText(m[2], saved).trim();
         const strMatch = /^["']([^"'\n]+)["']$/.exec(rawArg);
-        const typeOnly = isRawTypeofTypeContext(rawSource, m.index, Boolean(m[1]));
+        const typeOnly = isRawTypeofTypeContext(maskedSource, m.index, Boolean(m[1]));
         results.push({
             field: m[1] || null,
             spec: strMatch ? strMatch[1].trim() : null,
@@ -218,14 +229,37 @@ function extractTypeofRequires(rawSource) {
     return results;
 }
 
+function normalizeGenericStringLiterals(text, saved) {
+    let cur = text;
+    for (let pass = 0; pass < 16; pass++) {
+        let changed = false;
+        const next = cur.replace(
+            /(\b[A-Za-z_]\w*<[A-Za-z0-9_.,\s]*)(?:"[^"\n]*"|\uE8F0(\d+)\uE8F1)/g,
+            (full, pre, tokIdx) => {
+                if (tokIdx !== undefined) {
+                    const rawTok = saved?.[Number(tokIdx)] ?? "";
+                    if (!rawTok.startsWith('"') && !rawTok.startsWith("'"))
+                        return full;
+                }
+                changed = true;
+                return `${pre}string`;
+            },
+        );
+        cur = next;
+        if (!changed)
+            break;
+    }
+    return cur;
+}
+
 /**
  * Line-preserving pre-parse normalizer so tree-sitter-luau 1.2.0 (2023) parses
  * 2024-2026 Luau constructs without collapsing files into ERROR nodes.
  * Preserves exact line numbers (`startPosition.row` / `endPosition.row`).
  */
-export function normalizeLuauForParse(src) {
-    const { text: masked, saved } = maskLuauProtectedSpans(src);
-    const normalized = stripBalancedTypeof(masked)
+export function normalizeLuauForParse(src, preMasked = null) {
+    const { text: masked, saved } = preMasked ?? maskLuauProtectedSpans(src);
+    let normalized = stripBalancedTypeof(masked)
         // 1. Luau 2024+ `export type function` / `type function` -> `local function`
         .replace(/^(\s*)(?:export\s+)?type\s+function\b/gm, "$1local function")
         // 2. Ambient `.d.luau` `declare function` / `declare x:`
@@ -244,9 +278,9 @@ export function normalizeLuauForParse(src) {
         // 7. Anonymous generic function expression (`function<T>(...)` -> `function(...)`)
         .replace(/\bfunction\s*<[^>\n]+>(?=\s*\()/g, "function")
         // 8. Explicit generic call instantiation (`foo<<string>>(` or `foo<<A, B<C>>>(` -> `foo(`)
-        .replace(/<<[^\r\n>]+(?:>[^\r\n>]+)*>>(?=\s*[\(\{"'`])/g, "")
-        // 9. String literal singleton types inside generic type arguments (`Props<"Frame", ...>` -> `Props<string, ...>`)
-        .replace(/(\b[A-Za-z_]\w*<[A-Za-z0-9_.,\s]*)"[^"\n]*"/g, "$1string")
+        .replace(/<<[^\r\n>]+(?:>[^\r\n>]+)*>>(?=\s*[\(\{"'`])/g, "");
+    // 9. String literal singleton types inside generic type arguments (`Props<"Frame", ...>` -> `Props<string, ...>`)
+    normalized = normalizeGenericStringLiterals(normalized, saved)
         // 10. Generic type packs `<A..., R...>` or `<T...>` on functions/types
         .replace(/<([^>\n]*\.\.\.[^>\n]*)>/g, "")
         // 11. Variadic type pack return/param `(A...) -> R...`, `): R...`, `-> ...any`
@@ -257,14 +291,12 @@ export function normalizeLuauForParse(src) {
         .replace(/\(\s*([A-Za-z_]\w*)\s*,\s*\1\s*:\s*any\s*\)/g, "($1, $1)")
         // 13. Trailing comma in `for _, in expr do`
         .replace(/\bfor\s+([A-Za-z_]\w*)\s*,\s+in\b/g, "for $1 in")
-        // 14. Builtin/reserved type keywords used as field/param names (`thread:`, `type:`, etc.)
-        .replace(/\b(thread|number|string|boolean|type|export|typeof)(\s*:\s*(?![=]))/g, "$1_$2")
+        // 14. Builtin/reserved type keywords used as field/param names in type contexts (`thread:`, `type:`, etc.)
+        .replace(/(^|[({,;\n]\s*|\blocal\s+)\b(thread|number|string|boolean|type|export|typeof)(\s*:(?!:|=)(?!\s*[A-Za-z_]\w*\s*[\({"'`\[]))/gm, "$1$2_$3")
         // 15. Nested generic closing `>>` -> `> >` (repeat twice for `>>>`)
         .replace(/>>(?![=>])/g, "> >")
         .replace(/>>(?![=>])/g, "> >");
-    if (saved.length === 0)
-        return normalized;
-    return normalized.replace(/\uE8F0(\d+)\n*\uE8F1/g, (_, idx) => saved[Number(idx)] ?? "");
+    return unmaskLuauText(normalized, saved);
 }
 
 function isChunkReturnedFunction(fnNode) {
@@ -302,6 +334,55 @@ function unwrapExpr(node) {
     let cur = node;
     while (cur && (cur.type === "parenthesized_expression" || cur.type === "cast_expression")) {
         cur = cur.namedChild(0);
+    }
+    return cur;
+}
+
+const TABLE_WRAPPER_FNS = new Set(["table.freeze", "setmetatable", "table.clone"]);
+
+function tableWrapperArg0(callNode) {
+    if (!callNode || callNode.type !== "function_call")
+        return null;
+    const callee = unwrapExpr(callNode.childForFieldName("name"));
+    const chain = extractAccessChain(callee);
+    const fnName = chain ? chain.join(".") : null;
+    if (!fnName || !TABLE_WRAPPER_FNS.has(fnName))
+        return null;
+    const args = callNode.childForFieldName("arguments");
+    return args?.namedChild(0) ?? null;
+}
+
+function unwrapTableConstructor(rawNode, maxDepth = 5) {
+    let cur = unwrapExpr(rawNode);
+    for (let d = 0; cur && d < maxDepth; d++) {
+        if (cur.type === "table_constructor")
+            return cur;
+        if (cur.type === "function_call") {
+            const inner = tableWrapperArg0(cur);
+            if (!inner)
+                return null;
+            cur = unwrapExpr(inner);
+            continue;
+        }
+        return null;
+    }
+    return cur?.type === "table_constructor" ? cur : null;
+}
+
+function climbTableWrappersUp(tblNode) {
+    let cur = tblNode;
+    for (let d = 0; cur && d < 6; d++) {
+        const p1 = cur.parent;
+        const p2 = p1?.parent;
+        if (p1?.type === "parenthesized_expression" || p1?.type === "cast_expression") {
+            cur = p1;
+            continue;
+        }
+        if (p1?.type === "arguments" && p2?.type === "function_call" && tableWrapperArg0(p2)?.id === cur.id) {
+            cur = p2;
+            continue;
+        }
+        return cur;
     }
     return cur;
 }
@@ -386,7 +467,7 @@ function evalLuauIdentifierPath(node, instancePaths) {
     return null;
 }
 
-function evalLuauDotIndexPath(node, instancePaths, isBarrelTarget) {
+function evalLuauDotIndexPath(node, instancePaths, isBarrelTarget, paramNames = null) {
     const fullChain = extractAccessChain(node);
     if (fullChain && instancePaths?.has(fullChain.join("."))) {
         const b = instancePaths.get(fullChain.join("."));
@@ -397,17 +478,19 @@ function evalLuauDotIndexPath(node, instancePaths, isBarrelTarget) {
     if (!tbl || !fld)
         return null;
     const tblChain = extractAccessChain(tbl);
-    if (tblChain && isBarrelTarget && (isBarrelTarget(tblChain[tblChain.length - 1]) || isBarrelTarget(tblChain[0]))) {
+    const tblHead = tblChain?.[0];
+    const tblTail = tblChain?.[tblChain.length - 1];
+    if (tblChain && ((isBarrelTarget && (isBarrelTarget(tblTail) || isBarrelTarget(tblHead))) || (paramNames && tblHead && paramNames.has(tblHead) && tblChain.length === 1))) {
         if (fld.text === "script")
             return { base: "root", parents: 0, parts: [] };
         if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(fld.text))
             return { base: "root", parents: 0, parts: [fld.text] };
     }
-    const basePath = evalInstancePath(tbl, instancePaths, isBarrelTarget);
+    const basePath = evalInstancePath(tbl, instancePaths, isBarrelTarget, paramNames);
     return basePath ? applyPathStep(basePath, fld.text) : null;
 }
 
-function evalLuauCallPath(node, instancePaths, isBarrelTarget) {
+function evalLuauCallPath(node, instancePaths, isBarrelTarget, paramNames = null) {
     const callee = node.childForFieldName("name");
     const args = node.childForFieldName("arguments");
     if (callee?.type !== "method_index_expression")
@@ -416,36 +499,36 @@ function evalLuauCallPath(node, instancePaths, isBarrelTarget) {
     const mth = callee.childForFieldName("method")?.text;
     if (mth === "WaitForChild" || mth === "FindFirstChild") {
         const childName = extractStringLiteral(args);
-        const basePath = evalInstancePath(tbl, instancePaths, isBarrelTarget);
+        const basePath = evalInstancePath(tbl, instancePaths, isBarrelTarget, paramNames);
         return basePath && childName ? applyPathStep(basePath, childName) : null;
     }
     if (mth === "GetService" && tbl?.type === "identifier" && tbl.text === "game") {
         const svc = extractStringLiteral(args);
         return svc ? { base: "root", parents: 0, parts: [svc] } : null;
     }
-    return mth === "Clone" ? evalInstancePath(tbl, instancePaths, isBarrelTarget) : null;
+    return mth === "Clone" ? evalInstancePath(tbl, instancePaths, isBarrelTarget, paramNames) : null;
 }
 
-function evalInstancePath(rawNode, instancePaths, isBarrelTarget) {
+function evalInstancePath(rawNode, instancePaths, isBarrelTarget, paramNames = null) {
     const node = unwrapExpr(rawNode);
     if (!node)
         return null;
     if (node.type === "binary_expression") {
-        return evalInstancePath(node.namedChild(1), instancePaths, isBarrelTarget) ?? evalInstancePath(node.namedChild(0), instancePaths, isBarrelTarget);
+        return evalInstancePath(node.namedChild(1), instancePaths, isBarrelTarget, paramNames) ?? evalInstancePath(node.namedChild(0), instancePaths, isBarrelTarget, paramNames);
     }
     if (node.type === "identifier")
         return evalLuauIdentifierPath(node, instancePaths);
     if (node.type === "dot_index_expression")
-        return evalLuauDotIndexPath(node, instancePaths, isBarrelTarget);
+        return evalLuauDotIndexPath(node, instancePaths, isBarrelTarget, paramNames);
     if (node.type === "bracket_index_expression") {
         const tbl = node.childForFieldName("table") ?? node.namedChild(0);
         const idx = node.childForFieldName("field") ?? node.namedChild(1);
         const key = extractStringLiteral(idx);
-        const basePath = evalInstancePath(tbl, instancePaths, isBarrelTarget);
+        const basePath = evalInstancePath(tbl, instancePaths, isBarrelTarget, paramNames);
         return basePath && key ? applyPathStep(basePath, key) : null;
     }
     if (node.type === "function_call")
-        return evalLuauCallPath(node, instancePaths, isBarrelTarget);
+        return evalLuauCallPath(node, instancePaths, isBarrelTarget, paramNames);
     return null;
 }
 
@@ -483,12 +566,18 @@ function extractRequireSpec(rawNode, instancePaths, isBarrelTarget) {
     if (!node || node.type !== "function_call")
         return null;
     const fn = unwrapExpr(node.childForFieldName("name"));
-    if (!fn || fn.type !== "identifier" || fn.text !== "require")
+    if (!fn || fn.type !== "identifier")
         return null;
     const args = node.childForFieldName("arguments");
     if (!args)
         return null;
-    return parseRequireSpec(args.namedChild(0), instancePaths, isBarrelTarget);
+    if (fn.text === "require") {
+        return parseRequireSpec(args.namedChild(0), instancePaths, isBarrelTarget);
+    }
+    if ((fn.text === "pcall" || fn.text === "xpcall") && unwrapExpr(args.namedChild(0))?.text === "require") {
+        return parseRequireSpec(args.namedChild(1), instancePaths, isBarrelTarget);
+    }
+    return null;
 }
 
 function tableSiblingName(fieldNode) {
@@ -518,8 +607,17 @@ function enclosingTableContext(fieldNode, isPrimaryTable) {
     const tbl = fieldNode.parent;
     if (!tbl || tbl.type !== "table_constructor")
         return null;
-    const p1 = tbl.parent;
+    const topTblExpr = climbTableWrappersUp(tbl);
+    const p1 = topTblExpr.parent;
     const p2 = p1?.parent;
+    if (p1?.type === "field") {
+        const parentKey = p1.childForFieldName("name")?.text;
+        if (parentKey && /^[A-Za-z_][\w-]*$/.test(parentKey)) {
+            const outer = enclosingTableContext(p1, isPrimaryTable);
+            const prefix = outer?.prefix ? `${outer.prefix}.${parentKey}` : parentKey;
+            return { prefix, exported: outer ? outer.exported : !isInsideNestedFunction(p1) };
+        }
+    }
     if (p1?.type === "arguments" && p2?.type === "function_call") {
         const firstStr = extractStringLiteral(p1.namedChild(0));
         if (firstStr && /^[A-Za-z_][\w-]*$/.test(firstStr)) {
@@ -528,7 +626,7 @@ function enclosingTableContext(fieldNode, isPrimaryTable) {
     }
     if (p1?.type === "expression_list" && p2?.type === "assignment_statement") {
         const vars = p2.namedChild(0);
-        const idx = p1.namedChildren.findIndex((c) => c.id === tbl.id);
+        const idx = p1.namedChildren.findIndex((c) => c.id === topTblExpr.id);
         const lhs = vars?.namedChild(idx >= 0 ? idx : 0);
         const chain = extractAccessChain(lhs);
         if (chain && chain.length >= 1) {
@@ -571,13 +669,18 @@ function findReturnedTableName(rootNode) {
         const child = rootNode.namedChild(i);
         if (child?.type === "return_statement") {
             let expr = unwrapExpr(child.namedChild(0)?.namedChild(0));
-            if (expr?.type === "identifier")
-                return expr.text;
-            if (expr?.type === "function_call") {
-                const args = expr.childForFieldName("arguments");
-                const firstArg = unwrapExpr(args?.namedChild(0));
-                if (firstArg?.type === "identifier")
-                    return firstArg.text;
+            for (let d = 0; expr && d < 5; d++) {
+                if (expr.type === "identifier")
+                    return expr.text;
+                if (expr.type === "function_call") {
+                    const args = expr.childForFieldName("arguments");
+                    const firstArg = unwrapExpr(args?.namedChild(0));
+                    if (!firstArg)
+                        break;
+                    expr = firstArg;
+                    continue;
+                }
+                break;
             }
         }
     }
@@ -699,11 +802,30 @@ function prescanLuauNode(n, candidateTables, rootImportedTables, augmentedTables
         prescanLuauNode(n.namedChild(i), candidateTables, rootImportedTables, augmentedTables, paramNames);
 }
 
+function detectGetfenvModule(rootNode) {
+    for (let i = 0; i < rootNode.namedChildCount; i++) {
+        const child = rootNode.namedChild(i);
+        if (child?.type !== "assignment_statement")
+            continue;
+        const exprs = child.namedChild(1);
+        for (let j = 0; j < (exprs?.namedChildCount ?? 0); j++) {
+            const rhs = unwrapExpr(exprs.namedChild(j));
+            if (rhs?.type === "function_call") {
+                const fn = unwrapExpr(rhs.childForFieldName("name"));
+                if (fn?.type === "identifier" && fn.text === "getfenv")
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 function buildLuauExtractContext(rel, lines, fileNode, nodes, rawEdges, rootNode) {
     const stem = moduleStem(rel);
     const isRootInit = isInitLuau(rel) && rel.split("/").length <= 2;
     const returnedTable = findReturnedTableName(rootNode);
     const chunkParam = findChunkReturnedFunctionParam(rootNode);
+    const isGetfenvModule = detectGetfenvModule(rootNode);
     const candidateTables = new Set([returnedTable, chunkParam].filter(Boolean));
     const rootImportedTables = new Set([chunkParam, isRootInit ? returnedTable : null].filter(Boolean));
     const augmentedTables = new Set();
@@ -736,6 +858,7 @@ function buildLuauExtractContext(rel, lines, fileNode, nodes, rawEdges, rootNode
         rawEdges,
         stem,
         isRootInit,
+        isGetfenvModule,
         paramNames,
         isBarrelTarget,
         isPrimaryTable,
@@ -749,6 +872,7 @@ function buildLuauExtractContext(rel, lines, fileNode, nodes, rawEdges, rootNode
         submodules: {},
         barrelExports: {},
         instanceExports: {},
+        delegateTargets: [],
         rawCalls: [],
         rawRefs: [],
         sameFileFnNames: new Set(),
@@ -1059,14 +1183,15 @@ function recordSingleLuauTableField(f, prefixChain, isBarrel, isPrimaryTarget, t
             instanceExports[fullKey] = instSpec;
     }
     const modTarget = resolveLuauRhsModuleTarget(v, luauCtx);
+    const subTbl = modTarget ? null : unwrapTableConstructor(v);
     if (modTarget) {
         if (isPrimaryTarget)
             submodules[fullKey] = modTarget;
         if (isBarrel)
             barrelExports[fullKey] = modTarget;
     }
-    else if (v.type === "table_constructor") {
-        recordLuauTableFields(v, [...prefixChain, k], isBarrel, isPrimaryTarget, tblVarName, luauCtx);
+    else if (subTbl) {
+        recordLuauTableFields(subTbl, [...prefixChain, k], isBarrel, isPrimaryTarget, tblVarName, luauCtx);
     }
 }
 
@@ -1078,18 +1203,23 @@ function recordLuauTableFields(tblNode, prefixChain, isBarrel, isPrimaryTarget, 
     }
 }
 
-function scanLuauIdentAssignment(lhs, rhs, luauCtx) {
-    const { instancePaths, isBarrelTarget, isPrimaryTable, isRootInit, reqBindings, localTables } = luauCtx;
+function scanLuauIdentAssignment(lhs, rhs, stmtNode, luauCtx) {
+    const { instancePaths, isBarrelTarget, isPrimaryTable, isRootInit, isGetfenvModule, reqBindings, localTables, submodules } = luauCtx;
     const instPath = evalInstancePath(rhs, instancePaths, isBarrelTarget);
     if (instPath)
         instancePaths.set(lhs.text, instPath);
     const modTarget = resolveLuauRhsModuleTarget(rhs, luauCtx);
-    if (modTarget)
+    if (modTarget) {
         reqBindings.set(lhs.text, { ...modTarget, declStartIndex: lhs.startIndex });
-    const unwRhs = unwrapExpr(rhs);
-    if (unwRhs?.type === "table_constructor") {
+        const isLocalStmt = stmtNode.text.trimStart().startsWith("local ");
+        if (isGetfenvModule && !isLocalStmt && !isInsideNestedFunction(stmtNode)) {
+            submodules[lhs.text] = modTarget;
+        }
+    }
+    const tblNode = unwrapTableConstructor(rhs);
+    if (tblNode) {
         localTables.add(lhs.text);
-        recordLuauTableFields(unwRhs, [], isBarrelTarget(lhs.text) || isRootInit, isPrimaryTable(lhs.text), lhs.text, luauCtx);
+        recordLuauTableFields(tblNode, [], isBarrelTarget(lhs.text) || isRootInit, isPrimaryTable(lhs.text), lhs.text, luauCtx);
     }
 }
 
@@ -1104,6 +1234,12 @@ function scanLuauMemberAssignment(lhs, rhs, stmtNode, luauCtx) {
     if (subChain.length === 0)
         return;
     const key = subChain.join(".");
+    const unwRhs = unwrapExpr(rhs);
+    if (key === "__index" && isPrim && unwRhs?.text !== lhsChain[0]) {
+        const delTarget = resolveLuauRhsModuleTarget(rhs, luauCtx);
+        if (delTarget)
+            luauCtx.delegateTargets.push(delTarget);
+    }
     const instPath = evalInstancePath(rhs, instancePaths, isBarrelTarget);
     if (instPath) {
         instancePaths.set(lhsChain.join("."), instPath);
@@ -1119,16 +1255,16 @@ function scanLuauMemberAssignment(lhs, rhs, stmtNode, luauCtx) {
             barrelExports[key] = modTarget;
         return;
     }
-    const unwRhs = unwrapExpr(rhs);
-    if (unwRhs?.type === "table_constructor" && (isPrim || isBarrel))
-        recordLuauTableFields(unwRhs, subChain, isBarrel, isPrim, lhsChain[0], luauCtx);
+    const tblNode = unwrapTableConstructor(rhs);
+    if (tblNode && (isPrim || isBarrel))
+        recordLuauTableFields(tblNode, subChain, isBarrel, isPrim, lhsChain[0], luauCtx);
     else if (isPrim && unwRhs?.type === "identifier")
         exportLuauLocalAlias(luauCtx, key, unwRhs.text, stmtNode);
 }
 
 function scanLuauAssignmentPair(lhs, rhs, stmtNode, luauCtx) {
     if (lhs.type === "identifier")
-        scanLuauIdentAssignment(lhs, rhs, luauCtx);
+        scanLuauIdentAssignment(lhs, rhs, stmtNode, luauCtx);
     else
         scanLuauMemberAssignment(lhs, rhs, stmtNode, luauCtx);
 }
@@ -1152,8 +1288,23 @@ function isLuauAstTypeContext(node, lines) {
     return false;
 }
 
+function isInsideRequireCall(node) {
+    let p = node.parent;
+    while (p) {
+        if (p.type === "function_call") {
+            const fn = unwrapExpr(p.childForFieldName("name"));
+            if (fn?.type === "identifier" && fn.text === "require")
+                return true;
+        }
+        if (p.type === "chunk" || p.type === "assignment_statement")
+            return false;
+        p = p.parent;
+    }
+    return false;
+}
+
 function scanLuauBindings(n, luauCtx) {
-    const { rel, rawEdges, instancePaths, isBarrelTarget, isRootInit, stem, lines } = luauCtx;
+    const { rel, rawEdges, instancePaths, isBarrelTarget, isRootInit, stem, lines, defs } = luauCtx;
     if (n.type === "function_call") {
         const spec = extractRequireSpec(n, instancePaths, isBarrelTarget);
         if (spec) {
@@ -1165,6 +1316,22 @@ function scanLuauBindings(n, luauCtx) {
                 file: rel,
                 ...(typeOnly ? { typeOnly: true } : {}),
             });
+        }
+        else if (!isInsideRequireCall(n)) {
+            const callee = n.childForFieldName("name");
+            const mth = callee?.type === "method_index_expression" ? callee.childForFieldName("method")?.text : null;
+            if (mth === "WaitForChild" || mth === "FindFirstChild") {
+                const instSpec = instancePathToSpec(evalLuauCallPath(n, instancePaths, isBarrelTarget, luauCtx.paramNames));
+                if (instSpec) {
+                    const enc = enclosingDef(defs, n.startIndex);
+                    rawEdges.push({
+                        source: enc ? enc.id : rel,
+                        relation: "instance_ref",
+                        specifier: instSpec,
+                        file: rel,
+                    });
+                }
+            }
         }
     }
     if (n.type === "assignment_statement") {
@@ -1183,16 +1350,18 @@ function scanLuauBindings(n, luauCtx) {
     if (n.type === "return_statement" && n.parent?.type === "chunk") {
         const exprList = n.namedChild(0);
         const val = unwrapExpr(exprList?.namedChild(0));
+        const retTbl = unwrapTableConstructor(val);
         if (val?.type === "function_definition") {
             appendLuauDef(luauCtx, stem, "function", val, true);
         }
-        else if (val?.type === "table_constructor") {
-            recordLuauTableFields(val, [], isRootInit, true, null, luauCtx);
+        else if (retTbl) {
+            recordLuauTableFields(retTbl, [], isRootInit, true, null, luauCtx);
         }
         else if (val?.type === "function_call") {
-            const firstArg = unwrapExpr(val.childForFieldName("arguments")?.namedChild(0));
-            if (firstArg?.type === "table_constructor") {
-                recordLuauTableFields(firstArg, [], isRootInit, true, null, luauCtx);
+            const firstArg = val.childForFieldName("arguments")?.namedChild(0);
+            const argTbl = unwrapTableConstructor(firstArg);
+            if (argTbl) {
+                recordLuauTableFields(argTbl, [], isRootInit, true, null, luauCtx);
             }
         }
     }
@@ -1206,36 +1375,46 @@ function resolveDirectReqBindingSpec(val, reqBindings) {
     const b = reqBindings.get(val.text);
     return b.spec && (!b.chain || b.chain.length === 0) ? b.spec : null;
 }
-function matchLuauDelegateNode(n, reqBindings) {
+function matchLuauDelegateNode(n, luauCtx) {
+    const { reqBindings } = luauCtx;
     if (n.type === "return_statement" && n.parent?.type === "chunk") {
-        return resolveDirectReqBindingSpec(unwrapExpr(n.namedChild(0)?.namedChild(0)), reqBindings);
+        const val = unwrapExpr(n.namedChild(0)?.namedChild(0));
+        const direct = resolveDirectReqBindingSpec(val, reqBindings);
+        if (direct)
+            return { spec: direct, chain: [] };
+        return null;
     }
     if (n.type === "field") {
         if (n.childForFieldName("name")?.text !== "__index")
             return null;
-        return resolveDirectReqBindingSpec(unwrapExpr(n.childForFieldName("value")), reqBindings);
+        return resolveLuauRhsModuleTarget(n.childForFieldName("value"), luauCtx);
     }
     if (n.type === "function_call") {
         const callee = unwrapExpr(n.childForFieldName("name"));
         if (callee?.type === "identifier" && callee.text === "setmetatable") {
             const secondArg = unwrapExpr(n.childForFieldName("arguments")?.namedChild(1));
-            return resolveDirectReqBindingSpec(secondArg, reqBindings);
+            const direct = resolveDirectReqBindingSpec(secondArg, reqBindings);
+            if (direct)
+                return { spec: direct, chain: [] };
+            return resolveLuauRhsModuleTarget(secondArg, luauCtx);
         }
     }
     return null;
 }
-function findLuauDelegateSpec(n, reqBindings) {
-    let found = matchLuauDelegateNode(n, reqBindings);
+function findLuauDelegateTarget(n, luauCtx) {
+    let found = matchLuauDelegateNode(n, luauCtx);
     for (let i = 0; i < n.namedChildCount; i++) {
-        const childSpec = findLuauDelegateSpec(n.namedChild(i), reqBindings);
-        if (childSpec)
-            found = childSpec;
+        const childTarget = findLuauDelegateTarget(n.namedChild(i), luauCtx);
+        if (childTarget)
+            found = childTarget;
     }
+    if (!found && luauCtx.delegateTargets.length > 0)
+        return luauCtx.delegateTargets[luauCtx.delegateTargets.length - 1];
     return found;
 }
 
 function scanLuauReexports(n, luauCtx) {
-    const { rel, reqBindings, defNameAt, rawEdges } = luauCtx;
+    const { rel, reqBindings, defNameAt, rawEdges, isPrimaryTable } = luauCtx;
     if (n.type === "field" && !isInsideNestedFunction(n)) {
         const fname = n.childForFieldName("name");
         const fval = unwrapExpr(n.childForFieldName("value"));
@@ -1243,9 +1422,12 @@ function scanLuauReexports(n, luauCtx) {
             const chain = extractAccessChain(fval);
             if (chain && chain.length >= 2 && reqBindings.has(chain[0])) {
                 const b = reqBindings.get(chain[0]);
-                if (b.spec && (!b.chain || b.chain.length === 0) && chain.length === 2) {
+                const tblCtx = enclosingTableContext(n, isPrimaryTable);
+                const symName = tblCtx?.prefix ? `${tblCtx.prefix}.${fname.text}` : fname.text;
+                const exported = tblCtx ? tblCtx.exported : true;
+                if (exported && b.spec && (!b.chain || b.chain.length === 0) && chain.length === 2) {
                     defNameAt.add(fname.startIndex);
-                    const d = appendLuauDef(luauCtx, fname.text, "function", n, true);
+                    const d = appendLuauDef(luauCtx, symName, "function", n, true);
                     if (d) {
                         rawEdges.push({
                             source: d.id,
@@ -1602,8 +1784,9 @@ export function extractLuau(rel, rawSource, entry, tsMod) {
     if (!entry || !tsMod)
         return { nodes, rawEdges };
 
-    const typeofReqs = extractTypeofRequires(rawSource);
-    const normSource = normalizeLuauForParse(rawSource);
+    const masked = maskLuauProtectedSpans(rawSource);
+    const typeofReqs = extractTypeofRequires(masked.text, masked.saved);
+    const normSource = normalizeLuauForParse(rawSource, masked);
     const tree = parseLuauSyntaxTree(normSource, entry, tsMod);
     if (!tree)
         return { nodes, rawEdges };
@@ -1639,9 +1822,13 @@ export function extractLuau(rel, rawSource, entry, tsMod) {
         if (Object.keys(luauCtx.instanceExports).length > 0)
             fileNode.instanceExports = luauCtx.instanceExports;
 
-        const delegateSpec = findLuauDelegateSpec(tree.rootNode, luauCtx.reqBindings);
-        if (delegateSpec)
-            fileNode.delegateSpec = delegateSpec;
+        const delegateTarget = findLuauDelegateTarget(tree.rootNode, luauCtx);
+        if (delegateTarget) {
+            if (delegateTarget.spec && (!delegateTarget.chain || delegateTarget.chain.length === 0))
+                fileNode.delegateSpec = delegateTarget.spec;
+            else
+                fileNode.delegateTarget = delegateTarget;
+        }
 
         scanLuauReexports(tree.rootNode, luauCtx);
         for (const d of luauCtx.defs) {
@@ -1660,7 +1847,7 @@ export function extractLuau(rel, rawSource, entry, tsMod) {
 
 function isInitLuau(rel) {
     const b = posix.basename(rel);
-    return b === "init.luau" || b.startsWith("init.");
+    return b === "init.luau" || b === "init.lua" || b.startsWith("init.");
 }
 
 function candidateRoots(extraRoot) {
@@ -1704,26 +1891,39 @@ function unquoteTomlScalar(val) {
     return m ? m[1] : null;
 }
 
-function findWallyIndexTarget(rootDir, pkgBase, spec) {
-    const baseSpec = spec.split("@")[0].replace(/\//g, "_");
-    const prefix = pkgBase ? `${pkgBase}/Packages/_Index` : "Packages/_Index";
-    const idxDir = join(rootDir, prefix);
-    if (!existsSync(idxDir))
-        return null;
-    try {
-        const entries = readdirSync(idxDir, { withFileTypes: true }).filter((e) => e.isDirectory()).sort((a, b) => a.name.localeCompare(b.name));
-        for (const e of entries) {
-            if (!e.name.startsWith(`${baseSpec}@`) && e.name !== baseSpec)
-                continue;
-            const pkgName = spec.split("@")[0].split("/").pop();
-            for (const sub of [`${prefix}/${e.name}/${pkgName}/src`, `${prefix}/${e.name}/${pkgName}`, `${prefix}/${e.name}`]) {
-                if (existsSync(join(rootDir, sub)))
-                    return sub;
-            }
+function listWallyIndexDirs(idxDir, wallyIndexCache) {
+    if (wallyIndexCache?.has(idxDir))
+        return wallyIndexCache.get(idxDir);
+    let names = [];
+    if (existsSync(idxDir)) {
+        try {
+            names = readdirSync(idxDir, { withFileTypes: true })
+                .filter((e) => e.isDirectory())
+                .map((e) => e.name)
+                .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+        }
+        catch {
+            names = [];
         }
     }
-    catch {
-        /* unreadable Packages/_Index */
+    wallyIndexCache?.set(idxDir, names);
+    return names;
+}
+
+function findWallyIndexTarget(rootDir, pkgBase, pkgFolder, spec, wallyIndexCache) {
+    const baseSpec = spec.split("@")[0].replace(/\//g, "_");
+    const folder = pkgFolder || "Packages";
+    const prefix = pkgBase ? `${pkgBase}/${folder}/_Index` : `${folder}/_Index`;
+    const idxDir = join(rootDir, prefix);
+    const entries = listWallyIndexDirs(idxDir, wallyIndexCache);
+    for (const name of entries) {
+        if (!name.startsWith(`${baseSpec}@`) && name !== baseSpec)
+            continue;
+        const pkgName = spec.split("@")[0].split("/").pop();
+        for (const sub of [`${prefix}/${name}/${pkgName}/src`, `${prefix}/${name}/${pkgName}`, `${prefix}/${name}`]) {
+            if (existsSync(join(rootDir, sub)))
+                return sub;
+        }
     }
     return null;
 }
@@ -1738,7 +1938,7 @@ const WALLY_DEPENDENCY_FOLDERS = [
     ["server-dependencies", "ServerPackages"],
     ["dev-dependencies", "DevPackages"],
 ];
-function applyWallySectionAliases(rootDir, base, pkgFolder, entries, aliases, mounts) {
+function applyWallySectionAliases(rootDir, base, pkgFolder, entries, aliases, mounts, wallyIndexCache) {
     const folderRel = base ? `${base}/${pkgFolder}` : pkgFolder;
     if (existsSync(join(rootDir, folderRel)))
         addNormalizedAlias(aliases, pkgFolder, folderRel);
@@ -1746,7 +1946,9 @@ function applyWallySectionAliases(rootDir, base, pkgFolder, entries, aliases, mo
         const spec = unquoteTomlScalar(rawVal);
         if (!spec)
             continue;
-        const idxHit = pkgFolder === "Packages" ? findWallyIndexTarget(rootDir, base, spec) : null;
+        const idxHit = (pkgFolder === "Packages" || pkgFolder === "ServerPackages" || pkgFolder === "DevPackages")
+            ? findWallyIndexTarget(rootDir, base, pkgFolder, spec, wallyIndexCache)
+            : null;
         const direct = `${folderRel}/${depAlias}`;
         const resolvedTarget = idxHit ?? (existsSync(join(rootDir, direct)) ? direct : null);
         if (!resolvedTarget)
@@ -1756,7 +1958,7 @@ function applyWallySectionAliases(rootDir, base, pkgFolder, entries, aliases, mo
             mounts.set(direct, resolvedTarget);
     }
 }
-function readWallyAliasesForDir(rootDir, dirRel, aliases, mounts) {
+function readWallyAliasesForDir(rootDir, dirRel, aliases, mounts, wallyIndexCache) {
     const manifestPath = dirRel ? join(rootDir, dirRel, "wally.toml") : join(rootDir, "wally.toml");
     if (!existsSync(manifestPath))
         return;
@@ -1771,7 +1973,7 @@ function readWallyAliasesForDir(rootDir, dirRel, aliases, mounts) {
     for (const [secName, pkgFolder] of WALLY_DEPENDENCY_FOLDERS) {
         const entries = secs.get(secName);
         if (entries)
-            applyWallySectionAliases(rootDir, base, pkgFolder, entries, aliases, mounts);
+            applyWallySectionAliases(rootDir, base, pkgFolder, entries, aliases, mounts, wallyIndexCache);
     }
 }
 
@@ -1838,14 +2040,35 @@ function collectProjectDirs(allDirs) {
     return [...dirs].sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
 }
 
-function readPackageManagerAliases(extraRoot, allDirs, aliases, mounts) {
-    const dirs = collectProjectDirs(allDirs);
+function configDirsForFilename(rootDir, configFiles, filename) {
+    const dirs = [];
+    const seen = new Set();
+    for (const abs of configFiles) {
+        if (basename(abs) !== filename)
+            continue;
+        const rel = relPosix(rootDir, abs);
+        if (!rel || rel.startsWith(".."))
+            continue;
+        const dirRel = posix.dirname(rel) === "." ? "" : posix.dirname(rel);
+        if (!seen.has(dirRel)) {
+            seen.add(dirRel);
+            dirs.push(dirRel);
+        }
+    }
+    return dirs.sort((a, b) => a.split("/").length - b.split("/").length || (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function readPackageManagerAliases(extraRoot, allDirs, aliases, mounts, configFiles = null) {
+    const wallyIndexCache = new Map();
+    const dirs = configFiles ? null : collectProjectDirs(allDirs);
     for (const r of candidateRoots(extraRoot)) {
         const rootDir = resolve(r);
-        for (const dirRel of dirs) {
-            readWallyAliasesForDir(rootDir, dirRel, aliases, mounts);
+        const wallyDirs = configFiles ? configDirsForFilename(rootDir, configFiles, "wally.toml") : dirs;
+        const pesdeDirs = configFiles ? configDirsForFilename(rootDir, configFiles, "pesde.toml") : dirs;
+        for (const dirRel of wallyDirs)
+            readWallyAliasesForDir(rootDir, dirRel, aliases, mounts, wallyIndexCache);
+        for (const dirRel of pesdeDirs)
             readPesdeAliasesForDir(rootDir, dirRel, aliases, mounts);
-        }
     }
 }
 
@@ -1863,23 +2086,38 @@ function collectLuaurcCandidateRels(allDirs) {
     }
     return rcRels;
 }
-function loadLuaurcFileAliases(rootDir, rcRel, map) {
+function loadLuaurcFileAliases(rootDir, rcRel, map, luaurcByDir) {
     const d = readJson(join(rootDir, rcRel));
     if (!d || typeof d !== "object")
         return;
     const rcDir = posix.dirname(rcRel) === "." ? "" : posix.dirname(rcRel);
-    for (const [k, v] of Object.entries(d.aliases ?? {}))
-        addNormalizedAlias(map, k, rcDir ? posix.join(rcDir, String(v)) : String(v));
+    let dirMap = luaurcByDir.get(rcDir);
+    if (!dirMap) {
+        dirMap = new Map();
+        luaurcByDir.set(rcDir, dirMap);
+    }
+    for (const [k, v] of Object.entries(d.aliases ?? {})) {
+        const target = rcDir ? posix.join(rcDir, String(v)) : String(v);
+        addNormalizedAlias(dirMap, k, target);
+        addNormalizedAlias(map, k, target);
+    }
 }
-function readLuaurcAliases(extraRoot, allDirs) {
+function readLuaurcAliases(extraRoot, allDirs, configFiles = null) {
     const map = new Map();
-    const rcRels = collectLuaurcCandidateRels(allDirs);
+    const luaurcByDir = new Map();
     for (const r of candidateRoots(extraRoot)) {
         const rootDir = resolve(r);
+        const rcRels = configFiles
+            ? configFiles
+                .filter((abs) => basename(abs) === ".luaurc")
+                .map((abs) => relPosix(rootDir, abs))
+                .filter((rel) => rel && !rel.startsWith(".."))
+                .sort((a, b) => a.split("/").length - b.split("/").length || (a < b ? -1 : a > b ? 1 : 0))
+            : collectLuaurcCandidateRels(allDirs);
         for (const rcRel of rcRels)
-            loadLuaurcFileAliases(rootDir, rcRel, map);
+            loadLuaurcFileAliases(rootDir, rcRel, map, luaurcByDir);
     }
-    return map;
+    return { aliases: map, luaurcByDir };
 }
 
 function resolveRojoSubprojectPath(rootDir, projDirRel, targetRel) {
@@ -1937,19 +2175,45 @@ function walkRojoTreeMounts(obj, parentVirt, rootDir, dirRel, mounts) {
             setFirstMount(mounts, childVirt, phys);
             setFirstMount(mounts, k, phys);
             setFirstMount(mounts, `src/${k}`, phys);
-            if (dirRel)
+            if (dirRel) {
+                const subRel = posix.normalize(posix.join(dirRel, posix.relative(dirRel, childVirt) || k));
+                const localChildVirt = curVirt && curVirt.startsWith(`${dirRel}/`) ? `${curVirt.slice(dirRel.length + 1)}/${k}` : curVirt === dirRel ? k : k;
+                setFirstMount(mounts, `${dirRel}/${localChildVirt}`, phys);
                 setFirstMount(mounts, `${dirRel}/${k}`, phys);
+                void subRel;
+            }
         }
         walkRojoTreeMounts(v, childVirt, rootDir, dirRel, mounts);
     }
 }
-function readRojoMounts(extraRoot, allDirs) {
+function readRojoMounts(extraRoot, allDirs, configFiles = null) {
     const mounts = new Map();
-    const projDirs = collectProjectDirs(allDirs);
+    const projDirs = configFiles ? null : collectProjectDirs(allDirs);
     for (const r of candidateRoots(extraRoot)) {
         const rootDir = resolve(r);
         let foundAny = false;
-        for (const { dirRel, fileRel } of collectRojoProjectFiles(rootDir, projDirs)) {
+        const files = configFiles
+            ? configFiles
+                .filter((abs) => basename(abs).endsWith(".project.json"))
+                .map((abs) => relPosix(rootDir, abs))
+                .filter((rel) => rel && !rel.startsWith(".."))
+                .sort((a, b) => {
+                    const ad = posix.dirname(a) === "." ? "" : posix.dirname(a);
+                    const bd = posix.dirname(b) === "." ? "" : posix.dirname(b);
+                    const dl = (ad ? ad.split("/").length : 0) - (bd ? bd.split("/").length : 0);
+                    if (dl !== 0)
+                        return dl;
+                    const an = posix.basename(a);
+                    const bn = posix.basename(b);
+                    if (an === "default.project.json" && bn !== "default.project.json")
+                        return -1;
+                    if (bn === "default.project.json" && an !== "default.project.json")
+                        return 1;
+                    return a < b ? -1 : a > b ? 1 : 0;
+                })
+                .map((fileRel) => ({ dirRel: posix.dirname(fileRel) === "." ? "" : posix.dirname(fileRel), fileRel }))
+            : collectRojoProjectFiles(rootDir, projDirs);
+        for (const { dirRel, fileRel } of files) {
             const data = readJson(join(rootDir, fileRel));
             if (!data || typeof data !== "object" || !data.tree)
                 continue;
@@ -1964,8 +2228,18 @@ function readRojoMounts(extraRoot, allDirs) {
 
 function checkDirectLuauCandidates(joined, byId) {
     const norm = posix.normalize(joined).replace(/^\.\//, "");
-    const noExt = norm.replace(/\.luau$/i, "");
-    for (const c of [norm, `${noExt}.luau`, `${noExt}/init.luau`, `${noExt}/init.client.luau`, `${noExt}/init.server.luau`]) {
+    const noExt = norm.replace(/\.(?:luau|lua)$/i, "");
+    for (const c of [
+        norm,
+        `${noExt}.luau`,
+        `${noExt}.lua`,
+        `${noExt}/init.luau`,
+        `${noExt}/init.lua`,
+        `${noExt}/init.client.luau`,
+        `${noExt}/init.client.lua`,
+        `${noExt}/init.server.luau`,
+        `${noExt}/init.server.lua`,
+    ]) {
         if (byId.has(c))
             return c;
     }
@@ -2011,11 +2285,11 @@ function matchBarrelInstanceRoute(rel, barrelInstancePaths) {
     return null;
 }
 
-function resolveLuauRootSpecifier(spec, byId, luaurcAliases, rojoMounts, barrelInstancePaths) {
+function resolveLuauRootSpecifier(spec, byId, luaurcAliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache) {
     const rel = spec === "@root" ? "" : spec.slice(6);
     const mapped = matchBarrelInstanceRoute(rel, barrelInstancePaths);
     if (mapped) {
-        const hit = resolveLuauSpecifier(mapped.spec, mapped.fromFile, byId, luaurcAliases, rojoMounts, null);
+        const hit = resolveLuauSpecifier(mapped.spec, mapped.fromFile, byId, luaurcAliases, rojoMounts, null, luaurcByDir, specCache);
         if (byId.has(hit))
             return hit;
     }
@@ -2031,18 +2305,35 @@ function resolveLuauSelfSpecifier(spec, file, baseDir, byId, rojoMounts) {
         return checkLuauCandidates(baseDir, byId, rojoMounts) ?? (byId.has(file) ? file : spec);
     const rel = spec.slice(6);
     if (!isInitLuau(file)) {
-        const stemDir = posix.join(baseDir, posix.basename(file).replace(/\.luau$/i, ""));
+        const stemDir = posix.join(baseDir, posix.basename(file).replace(/\.(?:luau|lua)$/i, ""));
         const childHit = checkLuauCandidates(posix.join(stemDir, rel), byId, rojoMounts);
         if (childHit)
             return childHit;
     }
     return checkLuauCandidates(baseDir && baseDir !== "." ? posix.join(baseDir, rel) : rel, byId, rojoMounts) ?? spec;
 }
-function resolveLuauAliasSpecifier(spec, byId, luaurcAliases, rojoMounts) {
+function lookupLuaurcAliasNearestDir(file, alias, luaurcByDir, luaurcAliases) {
+    if (luaurcByDir && luaurcByDir.size > 0 && file) {
+        let dir = posix.dirname(file);
+        if (dir === ".")
+            dir = "";
+        for (;;) {
+            const dirMap = luaurcByDir.get(dir);
+            if (dirMap?.has(alias))
+                return dirMap.get(alias);
+            if (!dir)
+                break;
+            const parent = posix.dirname(dir);
+            dir = parent === "." ? "" : parent;
+        }
+    }
+    return luaurcAliases?.get(alias);
+}
+function resolveLuauAliasSpecifier(spec, file, byId, luaurcAliases, rojoMounts, luaurcByDir) {
     const slash = spec.indexOf("/");
     const alias = slash >= 0 ? spec.slice(1, slash) : spec.slice(1);
     const rest = slash >= 0 ? spec.slice(slash + 1) : "";
-    const target = luaurcAliases?.get(alias);
+    const target = lookupLuaurcAliasNearestDir(file, alias, luaurcByDir, luaurcAliases);
     if (target) {
         const hit = checkLuauCandidates(rest ? `${target}/${rest}` : target, byId, rojoMounts);
         if (hit)
@@ -2069,17 +2360,25 @@ function resolveLuauRelativeSpecifier(spec, file, baseDir, byId, rojoMounts) {
     }
     return spec;
 }
-function resolveLuauSpecifier(spec, file, byId, luaurcAliases, rojoMounts, barrelInstancePaths = null) {
+function resolveLuauSpecifier(spec, file, byId, luaurcAliases, rojoMounts, barrelInstancePaths = null, luaurcByDir = null, specCache = null) {
+    const cacheKey = specCache ? `${file}\0${spec}\0${barrelInstancePaths ? 1 : 0}` : null;
+    if (cacheKey && specCache.has(cacheKey))
+        return specCache.get(cacheKey);
     const baseDir = posix.dirname(file);
+    let resolved;
     if (spec === "@root" || spec.startsWith("@root/"))
-        return resolveLuauRootSpecifier(spec, byId, luaurcAliases, rojoMounts, barrelInstancePaths);
-    if (spec === "@self" || spec.startsWith("@self/"))
-        return resolveLuauSelfSpecifier(spec, file, baseDir, byId, rojoMounts);
-    if (spec.startsWith("@"))
-        return resolveLuauAliasSpecifier(spec, byId, luaurcAliases, rojoMounts);
-    if (spec === "." || spec === ".." || spec.startsWith("./") || spec.startsWith("../"))
-        return resolveLuauRelativeSpecifier(spec, file, baseDir, byId, rojoMounts);
-    return checkLuauCandidates(spec, byId, rojoMounts) ?? spec;
+        resolved = resolveLuauRootSpecifier(spec, byId, luaurcAliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
+    else if (spec === "@self" || spec.startsWith("@self/"))
+        resolved = resolveLuauSelfSpecifier(spec, file, baseDir, byId, rojoMounts);
+    else if (spec.startsWith("@"))
+        resolved = resolveLuauAliasSpecifier(spec, file, byId, luaurcAliases, rojoMounts, luaurcByDir);
+    else if (spec === "." || spec === ".." || spec.startsWith("./") || spec.startsWith("../"))
+        resolved = resolveLuauRelativeSpecifier(spec, file, baseDir, byId, rojoMounts);
+    else
+        resolved = checkLuauCandidates(spec, byId, rojoMounts) ?? spec;
+    if (cacheKey)
+        specCache.set(cacheKey, resolved);
+    return resolved;
 }
 
 function probeLuauDir(d, allDirs, rojoMounts) {
@@ -2114,7 +2413,7 @@ function resolveLuauDirSpecifier(spec, file, allDirs, rojoMounts, barrelInstance
     if (spec.startsWith("@self/")) {
         const rel = spec.slice(6);
         if (!isInitLuau(file)) {
-            const stemDir = posix.join(baseDir, posix.basename(file).replace(/\.luau$/i, ""));
+            const stemDir = posix.join(baseDir, posix.basename(file).replace(/\.(?:luau|lua)$/i, ""));
             const hit = probeLuauDir(posix.join(stemDir, rel), allDirs, rojoMounts);
             if (hit)
                 return hit;
@@ -2133,10 +2432,20 @@ function resolveLuauDirSpecifier(spec, file, allDirs, rojoMounts, barrelInstance
     return probeLuauDir(spec, allDirs, rojoMounts);
 }
 
-function pickUniqueLuauCandidate(cands) {
+function pickUniqueLuauCandidate(cands, preferFirstParty = true) {
     if (cands.length === 1)
         return cands[0];
     if (cands.length > 1) {
+        if (preferFirstParty) {
+            const firstParty = cands.filter((n) => !n.dependency);
+            if (firstParty.length === 1)
+                return firstParty[0];
+            if (firstParty.length > 1) {
+                const expFirst = firstParty.filter((n) => n.exported);
+                if (expFirst.length === 1)
+                    return expFirst[0];
+            }
+        }
         const exp = cands.filter((n) => n.exported);
         if (exp.length === 1)
             return exp[0];
@@ -2144,13 +2453,23 @@ function pickUniqueLuauCandidate(cands) {
     return null;
 }
 
-function isNonProdLuauPath(relPath) {
+function isTestLuauPath(relPath) {
     const norm = String(relPath || "").replace(/\\/g, "/");
     return (
-        /(?:^|\/)(?:test|tests|spec|specs|__tests__|bench|benchmarks|fixtures|vendor|Packages|RobloxPackages|\.sert)\//i.test(
-            norm,
-        ) || /\.(?:spec|test)\.(?:luau|lua)$/i.test(norm)
+        /(?:^|\/)(?:test|tests|spec|specs|__tests__|bench|benchmarks|fixtures|\.sert)\//i.test(norm) ||
+        /\.(?:spec|test)\.(?:luau|lua)$/i.test(norm)
     );
+}
+
+function isDependencyLuauPath(relPath, depPrefixes = []) {
+    const norm = String(relPath || "").replace(/\\/g, "/");
+    if (isDependencyPath(norm))
+        return true;
+    return depPrefixes.some((p) => pathUnderPrefix(norm, p));
+}
+
+function isLuauNodePath(path, luauFileSet = null) {
+    return Boolean(path && (path.endsWith(".luau") || luauFileSet?.has(path)));
 }
 
 function compareLuauFileOrder(a, b) {
@@ -2160,14 +2479,17 @@ function compareLuauFileOrder(a, b) {
         return aRoot - bRoot;
     return a.path.length - b.path.length || a.path.localeCompare(b.path);
 }
-function registerLuauBarrelFile(n, hasProdLuauFiles, state) {
-    if (n.path.endsWith(".luau")) {
+function registerLuauBarrelFile(n, hasProdLuauFiles, depPrefixes, state) {
+    if (n.path.endsWith(".luau") || n.luauMode) {
         state.luauFiles.push(n);
-        state.allDirs.add(posix.dirname(n.path));
+        const pDir = posix.dirname(n.path);
+        state.allDirs.add(pDir);
+        const parentKey = isInitLuau(n.path) ? (pDir === "." ? "" : posix.dirname(pDir)) : pDir;
+        pushMap(state.luauFilesByParentDir, parentKey, n);
     }
-    if (hasProdLuauFiles && isNonProdLuauPath(n.path))
+    if (hasProdLuauFiles && (isTestLuauPath(n.path) || isDependencyLuauPath(n.path, depPrefixes)))
         return;
-    const isRootInit = n.path.endsWith(".luau") && isInitLuau(n.path) && n.path.split("/").length <= 2;
+    const isRootInit = (n.path.endsWith(".luau") || n.luauMode) && isInitLuau(n.path) && n.path.split("/").length <= 2;
     if (isRootInit || n.isBarrelContributor)
         state.barrelFileSet.add(n.path);
     if (n.barrelTable)
@@ -2185,10 +2507,11 @@ function registerLuauBarrelFile(n, hasProdLuauFiles, state) {
         }
     }
 }
-function collectLuauBarrelState(nodes, hasProdLuauFiles) {
+function collectLuauBarrelState(nodes, hasProdLuauFiles, depPrefixes) {
     const state = {
         allDirs: new Set(),
         luauFiles: [],
+        luauFilesByParentDir: new Map(),
         barrelRoutes: new Map(),
         barrelInstancePaths: new Map(),
         barrelFileSet: new Set(),
@@ -2196,7 +2519,7 @@ function collectLuauBarrelState(nodes, hasProdLuauFiles) {
     };
     const fileNodesSorted = nodes.filter((n) => n.kind === "file").sort(compareLuauFileOrder);
     for (const n of fileNodesSorted)
-        registerLuauBarrelFile(n, hasProdLuauFiles, state);
+        registerLuauBarrelFile(n, hasProdLuauFiles, depPrefixes, state);
     return state;
 }
 
@@ -2207,7 +2530,7 @@ function indexLuauSymbols(nodes, hasProdLuauFiles) {
     for (const n of nodes) {
         if (n.kind === "file")
             continue;
-        if (!hasProdLuauFiles || !isNonProdLuauPath(n.path)) {
+        if (!hasProdLuauFiles || !isTestLuauPath(n.path)) {
             pushMap(globalName, n.name, n);
             if (n.kind === "method" || (n.kind === "function" && (n.owner || n.name.includes(".")))) {
                 const leaf = n.name.includes(".") ? n.name.slice(n.name.lastIndexOf(".") + 1) : n.name;
@@ -2239,35 +2562,38 @@ function collectBarrelSymbolExports(barrelFileSet, perFileName) {
     return barrelSymbols;
 }
 
-function buildLuauResolutionIndex(nodes, opts) {
+function buildLuauResolutionIndex(nodes, opts, luauFileSet) {
     const byId = new Map(nodes.map((n) => [n.id, n]));
-    const hasProdLuauFiles = nodes.some((n) => n.kind === "file" && n.path.endsWith(".luau") && !isNonProdLuauPath(n.path));
-    const barrelState = collectLuauBarrelState(nodes, hasProdLuauFiles);
+    const depPrefixes = opts?.dependencyPrefixes ?? discoverManifestMounts(opts?.root)?.dependencyPrefixes ?? [];
+    const hasProdLuauFiles = nodes.some(
+        (n) => n.kind === "file" && isLuauNodePath(n.path, luauFileSet) && !isTestLuauPath(n.path) && !isDependencyLuauPath(n.path, depPrefixes),
+    );
+    const barrelState = collectLuauBarrelState(nodes, hasProdLuauFiles, depPrefixes);
     const { perFileName, globalName, methodsByLeaf } = indexLuauSymbols(nodes, hasProdLuauFiles);
-    const aliases = readLuaurcAliases(opts?.root, barrelState.allDirs);
-    const rojoMounts = readRojoMounts(opts?.root, barrelState.allDirs);
-    readPackageManagerAliases(opts?.root, barrelState.allDirs, aliases, rojoMounts);
+    const configFiles = Array.isArray(opts?.configFiles) ? opts.configFiles : null;
+    const { aliases, luaurcByDir } = readLuaurcAliases(opts?.root, barrelState.allDirs, configFiles);
+    const rojoMounts = readRojoMounts(opts?.root, barrelState.allDirs, configFiles);
+    readPackageManagerAliases(opts?.root, barrelState.allDirs, aliases, rojoMounts, configFiles);
     const barrelSymbols = collectBarrelSymbolExports(barrelState.barrelFileSet, perFileName);
     return {
         byId,
+        luauFileSet,
         perFileName,
         globalName,
         methodsByLeaf,
         importedByFile: new Map(),
+        specCache: new Map(),
         ...barrelState,
         barrelSymbols,
         aliases,
+        luaurcByDir,
         rojoMounts,
     };
 }
 
 function emitLuauChildrenImports(e, dir, luauIdx, factoryClasses, emitLuauEdge) {
-    const { luauFiles, perFileName } = luauIdx;
-    for (const n of luauFiles) {
-        const pDir = posix.dirname(n.path);
-        const isDirectChild = (pDir === dir && !isInitLuau(n.path)) || (posix.dirname(pDir) === dir && isInitLuau(n.path));
-        if (!isDirectChild)
-            continue;
+    const { luauFilesByParentDir, perFileName } = luauIdx;
+    for (const n of luauFilesByParentDir.get(dir) ?? []) {
         emitLuauEdge(e.file, n.path, "imports", "inferred");
         const stem = moduleStem(n.path);
         const fm = perFileName.get(n.path);
@@ -2290,9 +2616,9 @@ function recordDirectLuauImport(direct, from, to) {
     s.add(to);
 }
 function resolveSingleLuauImportEdge(e, direct, luauIdx, factoryClasses, emitLuauEdge) {
-    const { byId, aliases, rojoMounts, barrelInstancePaths, allDirs } = luauIdx;
+    const { byId, aliases, luaurcByDir, specCache, rojoMounts, barrelInstancePaths, allDirs } = luauIdx;
     if (e.relation === "imports" && e.specifier) {
-        const target = resolveLuauSpecifier(e.specifier, e.file, byId, aliases, rojoMounts, barrelInstancePaths);
+        const target = resolveLuauSpecifier(e.specifier, e.file, byId, aliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
         if (byId.has(target)) {
             emitLuauEdge(e.source, target, "imports", "extracted", Boolean(e.typeOnly));
             recordDirectLuauImport(direct, e.file, target);
@@ -2310,10 +2636,82 @@ function resolveSingleLuauImportEdge(e, direct, luauIdx, factoryClasses, emitLua
             recordDirectLuauImport(direct, e.file, t);
     });
 }
+
+function findRojoMountEntryTarget(mountPhys, byId, luauIdx) {
+    const direct = checkDirectLuauCandidates(mountPhys, byId);
+    if (direct)
+        return direct;
+    for (const cand of [
+        `${mountPhys}/Loader/init.lua`,
+        `${mountPhys}/Loader/init.luau`,
+        `${mountPhys}/Core/init.lua`,
+        `${mountPhys}/Core/init.luau`,
+        `${mountPhys}/src/init.luau`,
+        `${mountPhys}/src/init.lua`,
+    ]) {
+        if (byId.has(cand))
+            return cand;
+    }
+    const entryFile = luauIdx.luauFiles.find((n) => pathUnderPrefix(n.path, mountPhys) && isInitLuau(n.path));
+    if (entryFile)
+        return entryFile.path;
+    const anyFile = luauIdx.luauFiles.find((n) => pathUnderPrefix(n.path, mountPhys));
+    return anyFile ? anyFile.path : null;
+}
+
+function resolveLuauInstanceRefEdge(e, direct, luauIdx, emitLuauEdge) {
+    const { byId, rojoMounts, barrelInstancePaths, aliases, luaurcByDir, specCache } = luauIdx;
+    if (!e.specifier || !rojoMounts || rojoMounts.size === 0)
+        return;
+    let rel = null;
+    if (e.specifier.startsWith("@root/")) {
+        rel = e.specifier.slice(6);
+    }
+    else if (e.specifier.startsWith("@self/")) {
+        const baseDir = posix.dirname(e.file);
+        const sub = e.specifier.slice(6);
+        rel = baseDir && baseDir !== "." ? posix.join(baseDir, sub) : sub;
+    }
+    if (!rel)
+        return;
+    const mapped = matchBarrelInstanceRoute(rel, barrelInstancePaths);
+    let candidateRel = rel;
+    if (mapped) {
+        if (mapped.spec.startsWith("@root/"))
+            candidateRel = mapped.spec.slice(6);
+        else if (mapped.spec.startsWith("@self/")) {
+            const mDir = posix.dirname(mapped.fromFile);
+            const sub = mapped.spec.slice(6);
+            candidateRel = mDir && mDir !== "." ? posix.join(mDir, sub) : sub;
+        }
+        const directTarget = resolveLuauSpecifier(mapped.spec, mapped.fromFile, byId, aliases, rojoMounts, null, luaurcByDir, specCache);
+        if (byId.has(directTarget)) {
+            if (!direct.get(e.file)?.has(directTarget))
+                emitLuauEdge(e.source, directTarget, "references", "extracted", false);
+            return;
+        }
+    }
+    const cleanRel = candidateRel.replace(/^src\//, "");
+    for (const key of [candidateRel, `src/${cleanRel}`, cleanRel, posix.basename(candidateRel)]) {
+        if (!rojoMounts.has(key))
+            continue;
+        const mountPhys = rojoMounts.get(key);
+        const target = findRojoMountEntryTarget(mountPhys, byId, luauIdx);
+        if (target && !direct.get(e.file)?.has(target)) {
+            emitLuauEdge(e.source, target, "references", "extracted", false);
+        }
+        return;
+    }
+}
+
 function resolveLuauImportsPass(luauRaw, luauIdx, factoryClasses, emitLuauEdge) {
     const direct = new Map();
     for (const e of luauRaw)
         resolveSingleLuauImportEdge(e, direct, luauIdx, factoryClasses, emitLuauEdge);
+    for (const e of luauRaw) {
+        if (e.relation === "instance_ref")
+            resolveLuauInstanceRefEdge(e, direct, luauIdx, emitLuauEdge);
+    }
     for (const [f, set] of direct) {
         const closure = new Set(set);
         for (const imp of set) {
@@ -2324,19 +2722,44 @@ function resolveLuauImportsPass(luauRaw, luauIdx, factoryClasses, emitLuauEdge) 
     }
 }
 
+function advanceDelegateFile(fnode, cur, luauIdx) {
+    const { byId, aliases, luaurcByDir, specCache, rojoMounts, barrelInstancePaths, barrelRoutes, barrelTableNames } = luauIdx;
+    if (fnode.delegateSpec) {
+        return resolveLuauSpecifier(fnode.delegateSpec, cur, byId, aliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
+    }
+    const dt = fnode.delegateTarget;
+    if (!dt)
+        return null;
+    if (dt.spec) {
+        const res = resolveLuauChainTarget(dt.spec, dt.barrel, cur, dt.chain ?? [], ["file"], true, null, luauIdx);
+        if (res?.moduleFile)
+            return res.moduleFile;
+        return resolveLuauSpecifier(dt.spec, cur, byId, aliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
+    }
+    if (dt.barrel && dt.chain?.length) {
+        const rem = barrelTableNames.has(dt.chain[0]) ? dt.chain.slice(1) : dt.chain;
+        const routeHit = matchLuauBarrelRoute(rem, barrelRoutes);
+        if (routeHit?.route?.spec) {
+            return resolveLuauSpecifier(routeHit.route.spec, routeHit.route.fromFile, byId, aliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
+        }
+    }
+    return null;
+}
+
 function lookupLuauSubmoduleTarget(fileId, key, luauIdx) {
-    const { byId, aliases, rojoMounts, barrelInstancePaths } = luauIdx;
+    const { byId } = luauIdx;
     let cur = fileId;
-    for (let d = 0; d < 3; d++) {
+    for (let d = 0; d < 4; d++) {
         const fn = byId.get(cur);
         if (!fn)
             break;
         if (fn.submodules && fn.submodules[key]) {
             return { fromFile: cur, ...fn.submodules[key] };
         }
-        if (!fn.delegateSpec)
+        const nextCur = advanceDelegateFile(fn, cur, luauIdx);
+        if (!nextCur || nextCur === cur)
             break;
-        cur = resolveLuauSpecifier(fn.delegateSpec, cur, byId, aliases, rojoMounts, barrelInstancePaths);
+        cur = nextCur;
     }
     return null;
 }
@@ -2367,7 +2790,7 @@ function probeLuauCandidatesAtHop(walkFile, curFile, rem, isDirect, kinds, luauI
     return null;
 }
 function walkLuauDelegateCandidates(curFile, rem, isDirect, kinds, luauIdx) {
-    const { byId, aliases, rojoMounts, barrelInstancePaths } = luauIdx;
+    const { byId } = luauIdx;
     let walkFile = curFile;
     for (let hop = 0; hop < 4; hop++) {
         const fnode = byId.get(walkFile);
@@ -2376,9 +2799,10 @@ function walkLuauDelegateCandidates(curFile, rem, isDirect, kinds, luauIdx) {
         const hit = probeLuauCandidatesAtHop(walkFile, curFile, rem, isDirect, kinds, luauIdx);
         if (hit)
             return hit;
-        if (!fnode.delegateSpec)
+        const nextFile = advanceDelegateFile(fnode, walkFile, luauIdx);
+        if (!nextFile || nextFile === walkFile)
             break;
-        walkFile = resolveLuauSpecifier(fnode.delegateSpec, walkFile, byId, aliases, rojoMounts, barrelInstancePaths);
+        walkFile = nextFile;
     }
     return { node: null, moduleFile: curFile };
 }
@@ -2392,7 +2816,7 @@ function matchLuauBarrelRoute(rem, barrelRoutes) {
     return null;
 }
 function resolveLuauBarrelChainStart(rawRem, directModuleCall, recvName, kinds, luauIdx) {
-    const { byId, barrelTableNames, barrelRoutes, barrelSymbols, aliases, rojoMounts, barrelInstancePaths } = luauIdx;
+    const { byId, barrelTableNames, barrelRoutes, barrelSymbols, aliases, luaurcByDir, specCache, rojoMounts, barrelInstancePaths } = luauIdx;
     let rem = rawRem;
     let explicitBarrel = !recvName || barrelTableNames.has(recvName);
     if (rem.length >= 2 && barrelTableNames.has(rem[0])) {
@@ -2404,7 +2828,7 @@ function resolveLuauBarrelChainStart(rawRem, directModuleCall, recvName, kinds, 
         const { matchedLen, route } = routeHit;
         if (!route.spec)
             return { curFile: null, rem, isDirect: directModuleCall };
-        const curFile = resolveLuauSpecifier(route.spec, route.fromFile, byId, aliases, rojoMounts, barrelInstancePaths);
+        const curFile = resolveLuauSpecifier(route.spec, route.fromFile, byId, aliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
         const nextRem = [...(route.chain ?? []), ...rem.slice(matchedLen)];
         return { curFile, rem: nextRem, isDirect: nextRem.length === 0 ? true : directModuleCall };
     }
@@ -2415,7 +2839,7 @@ function resolveLuauBarrelChainStart(rawRem, directModuleCall, recvName, kinds, 
     return { directResult: picked ? { node: picked, moduleFile: picked.path } : null };
 }
 function advanceLuauSubmoduleHops(startFile, startRem, startDirect, luauIdx) {
-    const { byId, barrelFileSet, barrelRoutes, aliases, rojoMounts, barrelInstancePaths } = luauIdx;
+    const { byId, barrelFileSet, barrelRoutes, aliases, luaurcByDir, specCache, rojoMounts, barrelInstancePaths } = luauIdx;
     let curFile = startFile;
     let rem = startRem;
     let isDirect = startDirect;
@@ -2426,7 +2850,7 @@ function advanceLuauSubmoduleHops(startFile, startRem, startDirect, luauIdx) {
             const subTarget = lookupLuauSubmoduleTarget(curFile, subKey, luauIdx) ?? (barrelFileSet.has(curFile) ? barrelRoutes.get(subKey) : null);
             if (!subTarget?.spec)
                 continue;
-            const nextFile = resolveLuauSpecifier(subTarget.spec, subTarget.fromFile, byId, aliases, rojoMounts, barrelInstancePaths);
+            const nextFile = resolveLuauSpecifier(subTarget.spec, subTarget.fromFile, byId, aliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
             if (!byId.has(nextFile))
                 continue;
             curFile = nextFile;
@@ -2442,7 +2866,7 @@ function advanceLuauSubmoduleHops(startFile, startRem, startDirect, luauIdx) {
     return { curFile, rem, isDirect };
 }
 function resolveLuauChainTarget(startSpec, startBarrel, fromFile, rawChain, kinds, directModuleCall, recvName, luauIdx) {
-    const { byId, aliases, rojoMounts, barrelInstancePaths } = luauIdx;
+    const { byId, aliases, luaurcByDir, specCache, rojoMounts, barrelInstancePaths } = luauIdx;
     let curFile = null;
     let rem = [...(rawChain ?? [])];
     let isDirect = directModuleCall;
@@ -2453,7 +2877,7 @@ function resolveLuauChainTarget(startSpec, startBarrel, fromFile, rawChain, kind
         ({ curFile, rem, isDirect } = started);
     }
     else if (startSpec) {
-        curFile = resolveLuauSpecifier(startSpec, fromFile, byId, aliases, rojoMounts, barrelInstancePaths);
+        curFile = resolveLuauSpecifier(startSpec, fromFile, byId, aliases, rojoMounts, barrelInstancePaths, luaurcByDir, specCache);
     }
     if (!curFile || !byId.has(curFile))
         return null;
@@ -2483,7 +2907,7 @@ function resolveLuauReceiverFallbackEdge(e, luauIdx, callKinds, emitLuauEdge) {
     if ((e.recvName && LUAU_STDLIB_TABLES.has(e.recvName)) || GENERIC_MEMBER_NAMES.has(leafName.toLowerCase()))
         return;
     const cands = (luauIdx.methodsByLeaf.get(leafName) ?? []).filter(
-        (n) => n.id !== e.source && n.path !== e.file && n.path.endsWith(".luau"),
+        (n) => n.id !== e.source && n.path !== e.file && isLuauNodePath(n.path, luauIdx.luauFileSet),
     );
     const impSet = luauIdx.importedByFile.get(e.file);
     const impCands = impSet ? cands.filter((n) => impSet.has(n.path)) : [];
@@ -2543,7 +2967,7 @@ function resolveLuauCallOrRefEdge(e, luauIdx, factoryClasses, emitLuauEdge) {
         resolveLuauReceiverFallbackEdge(e, luauIdx, callKinds, emitLuauEdge);
         return;
     }
-    const global = (luauIdx.globalName.get(e.name) ?? []).filter((n) => callKinds.includes(n.kind) && n.path.endsWith(".luau"));
+    const global = (luauIdx.globalName.get(e.name) ?? []).filter((n) => callKinds.includes(n.kind) && isLuauNodePath(n.path, luauIdx.luauFileSet));
     const pickedGlobal = pickUniqueLuauCandidate(global);
     if (pickedGlobal)
         emitLuauEdge(e.source, pickedGlobal.id, "calls", "inferred");
@@ -2564,15 +2988,26 @@ function recordPendingLuauEdge(pendingEdges, source, target, relation, confidenc
     pendingEdges.set(key, { source, target, relation, confidence, typeOnly: Boolean(typeOnly) });
 }
 export function resolveLuauEdges(nodes, rawEdges, addEdge, opts = {}) {
-    const luauRaw = rawEdges.filter((e) => e.file?.endsWith(".luau"));
+    const luauFileSet = new Set(
+        nodes.filter((n) => n.kind === "file" && (n.path.endsWith(".luau") || n.luauMode)).map((n) => n.path),
+    );
+    const luauRaw = rawEdges.filter((e) => e.file && (e.file.endsWith(".luau") || luauFileSet.has(e.file)));
     if (luauRaw.length === 0)
         return;
-    const luauIdx = buildLuauResolutionIndex(nodes, opts);
+    const luauIdx = buildLuauResolutionIndex(nodes, opts, luauFileSet);
     const factoryClasses = new Map();
     const pendingEdges = new Map();
     const emitLuauEdge = (source, target, relation, confidence, typeOnly = false) =>
         recordPendingLuauEdge(pendingEdges, source, target, relation, confidence, typeOnly);
     resolveLuauImportsPass(luauRaw, luauIdx, factoryClasses, emitLuauEdge);
+    for (const fnode of luauIdx.luauFiles ?? []) {
+        if (!fnode?.delegateSpec && !fnode?.delegateTarget)
+            continue;
+        const baseFile = advanceDelegateFile(fnode, fnode.path, luauIdx);
+        if (baseFile && luauIdx.byId.has(baseFile) && baseFile !== fnode.path) {
+            emitLuauEdge(fnode.path, baseFile, "extends", "extracted", false);
+        }
+    }
     for (const e of luauRaw)
         resolveLuauCallOrRefEdge(e, luauIdx, factoryClasses, emitLuauEdge);
     for (const edge of pendingEdges.values()) {

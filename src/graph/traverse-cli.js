@@ -1,16 +1,20 @@
 /**
  * CLI wiring for `plexer callers` and its `--direction` / `--depth` flags.
  */
-import { resolve } from "node:path";
-import { escapeRegExp, fileReader, needlesForName, referenceLines, spanRange } from "../util/span.js";
-import { suggestNearTargets } from "../ask/ask.js";
-import { loadAskIndexCached, queryAskPostings, tokenize } from "../ask/index-file.js";
+import { statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
+import { escapeRegExp, fileReader, fmtLine, needlesForName, referenceLines, spanRange } from "../util/span.js";
+import { suggestNearTargets } from "../ask/text-helpers.js";
+import { loadAskIndexCached, queryAskPostings } from "../ask/index-file.js";
+import { tokenize } from "../ask/tokenize.js";
+import { readAgySession, writeAgySession } from "../agy/session.js";
+import { isSpanCovered, mergeSpan } from "../agy/spans.js";
 import { GENERIC_MEMBER_NAMES } from "../util/id.js";
 import { isTestPath } from "../util/paths.js";
 import { loadGraphCached } from "../context/graph-store.js";
 import { contextDirFor } from "../context/node-file.js";
 import { resolveSymbol } from "../context/symbol-query.js";
-import { reachable } from "./resolve.js";
+import { reachable } from "./languages.js";
 import { linkTestsForGraph } from "./test-links.js";
 import { edgeWalk, parseWalkDepth } from "./traverse.js";
 
@@ -51,7 +55,7 @@ export function hitLine(direction, hit, showDepth, quote, opts = {}) {
             for (const w of q.window) {
                 formatted.push(
                     w.n > 0
-                        ? `      L${w.n}: ${w.text.trimEnd()}`
+                        ? `      ${fmtLine(w.n, w.text.trimEnd())}`
                         : `      ${w.text}`,
                 );
             }
@@ -87,18 +91,20 @@ function buildQuoteNeedles(needles, hit, opts) {
     return out;
 }
 
-function tryShortCallerWindow(hit, read, seenSourceIds) {
+function tryShortCallerWindow(hit, read, seenSourceIds, shownTargetSpans = null) {
     const r = spanRange(hit.node.span);
     const lines = read(hit.node.path);
     if (!r || !lines || r.end - r.start + 1 > MAX_SHORT_CALLER_LINES)
         return null;
+    const start = Math.max(1, r.start);
     const end = Math.min(lines.length, r.end);
     const window = [];
-    for (let ln = Math.max(1, r.start); ln <= end; ln++)
+    for (let ln = start; ln <= end; ln++)
         window.push({ n: ln, text: lines[ln - 1] });
     if (window.length === 0)
         return null;
     seenSourceIds?.add(hit.node.id);
+    shownTargetSpans?.push({ file: hit.node.path, start, end });
     return [{ n: r.start, text: lines[r.start - 1] ?? "", window }];
 }
 
@@ -117,7 +123,7 @@ export function quoteFor(hit, needles, read, opts = {}) {
         opts.source && !alreadyInlined && withinBudget && !isTest && (opts.sourceIndex ?? 0) < MAX_SOURCE_CALLERS,
     );
     if (allowFullWindow && !isFileNode) {
-        const shortWindow = tryShortCallerWindow(hit, read, opts.seenSourceIds);
+        const shortWindow = tryShortCallerWindow(hit, read, opts.seenSourceIds, opts.shownTargetSpans ?? null);
         if (shortWindow)
             return shortWindow;
     }
@@ -154,17 +160,17 @@ export function formatSymbolSource(symbol, read) {
     if (total <= MAX_SUBJECT_SOURCE_LINES) {
         const body = [];
         for (let ln = start; ln <= end; ln++)
-            body.push(`L${ln}: ${lines[ln - 1]}`);
+            body.push(fmtLine(ln, lines[ln - 1]));
         return `\`\`\`\n${body.join("\n")}\n\`\`\``;
     }
     const headCount = 24;
     const tailCount = 6;
     const body = [];
     for (let ln = start; ln < start + headCount; ln++)
-        body.push(`L${ln}: ${lines[ln - 1]}`);
+        body.push(fmtLine(ln, lines[ln - 1]));
     body.push(`  … (lines L${start + headCount}-L${end - tailCount} omitted)`);
     for (let ln = end - tailCount + 1; ln <= end; ln++)
-        body.push(`L${ln}: ${lines[ln - 1]}`);
+        body.push(fmtLine(ln, lines[ln - 1]));
     return `\`\`\`\n${body.join("\n")}\n\`\`\``;
 }
 
@@ -185,38 +191,79 @@ function coveringTestsFooter(symbol, hits, direction, testLinks) {
     return `  covering tests: ${extra.map((t) => `${t.testFile} (${t.kind})`).join(", ")}`;
 }
 
-function collectReceiverScanContext(graph, symbol, hits) {
-    const leaf = String(symbol.name ?? "").split(/[.:#]/).pop() ?? "";
-    const homonymIds = new Set();
-    const byPath = new Map();
-    const candidateFiles = [];
+function getGraphSpansCache(graph) {
+    if (graph._receiverSpansCache)
+        return graph._receiverSpansCache;
+    const fileNodes = [];
+    const spansByPath = new Map();
     for (const n of graph.nodes) {
         if (!n.path)
             continue;
         if (n.kind === "file") {
-            if (!isTestPath(n.path) && reachable(n.path, symbol.path))
-                candidateFiles.push(n);
+            if (!isTestPath(n.path))
+                fileNodes.push(n);
             continue;
         }
-        const nLeaf = String(n.name ?? "").split(/[.:#]/).pop();
-        if (nLeaf === leaf && (n.kind === "method" || n.kind === "function"))
-            homonymIds.add(n.id);
         const r = spanRange(n.span);
         if (r) {
-            let list = byPath.get(n.path);
+            let list = spansByPath.get(n.path);
             if (!list) {
                 list = [];
-                byPath.set(n.path, list);
+                spansByPath.set(n.path, list);
             }
             list.push({ node: n, start: r.start, end: r.end, len: r.end - r.start });
         }
     }
-    const alreadyLinkedCallerIds = new Set([symbol.id, ...hits.map((h) => h.id)]);
-    for (const e of graph.edges ?? []) {
-        if (e.relation === "calls" && homonymIds.has(e.target))
-            alreadyLinkedCallerIds.add(e.source);
+    const cache = { fileNodes, spansByPath };
+    Object.defineProperty(graph, "_receiverSpansCache", {
+        value: cache,
+        enumerable: false,
+        configurable: true,
+    });
+    return cache;
+}
+
+function collectReceiverScanContext(graph, symbol, hits) {
+    const leaf = String(symbol.name ?? "").split(/[.:#]/).pop() ?? "";
+    const homonymIds = new Set();
+    const { fileNodes, spansByPath } = getGraphSpansCache(graph);
+    const candidateFiles = [];
+    for (const fn of fileNodes) {
+        if (reachable(fn.path, symbol.path))
+            candidateFiles.push(fn);
     }
-    return { leaf, candidateFiles, byPath, alreadyLinkedCallerIds, homonymIds };
+    if (graph.byBareName) {
+        for (const n of graph.byBareName.get(leaf.toLowerCase()) ?? []) {
+            const nLeaf = String(n.name ?? "").split(/[.:#]/).pop();
+            if (nLeaf === leaf && (n.kind === "method" || n.kind === "function"))
+                homonymIds.add(n.id);
+        }
+    }
+    else {
+        for (const n of graph.nodes) {
+            if (!n.path || n.kind === "file")
+                continue;
+            const nLeaf = String(n.name ?? "").split(/[.:#]/).pop();
+            if (nLeaf === leaf && (n.kind === "method" || n.kind === "function"))
+                homonymIds.add(n.id);
+        }
+    }
+    const alreadyLinkedCallerIds = new Set([symbol.id, ...hits.map((h) => h.id)]);
+    if (graph._inEdges) {
+        for (const hid of homonymIds) {
+            for (const e of graph._inEdges.get(hid) ?? []) {
+                if (e.relation === "calls")
+                    alreadyLinkedCallerIds.add(e.source);
+            }
+        }
+    }
+    else {
+        for (const e of graph.edges ?? []) {
+            if (e.relation === "calls" && homonymIds.has(e.target))
+                alreadyLinkedCallerIds.add(e.source);
+        }
+    }
+    return { leaf, candidateFiles, byPath: spansByPath, alreadyLinkedCallerIds, homonymIds };
 }
 
 function filterScanFilesBySqlitePostings(candidateFiles, leafToks, contextDir) {
@@ -251,16 +298,60 @@ function filterScanFilesBySqlitePostings(candidateFiles, leafToks, contextDir) {
     return candidateFiles.filter((f) => allowedPaths.has(f.path));
 }
 
-function filterScanFilesByAskIndex(candidateFiles, leaf, graph, contextDir, preloadedAskIdx) {
-    if (candidateFiles.length <= 220 || !contextDir)
+const MAX_ASK_INDEXED_BODY_CHARS = 5000;
+
+function hasLargeSymbolBodyInFile(fn, byPath, read, repoRoot) {
+    if (!read)
+        return false;
+    if (repoRoot) {
+        const abs = isAbsolute(fn.path) ? fn.path : join(repoRoot, fn.path);
+        try {
+            if (statSync(abs).size <= MAX_ASK_INDEXED_BODY_CHARS)
+                return false;
+        }
+        catch {
+            return false;
+        }
+    }
+    const lines = read(fn.path);
+    if (!lines || lines.length === 0)
+        return false;
+    const syms = byPath?.get(fn.path);
+    if (syms && syms.length > 0) {
+        for (const s of syms) {
+            let chars = 0;
+            const lo = Math.max(1, s.start) - 1;
+            const hi = Math.min(lines.length, s.end);
+            for (let i = lo; i < hi; i++) {
+                chars += (lines[i]?.length ?? 0) + 1;
+                if (chars > MAX_ASK_INDEXED_BODY_CHARS)
+                    return true;
+            }
+        }
+        return false;
+    }
+    let total = 0;
+    for (let i = 0; i < lines.length; i++) {
+        total += (lines[i]?.length ?? 0) + 1;
+        if (total > MAX_ASK_INDEXED_BODY_CHARS)
+            return true;
+    }
+    return false;
+}
+
+function filterScanFilesByAskIndex(candidateFiles, leaf, graph, contextDir, preloadedAskIdx, byPath, read) {
+    if (candidateFiles.length <= 15 || !contextDir)
         return candidateFiles;
     const leafToks = tokenize(leaf);
     if (leafToks.length === 0)
         return candidateFiles;
+    const repoRoot = graph?.repoRoot ?? null;
     if (preloadedAskIdx == null) {
         const sqliteMatch = filterScanFilesBySqlitePostings(candidateFiles, leafToks, contextDir);
-        if (sqliteMatch !== null)
-            return sqliteMatch;
+        if (sqliteMatch !== null) {
+            const matchedSet = new Set(sqliteMatch.map((f) => f.path));
+            return candidateFiles.filter((f) => matchedSet.has(f.path) || hasLargeSymbolBodyInFile(f, byPath, read, repoRoot));
+        }
     }
     const rawIdx = preloadedAskIdx != null ? preloadedAskIdx : loadAskIndexCached(contextDir);
     if (!rawIdx || !Array.isArray(rawIdx.docs))
@@ -282,7 +373,7 @@ function filterScanFilesByAskIndex(candidateFiles, leaf, graph, contextDir, prel
                 allowedPaths.add(p);
         }
     }
-    return candidateFiles.filter((f) => allowedPaths.has(f.path));
+    return candidateFiles.filter((f) => allowedPaths.has(f.path) || hasLargeSymbolBodyInFile(f, byPath, read, repoRoot));
 }
 
 function findEnclosingCallNode(symsInFile, ln, fallbackFileNode) {
@@ -298,6 +389,10 @@ function isCommentOnlyLine(trimmed) {
     return trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("--") || trimmed.startsWith("*");
 }
 
+function stripQuotedStringLiterals(line) {
+    return line.replace(/(["'`])(?:\\.|(?!\1).)*\1/g, "$1$1");
+}
+
 function scanSingleFileReceiverSites(fn, symsInFile, ctx, state) {
     const lines = ctx.read(fn.path);
     if (!lines)
@@ -308,10 +403,13 @@ function scanSingleFileReceiverSites(fn, symsInFile, ctx, state) {
         if (isSelfFile && ln >= ctx.symRange.start && ln <= ctx.symRange.end)
             continue;
         const rawLine = lines[idx];
-        if (!rawLine.includes(ctx.leaf) || !ctx.callRe.test(rawLine) || ctx.defLineRe.test(rawLine) || ctx.methodDefRe?.test(rawLine))
+        if (!rawLine.includes(ctx.leaf))
             continue;
         const trimmed = rawLine.trim();
         if (isCommentOnlyLine(trimmed))
+            continue;
+        const codeLine = stripQuotedStringLiterals(rawLine);
+        if (!ctx.callRe.test(codeLine) || ctx.defLineRe.test(codeLine) || ctx.methodDefRe?.test(codeLine))
             continue;
         const encNode = findEnclosingCallNode(symsInFile, ln, fn);
         if (
@@ -320,7 +418,7 @@ function scanSingleFileReceiverSites(fn, symsInFile, ctx, state) {
             spanRange(encNode.span)?.start === ln
         )
             continue;
-        if (ctx.alreadyLinkedCallerIds.has(encNode.id) || ctx.alreadyLinkedCallerIds.has(fn.path))
+        if (ctx.alreadyLinkedCallerIds.has(encNode.id))
             continue;
         const siteKey = `${encNode.id}:${ln}`;
         if (state.seenEnclosing.has(encNode.id) || state.seenEnclosing.has(siteKey))
@@ -383,15 +481,15 @@ function collectUnlinkedReceiverCallSites(graph, symbol, hits, direction, read, 
     if (!eligibleKind || leaf.length < 3 || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(leaf))
         return { sites: [], truncated: false };
     const ctx = collectReceiverScanContext(graph, symbol, hits);
-    const filesToScan = filterScanFilesByAskIndex(ctx.candidateFiles, ctx.leaf, graph, contextDir, preloadedAskIdx);
+    const filesToScan = filterScanFilesByAskIndex(ctx.candidateFiles, ctx.leaf, graph, contextDir, preloadedAskIdx, ctx.byPath, read);
     return scanReceiverCallSitesInFiles(filesToScan, symbol, ctx.leaf, ctx.byPath, ctx.alreadyLinkedCallerIds, read, ctx.candidateFiles.length, ctx.homonymIds);
 }
 
-function formatUnlinkedReceiverFooter(symbol, unlinked) {
+function formatUnlinkedReceiverFooter(symbol, unlinked, hitsCount = 0) {
     const leaf = String(symbol.name ?? "").split(/[.:#]/).pop() ?? symbol.name;
     const isGeneric = GENERIC_MEMBER_NAMES.has(String(leaf ?? "").toLowerCase());
     if (!unlinked?.sites?.length) {
-        if (!isGeneric && typeof unlinked?.scannedFiles === "number") {
+        if (hitsCount === 0 && !isGeneric && typeof unlinked?.scannedFiles === "number") {
             return `  unlinked scan: 0 unlinked references across ${unlinked.scannedFiles} reachable files`;
         }
         return null;
@@ -402,7 +500,7 @@ function formatUnlinkedReceiverFooter(symbol, unlinked) {
     const lines = [`  unlinked .${leaf}() call sites (${unlinked.sites.length}${unlinked.truncated ? "+" : ""}${scanNote}):`];
     for (const s of unlinked.sites) {
         const label = s.enclosing ? `${s.enclosing} (${s.path}:${s.span})` : s.path;
-        lines.push(`    ? ${label} → L${s.line}: ${s.text}`);
+        lines.push(`    ? ${label} → ${fmtLine(s.line, s.text)}`);
     }
     if (unlinked.truncated) {
         lines.push(`    … more unlinked sites — run plexer grep ".${leaf}(" --fixed`);
@@ -447,7 +545,7 @@ function computeHitExcludesAndNeedles(h, namedSpansByPath, namedNeedlesByPath) {
 }
 
 function appendTrailingMatchFooters(lines, symbol, hits, direction, unlinked, testLinks) {
-    const unlinkedFooter = formatUnlinkedReceiverFooter(symbol, unlinked);
+    const unlinkedFooter = formatUnlinkedReceiverFooter(symbol, unlinked, hits.length);
     if (unlinkedFooter)
         lines.push(unlinkedFooter);
     const footer = coveringTestsFooter(symbol, hits, direction, testLinks);
@@ -464,11 +562,30 @@ export function renderMatchBlock(symbol, hits, direction, showDepth, candidateCo
     const lines = [head];
     sourceBudget.bytes += Buffer.byteLength(head, "utf8") + 1;
     if (opts.source && !seenSourceIds.has(symbol.id) && sourceBudget.bytes < sourceBudget.maxBytes) {
-        const src = formatSymbolSource(symbol, read);
-        if (src) {
+        const sr = symbol.kind !== "file" ? spanRange(symbol.span) : null;
+        const symLines = sr ? sr.end - sr.start + 1 : 0;
+        if (!opts.full && opts.seenSpans && sr && symLines >= 15 && isSpanCovered(opts.seenSpans, symbol.path, sr.start, sr.end)) {
             seenSourceIds.add(symbol.id);
-            lines.push(src);
-            sourceBudget.bytes += Buffer.byteLength(src, "utf8") + 1;
+            const marker = `// [seen: ${symbol.path}:${symbol.span}; --full]`;
+            lines.push(marker);
+            sourceBudget.bytes += Buffer.byteLength(marker, "utf8") + 1;
+        }
+        else {
+            const src = formatSymbolSource(symbol, read);
+            if (src) {
+                seenSourceIds.add(symbol.id);
+                lines.push(src);
+                sourceBudget.bytes += Buffer.byteLength(src, "utf8") + 1;
+                if (opts.shownTargetSpans && sr) {
+                    if (symLines <= MAX_SUBJECT_SOURCE_LINES) {
+                        opts.shownTargetSpans.push({ file: symbol.path, start: sr.start, end: sr.end });
+                    }
+                    else {
+                        opts.shownTargetSpans.push({ file: symbol.path, start: sr.start, end: sr.start + 23 });
+                        opts.shownTargetSpans.push({ file: symbol.path, start: Math.max(sr.start, sr.end - 5), end: sr.end });
+                    }
+                }
+            }
         }
     }
     if (hits.length === 0) {
@@ -485,7 +602,8 @@ export function renderMatchBlock(symbol, hits, direction, showDepth, candidateCo
     const hardMaxBytes = opts.hardMaxBytes ?? Infinity;
     for (let hIdx = 0; hIdx < hits.length; hIdx++) {
         if (sourceBudget.bytes >= hardMaxBytes) {
-            lines.push(`  … (+${hits.length - hIdx} more callers — narrow symbols or --depth)`);
+            const label = direction === "out" ? "callees" : "callers";
+            lines.push(`  … (+${hits.length - hIdx} more ${label} — narrow symbols or --depth)`);
             break;
         }
         const h = hits[hIdx];
@@ -500,6 +618,7 @@ export function renderMatchBlock(symbol, hits, direction, showDepth, candidateCo
                 source: Boolean(opts.source),
                 sourceIndex,
                 seenSourceIds,
+                shownTargetSpans: opts.shownTargetSpans ?? null,
                 sourceBudget,
             })
             : undefined;
@@ -518,10 +637,8 @@ export function renderMatchBlock(symbol, hits, direction, showDepth, candidateCo
 export function looseNoteFor(direction, name, candidateCount) {
     const label = direction === "out" ? "callees" : "callers";
     const dir = direction === "out" ? "outgoing" : "incoming";
-    const ambiguity = candidateCount > 1
-        ? ` ${candidateCount} definitions share the name "${name}"; a cross-file caller of an ambiguous name is dropped rather than guessed, so this may undercount.`
-        : "";
-    return `  no indexed ${label} — the graph has no ${dir} call/reference edges for this symbol as written.${ambiguity} Check the name (try the bare symbol, or "Type.method"), or find its uses with plexer grep "${name}". Fall back to raw grep -rn only for unindexed files`;
+    const ambiguity = candidateCount > 1 ? ` (${candidateCount} ambiguous "${name}" defs)` : "";
+    return `  no indexed ${label} (${dir} edges absent)${ambiguity} — try \`plexer grep "${name}"\` (bare name or Type.method).`;
 }
 
 function partitionLexicalFallbackNodes(graph) {
@@ -657,10 +774,10 @@ function resolveSingleQueryMatches(graph, q, opts) {
     }
 }
 
-function handleEmptyQueryMatches(graph, root, q, queryCount, direction, opts, allResults) {
+function handleEmptyQueryMatches(graph, read, q, queryCount, direction, opts, allResults) {
     if (!opts.json && direction === "in") {
         const pseudo = { id: `__query__:${q}`, name: q, kind: "reference", path: "", span: "" };
-        const lexHits = lexicalFallbackHits(graph, pseudo, fileReader(root));
+        const lexHits = lexicalFallbackHits(graph, pseudo, read);
         if (lexHits.length > 0) {
             allResults.push({ query: q, symbol: pseudo, candidateCount: 1, hits: lexHits });
             return;
@@ -675,16 +792,15 @@ function handleEmptyQueryMatches(graph, root, q, queryCount, direction, opts, al
     console.error(`⚠ no symbol "${q}" in the graph — ${skipTail}`);
 }
 
-function collectCallerMatchesForQueries(graph, root, queries, direction, depth, opts) {
+function collectCallerMatchesForQueries(graph, read, queries, direction, depth, opts) {
     const allResults = [];
     const seenSymbolIds = new Set();
-    const read = fileReader(root);
     for (const q of queries) {
         const matches = resolveSingleQueryMatches(graph, q, opts);
         if (!matches)
             return null;
         if (matches.length === 0) {
-            handleEmptyQueryMatches(graph, root, q, queries.length, direction, opts, allResults);
+            handleEmptyQueryMatches(graph, read, q, queries.length, direction, opts, allResults);
             continue;
         }
         for (const symbol of matches) {
@@ -708,6 +824,8 @@ function formatCallersJsonPayload(queries, allResults, graph, direction, read, c
         query: queries.length === 1 ? queries[0] : queries,
         matches: allResults.map((r) => {
             const m = { symbol: symbolJson(r.symbol), hits: r.hits.map(hitJson) };
+            if (r.hits.truncated)
+                m.truncated = true;
             const unlinked = collectUnlinkedReceiverCallSites(graph, r.symbol, r.hits, direction, read, contextDir, askIndex);
             if (unlinked.sites.length > 0)
                 m.unlinkedCallSites = unlinked.sites;
@@ -718,7 +836,7 @@ function formatCallersJsonPayload(queries, allResults, graph, direction, read, c
     };
 }
 
-function dedupeCrossQueryCallerHits(hits, symbol, candidateCount, idx, totalResults, seenHomonymKeys, seenDepth) {
+function dedupeCrossQueryCallerHits(hits, symbol, candidateCount, idx, totalResults, seenHomonymKeys, seenDepth, direction = "in") {
     let dedupedHits = candidateCount > 1 && idx > 0
         ? hits.filter((h) => !seenHomonymKeys.has(`${symbol.name}:${h.id}:${h.relation}:${h.depth}`))
         : hits;
@@ -738,7 +856,8 @@ function dedupeCrossQueryCallerHits(hits, symbol, candidateCount, idx, totalResu
             return true;
         });
         if (skippedCount > 0) {
-            sharedTransitiveNote = `  (+${skippedCount} transitive callers already listed above under ${[...skippedVia].slice(0, 3).join(", ")})`;
+            const label = direction === "out" ? "callees" : "callers";
+            sharedTransitiveNote = `  (+${skippedCount} transitive ${label} already listed above under ${[...skippedVia].slice(0, 3).join(", ")})`;
         }
     }
     for (const h of dedupedHits) {
@@ -756,8 +875,11 @@ function renderCallersTextBlocks(allResults, graph, direction, showDepth, read, 
     const seenHomonymKeys = new Set();
     const seenDepth = new Map();
     const testLinks = direction === "in" ? linkTestsForGraph(graph) : null;
-    const totalHardCap = 8600;
-    const quotePoolCap = allResults.length > 1 ? 5600 : 7200;
+    const label = direction === "out" ? "callees" : "callers";
+    const totalHardCap = opts.full ? 8600 : 7200;
+    const quotePoolCap = opts.full
+        ? (allResults.length > 1 ? 5600 : 7200)
+        : (allResults.length > 1 ? 4600 : 5800);
     const maxBytesPerSymbol = allResults.length > 1 ? Math.max(900, Math.floor(quotePoolCap / allResults.length)) : quotePoolCap;
     let totalBytes = 0;
     for (let idx = 0; idx < allResults.length; idx++) {
@@ -769,27 +891,32 @@ function renderCallersTextBlocks(allResults, graph, direction, showDepth, read, 
         const remainingQuote = Math.max(0, quotePoolCap - totalBytes);
         const remainingHard = Math.max(400, totalHardCap - totalBytes);
         const { dedupedHits, sharedTransitiveNote } = dedupeCrossQueryCallerHits(
-            hits, symbol, candidateCount, idx, allResults.length, seenHomonymKeys, seenDepth,
+            hits, symbol, candidateCount, idx, allResults.length, seenHomonymKeys, seenDepth, direction,
         );
-        if (candidateCount > 1 && idx > 0 && dedupedHits.length === 0 && hits.length > 0 && remainingQuote <= 0) {
-            blocks.push(`${headerOf(symbol)}\n  (shared callers shown above)`);
+        if (idx > 0 && candidateCount > 1 && dedupedHits.length === 0 && hits.length > 0) {
+            blocks.push(`${headerOf(symbol)}\n  (shared/transitive ${label} shown above)`);
             continue;
         }
         const sourceBudget = { bytes: 0, maxBytes: Math.min(maxBytesPerSymbol, remainingQuote) };
         const renderedBlock = renderMatchBlock(symbol, dedupedHits, direction, showDepth, candidateCount, read, {
             source: opts.source && remainingQuote > 0,
+            full: Boolean(opts.full),
             omitQuotes: remainingQuote <= 0,
             hardMaxBytes: remainingHard,
             sharedTransitiveNote,
             seenSourceIds,
             sourceBudget,
+            seenSpans: opts.seenSpans ?? null,
+            shownTargetSpans: opts.shownTargetSpans ?? null,
             graph,
             contextDir,
             askIndex,
             testLinks,
         });
-        blocks.push(renderedBlock);
-        totalBytes += Buffer.byteLength(renderedBlock, "utf8") + 2;
+        const truncNote = hits.truncated ? `\n  … (closure truncated at ${hits.length} ${label})` : "";
+        const finalBlock = renderedBlock + truncNote;
+        blocks.push(finalBlock);
+        totalBytes += Buffer.byteLength(finalBlock, "utf8") + 2;
     }
     return blocks;
 }
@@ -805,19 +932,35 @@ export function runCallersCommand(queryInput, dir, opts) {
     const queries = (Array.isArray(queryInput) ? queryInput : [queryInput]).filter(Boolean);
     const direction = resolveDirection(opts.direction);
     const depth = resolveCliDepth(opts.depth, DEFAULT_DEPTH);
-    const allResults = collectCallerMatchesForQueries(graph, root, queries, direction, depth, opts);
+    const read = fileReader(root);
+    const allResults = collectCallerMatchesForQueries(graph, read, queries, direction, depth, opts);
     if (!allResults)
         return;
     if (allResults.length === 0) {
         console.error(`✗ ${missingSymbolMessage(graph, queries.join(", "), opts.in)}`);
         process.exit(1);
     }
-    const read = fileReader(root);
     const askIndex = null;
     if (opts.json) {
         console.log(JSON.stringify(formatCallersJsonPayload(queries, allResults, graph, direction, read, contextDir, askIndex), null, 2));
         return;
     }
-    const blocks = renderCallersTextBlocks(allResults, graph, direction, depth > 1, read, opts, contextDir, askIndex);
-    process.stdout.write(`${blocks.join("\n\n")}\n`);
+    const sessionState = !opts.full && opts.sessionId ? readAgySession(opts.sessionId) : null;
+    const shownTargetSpans = sessionState ? [] : null;
+    const blocks = renderCallersTextBlocks(allResults, graph, direction, depth > 1, read, {
+        ...opts,
+        seenSpans: sessionState?.seenSpans ?? null,
+        shownTargetSpans,
+    }, contextDir, askIndex);
+    const outText = `${blocks.join("\n\n")}\n`;
+    if (sessionState && shownTargetSpans.length > 0 && Buffer.byteLength(outText, "utf8") <= 9500) {
+        sessionState.seenSpans = sessionState.seenSpans && typeof sessionState.seenSpans === "object"
+            ? sessionState.seenSpans
+            : {};
+        for (const sp of shownTargetSpans) {
+            mergeSpan(sessionState.seenSpans, sp.file, sp.start, sp.end);
+        }
+        writeAgySession(opts.sessionId, sessionState);
+    }
+    process.stdout.write(outText);
 }

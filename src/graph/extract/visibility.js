@@ -189,7 +189,136 @@ export function cCppExported(node, _ctx) {
     return !cCppHasStaticStorage(decl);
 }
 
-const KNOWN_LANGS = new Set(["typescript", "tsx", "javascript", "jsx", "python", "go", "r", "java", "kotlin", "swift", "php", "rust", "c", "cpp"]);
+const CSHARP_CONTAINER_TYPES = new Set([
+    "class_declaration",
+    "struct_declaration",
+    "interface_declaration",
+    "record_declaration",
+]);
+
+function cSharpModifierTexts(node) {
+    const out = [];
+    for (const c of node?.children ?? []) {
+        if (c.type === "modifier" || c.type === "public" || c.type === "private" || c.type === "protected" || c.type === "internal") {
+            out.push(c.text.trim().toLowerCase());
+        }
+    }
+    return out;
+}
+
+function cSharpExported(node) {
+    if (!node) return true;
+    const mods = cSharpModifierTexts(node);
+    if (mods.includes("private")) return false;
+    if (mods.includes("public") || mods.includes("protected") || mods.includes("internal")) return true;
+    if (node.parent?.type === "declaration_list" && CSHARP_CONTAINER_TYPES.has(node.parent.parent?.type)) {
+        return false;
+    }
+    return true;
+}
+
+function scalaExported(node) {
+    if (!node) return true;
+    for (const c of node.namedChildren ?? []) {
+        if (c.type === "modifiers") {
+            for (const m of c.namedChildren ?? []) {
+                if (m.type === "access_modifier" && m.text.trim().startsWith("private")) return false;
+            }
+        }
+    }
+    return true;
+}
+
+function zigExported(node) {
+    if (!node) return false;
+    if (node.children?.some((c) => c.type === "pub" || (!c.isNamed && c.text === "pub"))) return true;
+    const txt = node.text ?? "";
+    if (/^\s*pub\b/.test(txt)) return true;
+    let p = node.parent;
+    while (p && p.type !== "source_file") {
+        if (/^\s*pub\b/.test(p.text ?? "")) return true;
+        if (p.type === "struct_declaration" || p.type === "enum_declaration" || p.type === "union_declaration" || p.type === "statement") break;
+        p = p.parent;
+    }
+    return false;
+}
+
+function elixirExported(node) {
+    if (!node) return true;
+    const t = node.childForFieldName?.("target")?.text;
+    return !(t === "defp" || t === "defmacrop" || t === "defguardp" || t === "defnp");
+}
+
+function solidityExported(node) {
+    if (!node) return true;
+    const vis = node.namedChildren?.find((c) => c.type === "visibility");
+    if (!vis) return true;
+    const txt = vis.text.trim().toLowerCase();
+    return txt !== "private" && txt !== "internal";
+}
+
+function gleamExported(node) {
+    if (!node) return false;
+    return Boolean(node.namedChildren?.some((c) => c.type === "visibility_modifier" && /\bpub\b/.test(c.text)));
+}
+
+function rubyExported(node, rubyAccessCtx = null) {
+    if (!node) return true;
+    if (node.type === "method" && rubyAccessCtx) {
+        if (rubyAccessCtx.privateRanges?.some((r) => node.startIndex >= r.start && node.startIndex <= r.end)) {
+            return false;
+        }
+        if (rubyAccessCtx.privateNames?.has(node.childForFieldName?.("name")?.text)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function objcExported(node) {
+    if (!node) return true;
+    if (node.type === "class_interface" || node.type === "protocol_declaration" || node.type === "method_declaration") {
+        return true;
+    }
+    if (node.type === "method_definition" || node.type === "class_implementation") {
+        return true;
+    }
+    return cCppExported(node);
+}
+
+/** Dispatch symbol visibility rules for generic breadth languages. */
+export function genericExported(langName, node, name, extra = null) {
+    switch (langName) {
+        case "rust":
+            return rustExported(node);
+        case "c":
+        case "cpp":
+        case "cuda":
+            return cCppExported(node, extra);
+        case "objc":
+            return objcExported(node);
+        case "c_sharp":
+            return cSharpExported(node);
+        case "scala":
+            return scalaExported(node);
+        case "dart":
+            return !String(name ?? "").startsWith("_");
+        case "zig":
+            return zigExported(node);
+        case "elixir":
+            return elixirExported(node);
+        case "ruby":
+            return rubyExported(node, extra);
+        case "solidity":
+            return solidityExported(node);
+        case "gleam":
+            return gleamExported(node);
+        default:
+            return true;
+    }
+}
+
+const KNOWN_LANGS = new Set(["typescript", "tsx", "javascript", "jsx", "python", "go", "r", "java", "kotlin", "swift", "php", "rust", "c", "cpp", "objc", "cuda", "c_sharp", "scala", "dart", "zig", "elixir", "ruby", "solidity", "gleam"]);
 
 /** Dispatch symbol visibility rules for `ctx.lang` (or a language name string). */
 export function isNodeExported(node, name, ctx) {
@@ -215,10 +344,19 @@ export function isNodeExported(node, name, ctx) {
         case "php":
             return phpExported(node);
         case "rust":
-            return rustExported(node);
         case "c":
         case "cpp":
-            return cCppExported(node, ctx);
+        case "objc":
+        case "cuda":
+        case "c_sharp":
+        case "scala":
+        case "dart":
+        case "zig":
+        case "elixir":
+        case "ruby":
+        case "solidity":
+        case "gleam":
+            return genericExported(lang, node, symName, typeof ctx === "object" ? ctx : null);
         default:
             return tsExported(node);
     }

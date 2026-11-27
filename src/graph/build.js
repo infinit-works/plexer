@@ -12,14 +12,16 @@ import { basename, dirname, join, posix, resolve } from "node:path";
 import { walkDir } from "../util/fs.js";
 import { parseJsonc } from "../util/jsonc.js";
 import { CACHE_DIR, contextDirFor, ensureGitignored, ensureSearchable, readGraph, wiringPath } from "../context/node-file.js";
+import { registerExternalNodesLookup, registerGraphCacheClearer } from "../context/graph-store.js";
 import { contentHash, ensureMapSet, GENERIC_MEMBER_NAMES } from "../util/id.js";
-import { relPosix, toPosixPath } from "../util/paths.js";
-import { acquireLockIn, patchStats, readWalkConfig, releaseLockIn } from "../util/state.js";
+import { isDependencyPath, pathUnderPrefix, relPosix, toPosixPath } from "../util/paths.js";
+import { acquireLockIn, patchStats, readJson, readWalkConfig, releaseLockIn, resolveGitExcludePath } from "../util/state.js";
 import {
     emptyExtractCache,
     extractSourceFilesIncremental,
     extractorStamp,
     loadExtractCacheFiles,
+    syncExtractStatsRevision,
     writeExtractCache,
     writeExtractCacheIncremental,
 } from "./extract-cache.js";
@@ -34,20 +36,28 @@ export { collectResolverConfigPaths, isResolverConfigFilename };
 import { seedGraph } from "./seed.js";
 import { filterByOnlyDirs, listSourceStats } from "./source-files.js";
 import { resolveEdges } from "./resolve.js";
-import { edgeOrder, writeGraph } from "./write.js";
+import { compareUtf16, edgeOrder, writeGraphStreaming } from "./write.js";
 import { writeCards, writeIndex } from "./cards.js";
-import { computeMarkdownDocsDigest, writeAskIndex } from "../ask/index-file.js";
+import { collectMarkdownDocFiles, writeAskIndex } from "../ask/index-file.js";
 import { scopeOf } from "../context/scopes.js";
 import { discoverScopes } from "./scope-discovery.js";
 import { analyzeGitHistory } from "../util/git-history.js";
 import {
     checkpointSqliteStore,
     cleanupLegacyCacheFiles,
+    createBatchInserter,
     getSqliteMeta,
     openSqliteStore,
     prepareStmt,
+    readGraphCountsFromSqlite,
+    readGraphEdgesFromSqlite,
+    readGraphMetaFromSqlite,
+    readGraphNodesFromSqlite,
     setSqliteMeta,
+    setSqliteMetaMany,
+    updateGraphConeInSqlite,
     withSqliteTransaction,
+    writeGraphToSqlite,
 } from "../storage/sqlite-store.js";
 const RESOLVER_SCHEMA_VERSION = "v2-untyped-member";
 /** Minimum non-file node count for a discovered sub-scope to stand on its own.
@@ -78,17 +88,52 @@ function applyMinSubstanceGuard(scopes, nodes) {
 /** Every Go module in the repo: each `go.mod`'s declared `module` path and the repo
  * directory it lives in (posix, `.` for the root). Found anywhere in the tree, so a
  * monorepo whose module is in a subdir (e.g. `backend/go.mod`) resolves too. */
+function parseGoReplaces(text) {
+    const replaces = [];
+    let inReplace = false;
+    for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.replace(/\/\/.*$/, "").trim();
+        if (!line)
+            continue;
+        if (/^replace\s*\($/.test(line)) {
+            inReplace = true;
+            continue;
+        }
+        if (inReplace && line === ")") {
+            inReplace = false;
+            continue;
+        }
+        const m = (inReplace ? line : line.replace(/^replace\s+/, "")).match(/^(\S+)(?:\s+\S+)?\s*=>\s*(\S+)/);
+        if ((inReplace || /^replace\s+/.test(line)) && m && (m[2].startsWith(".") || m[2].startsWith("/"))) {
+            replaces.push({ old: m[1], local: m[2] });
+        }
+    }
+    return replaces;
+}
 function readGoModules(root, repoFiles) {
     const mods = [];
+    const workReplaces = [];
+    for (const f of repoFiles) {
+        if (basename(f) !== "go.work")
+            continue;
+        try {
+            workReplaces.push(...parseGoReplaces(readFileSync(f, "utf8")));
+        }
+        catch {
+            /* skip unreadable go.work */
+        }
+    }
     for (const f of repoFiles) {
         if (basename(f) !== "go.mod")
             continue;
         try {
-            const m = readFileSync(f, "utf8").match(/^\s*module\s+(\S+)/m);
+            const raw = readFileSync(f, "utf8");
+            const m = raw.match(/^\s*module\s+(\S+)/m);
             if (!m)
                 continue;
             const rel = relPosix(root, dirname(f));
-            mods.push({ module: m[1], dir: rel === "" ? "." : rel });
+            const replaces = [...parseGoReplaces(raw), ...workReplaces];
+            mods.push({ module: m[1], dir: rel === "" ? "." : rel, ...(replaces.length ? { replaces } : {}) });
         }
         catch {
             /* unreadable go.mod — skip this module */
@@ -269,9 +314,9 @@ function readTsConfigs(root, repoFiles) {
     configs.sort(
         (a, b) =>
             b.dir.length - a.dir.length ||
-            a.dir.localeCompare(b.dir) ||
+            compareUtf16(a.dir, b.dir) ||
             a._priority - b._priority ||
-            a._name.localeCompare(b._name)
+            compareUtf16(a._name, b._name)
     );
     return configs.map(({ dir, baseUrl, paths }) => ({ dir, baseUrl, paths }));
 }
@@ -288,6 +333,9 @@ function readPackageConfigs(root, repoFiles) {
             pkgs.push({
                 dir,
                 name: typeof parsed.name === "string" ? parsed.name : null,
+                main: typeof parsed.main === "string" ? parsed.main : null,
+                module: typeof parsed.module === "string" ? parsed.module : null,
+                types: typeof parsed.types === "string" ? parsed.types : (typeof parsed.typings === "string" ? parsed.typings : null),
                 exports: parsed.exports ?? null,
                 imports: parsed.imports ?? null,
             });
@@ -296,59 +344,234 @@ function readPackageConfigs(root, repoFiles) {
             /* ignore invalid/unreadable package.json */
         }
     }
-    pkgs.sort((a, b) => b.dir.length - a.dir.length || a.dir.localeCompare(b.dir));
+    pkgs.sort((a, b) => b.dir.length - a.dir.length || compareUtf16(a.dir, b.dir));
     return pkgs;
 }
+function readEcosystemManifests(root, repoFiles) {
+    const cargoCrates = new Map();
+    const composerPsr4 = [];
+    const pythonRoots = [];
+    const swiftTargets = new Map();
+    const dartPackages = new Map();
+    const foundryRemappings = [];
+    for (const f of repoFiles) {
+        const b = basename(f);
+        const dirRel = relPosix(root, dirname(f));
+        const dirPrefix = dirRel === "." || dirRel === "" ? "" : dirRel;
+        try {
+            if (b === "Cargo.toml") {
+                const raw = readFileSync(f, "utf8");
+                const pkgSec = /\[package\]([\s\S]*?)(?:\n\[|$)/.exec(raw)?.[1] ?? "";
+                const nameM = /^\s*name\s*=\s*["']([^"']+)["']/m.exec(pkgSec);
+                if (nameM)
+                    cargoCrates.set(nameM[1].replace(/-/g, "_"), dirPrefix ? `${dirPrefix}/src` : "src");
+            }
+            else if (b === "composer.json") {
+                const parsed = JSON.parse(readFileSync(f, "utf8"));
+                for (const sec of [parsed?.autoload?.["psr-4"], parsed?.["autoload-dev"]?.["psr-4"]]) {
+                    if (!sec || typeof sec !== "object")
+                        continue;
+                    for (const [ns, relDir] of Object.entries(sec)) {
+                        const firstDir = Array.isArray(relDir) ? relDir[0] : relDir;
+                        if (typeof firstDir === "string") {
+                            const fullDir = dirPrefix ? `${dirPrefix}/${firstDir.replace(/^\.\//, "")}` : firstDir.replace(/^\.\//, "");
+                            composerPsr4.push({ prefix: ns, dir: fullDir });
+                        }
+                    }
+                }
+            }
+            else if (b === "pyproject.toml") {
+                const raw = readFileSync(f, "utf8");
+                for (const key of ["pythonpath", "where"]) {
+                    const m = new RegExp(`^\\s*${key}\\s*=\\s*\\[([^\\]]*)\\]`, "m").exec(raw);
+                    if (m) {
+                        for (const s of m[1].matchAll(/["']([^"']+)["']/g)) {
+                            const sub = s[1].replace(/^\.\//, "");
+                            pythonRoots.push(dirPrefix ? `${dirPrefix}/${sub}` : sub);
+                        }
+                    }
+                }
+                for (const fm of raw.matchAll(/\bfrom\s*=\s*["']([^"']+)["']/g)) {
+                    const sub = fm[1].replace(/^\.\//, "");
+                    pythonRoots.push(dirPrefix ? `${dirPrefix}/${sub}` : sub);
+                }
+            }
+            else if (b === "Package.swift") {
+                const raw = readFileSync(f, "utf8");
+                for (const tm of raw.matchAll(/\.(?:executableT|t)arget\s*\(\s*name\s*:\s*"([^"]+)"([^)]*)\)/g)) {
+                    const name = tm[1];
+                    const pathM = /path\s*:\s*"([^"]+)"/.exec(tm[2]);
+                    const relT = pathM ? pathM[1] : `Sources/${name}`;
+                    swiftTargets.set(name, dirPrefix ? `${dirPrefix}/${relT}` : relT);
+                }
+            }
+            else if (b === "pubspec.yaml") {
+                const raw = readFileSync(f, "utf8");
+                const m = /^\s*name\s*:\s*([A-Za-z0-9_]+)\s*$/m.exec(raw);
+                if (m)
+                    dartPackages.set(m[1], dirPrefix || ".");
+            }
+            else if (b === "remappings.txt") {
+                for (const line of readFileSync(f, "utf8").split(/\r?\n/)) {
+                    const eq = line.indexOf("=");
+                    if (eq > 0) {
+                        const prefix = line.slice(0, eq).trim();
+                        const target = line.slice(eq + 1).trim();
+                        if (prefix && target)
+                            foundryRemappings.push({ prefix, target: dirPrefix ? `${dirPrefix}/${target}` : target });
+                    }
+                }
+            }
+            else if (b === "foundry.toml") {
+                const m = /^\s*remappings\s*=\s*\[([^\]]*)\]/m.exec(readFileSync(f, "utf8"));
+                if (m) {
+                    for (const s of m[1].matchAll(/["']([^"'=]+)=([^"']+)["']/g))
+                        foundryRemappings.push({ prefix: s[1].trim(), target: dirPrefix ? `${dirPrefix}/${s[2].trim()}` : s[2].trim() });
+                }
+            }
+        }
+        catch {
+            /* skip unreadable manifest */
+        }
+    }
+    composerPsr4.sort((a, b) => b.prefix.length - a.prefix.length);
+    return { cargoCrates, composerPsr4, pythonRoots: [...new Set(pythonRoots)], swiftTargets, dartPackages, foundryRemappings };
+}
 
-export function resolverConfigHash(root, repoFiles, scopes, goModules) {
-    const configFiles = [];
+function readResolverConfigBundle(root, repoFiles, scopes, outDir = null, priorBundle = null) {
+    const absRoot = resolve(root);
+    const configFiles = collectResolverConfigPaths(absRoot, repoFiles, scopes, outDir);
+    const configContents = new Map(priorBundle?.configContents ?? []);
+    const configSnapshots = { ...(priorBundle?.configSnapshots ?? {}) };
+    const excludeRaw = resolveGitExcludePath(absRoot);
+    const excludeAbs = excludeRaw ? resolve(excludeRaw) : null;
     const seen = new Set();
-    for (const f of collectResolverConfigPaths(root, repoFiles, scopes)) {
-        const rel = relPosix(root, f);
-        if (seen.has(rel))
+    const hashParts = [];
+
+    for (const f of configFiles) {
+        const abs = resolve(f);
+        const rel = excludeAbs && abs === excludeAbs ? ".git/info/exclude" : relPosix(absRoot, abs);
+        if (!rel || seen.has(rel))
             continue;
         try {
-            configFiles.push(`${rel}:${contentHash(readFileSync(f, "utf8"))}`);
+            let raw = configContents.get(abs);
+            let snap = configSnapshots[rel];
+            if (raw === undefined || !snap) {
+                const st = statSync(abs);
+                if (!st.isFile())
+                    continue;
+                raw = readFileSync(abs, "utf8");
+                const hash = contentHash(raw);
+                configContents.set(abs, raw);
+                snap = [st.size, st.mtimeMs, hash];
+                if (rel === ".git/info/exclude" || !rel.startsWith("..")) {
+                    configSnapshots[rel] = snap;
+                }
+            }
+            hashParts.push(`${rel}:${snap[2]}`);
             seen.add(rel);
         }
         catch {
             /* ignore absent/unreadable config */
         }
     }
-    configFiles.sort();
-    return contentHash(JSON.stringify({ schema: RESOLVER_SCHEMA_VERSION, scopes, goModules, configFiles }));
+    hashParts.sort(compareUtf16);
+    return { configFiles, configContents, configSnapshots, hashParts };
+}
+
+function readMarkdownDocsBundle(root, includeDocs) {
+    const absRoot = resolve(root);
+    const mdFiles = collectMarkdownDocFiles(absRoot);
+    const docSnapshots = {};
+    const markdownDocs = [];
+    const hashItems = [];
+    for (const { relPath, absPath } of mdFiles) {
+        try {
+            const st = statSync(absPath);
+            if (!st.isFile())
+                continue;
+            const raw = readFileSync(absPath, "utf8");
+            const hash = contentHash(raw);
+            docSnapshots[relPath] = [st.size, st.mtimeMs, hash];
+            if (includeDocs !== false) {
+                hashItems.push([relPath, hash]);
+                markdownDocs.push({ relPath, absPath, content: raw, hash });
+            }
+        }
+        catch {
+            /* ignore unreadable doc */
+        }
+    }
+    const docsDigest = includeDocs === false
+        ? "disabled"
+        : hashItems.length === 0
+            ? "empty"
+            : contentHash(hashItems.map(([rel, hash]) => `${rel}\0${hash}`).join("\n"));
+    return { docsDigest, docSnapshots, markdownDocs };
+}
+
+export function resolverConfigHash(root, repoFiles, scopes, goModules, opts = {}) {
+    const bundle = opts.bundle ?? readResolverConfigBundle(root, repoFiles, scopes, opts.outDir);
+    return contentHash(JSON.stringify({ schema: RESOLVER_SCHEMA_VERSION, scopes, goModules, configFiles: bundle.hashParts }));
 }
 
 /** Recompute the canonical resolver `config_hash` for `dir` against an extracted node set. */
 export function computeRepoConfigHash(dir, nodes, opts = {}) {
     const root = resolve(dir);
-    const walkCfg = readWalkConfig(root, opts.contextDir);
-    const walked = walkDir(root, walkCfg.includeDirs, {
-        followSubmodules: walkCfg.followSubmodules,
-        followNestedRepos: walkCfg.followNestedRepos,
-    });
+    const outDir = contextDirFor(root, opts.contextDir);
+    let walked = opts.walked;
+    if (!Array.isArray(walked)) {
+        const walkCfg = readWalkConfig(root, opts.contextDir);
+        walked = walkDir(root, walkCfg.includeDirs, {
+            followSubmodules: walkCfg.followSubmodules,
+            followNestedRepos: walkCfg.followNestedRepos,
+        });
+    }
     const onlyDirs = opts.onlyDirs && opts.onlyDirs.size > 0 ? opts.onlyDirs : undefined;
     const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
     const discoveredScopes = discoverScopes(root, repoFiles, opts.contextDir);
     const scopes = applyMinSubstanceGuard(discoveredScopes, nodes);
     const goModules = readGoModules(root, walked);
-    return resolverConfigHash(root, walked, scopes, goModules);
+    return resolverConfigHash(root, walked, scopes, goModules, { outDir });
 }
 
 const CLASSLIKE_KINDS = new Set(["class", "interface", "trait", "struct"]);
+const SUPPORTED_STEM_EXT_RE = /\.(?:d\.(?:ts|mts|cts)|tsx|jsx|mts|cts|ts|mjs|cjs|js|pyi|py|go|java|kt|kts|swift|php|r|rs|c|h|cpp|cc|cxx|hpp|hh|hxx|h\+\+|c\+\+|inl|ipp|tpp|ixx|rb|cs|scala|sc|ex|exs|sol|ml|mli|zig|dart|clj|cljs|cljc|bb|nix|lua|luau|vue|svelte|astro|sh|bash|zsh|sql|tf|tfvars|hcl|proto|graphql|gql|m|mm|hs|gleam|cu|cuh)$/i;
 
-function addSpecifierStemDepKeys(keys, specifier, prefix = "spec_stem:") {
+function addSpecifierStemDepKeys(keys, specifier, prefix = "spec_stem:", sourceFile = null) {
     if (!specifier || typeof specifier !== "string")
         return;
-    const clean = specifier.split(/[?#]/)[0].replace(/\\/g, "/").replace(/\/+$/, "");
+    let clean = specifier.split(/[?#]/)[0].replace(/\\/g, "/").replace(/\/+$/, "");
     if (!clean)
         return;
-    const noExt = clean.replace(/\.(?:js|cjs|mjs|ts|tsx|jsx|d\.ts|py|pyi|luau|lua|go|rs|java|cs|rb|php|kt|swift)$/i, "");
-    const parts = noExt.split(/[/.]/).filter(Boolean);
+    const isRelPath = clean === "." || clean === ".." || clean.startsWith("./") || clean.startsWith("../");
+    if (isRelPath && sourceFile) {
+        const baseDir = posix.dirname(toPosixPath(sourceFile));
+        const joined = baseDir === "." ? clean : `${baseDir}/${clean}`;
+        clean = posix.normalize(joined).replace(/\/+$/, "");
+        if (!clean || clean === "." || clean === "..") {
+            for (const barrel of ["index", "__init__", "init", "mod"]) {
+                keys.add(`spec_rel:${barrel}`);
+            }
+            return;
+        }
+        const relNoExt = clean.replace(SUPPORTED_STEM_EXT_RE, "").replace(/^\.\//, "").toLowerCase();
+        if (!relNoExt)
+            return;
+        keys.add(`spec_rel:${relNoExt}`);
+        const slash = relNoExt.lastIndexOf("/");
+        const leaf = slash >= 0 ? relNoExt.slice(slash + 1) : relNoExt;
+        if (slash > 0 && (leaf === "index" || leaf === "__init__" || leaf === "init" || leaf === "mod")) {
+            keys.add(`spec_rel:${relNoExt.slice(0, slash)}`);
+        }
+        return;
+    }
+    const noExt = clean.replace(SUPPORTED_STEM_EXT_RE, "");
+    const parts = noExt.split("/").filter(Boolean);
     if (parts.length === 0)
         return;
     const last = parts[parts.length - 1].toLowerCase();
-    if ((last === "index" || last === "init" || last === "mod") && parts.length >= 2) {
+    if ((last === "index" || last === "__init__" || last === "init" || last === "mod") && parts.length >= 2) {
         const parent = parts[parts.length - 2].toLowerCase();
         keys.add(`${prefix}${parent}/${last}`);
         keys.add(`${prefix}${parent}`);
@@ -356,19 +579,29 @@ function addSpecifierStemDepKeys(keys, specifier, prefix = "spec_stem:") {
     else {
         keys.add(`${prefix}${last}`);
     }
+    if (!clean.includes("/") && !isRelPath && noExt.includes(".")) {
+        const dotTail = noExt.replace(/^\.+/, "").split(".").filter(Boolean).pop()?.toLowerCase();
+        if (dotTail && dotTail !== last) {
+            keys.add(`${prefix}${dotTail}`);
+        }
+    }
 }
 
 function addFilePathStemDepKeys(keys, filePath) {
     if (!filePath)
         return;
     const posixPath = toPosixPath(filePath);
-    const noExt = posixPath.replace(/\.[^./]+$/, "");
+    const noExt = posixPath.replace(SUPPORTED_STEM_EXT_RE, "").replace(/\.[^./]+$/, "");
+    const relNoExt = noExt.replace(/^\.\//, "").toLowerCase();
+    if (relNoExt)
+        keys.add(`spec_rel:${relNoExt}`);
     const parts = noExt.split("/").filter(Boolean);
     if (parts.length === 0)
         return;
     const last = parts[parts.length - 1].toLowerCase();
-    if ((last === "index" || last === "init" || last === "mod") && parts.length >= 2) {
+    if ((last === "index" || last === "__init__" || last === "init" || last === "mod") && parts.length >= 2) {
         const parent = parts[parts.length - 2].toLowerCase();
+        keys.add(`spec_rel:${parts.slice(0, -1).join("/").toLowerCase()}`);
         keys.add(`spec_stem:${parent}/${last}`);
         keys.add(`spec_stem:${parent}`);
     }
@@ -381,10 +614,10 @@ function recordNodeSymbolDeps(n, depsByPath) {
     const s = ensureMapSet(depsByPath, n.path);
     if (n.path.endsWith(".go"))
         s.add(`dir:${posix.dirname(toPosixPath(n.path))}`);
-    if (n.path.endsWith(".luau")) {
+    if (n.path.endsWith(".luau") || n.luauMode) {
         s.add("lang:luau");
         const b = basename(n.path).toLowerCase();
-        if (b === "init.luau" || b === "index.luau")
+        if (b === "init.luau" || b === "index.luau" || b === "init.lua")
             s.add("luau_barrel");
     }
     if (CLASSLIKE_KINDS.has(n.kind) && n.name)
@@ -397,13 +630,13 @@ function recordRawEdgeSymbolDeps(e, depsByPath) {
     if (e.relation === "imports" || e.relation === "reexports") {
         if (e.relation === "reexports") {
             s.add(`barrel:${p}`);
-            if (p.endsWith(".luau"))
+            if (p.endsWith(".luau") || p.endsWith(".lua"))
                 s.add("luau_barrel");
         }
         if (e.specifier)
-            addSpecifierStemDepKeys(s, e.specifier);
+            addSpecifierStemDepKeys(s, e.specifier, "spec_stem:", p);
         if (e.fallbackSpecifier)
-            addSpecifierStemDepKeys(s, e.fallbackSpecifier);
+            addSpecifierStemDepKeys(s, e.fallbackSpecifier, "spec_stem:", p);
     }
     if (!e.name)
         return;
@@ -424,11 +657,12 @@ function recordRawEdgeSymbolDeps(e, depsByPath) {
     }
 }
 
-function buildSymbolDepsByPath(nodes, rawEdges, resolvedEdges, targetPaths = null) {
-    const nodeById = new Map();
+function buildSymbolDepsByPath(nodes, rawEdges, resolvedEdges, targetPaths = null, nodePathById = null) {
+    const pathById = nodePathById ?? new Map();
     const depsByPath = new Map();
     for (const n of nodes) {
-        nodeById.set(n.id, n);
+        if (!nodePathById)
+            pathById.set(n.id, n.path ?? "");
         if (!targetPaths || targetPaths.has(n.path))
             recordNodeSymbolDeps(n, depsByPath);
     }
@@ -437,13 +671,13 @@ function buildSymbolDepsByPath(nodes, rawEdges, resolvedEdges, targetPaths = nul
             recordRawEdgeSymbolDeps(e, depsByPath);
     }
     for (const e of resolvedEdges) {
-        const src = nodeById.get(e.source);
-        const tgt = nodeById.get(e.target);
-        if (!src?.path || !tgt?.path || src.path === tgt.path)
+        const srcPath = pathById.get(e.source);
+        const tgtPath = pathById.get(e.target);
+        if (!srcPath || !tgtPath || srcPath === tgtPath)
             continue;
-        if (targetPaths && !targetPaths.has(src.path))
+        if (targetPaths && !targetPaths.has(srcPath))
             continue;
-        ensureMapSet(depsByPath, src.path).add(`file:${tgt.path}`);
+        ensureMapSet(depsByPath, srcPath).add(`file:${tgtPath}`);
     }
     return depsByPath;
 }
@@ -490,7 +724,7 @@ function querySymbolDepKeysForSources(store, sourcePaths) {
 function recordNodeSeedKeys(n, seedKeys) {
     if (!n)
         return false;
-    const isLuau = Boolean(n.path?.endsWith(".luau"));
+    const isLuau = Boolean(n.path?.endsWith(".luau") || n.luauMode);
     if (n.kind === "file" || !n.name)
         return isLuau;
     const lower = n.name.toLowerCase();
@@ -507,13 +741,13 @@ function recordNodeSeedKeys(n, seedKeys) {
     return isLuau;
 }
 
-function collectInitialDirtySeedKeys(dirtyOrDeleted, priorNodes, dirtyNodes, dirtyEntries, seedKeys) {
+function collectInitialDirtySeedKeys(store, dirtyOrDeleted, priorNodes, dirtyNodes, dirtyEntries, seedKeys) {
     let touchesLuau = false;
     for (const p of dirtyOrDeleted) {
         seedKeys.add(`file:${p}`);
         if (p.endsWith(".go"))
             seedKeys.add(`dir:${posix.dirname(toPosixPath(p))}`);
-        if (p.endsWith(".luau"))
+        if (p.endsWith(".luau") || p.endsWith(".lua"))
             touchesLuau = true;
         addFilePathStemDepKeys(seedKeys, p);
     }
@@ -524,6 +758,15 @@ function collectInitialDirtySeedKeys(dirtyOrDeleted, priorNodes, dirtyNodes, dir
     for (const n of dirtyNodes) {
         if (recordNodeSeedKeys(n, seedKeys))
             touchesLuau = true;
+    }
+    if (dirtyOrDeleted.size > 0) {
+        for (const keys of querySymbolDepKeysForSources(store, dirtyOrDeleted).values()) {
+            for (const k of keys) {
+                if (k.startsWith("impl_of:")) {
+                    seedKeys.add(`type_user:${k.slice("impl_of:".length)}`);
+                }
+            }
+        }
     }
     for (const entry of Object.values(dirtyEntries)) {
         for (const e of entry?.rawEdges ?? []) {
@@ -537,7 +780,7 @@ function collectInitialDirtySeedKeys(dirtyOrDeleted, priorNodes, dirtyNodes, dir
 function expandBarrelConeHops(store, initialFrontier, dirtyOrDeleted, currentPathSet, conePaths) {
     let frontier = initialFrontier;
     const visitedBarrels = new Set(dirtyOrDeleted);
-    for (let hop = 0; hop < 3 && frontier.length > 0; hop++) {
+    for (let hop = 0; hop < 6 && frontier.length > 0; hop++) {
         const depMap = querySymbolDepKeysForSources(store, frontier);
         const nextKeys = new Set();
         for (const [src, keys] of depMap) {
@@ -575,13 +818,13 @@ function stepContextFrontierHop(store, ctxFrontier, currentPathSet, expandedCtx,
     const nextFrontier = new Set();
     let foundLuau = false;
     for (const [src, keys] of depMap) {
-        if (src.endsWith(".luau"))
+        if (src.endsWith(".luau") || keys.has("lang:luau"))
             foundLuau = true;
         for (const k of keys) {
             if (k.startsWith("file:")) {
                 addContextPathCandidate(k.slice(5), currentPathSet, expandedCtx, contextPaths, nextFrontier);
             }
-            else if (k.startsWith("impl_of:") || k.startsWith("type_user:")) {
+            else if (k.startsWith("impl_of:") || k.startsWith("type_user:") || k.startsWith("class:")) {
                 const cls = k.slice(k.indexOf(":") + 1);
                 classLookupKeys.add(`class:${cls}`);
                 classLookupKeys.add(`impl_of:${cls}`);
@@ -599,7 +842,7 @@ function computeDirtyConeAndContext(store, dirtyPaths, deletedPaths, priorNodes,
     const dirtyOrDeleted = new Set([...dirtyPaths, ...deletedPaths]);
     const conePaths = new Set(dirtyPaths);
     const seedKeys = new Set();
-    let touchesLuau = collectInitialDirtySeedKeys(dirtyOrDeleted, priorNodes, dirtyNodes, dirtyEntries, seedKeys);
+    let touchesLuau = collectInitialDirtySeedKeys(store, dirtyOrDeleted, priorNodes, dirtyNodes, dirtyEntries, seedKeys);
 
     // 1-hop dependents (+ propagate through re-export barrels up to 3 hops so barrel chains stay sound)
     const barrelFrontier = [];
@@ -616,7 +859,7 @@ function computeDirtyConeAndContext(store, dirtyPaths, deletedPaths, priorNodes,
     const contextPaths = new Set(conePaths);
     let ctxFrontier = new Set(conePaths);
     const expandedCtx = new Set(conePaths);
-    for (let hop = 0; hop < 4 && ctxFrontier.size > 0; hop++) {
+    for (let hop = 0; hop < 6 && ctxFrontier.size > 0; hop++) {
         const step = stepContextFrontierHop(store, ctxFrontier, currentPathSet, expandedCtx, contextPaths);
         if (step.foundLuau)
             touchesLuau = true;
@@ -634,7 +877,7 @@ function computeDirtyConeAndContext(store, dirtyPaths, deletedPaths, priorNodes,
 
 function updateSymbolDepsInTx(store, depsByPath, replaceAll, deletePaths = []) {
     if (replaceAll) {
-        store.db.exec("DELETE FROM symbol_deps");
+        store.db.exec("DROP INDEX IF EXISTS idx_symbol_deps_dep; DELETE FROM symbol_deps;");
     }
     else {
         const delStmt = prepareStmt(store, "DELETE FROM symbol_deps WHERE source_path = ?");
@@ -643,25 +886,40 @@ function updateSymbolDepsInTx(store, depsByPath, replaceAll, deletePaths = []) {
         for (const p of depsByPath.keys())
             delStmt.run(p);
     }
-    const insStmt = prepareStmt(store, "INSERT OR IGNORE INTO symbol_deps(source_path, dep_key) VALUES (?, ?)");
+    const batch = createBatchInserter(store, "INSERT OR IGNORE INTO symbol_deps(source_path, dep_key)", 2, 128);
     for (const [src, keys] of depsByPath) {
         for (const k of keys)
-            insStmt.run(src, k);
+            batch.push(src, k);
+    }
+    batch.flush();
+    if (replaceAll) {
+        store.db.exec("CREATE INDEX IF NOT EXISTS idx_symbol_deps_dep ON symbol_deps(dep_key);");
     }
     setSqliteMeta(store, "symbol_deps_ready", "1");
 }
-function finalizeGraphBuildOutput(root, outDir, opts, graph, nodes, edges, sortedLanguages) {
+function finalizeGraphBuildOutput(root, outDir, opts, built, sortedLanguages) {
+    const { graph, nodes, edges } = built;
     let cardStats = { written: 0, pruned: 0, files: [] };
     if (!opts.graphOnly) {
-        ensureGitignored(root, outDir);
         if (opts.cards === true) {
             ensureSearchable(root, outDir);
             cardStats = writeCards(graph, outDir);
             writeIndex(outDir, cardStats.files, graph);
         }
         else {
-            const filePaths = [...new Set(nodes.map((n) => n.path).filter(Boolean))].sort();
-            writeIndex(outDir, filePaths, graph);
+            const countsByPath = new Map();
+            for (const n of nodes) {
+                if (!n?.path)
+                    continue;
+                if (!countsByPath.has(n.path))
+                    countsByPath.set(n.path, 0);
+                if (n.kind !== "file")
+                    countsByPath.set(n.path, countsByPath.get(n.path) + 1);
+            }
+            const fileStats = [...countsByPath.entries()]
+                .sort((a, b) => compareUtf16(a[0], b[0]))
+                .map(([path, symbols]) => ({ path, symbols }));
+            writeIndex(outDir, fileStats, graph);
         }
         if (!opts.contextDir) {
             patchStats(root, {
@@ -669,10 +927,10 @@ function finalizeGraphBuildOutput(root, outDir, opts, graph, nodes, edges, sorte
                 staleCount: 0,
                 syncing: false,
                 syncedAt: new Date().toISOString(),
-                nodeCount: nodes.length,
-                edgeCount: edges.length,
+                nodeCount: built.nodeCount ?? nodes.length,
+                edgeCount: built.edgeCount ?? (edges?.length ?? 0),
                 languages: sortedLanguages,
-                totalCount: nodes.length,
+                totalCount: built.nodeCount ?? nodes.length,
             });
             if (existsSync(join(root, ".git")) && !existsSync(join(outDir, CACHE_DIR, "git-history.json"))) {
                 try {
@@ -684,33 +942,158 @@ function finalizeGraphBuildOutput(root, outDir, opts, graph, nodes, edges, sorte
             }
         }
     }
+    if (built.byKind && built.byRelation) {
+        return { cardsWritten: cardStats.written, byKind: built.byKind, byRelation: built.byRelation };
+    }
     const byKind = {};
     for (const n of nodes)
         byKind[n.kind] = (byKind[n.kind] ?? 0) + 1;
     const byRelation = {};
-    for (const e of edges)
+    for (const e of edges ?? [])
         byRelation[e.relation] = (byRelation[e.relation] ?? 0) + 1;
     return { cardsWritten: cardStats.written, byKind, byRelation };
 }
+const MAX_PRIOR_NODES_CACHE = 1;
+const priorNodesCache = new Map();
+const MAX_RESOLVED_ENV_CACHE = 2;
+const resolvedEnvCache = new Map();
+registerGraphCacheClearer((outDir, opts) => {
+    if (opts?.keepPriorNodes)
+        return;
+    if (outDir !== undefined && outDir !== null) {
+        const k = resolve(outDir);
+        priorNodesCache.delete(k);
+        resolvedEnvCache.delete(k);
+    }
+    else {
+        priorNodesCache.clear();
+        resolvedEnvCache.clear();
+    }
+});
+
+function buildNodePathMap(nodes) {
+    const m = new Map();
+    for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        m.set(n.id, n.path ?? "");
+    }
+    return m;
+}
+
+function setCachedPriorNodes(outDir, graphVersion, nodes, nodePathById = null) {
+    const key = resolve(outDir);
+    if (!priorNodesCache.has(key) && priorNodesCache.size >= MAX_PRIOR_NODES_CACHE) {
+        const oldest = priorNodesCache.keys().next().value;
+        if (oldest !== undefined)
+            priorNodesCache.delete(oldest);
+    }
+    priorNodesCache.delete(key);
+    priorNodesCache.set(key, { graphVersion, nodes, nodePathById: nodePathById ?? buildNodePathMap(nodes) });
+}
+
+function getCachedPriorNodes(outDir, sqliteStore, graphVersion) {
+    const key = resolve(outDir);
+    const cached = priorNodesCache.get(key);
+    if (cached && cached.graphVersion === graphVersion) {
+        priorNodesCache.delete(key);
+        priorNodesCache.set(key, cached);
+        return { nodes: cached.nodes, nodePathById: cached.nodePathById };
+    }
+    const nodes = readGraphNodesFromSqlite(sqliteStore);
+    const nodePathById = buildNodePathMap(nodes);
+    setCachedPriorNodes(key, graphVersion, nodes, nodePathById);
+    return { nodes, nodePathById };
+}
+
+registerExternalNodesLookup((absDir, graphVersion) => {
+    const cached = priorNodesCache.get(absDir);
+    return cached && cached.graphVersion === graphVersion ? cached.nodes : null;
+});
+
+function setCachedResolvedEnv(outDir, env) {
+    const key = resolve(outDir);
+    if (!resolvedEnvCache.has(key) && resolvedEnvCache.size >= MAX_RESOLVED_ENV_CACHE) {
+        const oldest = resolvedEnvCache.keys().next().value;
+        if (oldest !== undefined)
+            resolvedEnvCache.delete(oldest);
+    }
+    resolvedEnvCache.delete(key);
+    resolvedEnvCache.set(key, env);
+}
+
 function readBuildDbMeta(sqliteStore) {
     try {
         return {
-            vocabReady: Boolean(getSqliteMeta(sqliteStore, "vocab_json")),
+            vocabReady: getSqliteMeta(sqliteStore, "vocab_ready") === "1" || Boolean(getSqliteMeta(sqliteStore, "vocab_json")),
             depsReady: getSqliteMeta(sqliteStore, "symbol_deps_ready") === "1",
             stampMatch: getSqliteMeta(sqliteStore, "extractor_stamp") === (extractorStamp() ?? ""),
             docsHash: getSqliteMeta(sqliteStore, "docs_hash"),
+            graphHash: getSqliteMeta(sqliteStore, "graph_hash"),
+            graphVersion: Number(getSqliteMeta(sqliteStore, "graph_version") ?? 0),
+            wiringDirty: getSqliteMeta(sqliteStore, "wiring_dirty") === "1",
+            legacyCleaned: getSqliteMeta(sqliteStore, "legacy_cleaned") === "1",
         };
     }
     catch {
-        return { vocabReady: false, depsReady: false, stampMatch: false, docsHash: null };
+        return {
+            vocabReady: false,
+            depsReady: false,
+            stampMatch: false,
+            docsHash: null,
+            graphHash: null,
+            graphVersion: 0,
+            wiringDirty: false,
+            legacyCleaned: false,
+        };
     }
 }
 
+function wiringDiskMatchesHash(outDir, dbGraphHash) {
+    if (!dbGraphHash)
+        return false;
+    try {
+        return contentHash(readFileSync(wiringPath(outDir), "utf8")) === dbGraphHash;
+    }
+    catch {
+        return false;
+    }
+}
+
+function buildInMemoryFingerprintEntries(existingFp, upserts, mtimeUpdates, deletedPaths) {
+    if (!existingFp?.files || typeof existingFp.files !== "object")
+        return null;
+    const out = { ...existingFp.files };
+    for (const del of deletedPaths ?? []) {
+        delete out[del];
+    }
+    for (const u of mtimeUpdates ?? []) {
+        if (u?.rel)
+            out[u.rel] = [u.size ?? 0, u.mtimeMs ?? 0, u.hash ?? ""];
+    }
+    for (const [rel, entry] of Object.entries(upserts ?? {})) {
+        if (entry)
+            out[rel] = [entry.size ?? 0, entry.mtimeMs ?? 0, entry.hash ?? ""];
+    }
+    return out;
+}
+
 function runUnchangedSqliteBuild(ctx) {
-    const { prior, outDir, root, docsDirty, mtimeDirty, mtimeUpdates, configHash, configFilesForFp, onlyDirs, extensions, preWalkDirMtimes, errors } = ctx;
+    const { prior, sqliteStore, dbMeta, graphOnly, outDir, root, docsDirty, mtimeDirty, mtimeUpdates, configHash, configBundle, docsBundle, onlyDirs, extensions, preWalkDirMtimes, errors } = ctx;
+    if (!graphOnly && prior.edges === null) {
+        prior.edges = readGraphEdgesFromSqlite(sqliteStore) ?? [];
+    }
     if (docsDirty) {
+        if (prior.edges === null)
+            prior.edges = [];
         try {
-            writeAskIndex(outDir, prior, { dirtyPaths: [], deletedPaths: [], root });
+            writeAskIndex(outDir, prior, {
+                dirtyPaths: [],
+                deletedPaths: [],
+                root,
+                alreadySorted: true,
+                docsDigest: docsBundle.docsDigest,
+                markdownDocs: docsBundle.markdownDocs,
+            });
         }
         catch (err) {
             errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
@@ -718,6 +1101,13 @@ function runUnchangedSqliteBuild(ctx) {
     }
     if (mtimeDirty && mtimeUpdates.length > 0)
         writeExtractCacheIncremental(outDir, { updateStats: mtimeUpdates });
+    if (!graphOnly && (dbMeta.wiringDirty || !wiringDiskMatchesHash(outDir, dbMeta.graphHash))) {
+        const graphHash = writeGraphStreaming(prior, outDir, { alreadySorted: true });
+        withSqliteTransaction(sqliteStore, () => {
+            setSqliteMetaMany(sqliteStore, { wiring_dirty: "0", graph_hash: graphHash });
+        });
+        checkpointSqliteStore(outDir, "PASSIVE");
+    }
     const existingFp = readFingerprint(outDir);
     const fpStale =
         mtimeDirty ||
@@ -727,16 +1117,95 @@ function runUnchangedSqliteBuild(ctx) {
         existingFp?.configHash !== configHash ||
         JSON.stringify(existingFp?.extensions ?? []) !== JSON.stringify(extensions ?? []);
     if (fpStale) {
-        writeFingerprint(outDir, null, onlyDirs, root, extensions, preWalkDirMtimes, {
-            configFiles: configFilesForFp,
+        const fpEntries = buildInMemoryFingerprintEntries(existingFp, null, mtimeUpdates, null);
+        writeFingerprint(outDir, fpEntries, onlyDirs, root, extensions, preWalkDirMtimes, {
+            configFiles: configBundle.configFiles,
+            configContents: configBundle.configContents,
+            configSnapshots: configBundle.configSnapshots,
+            docSnapshots: docsBundle.docSnapshots,
             configHash,
         });
+    }
+    if (prior.edges === null) {
+        const counts = readGraphCountsFromSqlite(sqliteStore);
+        return {
+            nodes: prior.nodes,
+            edges: null,
+            nodeCount: counts.nodeCount,
+            edgeCount: counts.edgeCount,
+            byKind: counts.byKind,
+            byRelation: counts.byRelation,
+            graph: prior,
+            graphPath: wiringPath(outDir),
+        };
     }
     return { nodes: prior.nodes, edges: prior.edges, graph: prior, graphPath: wiringPath(outDir) };
 }
 
-function buildConeResolvedGraph(ctx, conePaths, contextPaths, dirtyPlusDeleted) {
-    const { outDir, prior, extractRes, dirtyPaths, deletedPaths, goModules, root, scopes, tsConfigs, packageConfigs, sortedLanguages, configHash } = ctx;
+function isDependencyNodePath(relPath, depPrefixes) {
+    if (!relPath)
+        return false;
+    if (isDependencyPath(relPath))
+        return true;
+    return Boolean(depPrefixes?.some((p) => pathUnderPrefix(relPath, p)));
+}
+
+function stampDependencyNodes(nodes, manifestMounts) {
+    const depPrefixes = manifestMounts?.dependencyPrefixes;
+    for (const n of nodes) {
+        if (isDependencyNodePath(n.path, depPrefixes)) {
+            n.dependency = true;
+        }
+        else if (n.dependency !== undefined) {
+            delete n.dependency;
+        }
+    }
+}
+
+function buildManifestMountsMeta(manifestMounts) {
+    const combined = [
+        ...(manifestMounts?.includePrefixes ?? []),
+        ...(manifestMounts?.exactFiles ?? []),
+    ];
+    if (combined.length === 0)
+        return undefined;
+    return [...new Set(combined)].sort(compareUtf16);
+}
+
+function mergeSortedNodes(priorNodes, dirtyPlusDeleted, sortedDirtyNodes) {
+    const nDirty = sortedDirtyNodes.length;
+    const out = [];
+    let j = 0;
+    for (let i = 0; i < priorNodes.length; i++) {
+        const pn = priorNodes[i];
+        if (dirtyPlusDeleted.has(pn.path))
+            continue;
+        while (j < nDirty && compareUtf16(sortedDirtyNodes[j].id, pn.id) <= 0) {
+            out.push(sortedDirtyNodes[j++]);
+        }
+        out.push(pn);
+    }
+    while (j < nDirty)
+        out.push(sortedDirtyNodes[j++]);
+    return out;
+}
+
+function sameStringArray(a, b) {
+    if (a === b)
+        return true;
+    const la = a?.length ?? 0;
+    const lb = b?.length ?? 0;
+    if (la !== lb)
+        return false;
+    for (let i = 0; i < la; i++) {
+        if (a[i] !== b[i])
+            return false;
+    }
+    return true;
+}
+
+function buildConeResolvedGraph(ctx, conePaths, contextPaths, dirtyPlusDeleted, includeFullEdges = true) {
+    const { sqliteStore, outDir, prior, extractRes, dirtyPaths, deletedPaths, goModules, root, scopes, tsConfigs, packageConfigs, ecoManifests, configBundle, sortedLanguages, configHash, manifestMounts } = ctx;
     const contextToLoad = [];
     for (const p of contextPaths) {
         if (!dirtyPaths.has(p))
@@ -747,34 +1216,79 @@ function buildConeResolvedGraph(ctx, conePaths, contextPaths, dirtyPlusDeleted) 
     for (const entry of loadedContext.values())
         subsetRawEdges.push(...(entry.rawEdges ?? []));
 
-    const nodes = [...prior.nodes.filter((n) => !dirtyPlusDeleted.has(n.path)), ...extractRes.nodes];
-    const resolvedSubset = resolveEdges(nodes, subsetRawEdges, { goModules, root, scopes, tsConfigs, packageConfigs });
-    const coneNodeIds = new Set(nodes.filter((n) => conePaths.has(n.path)).map((n) => n.id));
+    const mountsMeta = buildManifestMountsMeta(manifestMounts);
+    const sortedDirty = [...extractRes.nodes].sort((a, b) => compareUtf16(a.id, b.id));
+    let nodes;
+    if (sameStringArray(mountsMeta, prior.meta?.manifestMounts)) {
+        stampDependencyNodes(sortedDirty, manifestMounts);
+        nodes = mergeSortedNodes(prior.nodes, dirtyPlusDeleted, sortedDirty);
+    }
+    else {
+        nodes = mergeSortedNodes(prior.nodes, dirtyPlusDeleted, sortedDirty);
+        stampDependencyNodes(nodes, manifestMounts);
+    }
+    const skipLuau = !sortedLanguages.some((l) => /lua/i.test(l)) && !sortedDirty.some((n) => n.path?.endsWith(".luau") || n.path?.endsWith(".lua") || n.luauMode);
+    const resolvedSubset = resolveEdges(nodes, subsetRawEdges, {
+        goModules, root, scopes, tsConfigs, packageConfigs, configFiles: configBundle?.configFiles,
+        dependencyPrefixes: manifestMounts?.dependencyPrefixes,
+        coneOnly: true,
+        contextPaths,
+        skipLuau,
+        ...ecoManifests,
+    });
     const deletedSet = new Set(deletedPaths);
-    const deletedNodeIds = new Set(prior.nodes.filter((n) => deletedSet.has(n.path)).map((n) => n.id));
+    const priorConeNodeIds = new Set();
+    const removedNodeIds = new Set();
+    const prevTouchedNodes = [];
+    const dirtyNewIdSet = new Set(sortedDirty.map((n) => n.id));
+    for (let i = 0; i < prior.nodes.length; i++) {
+        const n = prior.nodes[i];
+        const inCone = conePaths.has(n.path);
+        const isDel = deletedSet.has(n.path);
+        const isDirtyPath = dirtyPaths.has(n.path);
+        if (inCone || isDel)
+            priorConeNodeIds.add(n.id);
+        if (isDel || isDirtyPath) {
+            prevTouchedNodes.push(n);
+            if (!dirtyNewIdSet.has(n.id))
+                removedNodeIds.add(n.id);
+        }
+    }
+    const coneNodeIds = new Set();
+    for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        if (conePaths.has(n.path))
+            coneNodeIds.add(n.id);
+    }
     const newConeEdges = resolvedSubset.filter((e) => coneNodeIds.has(e.source));
-    const edges = [
-        ...prior.edges.filter((e) => !coneNodeIds.has(e.source) && !deletedNodeIds.has(e.source) && !deletedNodeIds.has(e.target)),
-        ...newConeEdges,
-    ].sort(edgeOrder);
+    let edges = null;
+    if (includeFullEdges) {
+        if (prior.edges === null)
+            prior.edges = readGraphEdgesFromSqlite(sqliteStore) ?? [];
+        edges = [
+            ...prior.edges.filter((e) => !priorConeNodeIds.has(e.source) && !removedNodeIds.has(e.target)),
+            ...newConeEdges,
+        ].sort(edgeOrder);
+    }
 
     const graph = {
         meta: {
             version: 1,
             nodeCount: nodes.length,
-            edgeCount: edges.length,
+            edgeCount: edges ? edges.length : (prior.meta?.edgeCount ?? 0),
             languages: sortedLanguages,
             scopes,
             config_hash: configHash,
+            ...(mountsMeta ? { manifestMounts: mountsMeta } : {}),
         },
         nodes,
-        edges,
+        edges: edges ?? [],
     };
-    return { nodes, edges, graph, subsetRawEdges, newConeEdges };
+    return { nodes, edges, graph, subsetRawEdges, newConeEdges, removedNodeIds, sortedDirty, prevTouchedNodes };
 }
 
 function tryBuildDirtyConePath(ctx) {
-    const { sqliteStore, dirtyPaths, deletedPaths, prior, extractRes, currentPathSet, files, outDir, mtimeUpdates, configHash, root, onlyDirs, extensions, preWalkDirMtimes, configFilesForFp, errors } = ctx;
+    const { sqliteStore, graphOnly, skipAggregateCounts, dirtyPaths, deletedPaths, prior, extractRes, currentPathSet, files, outDir, mtimeUpdates, configHash, root, onlyDirs, extensions, preWalkDirMtimes, configBundle, docsBundle, errors } = ctx;
     const dirtyPlusDeleted = new Set([...dirtyPaths, ...deletedPaths]);
     const canDirtyCone =
         ctx.reuse !== false &&
@@ -795,23 +1309,113 @@ function tryBuildDirtyConePath(ctx) {
     if (conePaths.size > Math.max(8, Math.floor(files.length * 0.75)))
         return null;
 
-    const { nodes, edges, graph, subsetRawEdges, newConeEdges } = buildConeResolvedGraph(ctx, conePaths, contextPaths, dirtyPlusDeleted);
-    const graphPath = writeGraph(graph, outDir);
-    const coneDeps = buildSymbolDepsByPath(nodes, subsetRawEdges, newConeEdges, conePaths);
+    const sqlOnlyFast = Boolean(graphOnly && dirtyPaths.size <= 32 && ctx.dbMeta.vocabReady);
+    const { nodes, edges, graph, subsetRawEdges, newConeEdges, removedNodeIds, sortedDirty, prevTouchedNodes } = buildConeResolvedGraph(
+        ctx,
+        conePaths,
+        contextPaths,
+        dirtyPlusDeleted,
+        !sqlOnlyFast,
+    );
+    const nextNodePathById = prior.nodePathById ?? buildNodePathMap(nodes);
+    if (prior.nodePathById) {
+        for (const id of removedNodeIds)
+            nextNodePathById.delete(id);
+        for (const n of sortedDirty)
+            nextNodePathById.set(n.id, n.path ?? "");
+    }
+    const coneDeps = buildSymbolDepsByPath(nodes, subsetRawEdges, newConeEdges, conePaths, nextNodePathById);
+    let fastCounts = null;
+    let nextGraphVersion = ctx.dbMeta.graphVersion;
     withSqliteTransaction(sqliteStore, () => {
         writeExtractCacheIncremental(outDir, { upsertEntries: extractRes.entries, updateStats: mtimeUpdates, deletePaths: deletedPaths });
         updateSymbolDepsInTx(sqliteStore, coneDeps, false, deletedPaths);
-        setSqliteMeta(sqliteStore, "config_hash", configHash);
+        nextGraphVersion = updateGraphConeInSqlite(sqliteStore, {
+            meta: graph.meta,
+            allNodes: nodes,
+            dirtyNodes: sortedDirty,
+            nodePathById: nextNodePathById,
+            dirtyPaths,
+            deletedPaths,
+            conePaths,
+            newConeEdges,
+            removedNodeIds,
+            trackEdgeDelta: sqlOnlyFast && Boolean(skipAggregateCounts),
+        });
+        if (sqlOnlyFast && !skipAggregateCounts) {
+            fastCounts = readGraphCountsFromSqlite(sqliteStore);
+            graph.meta.edgeCount = fastCounts.edgeCount;
+            setSqliteMeta(sqliteStore, "graph_meta_json", JSON.stringify(graph.meta));
+        }
+        setSqliteMetaMany(sqliteStore, {
+            config_hash: configHash,
+            wiring_dirty: "1",
+            graph_hash: "",
+            rojo_lua_mode: ctx.manifestMounts?.hasRojoProject ? "1" : "0",
+        });
         try {
-            writeAskIndex(outDir, graph, { dirtyPaths, deletedPaths, root });
+            writeAskIndex(outDir, graph, {
+                dirtyPaths,
+                deletedPaths,
+                dirtyNodes: sortedDirty,
+                prevTouchedNodes,
+                root,
+                alreadySorted: true,
+                docsDigest: docsBundle.docsDigest,
+                markdownDocs: docsBundle.markdownDocs,
+            });
         }
         catch (err) {
             errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
         }
     });
+    if (!graphOnly) {
+        const graphHash = writeGraphStreaming(graph, outDir, { alreadySorted: true });
+        withSqliteTransaction(sqliteStore, () => {
+            setSqliteMetaMany(sqliteStore, { wiring_dirty: "0", graph_hash: graphHash });
+        });
+    }
     checkpointSqliteStore(outDir, "PASSIVE");
-    cleanupLegacyCacheFiles(outDir);
-    writeFingerprint(outDir, null, onlyDirs, root, extensions, preWalkDirMtimes, { configFiles: configFilesForFp, configHash });
+    if (!ctx.dbMeta.legacyCleaned) {
+        cleanupLegacyCacheFiles(outDir);
+        withSqliteTransaction(sqliteStore, () => setSqliteMeta(sqliteStore, "legacy_cleaned", "1"));
+    }
+    syncExtractStatsRevision(outDir);
+    const existingFp = readFingerprint(outDir);
+    const fpEntries = buildInMemoryFingerprintEntries(existingFp, extractRes.entries, mtimeUpdates, deletedPaths);
+    writeFingerprint(outDir, fpEntries, onlyDirs, root, extensions, preWalkDirMtimes, {
+        configFiles: configBundle.configFiles,
+        configContents: configBundle.configContents,
+        configSnapshots: configBundle.configSnapshots,
+        docSnapshots: docsBundle.docSnapshots,
+        configHash,
+    });
+    const graphPath = wiringPath(outDir);
+    setCachedPriorNodes(outDir, nextGraphVersion, nodes, nextNodePathById);
+    setCachedResolvedEnv(outDir, {
+        graphVersion: nextGraphVersion,
+        discoveredScopes: ctx.discoveredScopes,
+        scopes: ctx.scopes,
+        goModules: ctx.goModules,
+        tsConfigs: ctx.tsConfigs,
+        packageConfigs: ctx.packageConfigs,
+        ecoManifests: ctx.ecoManifests,
+        configBundle: ctx.configBundle,
+        docsBundle: ctx.docsBundle,
+        configHash,
+    });
+    if (sqlOnlyFast) {
+        return {
+            nodes,
+            edges: null,
+            nodeCount: fastCounts?.nodeCount ?? nodes.length,
+            edgeCount: fastCounts?.edgeCount ?? graph.meta.edgeCount,
+            byKind: fastCounts?.byKind ?? {},
+            byRelation: fastCounts?.byRelation ?? {},
+            graph,
+            graphPath,
+        };
+    }
     return { nodes, edges, graph, graphPath };
 }
 
@@ -831,11 +1435,19 @@ function collectFullBuildInputs(outDir, extractRes, cleanPaths) {
 }
 
 function runFullResolutionBuildPath(ctx) {
-    const { outDir, extractRes, cleanPaths, discoveredScopes, root, walked, goModules, tsConfigs, packageConfigs, sortedLanguages, sqliteStore, dbMeta, dirtyPaths, deletedPaths, onlyDirs, extensions, preWalkDirMtimes, errors } = ctx;
-    const { nodes, fullRawEdges, fullEntries } = collectFullBuildInputs(outDir, extractRes, cleanPaths);
+    const { outDir, graphOnly, extractRes, cleanPaths, discoveredScopes, root, walked, goModules, tsConfigs, packageConfigs, ecoManifests, configBundle, docsBundle, sortedLanguages, sqliteStore, dbMeta, dirtyPaths, deletedPaths, onlyDirs, extensions, preWalkDirMtimes, manifestMounts, errors } = ctx;
+    const { nodes: rawNodes, fullRawEdges, fullEntries } = collectFullBuildInputs(outDir, extractRes, cleanPaths);
+    const nodes = [...rawNodes].sort((a, b) => compareUtf16(a.id, b.id));
+    stampDependencyNodes(nodes, manifestMounts);
     const finalScopes = applyMinSubstanceGuard(discoveredScopes, nodes);
-    const finalConfigHash = resolverConfigHash(root, walked, finalScopes, goModules);
-    const edges = resolveEdges(nodes, fullRawEdges, { goModules, root, scopes: finalScopes, tsConfigs, packageConfigs });
+    const finalBundle = readResolverConfigBundle(root, walked, finalScopes, outDir, configBundle);
+    const finalConfigHash = resolverConfigHash(root, walked, finalScopes, goModules, { bundle: finalBundle, outDir });
+    const edges = resolveEdges(nodes, fullRawEdges, {
+        goModules, root, scopes: finalScopes, tsConfigs, packageConfigs, configFiles: finalBundle.configFiles,
+        dependencyPrefixes: manifestMounts?.dependencyPrefixes,
+        ...ecoManifests,
+    }).sort(edgeOrder);
+    const mountsMeta = buildManifestMountsMeta(manifestMounts);
     const graph = {
         meta: {
             version: 1,
@@ -844,75 +1456,190 @@ function runFullResolutionBuildPath(ctx) {
             languages: sortedLanguages,
             scopes: finalScopes,
             config_hash: finalConfigHash,
+            ...(mountsMeta ? { manifestMounts: mountsMeta } : {}),
         },
         nodes,
         edges,
     };
-    const graphPath = writeGraph(graph, outDir);
     const allDeps = buildSymbolDepsByPath(nodes, fullRawEdges, edges);
+    fullRawEdges.length = 0;
+    const compactFpEntries = {};
+    for (const [rel, entry] of Object.entries(fullEntries)) {
+        if (entry)
+            compactFpEntries[rel] = [entry.size ?? 0, entry.mtimeMs ?? 0, entry.hash ?? ""];
+    }
+    let nextGraphVersion = dbMeta.graphVersion;
     withSqliteTransaction(sqliteStore, () => {
-        writeExtractCache(outDir, { ...emptyExtractCache(), files: fullEntries });
         updateSymbolDepsInTx(sqliteStore, allDeps, true);
-        setSqliteMeta(sqliteStore, "config_hash", finalConfigHash);
+        allDeps.clear();
         try {
             writeAskIndex(outDir, graph, {
                 dirtyPaths: extractRes.mode === "sqlite" && dbMeta.vocabReady ? dirtyPaths : undefined,
                 deletedPaths: extractRes.mode === "sqlite" && dbMeta.vocabReady ? deletedPaths : undefined,
                 root,
+                alreadySorted: true,
+                docsDigest: docsBundle.docsDigest,
+                markdownDocs: docsBundle.markdownDocs,
             });
         }
         catch (err) {
             errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
         }
+        writeExtractCache(outDir, { ...emptyExtractCache(), files: fullEntries });
+        fullRawEdges.length = 0;
+        for (const k of Object.keys(fullEntries))
+            delete fullEntries[k];
+        nextGraphVersion = writeGraphToSqlite(sqliteStore, graph);
+        setSqliteMetaMany(sqliteStore, {
+            config_hash: finalConfigHash,
+            wiring_dirty: "1",
+            graph_hash: "",
+            rojo_lua_mode: manifestMounts?.hasRojoProject ? "1" : "0",
+        });
     });
+    const graphPath = wiringPath(outDir);
+    setCachedPriorNodes(outDir, nextGraphVersion, nodes);
+    setCachedResolvedEnv(outDir, {
+        graphVersion: nextGraphVersion,
+        discoveredScopes,
+        scopes: finalScopes,
+        goModules,
+        tsConfigs,
+        packageConfigs,
+        ecoManifests,
+        configBundle: finalBundle,
+        docsBundle,
+        configHash: finalConfigHash,
+    });
+    if (!graphOnly) {
+        const graphHash = writeGraphStreaming(graph, outDir, { alreadySorted: true });
+        withSqliteTransaction(sqliteStore, () => {
+            setSqliteMetaMany(sqliteStore, { wiring_dirty: "0", graph_hash: graphHash });
+        });
+    }
     checkpointSqliteStore(outDir, "PASSIVE");
-    cleanupLegacyCacheFiles(outDir);
-    writeFingerprint(outDir, fullEntries, onlyDirs, root, extensions, preWalkDirMtimes, {
-        configFiles: collectResolverConfigPaths(root, walked, finalScopes),
+    if (!dbMeta.legacyCleaned) {
+        cleanupLegacyCacheFiles(outDir);
+        withSqliteTransaction(sqliteStore, () => setSqliteMeta(sqliteStore, "legacy_cleaned", "1"));
+    }
+    syncExtractStatsRevision(outDir);
+    writeFingerprint(outDir, compactFpEntries, onlyDirs, root, extensions, preWalkDirMtimes, {
+        configFiles: finalBundle.configFiles,
+        configContents: finalBundle.configContents,
+        configSnapshots: finalBundle.configSnapshots,
+        docSnapshots: docsBundle.docSnapshots,
         configHash: finalConfigHash,
     });
     return { nodes, edges, graph, graphPath };
+}
+
+async function waitForBuildLock(cache, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if (acquireLockIn(cache))
+            return true;
+        if (Date.now() >= deadline)
+            return false;
+        await new Promise((r) => setTimeout(r, 25));
+    }
 }
 
 export async function buildGraph(dir, opts = {}) {
     const root = resolve(dir);
     const outDir = contextDirFor(root, opts.contextDir);
     const lockCache = join(outDir, CACHE_DIR);
-    const acquiredLock = opts._lockHeld ? false : acquireLockIn(lockCache);
+    const lockHolderPid = readJson(join(lockCache, ".sync.lock"))?.pid;
+    const heldBySelf = Boolean(opts._lockHeld) || lockHolderPid === process.pid;
+    const acquiredLock = heldBySelf ? false : await waitForBuildLock(lockCache, opts.lockTimeoutMs ?? 5000);
+    if (!heldBySelf && !acquiredLock) {
+        throw new Error(`timed out waiting for graph build lock: ${lockCache}`);
+    }
     try {
-        const preWalkDirMtimes = snapshotDirMtimes(root, outDir);
+        const preWalkDirMtimes = opts.dirMtimes && typeof opts.dirMtimes === "object"
+            ? opts.dirMtimes
+            : snapshotDirMtimes(root, outDir);
         const walkCfg = readWalkConfig(root, opts.contextDir);
-        const walked = walkDir(root, walkCfg.includeDirs, {
-            followSubmodules: walkCfg.followSubmodules,
-            followNestedRepos: walkCfg.followNestedRepos,
-        });
+        const walked = Array.isArray(opts.walked)
+            ? opts.walked
+            : walkDir(root, walkCfg.includeDirs, {
+                followSubmodules: walkCfg.followSubmodules,
+                followNestedRepos: walkCfg.followNestedRepos,
+            });
         const onlyDirs = opts.onlyDirs && opts.onlyDirs.length > 0 ? new Set(opts.onlyDirs) : undefined;
         const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
-        const files = listSourceStats(root, outDir, repoFiles, undefined, opts.extensions);
+        const files = Array.isArray(opts.sourceStats)
+            ? opts.sourceStats
+            : listSourceStats(root, outDir, repoFiles, undefined, opts.extensions);
         const currentPathSet = new Set(files.map((f) => f.rel));
-        const discoveredScopes = discoverScopes(root, repoFiles, opts.contextDir);
         const seed = opts.reuse === false ? { seeded: false } : seedGraph(root, { contextDir: opts.contextDir });
+        if (!opts.graphOnly) {
+            ensureGitignored(root, outDir);
+        }
 
         const extractRes = await extractSourceFilesIncremental(files, outDir, {
             reuse: opts.reuse,
             onProgress: opts.onProgress,
+            hasRojoProject: walkCfg.manifestMounts?.hasRojoProject,
+            rojoMountPrefixes: walkCfg.manifestMounts?.rojoMountPrefixes,
         });
         const { langs, errors, parsed, reused, mtimeDirty, dirtyPaths, deletedPaths, cleanPaths, mtimeUpdates } = extractRes;
-        const sortedLanguages = [...langs].sort();
-        const prior = (opts.reuse === false || Boolean(seed.from)) ? null : readGraph(wiringPath(outDir));
-
+        const sortedLanguages = [...langs].sort(compareUtf16);
         const sqliteStore = openSqliteStore(outDir, { create: true });
         const dbMeta = readBuildDbMeta(sqliteStore);
-        const docsDirty = dbMeta.docsHash !== computeMarkdownDocsDigest(root);
-        const scopeNodes = extractRes.mode === "sqlite"
-            ? [...(prior?.nodes ?? []).filter((n) => !dirtyPaths.has(n.path) && !deletedPaths.includes(n.path)), ...extractRes.nodes]
-            : extractRes.nodes;
-        const scopes = applyMinSubstanceGuard(discoveredScopes, scopeNodes);
-        const goModules = readGoModules(root, walked);
-        const tsConfigs = readTsConfigs(root, walked);
-        const packageConfigs = readPackageConfigs(root, walked);
-        const configFilesForFp = collectResolverConfigPaths(root, walked, scopes);
-        const configHash = resolverConfigHash(root, walked, scopes, goModules);
+        let prior = null;
+        if (opts.reuse !== false && !seed.from) {
+            const sqlMeta = readGraphMetaFromSqlite(sqliteStore);
+            if (sqlMeta) {
+                const cachedPrior = getCachedPriorNodes(outDir, sqliteStore, dbMeta.graphVersion);
+                prior = { meta: sqlMeta, nodes: cachedPrior.nodes, nodePathById: cachedPrior.nodePathById, edges: null };
+            }
+        }
+        const cachedEnv = resolvedEnvCache.get(resolve(outDir));
+        const canReuseResolvedEnv = Boolean(
+            opts.configsUnchanged &&
+            opts.docsUnchanged &&
+            opts.noFileAddRemove &&
+            opts.includeDocs !== false &&
+            prior &&
+            cachedEnv &&
+            cachedEnv.graphVersion === dbMeta.graphVersion &&
+            prior.meta?.config_hash === cachedEnv.configHash
+        );
+        let discoveredScopes;
+        let docsBundle;
+        let scopes;
+        let goModules;
+        let tsConfigs;
+        let packageConfigs;
+        let ecoManifests;
+        let configBundle;
+        let configHash;
+        if (canReuseResolvedEnv) {
+            discoveredScopes = cachedEnv.discoveredScopes;
+            docsBundle = cachedEnv.docsBundle;
+            scopes = cachedEnv.scopes;
+            goModules = cachedEnv.goModules;
+            tsConfigs = cachedEnv.tsConfigs;
+            packageConfigs = cachedEnv.packageConfigs;
+            ecoManifests = cachedEnv.ecoManifests;
+            configBundle = cachedEnv.configBundle;
+            configHash = cachedEnv.configHash;
+        }
+        else {
+            discoveredScopes = discoverScopes(root, repoFiles, opts.contextDir);
+            docsBundle = readMarkdownDocsBundle(root, opts.includeDocs);
+            const scopeNodes = extractRes.mode === "sqlite"
+                ? [...(prior?.nodes ?? []).filter((n) => !dirtyPaths.has(n.path) && !deletedPaths.includes(n.path)), ...extractRes.nodes]
+                : extractRes.nodes;
+            scopes = applyMinSubstanceGuard(discoveredScopes, scopeNodes);
+            goModules = readGoModules(root, walked);
+            tsConfigs = readTsConfigs(root, walked);
+            packageConfigs = readPackageConfigs(root, walked);
+            ecoManifests = readEcosystemManifests(root, walked);
+            configBundle = readResolverConfigBundle(root, walked, scopes, outDir);
+            configHash = resolverConfigHash(root, walked, scopes, goModules, { bundle: configBundle, outDir });
+        }
+        const docsDirty = dbMeta.docsHash !== docsBundle.docsDigest;
 
         const isSqliteUnchanged =
             opts.reuse !== false &&
@@ -927,9 +1654,12 @@ export async function buildGraph(dir, opts = {}) {
 
         const buildCtx = {
             root, outDir, walked, files, currentPathSet, discoveredScopes, scopes,
-            goModules, tsConfigs, packageConfigs, configFilesForFp, configHash,
+            goModules, tsConfigs, packageConfigs, ecoManifests, configBundle, docsBundle, configHash,
             preWalkDirMtimes, extractRes, sortedLanguages, prior, sqliteStore, dbMeta,
             docsDirty, mtimeDirty, dirtyPaths, deletedPaths, cleanPaths, mtimeUpdates,
+            graphOnly: Boolean(opts.graphOnly),
+            skipAggregateCounts: Boolean(opts.skipAggregateCounts),
+            manifestMounts: walkCfg.manifestMounts,
             reuse: opts.reuse, seedFrom: seed.from, onlyDirs: opts.onlyDirs, extensions: opts.extensions, errors,
         };
 
@@ -938,7 +1668,7 @@ export async function buildGraph(dir, opts = {}) {
             : (tryBuildDirtyConePath(buildCtx) ?? runFullResolutionBuildPath(buildCtx));
 
         const { cardsWritten, byKind, byRelation } = finalizeGraphBuildOutput(
-            root, outDir, opts, built.graph, built.nodes, built.edges, sortedLanguages,
+            root, outDir, opts, built, sortedLanguages,
         );
         return {
             contextDir: outDir,
@@ -948,8 +1678,8 @@ export async function buildGraph(dir, opts = {}) {
             parsed,
             reused,
             seededFrom: seed.from,
-            nodes: built.nodes.length,
-            edges: built.edges.length,
+            nodes: built.nodeCount ?? built.nodes.length,
+            edges: built.edgeCount ?? (built.edges?.length ?? 0),
             byKind,
             byRelation,
             languages: sortedLanguages,

@@ -12,9 +12,10 @@ import { extractLeadingSummary } from "./extract/ast.js";
 import { R_ASSIGN_OPS, R_RIGHT_ASSIGN_OPS, collectBindings, goReceiverTypeOf, goReceiverVarOf, phpClosureName, resolveRecvFactory, resolveRecvType } from "./bindings.js";
 import { collectShadowedLocals, sameSyntaxNode } from "./extract/shadow.js";
 import { cCppExported, isNodeExported, rustExported, tsDefaultExported } from "./extract/visibility.js";
-import { genericLangOf, loadWasmLanguage, parseWasm } from "./generic.js";
+import { DEPTH_EXTENSIONS as EXTENSIONS, depthExtensions, genericLangOf, languageLabelOf, languageOf } from "./languages.js";
+import { loadWasmLanguage, parseWasm } from "./generic.js";
 
-export { cCppExported, extractLeadingSummary, fileResidual, isNodeExported, mintId, rustExported, searchBody };
+export { cCppExported, depthExtensions, extractLeadingSummary, fileResidual, isNodeExported, languageLabelOf, languageOf, mintId, rustExported, searchBody };
 /**
  * Extension → the tree-sitter grammar that parses it, and the label a human expects
  * to see for it.
@@ -30,60 +31,21 @@ export { cCppExported, extractLeadingSummary, fileResidual, isNodeExported, mint
  * extraction and forget the label. Ordered longest-suffix-first: `.tsx` has to be
  * tested before `.ts` would match it.
  */
-const EXTENSIONS = [
-    { ext: ".tsx", grammar: "tsx", label: "tsx" },
-    { ext: ".jsx", grammar: "tsx", label: "jsx" },
-    { ext: ".mts", grammar: "typescript", label: "typescript" },
-    { ext: ".cts", grammar: "typescript", label: "typescript" },
-    { ext: ".ts", grammar: "typescript", label: "typescript" },
-    { ext: ".mjs", grammar: "typescript", label: "javascript" },
-    { ext: ".cjs", grammar: "typescript", label: "javascript" },
-    { ext: ".js", grammar: "typescript", label: "javascript" },
-    { ext: ".pyi", grammar: "python", label: "python" },
-    { ext: ".py", grammar: "python", label: "python" },
-    { ext: ".go", grammar: "go", label: "go" },
-    { ext: ".java", grammar: "java", label: "java" },
-    { ext: ".kt", grammar: "kotlin", label: "kotlin" },
-    { ext: ".kts", grammar: "kotlin", label: "kotlin" },
-    { ext: ".swift", grammar: "swift", label: "swift" },
-    { ext: ".php", grammar: "php", label: "php" },
-    // `entryFor` lower-cases the path before matching, so this one entry covers
-    // both `.R` (the conventional case in real R codebases) and `.r`.
-    { ext: ".r", grammar: "r", label: "r" },
-];
-function entryFor(path) {
-    const p = path.toLowerCase();
-    return EXTENSIONS.find((e) => p.endsWith(e.ext));
-}
-/** Every file extension a depth-tier (hand-written) extractor claims. */
-export function depthExtensions() {
-    return EXTENSIONS.map((e) => e.ext);
-}
-/** Map a file path to a supported language, or null if unsupported. */
-export function languageOf(path) {
-    return entryFor(path)?.grammar ?? null;
-}
-/**
- * What to *call* the language of this file, for a banner or a repo map — or null when
- * the file isn't indexed at all, which is the distinction {@link languageOf} shares
- * and the one that matters to a reader checking coverage.
- */
-export function languageLabelOf(path) {
-    const p = path.toLowerCase();
-    const containerLabel = p.endsWith(".vue") ? "vue" : p.endsWith(".svelte") ? "svelte" : p.endsWith(".astro") ? "astro" : null;
-    return entryFor(path)?.label ?? containerLabel ?? genericLangOf(path)?.name ?? null;
-}
+// Depth extension tables moved to ./languages.js (re-exported above for compatibility).
 const TS_KINDS = {
     class_declaration: "class",
     abstract_class_declaration: "class",
     function_declaration: "function",
     generator_function_declaration: "function",
+    function_signature: "function",
     method_definition: "method",
     method_signature: "method",
     abstract_method_signature: "method",
     interface_declaration: "interface",
     type_alias_declaration: "type",
     enum_declaration: "enum",
+    internal_module: "module",
+    module_declaration: "module",
 };
 const PY_KINDS = {
     class_definition: "class",
@@ -183,11 +145,11 @@ const KINDS_BY_LANG = {
  * call, never a single `call_expression`.
  */
 const CALL_TYPES = {
-    typescript: new Set(["call_expression"]),
-    tsx: new Set(["call_expression"]),
+    typescript: new Set(["call_expression", "new_expression"]),
+    tsx: new Set(["call_expression", "new_expression"]),
     python: new Set(["call"]),
     go: new Set(["call_expression"]),
-    java: new Set(["method_invocation", "object_creation_expression"]),
+    java: new Set(["method_invocation", "object_creation_expression", "method_reference", "explicit_constructor_invocation"]),
     kotlin: new Set(["call_expression"]),
     swift: new Set(["call_expression"]),
     php: new Set([
@@ -195,6 +157,7 @@ const CALL_TYPES = {
         "member_call_expression",
         "nullsafe_member_call_expression",
         "scoped_call_expression",
+        "object_creation_expression",
     ]),
     r: new Set(["call"]),
 };
@@ -217,7 +180,7 @@ export async function warmDepthGrammars(langs = EXTENSIONS.map((e) => e.grammar)
             DEPTH_GRAMMARS.set(lang, language);
     }));
 }
-export function extractFile(rel, source, lang = languageOf(rel)) {
+export function extractFile(rel, source, lang = languageOf(rel), opts = null) {
     const grammar = DEPTH_GRAMMARS.get(lang);
     const root = grammar ? parseWasm(grammar, source) : null;
     if (!root) {
@@ -244,7 +207,12 @@ export function extractFile(rel, source, lang = languageOf(rel)) {
     }
     const bindings = collectBindings(root, lang);
     const importedSymbols = collectImportedSymbols(root, lang);
+    if (opts?.includeImportedSymbols instanceof Map) {
+        for (const [k, v] of importedSymbols)
+            opts.includeImportedSymbols.set(k, v);
+    }
     const rGenerics = lang === "r" ? collectRGenerics(root) : EMPTY_SET;
+    const pyAllExports = lang === "python" ? collectPythonAllExports(root) : EMPTY_SET;
     const nodes = [
         {
             id: rel,
@@ -277,6 +245,7 @@ export function extractFile(rel, source, lang = languageOf(rel)) {
         enclosingClass: null,
         goReceiverVar: null,
         importedSymbols,
+        pyAllExports,
         shadowedNames: EMPTY_SET,
         nonCallableShadows: EMPTY_SET,
         defaultExportNames: new Set(),
@@ -419,18 +388,89 @@ function deriveChildShadows(node, desc, ctx) {
     return { importedSymbols, shadowedNames, nonCallableShadows };
 }
 
+function firstClassSuperName(node, lang) {
+    if (lang === "r")
+        return rR6ParentClass(node);
+    if (lang === "swift")
+        return swiftSuperClassName(node);
+    if (lang === "python") {
+        const sc = node.childForFieldName("superclasses")?.namedChildren.find((c) => c.type === "identifier" || c.type === "attribute" || c.type === "subscript");
+        if (sc?.type === "subscript") {
+            const v = sc.childForFieldName("value");
+            return v?.type === "attribute" ? (v.childForFieldName("attribute")?.text ?? null) : (v?.text ?? null);
+        }
+        return sc?.type === "attribute" ? (sc.childForFieldName("attribute")?.text ?? null) : (sc?.text ?? null);
+    }
+    if (lang === "typescript" || lang === "tsx") {
+        const ext = node.namedChildren.find((c) => c.type === "class_heritage")?.namedChildren.find((c) => c.type === "extends_clause");
+        const first = ext?.namedChildren[0];
+        const base = first?.type === "generic_type" ? first.childForFieldName("name") : first;
+        return base?.type === "member_expression" ? (base.childForFieldName("property")?.text ?? null) : (base?.text ?? null);
+    }
+    if (lang === "java") {
+        const sup = node.namedChildren.find((c) => c.type === "superclass");
+        const first = sup?.namedChildren[0];
+        return first ? javaSupertypeName(first) : null;
+    }
+    if (lang === "kotlin") {
+        const ds = node.namedChildren.find((c) => c.type === "delegation_specifier");
+        const ci = ds?.namedChildren.find((c) => c.type === "constructor_invocation");
+        const ut = (ci ?? ds)?.namedChildren.find((c) => c.type === "user_type");
+        return ut?.namedChildren.filter((c) => c.type === "type_identifier").at(-1)?.text ?? null;
+    }
+    if (lang === "php") {
+        const bc = node.namedChildren.find((c) => c.type === "base_clause")?.namedChildren[0];
+        return bc ? bc.text.replace(/^.*\\/, "") : null;
+    }
+    return null;
+}
+function tsDecoratorReferenceEdges(node, sourceId, ctx) {
+    const edges = [];
+    const decorators = [];
+    for (const c of node.namedChildren) {
+        if (c.type === "decorator")
+            decorators.push(c);
+    }
+    if (node.parent?.type === "export_statement") {
+        for (const c of node.parent.namedChildren) {
+            if (c.type === "decorator")
+                decorators.push(c);
+        }
+    }
+    for (let prev = node.previousNamedSibling; prev?.type === "decorator"; prev = prev.previousNamedSibling)
+        decorators.push(prev);
+    for (const c of decorators) {
+        const expr = c.namedChildren[0];
+        const fn = expr?.type === "call_expression" ? expr.childForFieldName("function") : expr;
+        const name = fn?.type === "identifier"
+            ? fn.text
+            : fn?.type === "member_expression" ? fn.childForFieldName("property")?.text : null;
+        if (name) {
+            const imp = ctx.importedSymbols.get(name);
+            edges.push({
+                source: sourceId,
+                relation: "references",
+                name: imp ? (imp.isDefault ? name : imp.name) : name,
+                ...(imp?.specifier ? { specifier: imp.specifier } : {}),
+                file: ctx.rel,
+            });
+        }
+    }
+    return edges;
+}
 function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
     const idPart = desc.idName ?? desc.name;
     const base = `${ctx.rel}#${[...ctx.scope, idPart].join(".")}`;
     const id = mintId(base, minted);
     const isGoMethod = ctx.lang === "go" && node.type === "method_declaration";
-    const owner = desc.kind === "method"
+    const owner = (desc.kind === "method" || desc.kind === "field")
         ? (isGoMethod ? (goReceiverTypeOf(node) ?? undefined) : (desc.owner ?? ctx.enclosingClass ?? undefined))
         : undefined;
     const nodeText = desc.hashNode.text;
     const isTsOrTsx = ctx.lang === "typescript" || ctx.lang === "tsx";
-    const isDefaultExp = isTsOrTsx && tsDefaultExported(node);
+    const isDefaultExp = Boolean(desc.isDefaultExport) || (isTsOrTsx && tsDefaultExported(node));
     const returnType = ctx.bindings.getNodeReturnType?.(node);
+    const exported = typeof desc.exported === "boolean" ? desc.exported : (isDefaultExp || isNodeExported(node, desc.name, ctx));
     out.push({
         id,
         name: desc.name,
@@ -438,12 +478,12 @@ function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
         path: ctx.rel,
         span: `L${desc.hashNode.startPosition.row + 1}-L${desc.hashNode.endPosition.row + 1}`,
         signature: clean(ctx.source.slice(desc.hashNode.startIndex, desc.headerEnd)),
-        exported: isDefaultExp || isNodeExported(node, desc.name, ctx),
+        exported,
         origin: "ast",
         body_hash: contentHash(nodeText),
         body_text: searchBody(nodeText),
         summary_state: "pending",
-        summary: extractLeadingSummary(ctx.lines, desc.hashNode.startPosition.row, ctx.lang === "python" ? nodeText : ""),
+        summary: extractLeadingSummary(ctx.lines, desc.hashNode.startPosition.row, ctx.lang === "python" ? nodeText : "", ctx.lang),
         crux: null,
         ...(owner !== undefined ? { owner } : {}),
         ...(desc.arity !== undefined ? { arity: desc.arity } : {}),
@@ -455,13 +495,15 @@ function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
     const javaTypeDecl = ctx.lang === "java" && JAVA_TYPE_KINDS.has(desc.kind);
     const kotlinTypeDecl = ctx.lang === "kotlin" && KOTLIN_TYPE_KINDS.has(desc.kind);
     const swiftTypeDecl = ctx.lang === "swift" && SWIFT_TYPE_KINDS.has(desc.kind);
-    if (desc.kind === "class" || desc.kind === "interface" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
+    if (desc.kind === "class" || desc.kind === "interface" || desc.kind === "struct" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
         edges.push(...heritageEdges(node, id, ctx));
+    if (isTsOrTsx)
+        edges.push(...tsDecoratorReferenceEdges(node, id, ctx));
     if (ctx.lang === "php")
         edges.push(...phpAttributeReferenceEdges(node, id, ctx));
     if (ctx.lang === "java")
         edges.push(...javaAnnotationReferenceEdges(node, id, ctx));
-    const enclosingClass = desc.kind === "class" || desc.kind === "interface" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl
+    const enclosingClass = desc.kind === "class" || desc.kind === "interface" || desc.kind === "struct" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl
         ? desc.name
         : isGoMethod
             ? goReceiverTypeOf(node)
@@ -476,15 +518,43 @@ function emitExtractedDefNode(node, desc, ctx, out, edges, minted) {
         goReceiverVar: isGoMethod ? goReceiverVarOf(node) : ctx.goReceiverVar,
         ...shadowState,
         rR6Access: null,
-        rSuperClass: desc.kind === "class"
-            ? ctx.lang === "r"
-                ? rR6ParentClass(node)
-                : ctx.lang === "swift"
-                    ? swiftSuperClassName(node)
-                    : null
+        rSuperClass: (desc.kind === "class" || desc.kind === "struct")
+            ? firstClassSuperName(node, ctx.lang)
             : ctx.rSuperClass,
     };
     walkNamedChildren(node.namedChildren, childCtx, out, edges, minted);
+    if (ctx.lang === "kotlin" && (desc.kind === "class" || desc.kind === "struct")) {
+        const pc = node.namedChildren.find((c) => c.type === "primary_constructor");
+        if (pc) {
+            for (const cp of pc.namedChildren) {
+                if (cp.type !== "class_parameter")
+                    continue;
+                if (!cp.children?.some((k) => k.type === "val" || k.type === "var" || k.text === "val" || k.text === "var"))
+                    continue;
+                const pName = cp.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+                if (pName) {
+                    const pId = mintId(`${ctx.rel}#${[...childCtx.scope, pName].join(".")}`, minted);
+                    out.push({
+                        id: pId,
+                        name: pName,
+                        kind: "field",
+                        path: ctx.rel,
+                        span: `L${cp.startPosition.row + 1}-L${cp.endPosition.row + 1}`,
+                        signature: clean(cp.text),
+                        exported: true,
+                        origin: "ast",
+                        body_hash: contentHash(cp.text),
+                        body_text: searchBody(cp.text),
+                        summary_state: "pending",
+                        summary: null,
+                        crux: null,
+                        owner: desc.name,
+                    });
+                    edges.push({ source: id, relation: "contains", targetId: pId, file: ctx.rel });
+                }
+            }
+        }
+    }
 }
 function resolveCallFactoryMeta(recvFactory, ctx) {
     if (!recvFactory)
@@ -562,10 +632,13 @@ function buildExtractedCallEdge(node, callee, recvType, ctx) {
 function emitExtractedCallEdge(node, ctx, edges) {
     const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
     const isConsumedRClassCall = consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
-    const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
+    let callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
     if (!callee || (!callee.viaMember && ctx.nonCallableShadows?.has(callee.name)))
         return;
-    const recvType = callee.viaMember ? resolveRecvType(callee.receiver, ctx) : undefined;
+    let recvType = callee.viaMember ? resolveRecvType(callee.receiver, ctx) : undefined;
+    if (ctx.lang === "r" && callee.rBoundRecv && !recvType) {
+        callee = { ...callee, viaMember: false, receiver: undefined };
+    }
     const callEdge = buildExtractedCallEdge(node, callee, recvType, ctx);
     const swiftImplicitSelf = ctx.lang === "swift" && !callee.viaMember && !callee.kinds && ctx.enclosingClass && !/^[A-Z]/.test(callee.name);
     if (swiftImplicitSelf) {
@@ -642,12 +715,16 @@ function emitImportNodeEdges(node, ctx, edges) {
         file: ctx.rel,
         ...(typeOnly ? { typeOnly: true } : {}),
     });
-    if (
-        ctx.lang === "python" &&
-        node.type === "import_from_statement" &&
-        (ctx.rel === "__init__.py" || ctx.rel.endsWith("/__init__.py"))
-    ) {
-        emitPythonInitReexports(node, spec, ctx, edges);
+    if (ctx.lang === "python" && node.type === "import_from_statement") {
+        const isInitPy = ctx.rel === "__init__.py" || ctx.rel.endsWith("/__init__.py");
+        if (isInitPy || (ctx.pyAllExports && ctx.pyAllExports.size > 0)) {
+            emitPythonInitReexports(node, spec, ctx, edges, !isInitPy);
+        }
+        else if (/^\.+$/.test(spec)) {
+            for (const item of pythonFromImportItems(node)) {
+                edges.push({ source: ctx.rel, relation: "imports", specifier: `${spec}${item.name}`, file: ctx.rel });
+            }
+        }
     }
 }
 
@@ -704,6 +781,109 @@ function emitImportedIdentifierRefEdge(node, callTypes, ctx, edges) {
     });
 }
 
+function emitMemberReferenceEdge(node, ctx, edges) {
+    const isPyAttr = ctx.lang === "python" && node.type === "attribute";
+    const isTsMember = (ctx.lang === "typescript" || ctx.lang === "tsx") && node.type === "member_expression";
+    if (!isPyAttr && !isTsMember)
+        return;
+    const parent = node.parent;
+    if (isPyAttr && parent?.type === "call" && parent.childForFieldName("function")?.id === node.id)
+        return;
+    if (isPyAttr && parent?.type === "assignment" && parent.childForFieldName("left")?.id === node.id)
+        return;
+    if (isTsMember && parent?.type === "call_expression" && parent.childForFieldName("function")?.id === node.id)
+        return;
+    if (isTsMember && parent?.type === "assignment_expression" && parent.childForFieldName("left")?.id === node.id)
+        return;
+    const propNode = isPyAttr
+        ? (node.childForFieldName("attribute") ?? node.namedChildren.at(-1))
+        : node.childForFieldName("property");
+    const name = propNode?.type === (isPyAttr ? "identifier" : "property_identifier") ? propNode.text : null;
+    if (!name || (isPyAttr && name.startsWith("__") && name.endsWith("__")))
+        return;
+    const receiver = isPyAttr
+        ? memberCallReceiver(node, "attribute", "attribute", "self", false)
+        : memberCallReceiver(node, "member_expression", "property", "this", true);
+    if (!receiver)
+        return;
+    const recvType = resolveRecvType(receiver, ctx);
+    const recvDefaultImp = recvType ? ctx.importedSymbols.get(recvType) : undefined;
+    const recvFactory = !recvType ? resolveRecvFactory(receiver, ctx) : undefined;
+    const { factoryName, factorySpec, factoryOwner, factoryIsDefault } = resolveCallFactoryMeta(recvFactory, ctx);
+    const { nsImported, nsSpec, nsFallbackSpec, subModule } = resolveCallNamespaceMeta({ viaMember: true, receiver }, recvType, ctx);
+    if (!recvType && !factoryName && !nsSpec)
+        return;
+    edges.push({
+        source: ctx.parentId,
+        relation: "references",
+        name,
+        viaMember: true,
+        file: ctx.rel,
+        ...(recvType ? { recvType } : {}),
+        ...(recvDefaultImp?.isDefault ? { recvSpecifier: recvDefaultImp.specifier, recvIsDefault: true } : {}),
+        ...(nsSpec ? { specifier: nsSpec } : {}),
+        ...(nsFallbackSpec ? { fallbackSpecifier: nsFallbackSpec } : {}),
+        ...(subModule ? { subModule } : {}),
+        ...(factoryName ? { factoryName } : {}),
+        ...(factorySpec ? { factorySpecifier: factorySpec } : {}),
+        ...(factoryOwner ? { factoryOwner } : {}),
+        ...(factoryIsDefault ? { factoryIsDefault: true } : {}),
+        ...(nsImported?.typeOnly ? { typeOnly: true } : {}),
+    });
+}
+
+function emitJsxAndDecoratorRefs(node, ctx, edges) {
+    if (node.type === "jsx_opening_element" || node.type === "jsx_self_closing_element") {
+        const nameNode = node.childForFieldName("name");
+        if (nameNode?.type === "identifier" && /^[A-Z]/.test(nameNode.text)) {
+            const imp = ctx.importedSymbols.get(nameNode.text);
+            edges.push({
+                source: ctx.parentId,
+                relation: "references",
+                name: imp ? (imp.isDefault ? nameNode.text : imp.name) : nameNode.text,
+                ...(imp?.specifier ? { specifier: imp.specifier } : {}),
+                ...(imp?.isDefault ? { isDefault: true } : {}),
+                file: ctx.rel,
+            });
+        }
+        else if (nameNode?.type === "member_expression") {
+            const obj = nameNode.childForFieldName("object");
+            const prop = nameNode.childForFieldName("property");
+            if (obj?.type === "identifier" && prop) {
+                const imp = ctx.importedSymbols.get(obj.text);
+                edges.push({
+                    source: ctx.parentId,
+                    relation: "references",
+                    name: prop.text,
+                    ...(imp?.specifier ? { specifier: imp.specifier } : {}),
+                    file: ctx.rel,
+                });
+            }
+        }
+        return true;
+    }
+    if (node.type === "type_arguments") {
+        const walkTypes = (t) => {
+            if (t.type === "type_identifier" && (t.text.length > 1 || ctx.importedSymbols.has(t.text))) {
+                const imp = ctx.importedSymbols.get(t.text);
+                edges.push({
+                    source: ctx.parentId,
+                    relation: "references",
+                    name: imp ? (imp.isDefault ? t.text : imp.name) : t.text,
+                    ...(imp?.specifier ? { specifier: imp.specifier } : {}),
+                    ...(imp?.isDefault ? { isDefault: true } : {}),
+                    file: ctx.rel,
+                });
+            }
+            for (const c of t.namedChildren)
+                walkTypes(c);
+        };
+        walkTypes(node);
+        return true;
+    }
+    return false;
+}
+
 function emitStatementOrExprEdges(node, ctx, edges) {
     const callTypes = CALL_TYPES[ctx.lang];
     const isTsOrTsx = ctx.lang === "typescript" || ctx.lang === "tsx";
@@ -711,14 +891,80 @@ function emitStatementOrExprEdges(node, ctx, edges) {
         emitTsExportEdges(node, ctx, edges);
         return;
     }
+    if (isTsOrTsx && node.type === "assignment_expression" && ctx.enclosingKind === null) {
+        const left = node.childForFieldName("left");
+        const right = node.childForFieldName("right");
+        if (left?.type === "member_expression" && left.text === "module.exports") {
+            if (right?.type === "identifier") {
+                ctx.defaultExportNames.add(right.text);
+                const imp = ctx.importedSymbols.get(right.text);
+                if (imp?.specifier) {
+                    edges.push({
+                        source: ctx.rel,
+                        relation: "reexports",
+                        specifier: imp.specifier,
+                        exportedName: "default",
+                        localName: imp.isDefault ? right.text : imp.name,
+                        ...(imp.isDefault ? { isDefault: true } : {}),
+                        file: ctx.rel,
+                    });
+                }
+            }
+            else if (right?.type === "object") {
+                for (const p of right.namedChildren) {
+                    let expName = null;
+                    let localId = null;
+                    if (p.type === "shorthand_property_identifier") {
+                        expName = p.text;
+                        localId = p.text;
+                    }
+                    else if (p.type === "pair") {
+                        expName = p.childForFieldName("key")?.text?.replace(/^['"]|['"]$/g, "") ?? null;
+                        const val = p.childForFieldName("value");
+                        if (val?.type === "identifier")
+                            localId = val.text;
+                    }
+                    if (!localId)
+                        continue;
+                    ctx.defaultExportNames.add(localId);
+                    const imp = ctx.importedSymbols.get(localId);
+                    if (imp?.specifier) {
+                        edges.push({
+                            source: ctx.rel,
+                            relation: "reexports",
+                            specifier: imp.specifier,
+                            exportedName: expName ?? localId,
+                            localName: imp.isDefault ? localId : imp.name,
+                            ...(imp.isDefault ? { isDefault: true } : {}),
+                            file: ctx.rel,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if (isTsOrTsx && emitJsxAndDecoratorRefs(node, ctx, edges))
+        return;
     if (callTypes.has(node.type)) {
         if (isTsOrTsx && node.type === "call_expression")
             emitTsDynamicImportEdges(node, ctx, edges);
+        if (ctx.lang === "php" && (node.type === "include_expression" || node.type === "include_once_expression" ||
+            node.type === "require_expression" || node.type === "require_once_expression")) {
+            emitImportNodeEdges(node, ctx, edges);
+            return;
+        }
         emitExtractedCallEdge(node, ctx, edges);
+        return;
+    }
+    if (ctx.lang === "php" && (node.type === "include_expression" || node.type === "include_once_expression" ||
+        node.type === "require_expression" || node.type === "require_once_expression")) {
+        emitImportNodeEdges(node, ctx, edges);
         return;
     }
     if (node.type === "identifier")
         emitImportedIdentifierRefEdge(node, callTypes, ctx, edges);
+    else
+        emitMemberReferenceEdge(node, ctx, edges);
 }
 
 function walk(node, ctx, out, edges, minted) {
@@ -748,6 +994,67 @@ function walk(node, ctx, out, edges, minted) {
     for (const child of node.namedChildren)
         walk(child, ctx, out, edges, minted);
 }
+function collectJavaImportedSymbols(root) {
+    const out = new Map();
+    const visitJavaNode = (node) => {
+        if (node.type === "import_declaration") {
+            const id = node.namedChildren.find((c) => c.type === "scoped_identifier" || c.type === "identifier")?.text;
+            const hasStar = node.children?.some((c) => c.type === "asterisk" || c.type === "*");
+            if (id && !hasStar) {
+                const name = id.split(".").pop();
+                if (name)
+                    out.set(name, { name, specifier: id });
+            }
+            return;
+        }
+        for (const child of node.namedChildren)
+            visitJavaNode(child);
+    };
+    visitJavaNode(root);
+    return out;
+}
+function collectKotlinImportedSymbols(root) {
+    const out = new Map();
+    const visitKotlinNode = (node) => {
+        if (node.type === "import_header") {
+            const id = node.namedChildren.find((c) => c.type === "identifier")?.text;
+            const hasStar = node.children?.some((c) => c.type === "*");
+            const alias = node.namedChildren.find((c) => c.type === "import_alias")
+                ?.namedChildren.find((c) => c.type === "type_identifier")?.text;
+            if (id && !hasStar) {
+                const orig = id.split(".").pop();
+                if (orig)
+                    out.set(alias || orig, { name: orig, specifier: id });
+            }
+            return;
+        }
+        for (const child of node.namedChildren)
+            visitKotlinNode(child);
+    };
+    visitKotlinNode(root);
+    return out;
+}
+function collectPythonAllExports(root) {
+    const names = new Set();
+    for (const stmt of root.namedChildren) {
+        const assign = stmt.type === "expression_statement" ? stmt.namedChildren[0] : stmt;
+        if (assign?.type !== "assignment")
+            continue;
+        if (assign.childForFieldName("left")?.text !== "__all__")
+            continue;
+        const rhs = assign.childForFieldName("right");
+        if (rhs?.type !== "list" && rhs?.type !== "tuple")
+            continue;
+        for (const el of rhs.namedChildren) {
+            if (el.type === "string") {
+                const sc = el.namedChildren.find((c) => c.type === "string_content")?.text ?? el.text.replace(/^['"]|['"]$/g, "");
+                if (sc)
+                    names.add(sc);
+            }
+        }
+    }
+    return names;
+}
 /**
  * Named imports whose local binding can be recognized later as a symbol use.
  * Namespace/default imports are intentionally excluded: they do not tell us
@@ -765,6 +1072,15 @@ function collectImportedSymbols(root, lang) {
                 collectTsImportBindings(node, specifier, out, stmtTypeOnly);
                 return;
             }
+            if (node.type === "import_alias") {
+                const alias = node.namedChildren[0]?.type === "identifier" ? node.namedChildren[0].text : null;
+                const reqClause = node.namedChildren.find((c) => c.type === "import_require_clause");
+                const str = reqClause?.namedChildren.find((c) => c.type === "string");
+                const spec = str ? (str.namedChildren.find((c) => c.type === "string_fragment")?.text ?? str.text.replace(/^['"]|['"]$/g, "")) : null;
+                if (alias && spec)
+                    out.set(alias, { name: "default", local: alias, specifier: spec, isDefault: true });
+                return;
+            }
             if (node.type === "variable_declarator") {
                 collectTsRequireBindings(node, out);
             }
@@ -780,6 +1096,10 @@ function collectImportedSymbols(root, lang) {
         return collectGoImportedPackages(root);
     if (lang === "php")
         return collectPhpImportedSymbols(root);
+    if (lang === "java")
+        return collectJavaImportedSymbols(root);
+    if (lang === "kotlin")
+        return collectKotlinImportedSymbols(root);
     return new Map();
 }
 function collectGoImportedPackages(root) {
@@ -814,8 +1134,11 @@ function collectPythonImportedSymbols(root) {
                     if (orig && alias)
                         out.set(alias, { specifier: orig, isNamespace: true });
                 }
-                else if (child.type === "dotted_name" && !child.text.includes(".")) {
+                else if (child.type === "dotted_name") {
+                    const rootPkg = child.text.split(".")[0];
                     out.set(child.text, { specifier: child.text, isNamespace: true });
+                    if (rootPkg && !out.has(rootPkg))
+                        out.set(rootPkg, { specifier: child.text, isNamespace: true });
                 }
             }
             return;
@@ -855,8 +1178,8 @@ function pythonFromImportItems(node) {
     }
     return items;
 }
-function emitPythonInitReexports(node, spec, ctx, edges) {
-    if (node.namedChildren.some((c) => c.type === "wildcard_import")) {
+function emitPythonInitReexports(node, spec, ctx, edges, filterByAll = false) {
+    if (!filterByAll && node.namedChildren.some((c) => c.type === "wildcard_import")) {
         edges.push({
             source: ctx.rel,
             relation: "reexports",
@@ -867,6 +1190,8 @@ function emitPythonInitReexports(node, spec, ctx, edges) {
         return;
     }
     for (const item of pythonFromImportItems(node)) {
+        if (filterByAll && !ctx.pyAllExports?.has(item.local))
+            continue;
         const effectiveSpec = /^\.+$/.test(spec) ? `${spec}${item.name}` : spec;
         edges.push({
             source: ctx.rel,
@@ -1127,16 +1452,25 @@ function collectTsObjectRequireProps(nameNode, specifier, out) {
     }
 }
 function collectTsRequireBindings(node, out) {
-    const call = unwrapCallExpression(node.childForFieldName("value"));
+    let value = node.childForFieldName("value");
+    let memberProp = null;
+    if (value?.type === "member_expression") {
+        memberProp = value.childForFieldName("property")?.text ?? null;
+        value = value.childForFieldName("object");
+    }
+    const call = unwrapCallExpression(value);
     const specifier = call ? tsCallImportSpecifier(call) : null;
     const nameNode = specifier ? node.childForFieldName("name") : null;
     if (!nameNode)
         return;
     if (nameNode.type === "identifier") {
-        out.set(nameNode.text, { name: "default", local: nameNode.text, specifier, isDefault: true });
+        if (memberProp)
+            out.set(nameNode.text, { name: memberProp, local: nameNode.text, specifier });
+        else
+            out.set(nameNode.text, { name: "default", local: nameNode.text, specifier, isDefault: true });
         return;
     }
-    if (nameNode.type === "object_pattern")
+    if (nameNode.type === "object_pattern" && !memberProp)
         collectTsObjectRequireProps(nameNode, specifier, out);
 }
 function emitTsExternalExportEdges(node, spec, exportClause, specifiers, isExportType, ctx, edges) {
@@ -1160,8 +1494,12 @@ function emitTsExternalExportEdges(node, spec, exportClause, specifiers, isExpor
                 });
             }
         }
+        return;
     }
     const nsExport = node.namedChildren.find((c) => c.type === "namespace_export");
+    const hasStar = Boolean(nsExport) || node.children.some((c) => c.type === "*");
+    if (!hasStar)
+        return;
     const nsName = nsExport
         ? (nsExport.namedChildren.find((c) => c.type === "identifier")?.text ?? nsExport.text.replace(/^\*\s+as\s+/, "").trim())
         : null;
@@ -1248,6 +1586,10 @@ function isDirectCallee(node, callTypes) {
 /** Definition/declaration identifiers name a new binding; they do not use one. */
 function isDeclarationName(node) {
     const parent = node.parent;
+    if (parent?.type === "jsx_opening_element" ||
+        parent?.type === "jsx_self_closing_element" ||
+        parent?.type === "jsx_closing_element")
+        return false;
     if (parent?.type === "export_specifier" ||
         parent?.type === "import_specifier" ||
         parent?.type === "namespace_export" ||
@@ -1273,32 +1615,109 @@ function describeTsDefaultExport(node) {
     const body = node.childForFieldName("body");
     return { name: "default", kind: isClass ? "class" : "function", headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
 }
-function describeTsAssignedFn(node) {
+function unwrapTsReactHocFn(value) {
+    if (!value)
+        return null;
+    if (FUNCTION_VALUE_TYPES.has(value.type))
+        return value;
+    if (value.type !== "call_expression")
+        return null;
+    const fn = value.childForFieldName("function");
+    const fnName = fn?.type === "identifier"
+        ? fn.text
+        : fn?.type === "member_expression" ? fn.childForFieldName("property")?.text : null;
+    if (fnName !== "memo" && fnName !== "forwardRef")
+        return null;
+    const firstArg = value.childForFieldName("arguments")?.namedChildren[0];
+    return firstArg && FUNCTION_VALUE_TYPES.has(firstArg.type) ? firstArg : unwrapTsReactHocFn(firstArg);
+}
+function describeTsAssignedFn(node, ctx) {
     if (node.type === "variable_declarator") {
         const value = node.childForFieldName("value");
-        const name = value && FUNCTION_VALUE_TYPES.has(value.type) ? node.childForFieldName("name")?.text : null;
+        const fnVal = unwrapTsReactHocFn(value);
+        const name = fnVal ? node.childForFieldName("name")?.text : null;
+        if (name && fnVal) {
+            const vbody = fnVal.childForFieldName("body");
+            return { name, kind: "function", headerEnd: vbody ? vbody.startIndex : node.endIndex, hashNode: node };
+        }
+        const declName = node.childForFieldName("name")?.text;
+        const expStmt = node.parent?.parent;
+        const reqCall = value ? unwrapCallExpression(value) : null;
+        if (declName && expStmt?.type === "export_statement" && (!reqCall || !tsCallImportSpecifier(reqCall))) {
+            return {
+                name: declName,
+                kind: /^[A-Z][A-Z0-9_]*$/.test(declName) ? "constant" : "variable",
+                headerEnd: value ? value.startIndex : node.endIndex,
+                hashNode: node,
+                exported: true,
+            };
+        }
+        return null;
+    }
+    if (node.type === "public_field_definition") {
+        const value = node.childForFieldName("value");
+        const name = node.childForFieldName("name")?.text;
         if (!name)
             return null;
-        const vbody = value.childForFieldName("body");
-        return { name, kind: "function", headerEnd: vbody ? vbody.startIndex : node.endIndex, hashNode: node };
+        if (value && FUNCTION_VALUE_TYPES.has(value.type)) {
+            const vbody = value.childForFieldName("body");
+            return { name, kind: "method", headerEnd: vbody ? vbody.startIndex : node.endIndex, hashNode: node };
+        }
+        if (ctx.enclosingClass && (value || node.childForFieldName("type"))) {
+            return { name, kind: "field", headerEnd: value ? value.startIndex : node.endIndex, hashNode: node, owner: ctx.enclosingClass };
+        }
+        return null;
     }
     if (node.type !== "assignment_expression")
         return null;
     const left = node.childForFieldName("left");
     const right = node.childForFieldName("right");
-    if (left?.type !== "member_expression" || !right || !FUNCTION_VALUE_TYPES.has(right.type))
+    if (left?.type !== "member_expression" || !right)
         return null;
+    if (left.text === "module.exports") {
+        const isFnOrClass = FUNCTION_VALUE_TYPES.has(right.type) ||
+            right.type === "class" ||
+            right.type === "class_declaration" ||
+            right.type === "function_declaration" ||
+            right.type === "generator_function_declaration";
+        if (!isFnOrClass)
+            return null;
+        const isClass = right.type === "class" || right.type === "class_declaration";
+        const rName = right.childForFieldName("name")?.text;
+        const vbody = right.childForFieldName("body");
+        return {
+            name: rName || "default",
+            kind: isClass ? "class" : "function",
+            headerEnd: vbody ? vbody.startIndex : node.endIndex,
+            hashNode: node,
+            isDefaultExport: true,
+        };
+    }
     const prop = left.childForFieldName("property")?.text;
     if (!prop || prop === "exports" || !/^[A-Za-z_$][\w$]*$/.test(prop))
         return null;
     const objText = left.childForFieldName("object")?.text;
-    const owner = objText && objText !== "exports" && objText !== "module.exports" && objText !== "this"
-        ? objText.replace(/\.prototype$/, "")
+    const isDirectExportAssign = objText === "exports" || objText === "module.exports";
+    if (!FUNCTION_VALUE_TYPES.has(right.type)) {
+        if (isDirectExportAssign && ctx.enclosingKind === null && right.type !== "call_expression") {
+            return {
+                name: prop,
+                kind: /^[A-Z][A-Z0-9_]*$/.test(prop) ? "constant" : "variable",
+                headerEnd: right.startIndex,
+                hashNode: node,
+                exported: true,
+            };
+        }
+        return null;
+    }
+    const rawOwner = objText && objText !== "exports" && objText !== "module.exports" && objText !== "this"
+        ? objText.replace(/^(?:module\.)?exports\./, "").replace(/\.prototype$/, "")
         : undefined;
+    const owner = rawOwner && rawOwner !== "exports" && rawOwner !== "module" ? rawOwner : undefined;
     const vbody = right.childForFieldName("body");
     return {
         name: prop,
-        ...(owner && /^[A-Za-z_$][\w$]*$/.test(owner) ? { idName: `${owner}.${prop}`, owner, kind: "method" } : { kind: "function" }),
+        ...(owner && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(owner) ? { idName: `${owner}.${prop}`, owner, kind: "method" } : { kind: "function" }),
         headerEnd: vbody ? vbody.startIndex : node.endIndex,
         hashNode: node,
     };
@@ -1340,7 +1759,7 @@ function describeTsCliCommandAction(node, ctx) {
     };
 }
 function describeTypeScriptSpecial(node, ctx) {
-    return describeTsDefaultExport(node) ?? describeTsAssignedFn(node) ?? describeTsCliCommandAction(node, ctx);
+    return describeTsDefaultExport(node) ?? describeTsAssignedFn(node, ctx) ?? describeTsCliCommandAction(node, ctx);
 }
 function describeLangSpecial(node, ctx) {
     if (ctx.lang === "go")
@@ -1363,16 +1782,60 @@ function describeLangSpecial(node, ctx) {
     }
     return undefined;
 }
+function describePyModuleOrClassAttr(node, ctx) {
+    if (ctx.lang !== "python")
+        return null;
+    if (node.type === "type_alias_statement") {
+        const name = node.childForFieldName("name")?.text ?? node.namedChildren[0]?.text;
+        return name ? { name, kind: "type", headerEnd: node.endIndex, hashNode: node } : null;
+    }
+    if (node.type !== "expression_statement")
+        return null;
+    const inClass = ctx.enclosingKind === "class" && node.parent?.type === "block" && node.parent?.parent?.type === "class_definition";
+    const atTopLevel = ctx.enclosingKind === null && node.parent?.type === "module";
+    if (!inClass && !atTopLevel)
+        return null;
+    const expr = node.namedChildren.length === 1 ? node.namedChildren[0] : null;
+    if (expr?.type !== "assignment")
+        return null;
+    const left = expr.childForFieldName("left");
+    if (left?.type !== "identifier")
+        return null;
+    const name = left.text;
+    if (!name || name === "__all__" || (name.startsWith("__") && name.endsWith("__")))
+        return null;
+    const hasType = Boolean(expr.childForFieldName("type"));
+    const isCall = expr.childForFieldName("right")?.type === "call";
+    const isUpperConst = /^[A-Z][A-Z0-9_]*$/.test(name);
+    if (inClass) {
+        if (!hasType && !isCall && !isUpperConst)
+            return null;
+        return { name, kind: "field", headerEnd: expr.endIndex, hashNode: node };
+    }
+    if (!hasType && !isUpperConst)
+        return null;
+    return { name, kind: isUpperConst ? "constant" : "variable", headerEnd: expr.endIndex, hashNode: node };
+}
 /** Recognize the definition shapes: mapped node types, Go's type/method forms, and
  * TS arrow-consts. */
 function describe(node, ctx) {
     const special = describeLangSpecial(node, ctx);
     if (special !== undefined)
         return special;
+    if (ctx.lang === "python") {
+        const pyAttr = describePyModuleOrClassAttr(node, ctx);
+        if (pyAttr)
+            return pyAttr;
+    }
     if (ctx.lang === "typescript" || ctx.lang === "tsx") {
         const tsSpecial = describeTypeScriptSpecial(node, ctx);
         if (tsSpecial)
             return tsSpecial;
+        if (node.type === "function_signature") {
+            const inAmbient = ctx.rel.endsWith(".d.ts") || node.parent?.type === "ambient_declaration" || ctx.enclosingKind === "module";
+            if (!inAmbient)
+                return null;
+        }
     }
     const mapped = ctx.kinds[node.type];
     const name = mapped ? node.childForFieldName("name")?.text : null;
@@ -1383,13 +1846,13 @@ function describe(node, ctx) {
         (ctx.lang === "php" && mapped === "function" && ctx.enclosingKind === "enum")) {
         kind = "method";
     }
-    const body = node.childForFieldName("body");
+    const body = node.childForFieldName("body") ?? (node.type === "type_alias_declaration" ? node.childForFieldName("value") : null);
     return { name, kind, headerEnd: body ? body.startIndex : node.endIndex, hashNode: node };
 }
 /** Go definition shapes: top-level funcs, receiver methods, and named types
  * (struct / interface / type alias). Methods carry no nesting — they're qualified
  * by their receiver type (`User.Save`) so calls can resolve and cards read clearly. */
-function describeGo(node, _ctx) {
+function describeGo(node, ctx) {
     if (node.type === "function_declaration") {
         const name = node.childForFieldName("name")?.text;
         if (!name)
@@ -1430,6 +1893,15 @@ function describeGo(node, _ctx) {
         if (!name)
             return null;
         return { name, kind: "method", headerEnd: node.endIndex, hashNode: node };
+    }
+    if (node.type === "field_declaration" && ctx.enclosingKind === "struct") {
+        const fName = node.childForFieldName("name")?.text;
+        return fName ? { name: fName, kind: "field", headerEnd: node.endIndex, hashNode: node, owner: ctx.enclosingClass } : null;
+    }
+    if ((node.type === "const_spec" || node.type === "var_spec") && ctx.enclosingKind === null) {
+        const name = node.childForFieldName("name")?.text;
+        if (name && name !== "_")
+            return { name, kind: node.type === "const_spec" ? "constant" : "variable", headerEnd: node.endIndex, hashNode: node };
     }
     return null;
 }
@@ -1481,6 +1953,32 @@ function describeGo(node, _ctx) {
  *     NOT specially extracted — it doesn't naturally map to a class or method
  *     kind, and the plan flags it as a case not worth the design risk.
  */
+function firstParenLineEnd(source, node) {
+    const paren = source.indexOf("(", node.startIndex);
+    if (paren < 0 || paren >= node.endIndex)
+        return node.endIndex;
+    const nl = source.indexOf("\n", paren);
+    return nl >= 0 && nl < node.endIndex ? nl : node.endIndex;
+}
+
+function headerEndBeforeAssignOrBrace(node) {
+    for (const c of node.children ?? []) {
+        if (
+            c.type === "=" ||
+            c.type === "{" ||
+            c.type === "type_initializer" ||
+            c.type === "computed_getter" ||
+            c.type === "willset_didset_block" ||
+            c.type === "property_delegate" ||
+            c.type === "getter" ||
+            c.type === "setter"
+        ) {
+            return c.startIndex;
+        }
+    }
+    return node.endIndex;
+}
+
 function describeRBinaryOp(node, ctx) {
     const op = node.childForFieldName("operator")?.text;
     if (!op || !R_ASSIGN_OPS.has(op))
@@ -1495,11 +1993,11 @@ function describeRBinaryOp(node, ctx) {
     if (rhs?.type === "call" && rCalleeName(rhs) === "R6Class") {
         // The class node itself; its public=/private=/active= method lists are
         // handled by walk()'s own `argument`-node interception, not here.
-        return { name: lhs.text, kind: "class", headerEnd: rhs.endIndex, hashNode: rhs };
+        return { name: lhs.text, kind: "class", headerEnd: firstParenLineEnd(ctx.source, rhs), hashNode: rhs };
     }
     if (rhs?.type === "call" && rCalleeName(rhs) === "list" && rIsMixinContainer(rhs)) {
         // Phase 5: a plain-list mixin/extension bundle — same treatment as R6Class.
-        return { name: lhs.text, kind: "class", headerEnd: rhs.endIndex, hashNode: rhs };
+        return { name: lhs.text, kind: "class", headerEnd: firstParenLineEnd(ctx.source, rhs), hashNode: rhs };
     }
     return null;
 }
@@ -1545,7 +2043,7 @@ function describeR(node, ctx) {
     if (node.type === "function_definition")
         return describeRRightAssignFn(node, ctx);
     if (node.type === "call")
-        return describeRTopLevelCall(node);
+        return describeRTopLevelCall(node, ctx);
     if (node.type === "argument" && ctx.rR6Access !== null)
         return describeR6MethodArg(node);
     return null;
@@ -1699,14 +2197,14 @@ function findUseMethodArg(node) {
  * function() {})` → a method owned by "Foo". Both are ordinary top-level
  * `call` nodes — S4's registration functions have side effects and are
  * essentially never assigned to a variable, unlike R6Class. */
-function describeRTopLevelCall(node) {
+function describeRTopLevelCall(node, ctx) {
     const callee = rCalleeName(node);
     if (callee === "setClass") {
         const first = rCallArgs(node)[0]?.childForFieldName("value");
         const name = first?.type === "string" ? rStringContent(first) : null;
         if (!name)
             return null;
-        return { name, kind: "class", headerEnd: node.endIndex, hashNode: node };
+        return { name, kind: "class", headerEnd: firstParenLineEnd(ctx.source, node), hashNode: node };
     }
     if (callee === "setMethod") {
         const args = rCallArgs(node);
@@ -1809,6 +2307,14 @@ function rStringOrCVector(value) {
  * covers classes, interfaces, enums, records, methods, and constructors. Methods are
  * lexically nested in their type, so — unlike Go — they need no receiver qualification. */
 function describeJava(node, ctx) {
+    if (node.type === "variable_declarator" && node.parent?.type === "field_declaration" && ctx.enclosingClass) {
+        const name = node.childForFieldName("name")?.text;
+        return name ? { name, kind: "field", headerEnd: node.parent.endIndex, hashNode: node.parent, owner: ctx.enclosingClass } : null;
+    }
+    if (node.type === "enum_constant" && ctx.enclosingClass) {
+        const name = node.childForFieldName("name")?.text;
+        return name ? { name, kind: "field", headerEnd: node.endIndex, hashNode: node, owner: ctx.enclosingClass } : null;
+    }
     const mapped = ctx.kinds[node.type];
     if (!mapped)
         return null;
@@ -1863,24 +2369,41 @@ function describeKotlinClass(node) {
 function describeKotlin(node, ctx) {
     if (node.type === "class_declaration")
         return describeKotlinClass(node);
+    if (node.type === "companion_object") {
+        const name = childTypeName(node) ?? "Companion";
+        return { name, kind: "class", headerEnd: childHeadEnd(node, "class_body"), hashNode: node };
+    }
     if (node.type === "object_declaration" || node.type === "type_alias") {
         const name = childTypeName(node);
         if (!name)
             return null;
         return node.type === "object_declaration"
             ? { name, kind: "class", headerEnd: childHeadEnd(node, "class_body"), hashNode: node }
-            : { name, kind: "type", headerEnd: node.endIndex, hashNode: node };
+            : { name, kind: "type", headerEnd: headerEndBeforeAssignOrBrace(node), hashNode: node };
     }
     if (node.type === "function_declaration") {
         const name = childFuncName(node);
-        return name ? { name, kind: KOTLIN_TYPE_KINDS.has(ctx.enclosingKind ?? "file") ? "method" : "function", headerEnd: childHeadEnd(node, "function_body"), hashNode: node } : null;
+        if (!name)
+            return null;
+        const headerEnd = childHeadEnd(node, "function_body");
+        const fnIdx = node.namedChildren.findIndex((c) => c.type === "simple_identifier");
+        const recvNode = fnIdx > 0 ? node.namedChildren.slice(0, fnIdx).find((c) => c.type === "user_type" || c.type === "nullable_type") : null;
+        const recvType = recvNode?.namedChildren.filter((c) => c.type === "type_identifier").at(-1)?.text ??
+            recvNode?.namedChildren.find((c) => c.type === "user_type")?.namedChildren.filter((c) => c.type === "type_identifier").at(-1)?.text ?? null;
+        if (recvType)
+            return { name, idName: `${recvType}.${name}`, owner: recvType, kind: "method", headerEnd, hashNode: node };
+        return { name, kind: KOTLIN_TYPE_KINDS.has(ctx.enclosingKind ?? "file") ? "method" : "function", headerEnd, hashNode: node };
     }
     if (node.type === "secondary_constructor") {
         return ctx.enclosingClass ? { name: ctx.enclosingClass, kind: "method", headerEnd: childHeadEnd(node, "statements"), hashNode: node } : null;
     }
-    if (node.type === "property_declaration" && ctx.enclosingKind === null) {
+    if (node.type === "property_declaration") {
         const name = node.namedChildren.find((c) => c.type === "variable_declaration")?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
-        return name ? { name, kind: "variable", headerEnd: node.endIndex, hashNode: node } : null;
+        if (!name)
+            return null;
+        if (KOTLIN_TYPE_KINDS.has(ctx.enclosingKind ?? "file"))
+            return { name, kind: "field", headerEnd: headerEndBeforeAssignOrBrace(node), hashNode: node, owner: ctx.enclosingClass };
+        return { name, kind: "variable", headerEnd: headerEndBeforeAssignOrBrace(node), hashNode: node };
     }
     return null;
 }
@@ -1904,7 +2427,7 @@ function describeSwift(node, ctx) {
             return null;
         return node.type === "protocol_declaration"
             ? { name, kind: "interface", headerEnd: childHeadEnd(node, "protocol_body"), hashNode: node }
-            : { name, kind: "type", headerEnd: node.endIndex, hashNode: node };
+            : { name, kind: "type", headerEnd: headerEndBeforeAssignOrBrace(node), hashNode: node };
     }
     if (node.type === "function_declaration" || node.type === "protocol_function_declaration") {
         const name = childFuncName(node);
@@ -1920,7 +2443,7 @@ function describeSwift(node, ctx) {
     }
     if (node.type === "property_declaration" && ctx.enclosingKind === null) {
         const name = node.namedChildren.find((c) => c.type === "pattern")?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
-        return name ? { name, kind: "variable", headerEnd: node.endIndex, hashNode: node } : null;
+        return name ? { name, kind: "variable", headerEnd: headerEndBeforeAssignOrBrace(node), hashNode: node } : null;
     }
     return null;
 }
@@ -1954,6 +2477,8 @@ function swiftArgCount(node) {
  * specifier — Swift's grammar requires the superclass to precede any protocol
  * in the `:` list, so when a superclass exists it is always this entry. */
 function swiftSuperClassName(node) {
+    if (!node.children?.some((c) => c.type === "class"))
+        return null;
     const spec = node.namedChildren.find((c) => c.type === "inheritance_specifier");
     const ids = spec?.namedChildren
         .find((c) => c.type === "user_type")
@@ -1983,17 +2508,24 @@ function jvmSwiftHeritageEdges(node, classId, ctx) {
     if (ctx.lang === "java")
         return javaHeritageEdges(node, classId, ctx);
     const edges = [];
+    let specIdx = 0;
+    const isSwiftClass = ctx.lang === "swift" && node.children?.some((c) => c.type === "class");
     for (const child of node.namedChildren) {
         if (ctx.lang === "kotlin" && child.type === "delegation_specifier") {
-            const t = child.namedChildren.find((c) => c.type === "user_type")?.namedChildren.find((c) => c.type === "type_identifier");
+            const ci = child.namedChildren.find((c) => c.type === "constructor_invocation");
+            const ut = (ci ?? child).namedChildren.find((c) => c.type === "user_type");
+            const t = ut?.namedChildren.filter((c) => c.type === "type_identifier").at(-1);
             if (t)
-                edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
+                edges.push({ source: classId, relation: ci ? "extends" : "implements", name: t.text, file: ctx.rel });
         }
         else if (ctx.lang === "swift" && child.type === "inheritance_specifier") {
             const ids = child.namedChildren.find((c) => c.type === "user_type")?.namedChildren.filter((c) => c.type === "type_identifier");
             const t = ids?.at(-1);
-            if (t)
-                edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
+            if (t) {
+                const relKind = isSwiftClass && specIdx === 0 ? "extends" : "implements";
+                edges.push({ source: classId, relation: relKind, name: t.text, file: ctx.rel });
+                specIdx++;
+            }
         }
     }
     return edges;
@@ -2019,8 +2551,17 @@ function extractPhpHeritageEdges(node, classId, ctx) {
         const relation = clause.type === "base_clause" ? "extends" : clause.type === "class_interface_clause" ? "implements" : null;
         if (!relation) continue;
         for (const t of clause.namedChildren) {
-            if (t.type === "name" || t.type === "qualified_name")
-                edges.push({ source: classId, relation, name: t.text.replace(/^.*\\/, ""), file: ctx.rel });
+            if (t.type === "name" || t.type === "qualified_name") {
+                const bare = t.text.replace(/^.*\\/, "");
+                const imp = t.type === "name" ? ctx.importedSymbols.get(bare) : null;
+                edges.push({
+                    source: classId,
+                    relation,
+                    name: imp ? imp.name : bare,
+                    ...(imp?.specifier ? { specifier: imp.specifier } : t.type === "qualified_name" ? { specifier: t.text.replace(/^\\/, "") } : {}),
+                    file: ctx.rel,
+                });
+            }
         }
     }
     return edges;
@@ -2028,12 +2569,27 @@ function extractPhpHeritageEdges(node, classId, ctx) {
 function extractGoHeritageEdges(node, classId, ctx) {
     const edges = [];
     const ifaceNode = node.childForFieldName("type");
-    if (ifaceNode?.type !== "interface_type")
+    if (ifaceNode?.type === "interface_type") {
+        for (const elem of ifaceNode.namedChildren) {
+            if (elem.type !== "type_elem")
+                continue;
+            for (const t of elem.namedChildren) {
+                const name = t.type === "type_identifier" ? t.text : t.type === "qualified_type" ? t.childForFieldName("name")?.text : null;
+                if (name)
+                    edges.push({ source: classId, relation: "extends", name, file: ctx.rel });
+            }
+        }
         return edges;
-    for (const elem of ifaceNode.namedChildren) {
-        if (elem.type !== "type_elem") continue;
-        for (const t of elem.namedChildren) {
-            const name = t.type === "type_identifier" ? t.text : t.type === "qualified_type" ? t.childForFieldName("name")?.text : null;
+    }
+    if (ifaceNode?.type === "struct_type") {
+        const list = ifaceNode.namedChildren.find((c) => c.type === "field_declaration_list");
+        for (const fd of list?.namedChildren ?? []) {
+            if (fd.type !== "field_declaration" || fd.childForFieldName("name"))
+                continue;
+            let t = fd.childForFieldName("type") ?? fd.namedChildren[0];
+            if (t?.type === "pointer_type")
+                t = t.namedChildren.at(-1);
+            const name = t?.type === "type_identifier" ? t.text : t?.type === "qualified_type" ? t.childForFieldName("name")?.text : null;
             if (name)
                 edges.push({ source: classId, relation: "extends", name, file: ctx.rel });
         }
@@ -2057,6 +2613,16 @@ function extractTsHeritageEdges(node, classId, ctx) {
             const nameNode = t.type === "generic_type" ? t.childForFieldName("name") : t;
             if (nameNode?.type === "identifier" || nameNode?.type === "type_identifier")
                 edges.push({ source: classId, relation, name: nameNode.text, file: ctx.rel });
+            else if (nameNode?.type === "member_expression") {
+                const prop = nameNode.childForFieldName("property")?.text;
+                if (prop)
+                    edges.push({ source: classId, relation, name: prop, file: ctx.rel });
+            }
+            else if (nameNode?.type === "nested_type_identifier") {
+                const tail = nameNode.namedChildren.findLast((c) => c.type === "type_identifier")?.text;
+                if (tail)
+                    edges.push({ source: classId, relation, name: tail, file: ctx.rel });
+            }
         }
     }
     return edges;
@@ -2065,9 +2631,24 @@ function heritageEdges(node, classId, ctx) {
     if (ctx.lang === "java" || ctx.lang === "kotlin" || ctx.lang === "swift")
         return jvmSwiftHeritageEdges(node, classId, ctx);
     if (ctx.lang === "python") {
-        return (node.childForFieldName("superclasses")?.namedChildren ?? [])
-            .filter((c) => c.type === "identifier")
-            .map((c) => ({ source: classId, relation: "extends", name: c.text, file: ctx.rel }));
+        const edges = [];
+        for (const c of node.childForFieldName("superclasses")?.namedChildren ?? []) {
+            if (c.type === "identifier") {
+                edges.push({ source: classId, relation: "extends", name: c.text, file: ctx.rel });
+            }
+            else if (c.type === "attribute") {
+                const attr = c.childForFieldName("attribute") ?? c.namedChildren.at(-1);
+                if (attr?.type === "identifier")
+                    edges.push({ source: classId, relation: "extends", name: attr.text, file: ctx.rel });
+            }
+            else if (c.type === "subscript") {
+                const val = c.childForFieldName("value");
+                const b = val?.type === "identifier" ? val.text : val?.type === "attribute" ? val.childForFieldName("attribute")?.text : null;
+                if (b && b !== "Generic" && b !== "Protocol")
+                    edges.push({ source: classId, relation: "extends", name: b, file: ctx.rel });
+            }
+        }
+        return edges;
     }
     if (ctx.lang === "r")
         return extractRHeritageEdges(node, classId, ctx);
@@ -2134,11 +2715,44 @@ function javaCalleeName(node) {
         const name = javaConstructedTypeName(node.childForFieldName("type"));
         return name ? { name, viaMember: false } : null;
     }
+    if (node.type === "method_reference") {
+        const ids = node.namedChildren.filter((c) => c.type === "identifier");
+        const m = ids.at(-1)?.text;
+        const recvNode = node.namedChildren[0];
+        const recv = recvNode && recvNode.type !== "super"
+            ? (recvNode.type === "this" ? "this" : recvNode.type === "type_identifier" || recvNode.type === "identifier" ? recvNode.text : undefined)
+            : "super";
+        return m ? { name: m, viaMember: Boolean(recv), ...(recv ? { receiver: recv } : {}) } : null;
+    }
+    if (node.type === "explicit_constructor_invocation") {
+        const ctor = node.namedChildren[0]?.type;
+        if (ctor === "super" || node.children?.some((c) => c.type === "super"))
+            return { name: "constructor", viaMember: true, receiver: "super" };
+        if (ctor === "this" || node.children?.some((c) => c.type === "this"))
+            return { name: "constructor", viaMember: true, receiver: "this" };
+        return null;
+    }
     const nameNode = node.childForFieldName("name");
     if (!nameNode)
         return null;
     const obj = node.childForFieldName("object");
     return { name: nameNode.text, viaMember: true, receiver: obj ? javaReceiver(obj) : "this" };
+}
+function kotlinNavigationChain(nav, depth = 0) {
+    if (!nav || depth > 4)
+        return undefined;
+    if (nav.type === "simple_identifier")
+        return nav.text;
+    if (nav.type === "this_expression")
+        return "this";
+    if (nav.type === "super_expression")
+        return "super";
+    if (nav.type === "navigation_expression") {
+        const head = kotlinNavigationChain(nav.namedChildren[0], depth + 1);
+        const suf = nav.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+        return head && suf ? `${head}.${suf}` : (suf ?? head);
+    }
+    return undefined;
 }
 function kotlinCalleeName(node) {
     const target = node.namedChildren[0];
@@ -2147,36 +2761,40 @@ function kotlinCalleeName(node) {
     if (target?.type !== "navigation_expression")
         return null;
     const name = target.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier");
-    const receiver = target.namedChildren[0];
+    const receiver = kotlinNavigationChain(target.namedChildren[0]);
     if (!name)
         return null;
-    if (receiver?.type === "simple_identifier")
-        return { name: name.text, viaMember: true, receiver: receiver.text };
-    if (receiver?.type === "this_expression" || receiver?.type === "super_expression")
-        return { name: name.text, viaMember: true, receiver: receiver.type === "this_expression" ? "this" : "super" };
-    return null;
+    return receiver ? { name: name.text, viaMember: true, receiver } : null;
+}
+function swiftNavigationChain(nav, depth = 0) {
+    if (!nav || depth > 4)
+        return undefined;
+    if (nav.type === "simple_identifier")
+        return nav.text;
+    if (nav.type === "self_expression")
+        return "self";
+    if (nav.type === "super_expression")
+        return "super";
+    if (nav.type === "navigation_expression") {
+        const head = swiftNavigationChain(nav.namedChildren[0], depth + 1);
+        const suf = nav.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier")?.text;
+        return head && suf ? `${head}.${suf}` : (suf ?? head);
+    }
+    return undefined;
 }
 function swiftCalleeName(node) {
-    const target = node.namedChildren[0];
+    let target = node.namedChildren[0];
+    while (target && (target.type === "try_expression" || target.type === "await_expression"))
+        target = target.namedChildren[0];
     if (target?.type === "simple_identifier")
         return { name: target.text, viaMember: false };
     if (target?.type !== "navigation_expression")
         return null;
     const name = target.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier");
-    const receiver = target.namedChildren[0];
     if (!name)
         return null;
-    if (receiver?.type === "simple_identifier")
-        return { name: name.text, viaMember: true, receiver: receiver.text };
-    if (receiver?.type === "self_expression" || receiver?.type === "super_expression")
-        return { name: name.text, viaMember: true, receiver: receiver.type === "self_expression" ? "self" : "super" };
-    if (receiver?.type === "navigation_expression") {
-        const head = receiver.namedChildren[0];
-        const field = receiver.namedChildren.find((c) => c.type === "navigation_suffix")?.namedChildren.find((c) => c.type === "simple_identifier");
-        if (head?.type === "self_expression" && field)
-            return { name: name.text, viaMember: true, receiver: `self.${field.text}` };
-    }
-    return { name: name.text, viaMember: true };
+    const receiver = swiftNavigationChain(target.namedChildren[0]);
+    return receiver ? { name: name.text, viaMember: true, receiver } : { name: name.text, viaMember: true };
 }
 function jvmSwiftCalleeName(node, lang) {
     if (lang === "java")
@@ -2197,15 +2815,42 @@ function rOperatorCalleeName(fn) {
         if (lhs?.type === "identifier" && lhs.text === "super") {
             return { name: rhs.text, viaMember: true, receiver: "super" };
         }
+        if (lhs?.type === "identifier") {
+            return { name: rhs.text, viaMember: true, receiver: lhs.text, rBoundRecv: true, kinds: ["function", "method"] };
+        }
         return { name: rhs.text, viaMember: false, kinds: ["function", "method"] };
     }
     return { name: rhs.text, viaMember: false };
+}
+function goMemberChain(operand, depth = 0) {
+    if (!operand || depth > 4)
+        return undefined;
+    if (operand.type === "identifier")
+        return operand.text;
+    if (operand.type === "selector_expression") {
+        const inner = goMemberChain(operand.childForFieldName("operand"), depth + 1);
+        const field = (operand.childForFieldName("field") ?? operand.namedChildren.at(-1))?.text;
+        return inner && field ? `${inner}.${field}` : (field ?? inner);
+    }
+    return undefined;
 }
 function calleeName(node, lang) {
     if (lang === "java" || lang === "kotlin" || lang === "swift")
         return jvmSwiftCalleeName(node, lang);
     if (lang === "php")
         return phpCallee(node);
+    if (lang === "typescript" || lang === "tsx") {
+        if (node.type === "new_expression") {
+            const ctor = node.childForFieldName("constructor");
+            if (ctor?.type === "identifier")
+                return { name: ctor.text, viaMember: false };
+            if (ctor?.type === "member_expression") {
+                const prop = ctor.childForFieldName("property")?.text;
+                return prop ? { name: prop, viaMember: true, receiver: memberCallReceiver(ctor, "member_expression", "property", "this", true) } : null;
+            }
+            return null;
+        }
+    }
     const fn = node.childForFieldName("function");
     if (!fn)
         return null;
@@ -2218,7 +2863,7 @@ function calleeName(node, lang) {
     if (lang === "go" && fn.type === "selector_expression") {
         const p = fn.childForFieldName("field") ?? fn.namedChildren.at(-1);
         const operand = fn.childForFieldName("operand");
-        const receiver = operand?.type === "identifier" ? operand.text : undefined;
+        const receiver = goMemberChain(operand);
         return p ? { name: p.text, viaMember: true, receiver } : null;
     }
     if ((lang === "typescript" || lang === "tsx") && fn.type === "member_expression") {
@@ -2271,54 +2916,61 @@ function javaConstructedTypeName(node) {
         return null;
     if (node.type === "generic_type")
         return javaConstructedTypeName(node.namedChildren[0]);
+    if (node.type === "scoped_type_identifier") {
+        const parts = node.text.split(".");
+        if (parts.length === 2 && /^[A-Z]/.test(parts[0]) && /^[A-Z]/.test(parts[1]))
+            return node.text;
+        return null;
+    }
     return node.type === "type_identifier" ? node.text : null;
 }
 /** A Java call's receiver text: a bare identifier (`repo.save()`), `this`, or
- * `this.x` for a field access (`this.repo.save()`). A chained call or a qualified
- * static reference yields none — there is no confident local clue to bind. */
-function javaReceiver(obj) {
-    if (!obj)
+ * chained field access (`this.repo.client.save()`). */
+function javaReceiver(obj, depth = 0) {
+    if (!obj || depth > 4)
         return undefined;
     if (obj.type === "identifier")
         return obj.text;
     if (obj.type === "this")
         return "this";
+    if (obj.type === "super")
+        return "super";
     if (obj.type === "field_access") {
-        const inner = obj.childForFieldName("object");
+        const inner = javaReceiver(obj.childForFieldName("object"), depth + 1);
         const field = obj.childForFieldName("field");
-        if (inner?.type === "this" && field)
-            return `this.${field.text}`;
+        if (inner && field)
+            return `${inner}.${field.text}`;
     }
     return undefined;
 }
-/** Shared member-call receiver extractor for Python (`attribute`) and TS/JS (`member_expression`). */
+/** Shared member-call receiver extractor for Python (`attribute`) and TS/JS (`member_expression`), supporting multi-hop chains & `super().m()`. */
 function memberCallReceiver(fn, memberNodeType, propField, selfWord, allowBareSelf = false) {
-    const obj = fn.childForFieldName("object");
-    if (allowBareSelf && obj?.type === selfWord)
-        return selfWord;
-    if (obj?.type === "identifier")
-        return obj.text;
-    if (obj?.type === memberNodeType) {
-        const innerObj = obj.childForFieldName("object");
-        const innerProp = obj.childForFieldName(propField);
-        const isSelf = allowBareSelf
-            ? innerObj?.type === selfWord
-            : innerObj?.type === "identifier" && innerObj.text === selfWord;
-        if (isSelf && innerProp)
-            return `${selfWord}.${innerProp.text}`;
-        if (innerObj?.type === "identifier" && innerProp)
-            return `${innerObj.text}.${innerProp.text}`;
-    }
-    return undefined;
+    const step = (cur, depth) => {
+        if (!cur || depth > 4)
+            return undefined;
+        if (allowBareSelf && cur.type === selfWord)
+            return selfWord;
+        if (cur.type === "super")
+            return "super";
+        if (cur.type === "call" && cur.childForFieldName("function")?.text === "super")
+            return "super";
+        if (cur.type === "identifier")
+            return cur.text;
+        if (cur.type === memberNodeType) {
+            const inner = step(cur.childForFieldName("object"), depth + 1);
+            const prop = cur.childForFieldName(propField);
+            return inner && prop ? `${inner}.${prop.text}` : undefined;
+        }
+        return undefined;
+    };
+    return step(fn.childForFieldName("object"), 0);
 }
-/**
- * PHP call shapes: `foo()` (function_call_expression), `$obj->m()` /
- * `$obj?->m()` (member/nullsafe_member_call_expression), and `Cls::m()`
- * (scoped_call_expression). The called name is the trailing `name`; the
- * receiver, when locally knowable (`$this`, `self`/`static`/`parent`), feeds
- * receiver-typed resolution the same way Python's `self` and Go's receiver do.
- */
 function phpCallee(node) {
+    if (node.type === "object_creation_expression") {
+        const cls = node.namedChildren.find((c) => c.type === "name" || c.type === "qualified_name");
+        const bare = cls ? cls.text.replace(/^.*\\/, "") : null;
+        return bare ? { name: bare, viaMember: false } : null;
+    }
     if (node.type === "function_call_expression") {
         const fn = node.childForFieldName("function");
         const name = fn ? phpName(fn) : null;
@@ -2342,12 +2994,18 @@ function phpName(node) {
         return node.text.replace(/^.*\\/, "") || null;
     return null;
 }
-/** `$obj->m()` receiver: `$this` normalizes to `this` (→ enclosing class); any
- * other variable is returned verbatim for a bindings lookup. */
-function phpObjReceiver(obj) {
-    if (obj?.type !== "variable_name")
+/** `$obj->m()` receiver: `$this` normalizes to `this`; chained `$this->repo->m()` unwinds cleanly. */
+function phpObjReceiver(obj, depth = 0) {
+    if (!obj || depth > 4)
         return undefined;
-    return obj.text === "$this" ? "this" : obj.text;
+    if (obj.type === "variable_name")
+        return obj.text === "$this" ? "this" : obj.text;
+    if (obj.type === "member_access_expression") {
+        const inner = phpObjReceiver(obj.childForFieldName("object"), depth + 1);
+        const prop = obj.childForFieldName("name")?.text;
+        return inner && prop ? `${inner}.${prop}` : undefined;
+    }
+    return undefined;
 }
 /** `Cls::m()` receiver: `self`/`static`/`parent` normalize to `self` (→ enclosing
  * class); an explicit class name is the trailing segment of its qualified path. */
@@ -2389,14 +3047,50 @@ function isImport(node, lang) {
     // PHP: one edge per imported symbol — the clause leaf inside a (possibly
     // grouped) `use A\B, C\D;` / `use A\{B, C};` declaration.
     if (lang === "php")
-        return node.type === "namespace_use_clause";
+        return node.type === "namespace_use_clause" ||
+            node.type === "include_expression" ||
+            node.type === "include_once_expression" ||
+            node.type === "require_expression" ||
+            node.type === "require_once_expression";
+    if (lang === "typescript" || lang === "tsx")
+        return node.type === "import_statement" || node.type === "import_alias";
     return node.type === "import_statement" || node.type === "import_from_statement";
 }
 function importSpecifier(node, lang) {
+    if ((lang === "typescript" || lang === "tsx") && node.type === "import_alias") {
+        const str = node.namedChildren.find((c) => c.type === "import_require_clause")?.namedChildren.find((c) => c.type === "string");
+        if (!str)
+            return null;
+        return str.namedChildren.find((c) => c.type === "string_fragment")?.text ?? str.text.replace(/^['"]|['"]$/g, "");
+    }
     if (lang === "php") {
+        if (node.type === "include_expression" || node.type === "include_once_expression" ||
+            node.type === "require_expression" || node.type === "require_once_expression") {
+            const stack = [node];
+            for (let i = 0; i < stack.length; i++) {
+                const cur = stack[i];
+                if (cur.type === "string" || cur.type === "encapsed_string") {
+                    const txt = cur.text.replace(/^['"]|['"]$/g, "").trim();
+                    if (txt)
+                        return txt.startsWith("/") ? `.${txt}` : txt;
+                }
+                for (const c of cur.namedChildren ?? [])
+                    stack.push(c);
+            }
+            return null;
+        }
         // namespace_use_clause → its `qualified_name`/`name`, e.g. `App\Models\Animal`.
+        // For grouped `use App\Models\{User, Order};`, prepend parent's `namespace_name`.
         const q = node.namedChildren.find((c) => c.type === "qualified_name" || c.type === "name");
-        return q ? q.text.replace(/^\\/, "") : null;
+        if (!q)
+            return null;
+        const itemName = q.text.replace(/^\\/, "");
+        if (node.parent?.type === "namespace_use_group" && node.parent.parent?.type === "namespace_use_declaration") {
+            const prefix = node.parent.parent.namedChildren.find((c) => c.type === "namespace_name")?.text.replace(/^\\|\\$/g, "") ?? "";
+            if (prefix)
+                return `${prefix}\\${itemName}`;
+        }
+        return itemName;
     }
     if (lang === "python") {
         const m = node.childForFieldName("module_name") ??
@@ -2443,12 +3137,68 @@ function importSpecifier(node, lang) {
     const frag = str.namedChildren.find((c) => c.type === "string_fragment");
     return frag?.text ?? str.text.replace(/^['"]|['"]$/g, "");
 }
+function skipParenGroup(src, startIdx) {
+    let i = startIdx + 1;
+    let depth = 1;
+    let quote = null;
+    while (i < src.length && depth > 0) {
+        const ch = src[i];
+        if (quote) {
+            if (ch === "\\" && i + 1 < src.length) {
+                i += 2;
+                continue;
+            }
+            if (ch === quote)
+                quote = null;
+            i++;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+            quote = ch;
+            i++;
+            continue;
+        }
+        if (ch === "(")
+            depth++;
+        else if (ch === ")")
+            depth--;
+        i++;
+    }
+    return depth === 0 ? i : src.length;
+}
+
+function stripLeadingDecorators(raw) {
+    let i = 0;
+    const n = raw.length;
+    while (i < n) {
+        while (i < n && /\s/.test(raw[i]))
+            i++;
+        if (i >= n || raw[i] !== "@")
+            break;
+        if (/^@interface\b/.test(raw.slice(i)))
+            break;
+        const m = /^@[A-Za-z_][\w.]*/.exec(raw.slice(i));
+        if (!m)
+            break;
+        i += m[0].length;
+        let ws = i;
+        while (ws < n && (raw[ws] === " " || raw[ws] === "\t"))
+            ws++;
+        if (ws < n && raw[ws] === "(") {
+            i = skipParenGroup(raw, ws);
+        }
+    }
+    return raw.slice(i);
+}
+
 /** Signature = the definition header, whitespace-collapsed, trailing punctuation stripped. */
 function clean(raw) {
-    const sig = raw
+    const sig = stripLeadingDecorators(raw)
         .replace(/\s+/g, " ")
         .trim()
         .replace(/(=>|[{:=])\s*$/, "")
         .trim();
-    return sig || null;
+    if (!sig)
+        return null;
+    return sig.length > 240 ? `${sig.slice(0, 239)}…` : sig;
 }

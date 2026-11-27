@@ -17,7 +17,8 @@ import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { contextDirFor, wiringPath } from "../context/node-file.js";
-import { workspacePath } from "./workspace.js";
+import { sqliteHasGraph } from "../storage/sqlite-store.js";
+import { workspacePath } from "./workspace-path.js";
 
 const REPO_ROOT_MARKERS = [
     ".git",
@@ -34,7 +35,8 @@ const REPO_ROOT_MARKERS = [
 
 /** True when `dir` is a plexer root of either shape — a built repo or a workspace parent. */
 export function hasPlexerIndex(dir) {
-    return existsSync(wiringPath(contextDirFor(dir))) || existsSync(workspacePath(dir));
+    const ctxDir = contextDirFor(dir);
+    return sqliteHasGraph(ctxDir) || existsSync(wiringPath(ctxDir)) || existsSync(workspacePath(dir));
 }
 
 export function isBoundaryDir(resolved) {
