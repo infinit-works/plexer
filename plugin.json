@@ -2,7 +2,7 @@
   "name": "plexer",
   "displayName": "Plexer",
   "version": "2.0.0",
-  "description": "Offline structural code graph, Turn-0 context retrieval, anti-pagination file hooks, and live health/call-graph visualizer for coding agents.",
+  "description": "Offline code graph, Turn-0 span retrieval, anti-pagination file hooks, and live health treemap visualizer for coding agents.",
   "author": "Infinit Works",
   "homepage": "https://github.com/infinit-works/plexer#readme",
   "repository": {
@@ -11,8 +11,8 @@
   },
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Trace callers and blast radius before refactoring a shared module",
-    "Run a codebase health scan and triage the top high-leverage issues",
-    "Map directory hubs, hotspots, and co-edit peers across this repository"
+    "Trace callers and blast radius before editing a shared module",
+    "Scan codebase health and triage the top high-leverage issues",
+    "Map directory hubs, hotspots, and co-edit peers in this repo"
   ]
 }
